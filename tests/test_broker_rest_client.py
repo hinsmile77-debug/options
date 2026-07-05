@@ -20,21 +20,35 @@ def _token_daemon() -> TokenDaemon:
     return TokenDaemon(_settings(), client=httpx.Client(transport=httpx.MockTransport(handler)))
 
 
-def test_get_option_chain_sends_expected_headers_and_params():
+def test_get_quote_sends_expected_headers_and_params():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
         captured["headers"] = request.headers
-        return httpx.Response(200, json={"output": []})
+        return httpx.Response(200, json={"output1": {}})
 
     client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
-    result = client.get_option_chain("201")
+    result = client.get_quote("201S03", market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
 
-    assert result == {"output": []}
-    assert "FID_INPUT_ISCD=201" in captured["url"]
-    assert captured["headers"]["tr_id"] == tr_codes.TR_OPTION_CHAIN["vps"]
+    assert result == {"output1": {}}
+    assert "FID_INPUT_ISCD=201S03" in captured["url"]
+    assert "FID_COND_MRKT_DIV_CODE=F" in captured["url"]
+    assert captured["headers"]["tr_id"] == tr_codes.TR_OPTION_QUOTE["vps"]
     assert captured["headers"]["authorization"] == "Bearer tok"
+
+
+def test_get_asking_price_sends_expected_tr_id():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return httpx.Response(200, json={"output2": {}})
+
+    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client.get_asking_price("201S11305")
+
+    assert captured["headers"]["tr_id"] == tr_codes.TR_OPTION_ASKING_PRICE["vps"]
 
 
 def test_get_balance_uses_account_settings():
@@ -65,6 +79,24 @@ def test_submit_order_maps_sell_and_buy_direction_codes():
 
     assert captured[0]["SLL_BUY_DVSN_CD"] == "01"
     assert captured[1]["SLL_BUY_DVSN_CD"] == "02"
+
+
+def test_submit_order_includes_required_fields_kis_would_otherwise_reject():
+    # ORD_PRCS_DVSN_CD와 ORD_DVSN_CD는 "선물옵션 주문" 문서 기준 Required=Y — 누락 시 KIS가 거부한다.
+    captured = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"rt_cd": "0"})
+
+    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client.submit_order(symbol="201W09", side="BUY", qty=1, price=350.0, order_dvsn_cd="01")
+
+    body = captured[0]
+    assert body["ORD_PRCS_DVSN_CD"] == "02"
+    assert body["ORD_DVSN_CD"] == "01"
 
 
 def test_http_error_propagates():

@@ -12,8 +12,8 @@ venv/
 .env
 *.env.local
 
-# Data / research artifacts
-data/
+# Data / research artifacts (anchored to repo root — NOT mahdi/data/, which is source code)
+/data/
 *.parquet
 *.duckdb
 research/scratch/
