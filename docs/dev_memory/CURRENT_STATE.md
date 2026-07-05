@@ -43,6 +43,7 @@ _최종 갱신: 2026-07-06_
 ### mahdi/dashboard/ — COCKPIT v1 (Streamlit)
 - Regime/Gamma Map/Flow Radar/수급 패널, DB 데이터 없으면 합성 리플레이로 폴백
 - `streamlit.testing.v1.AppTest`로 예외 없이 렌더링 확인
+- 2026-07-06: `render()` 뒤 `time.sleep(REFRESH_INTERVAL_SECONDS)` → `st.rerun()` 폴링 추가 — 브라우저 수동 새로고침 없이 10초 간격 자동 갱신(외부 패키지 불필요)
 
 ### mahdi/main.py — 관측 전용 오케스트레이터
 - 기동 시 종목코드 마스터파일 다운로드 → 최근월 선물코드 확정 → REST 시세로 스팟 조회 → ATM 구독 → WS 리슨 루프
@@ -57,6 +58,7 @@ _최종 갱신: 2026-07-06_
 - **배치파일은 반드시 CRLF 줄바꿈이어야 함** — LF만 있으면 cmd.exe 파싱이 깨짐(2026-07-06 실제로 겪음)
 - 배치파일 내부는 `%~dp0` 기준 상대경로로 프로젝트 루트를 계산 — 절대경로 하드코딩 없음(멀티 PC 이식성).
   단, 스케줄러 Action 등록 자체는 Windows 제약상 절대경로 필요 → PC별 1회 등록 절차로 분리
+- 2026-07-06: `docker compose up -d` 실행 전 Docker 데몬 준비 여부를 확인하고, 없으면 `Docker Desktop.exe`를 직접 실행한 뒤 5초 간격 최대 3분 폴링하는 로직 추가(당일 07:30 기동 시 Docker Desktop이 안 켜져 있어 DB/Redis 없이 COCKPIT/관측루프만 뜬 사고 재발 방지). COCKPIT/관측루프 실행 줄에 `logs/cockpit.log`, `logs/observation_loop.log` 리다이렉션도 추가 — 이전엔 런타임 로그가 콘솔 창에만 출력되고 파일에 안 남았음.
 
 ### 테스트
 - `uv run pytest` — 109개 전부 통과 (2026-07-06 기준)

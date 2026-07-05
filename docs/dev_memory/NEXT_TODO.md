@@ -16,9 +16,11 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ## 운영 검증
 
-- [ ] 2026-07-06(월) 07:30 자동 기동 스케줄 실제 동작 확인 (Mahdi-PreMarket-Startup)
+- [x] 2026-07-06(월) 07:30 자동 기동 스케줄 실제 동작 확인 (Mahdi-PreMarket-Startup) — 실행은 됐으나 Docker Desktop 미기동으로 DB/Redis 없이 COCKPIT/관측루프만 뜸(수동으로 Docker 기동해 당일 대응, 배치파일에 자동 기동/대기 로직 추가함)
+- [ ] 2026-07-07(화) 07:30 기동 시 새로 추가한 Docker 자동 기동/폴링 로직이 실제로 동작하는지 확인(Docker Desktop이 꺼진 상태에서 스케줄러가 트리거되는 시나리오로)
 - [ ] 같은 날 15:45 자동 종료 확인 (Mahdi-MarketClose-Shutdown)
-- [ ] 정규장 시간 중 `market_raw_1m`/`regime_state`에 실제 1분봉이 쌓이는지 확인
+- [ ] 정규장 시간 중 `market_raw_1m`/`regime_state`에 실제 1분봉이 쌓이는지, `logs/observation_loop.log`에 에러 없이 insert가 찍히는지 확인
+- [ ] COCKPIT의 `st.rerun()` 10초 폴링이 브라우저에서 실제로 갱신되는지, 장시간(하루 종일) 방치 시 메모리/연결 누수 없는지 확인
 - [ ] KIS 토큰 발급 레이트리밋(분당 1회 추정) 실운영 중 재현 여부 관찰 — 오늘 테스트 중 반복 호출로 403 재현됨
 
 ## Phase 2(판단·실행) — 아직 시작 안 함

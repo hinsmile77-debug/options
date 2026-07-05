@@ -6,6 +6,8 @@ Regime · Gamma Map · Flow Radar · 수급 패널만 표시한다. 주문 실�
 
 from __future__ import annotations
 
+import time
+
 import streamlit as st
 
 from mahdi.dashboard.data_source import load_snapshot
@@ -19,6 +21,8 @@ from mahdi.dashboard.panels.position_panel import build_position_flow_chart
 from mahdi.dashboard.panels.regime_panel import REGIME_LABEL_KO, build_regime_probability_chart
 
 st.set_page_config(page_title="마흐디 COCKPIT v1", layout="wide")
+
+REFRESH_INTERVAL_SECONDS = 10  # 1분봉 적재 주기보다 짧게 잡아 새 봉을 빠르게 반영
 
 
 def render() -> None:
@@ -62,3 +66,6 @@ def render() -> None:
 
 
 render()
+
+time.sleep(REFRESH_INTERVAL_SECONDS)
+st.rerun()
