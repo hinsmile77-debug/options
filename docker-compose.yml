@@ -1,0 +1,24 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: mahdi_timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-mahdi}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mahdi}
+      POSTGRES_DB: ${DB_NAME:-mahdi}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:7
+    container_name: mahdi_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+volumes:
+  timescaledb_data:

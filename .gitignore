@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# Env / secrets
+.env
+*.env.local
+
+# Data / research artifacts
+data/
+*.parquet
+*.duckdb
+research/scratch/
+
+# Logs
+*.log
+logs/
+
+# OS / IDE
+.DS_Store
+.idea/

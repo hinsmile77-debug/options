@@ -1,0 +1,28 @@
+# 마흐디 리스크 한도 (v6 §12.2, §12.3) — Phase1은 관측 전용이라 실행에는 연결되지 않지만
+# Risk Engine(Phase2)이 그대로 로드해 쓸 수 있도록 여기서 단일 소스로 정의한다.
+version: "1"
+
+sizing:
+  kelly_fraction: 0.25          # Quarter Kelly 기본, Full Kelly 절대 금지
+  max_kelly_fraction: 0.25
+
+limits:
+  per_trade_loss_pct: -0.005    # 계좌의 -0.5% — 진입 거부
+  daily_loss_pct: -0.02         # 계좌의 -2% — 신규 거래 중단
+  weekly_loss_pct: -0.05        # -5% — 시스템 Review 모드
+  max_drawdown_pct: -0.10       # -10% — 자동 거래 정지 + 수동 재가동만 허용
+  max_same_direction_positions: 3
+  max_daily_trades_per_strategy: null   # 전략별 상한은 strategy_params.yaml에서 세팅
+
+circuit_breaker:
+  daily_loss_pct: -0.02
+  drawdown_pct: -0.10
+  vpin_crisis: 0.90
+  vix_spike: 40
+  usdkrw_daily_change: 0.02
+  data_quality_fail: true
+  model_drift: true
+
+operating_constitution:
+  forced_flat_time: "15:10"     # 당일 청산 절대 원칙 — 항상 자동, 해제 불가
+  review_mode_after_consecutive_loss_days: 3

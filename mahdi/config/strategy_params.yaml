@@ -1,0 +1,33 @@
+# 마흐디 전략 파라미터 (v6 §11.3~11.4) — Phase1은 관측 전용이므로 앙상블 학습/전략
+# 실행에는 연결되지 않지만, Fusion/Execution Engine(Phase2)이 동일 파일을 로드한다.
+version: "1"
+
+underlying: "KOSPI200_OPTIONS"
+
+hybrid_mode:
+  default: "ADVISORY"           # ADVISORY → CONFIRM → AUTO 순으로 순차 개방
+  always_automatic:             # 모드와 무관하게 항상 자동
+    - "hard_stop"
+    - "circuit_breaker"
+    - "forced_flat_15_10"
+
+ensemble:
+  regime_hmm:          { base_w: 0.20 }
+  xgboost_tabular:      { base_w: 0.20 }
+  lstm_temporal:        { base_w: 0.15 }
+  options_flow:         { base_w: 0.20 }   # GEX/Vanna/Charm/VRP
+  orderflow_ofi_vpin:   { base_w: 0.15 }
+  flow_position:        { base_w: 0.10 }   # 수급 주체
+# 고정 가중치 금지 — E9(Phase3)가 최근 성과 기반 Thompson Sampling으로 매일 재배분
+
+strategy_gates:
+  max_priority_strategies_per_regime_day: 2
+  short_gamma_requires:
+    - "highest_confidence_level"
+    - "positive_gex"
+    - "stable_regime"
+
+weekly_0dte:
+  size_cap_pct_of_normal: 0.50
+  time_stop_pct_of_normal: 0.50
+  charm_drift_priority_after: "14:00"
