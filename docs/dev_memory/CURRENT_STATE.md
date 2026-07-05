@@ -55,6 +55,8 @@ _최종 갱신: 2026-07-06_
 - `scripts/start_mahdi_premarket.bat` + `Mahdi-PreMarket-Startup` 태스크: 평일 07:30, DB/Redis+COCKPIT+관측루프 기동
 - `scripts/stop_mahdi_marketclose.bat` + `Mahdi-MarketClose-Shutdown` 태스크: 평일 15:45, COCKPIT+관측루프만 종료(DB는 유지)
 - **배치파일은 반드시 CRLF 줄바꿈이어야 함** — LF만 있으면 cmd.exe 파싱이 깨짐(2026-07-06 실제로 겪음)
+- 배치파일 내부는 `%~dp0` 기준 상대경로로 프로젝트 루트를 계산 — 절대경로 하드코딩 없음(멀티 PC 이식성).
+  단, 스케줄러 Action 등록 자체는 Windows 제약상 절대경로 필요 → PC별 1회 등록 절차로 분리
 
 ### 테스트
 - `uv run pytest` — 109개 전부 통과 (2026-07-06 기준)
