@@ -1,7 +1,8 @@
 @echo off
 setlocal
 
-set "PROJECT_DIR=C:\Users\82108\PycharmProjects\options"
+REM 배치파일 자기 위치 기준으로 프로젝트 루트를 계산(절대경로 하드코딩 금지 — 다른 PC/경로에서도 동작)
+for %%I in ("%~dp0..") do set "PROJECT_DIR=%%~fI"
 set "LOG_FILE=%PROJECT_DIR%\logs\premarket_startup.log"
 
 if not exist "%PROJECT_DIR%\logs" mkdir "%PROJECT_DIR%\logs"
