@@ -59,6 +59,18 @@ def test_ofi_sparkline_applies_explicit_x_range_when_given():
     assert list(fig.layout.xaxis.range) == [datetime(2026, 7, 5, 9, 0), datetime(2026, 7, 5, 10, 0)]
 
 
+def test_ofi_sparkline_shows_marker_for_single_point_series():
+    # mode="lines"만 쓰면 점이 1개뿐일 때 Plotly가 선을 못 그려 아무것도 안 보인다
+    # (2026-07-06 거래가 뜸한 옵션 실데이터로 발견) — 마커가 항상 같이 그려져야 한다.
+    fig = build_ofi_sparkline([datetime(2026, 7, 6, 12, 23)], [0.0])
+    assert "markers" in fig.data[0].mode
+
+
+def test_microprice_vs_price_chart_shows_markers_for_single_point_series():
+    fig = build_microprice_vs_price_chart([datetime(2026, 7, 6, 12, 23)], [49.6], [49.55])
+    assert all("markers" in trace.mode for trace in fig.data)
+
+
 def test_vpin_chart_marks_status_colors_by_threshold():
     timestamps = [datetime(2026, 7, 5, 9, i) for i in range(3)]
     vpin = [0.1, 0.5, 0.8]  # good, warning, critical

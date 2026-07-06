@@ -28,12 +28,15 @@ def _vpin_status_color(v: float) -> str:
 def build_ofi_sparkline(
     timestamps: list[datetime], ofi_series: list[float], x_range: tuple[datetime, datetime] | None = None
 ) -> go.Figure:
+    # mode="lines"만 쓰면 점이 1개뿐인 계열(거래가 뜸한 옵션 등)은 Plotly가 선을 그릴 수 없어
+    # 아무것도 안 보인다(2026-07-06 실데이터로 발견) — 마커를 항상 같이 그려 최소 1개 점은 보이게 한다.
     fig = go.Figure(
         go.Scatter(
             x=timestamps,
             y=ofi_series,
-            mode="lines",
+            mode="lines+markers",
             line=dict(color="#0072B2", width=2),
+            marker=dict(color="#0072B2", size=5),
             hovertemplate="%{x|%H:%M}: OFI %{y:.0f}<extra></extra>",
         )
     )
@@ -73,11 +76,19 @@ def build_microprice_vs_price_chart(
     microprice_series: list[float],
     x_range: tuple[datetime, datetime] | None = None,
 ) -> go.Figure:
+    # mode="lines"만 쓰면 점이 1개뿐인 계열(거래가 뜸한 옵션 등)은 Plotly가 선을 그릴 수 없어
+    # 아무것도 안 보인다(2026-07-06 실데이터로 발견) — 마커를 항상 같이 그려 최소 1개 점은 보이게 한다.
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=timestamps, y=price_series, mode="lines", name="체결가", line=dict(color="#8A8A8A", width=2)))
     fig.add_trace(
         go.Scatter(
-            x=timestamps, y=microprice_series, mode="lines", name="Microprice", line=dict(color="#0072B2", width=2, dash="dot")
+            x=timestamps, y=price_series, mode="lines+markers", name="체결가",
+            line=dict(color="#8A8A8A", width=2), marker=dict(color="#8A8A8A", size=5),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=timestamps, y=microprice_series, mode="lines+markers", name="Microprice",
+            line=dict(color="#0072B2", width=2, dash="dot"), marker=dict(color="#0072B2", size=5),
         )
     )
     fig.update_layout(
