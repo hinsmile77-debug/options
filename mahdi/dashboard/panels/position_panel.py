@@ -26,5 +26,7 @@ def build_position_flow_chart(foreign_net: float, institution_net: float, indivi
         )
     )
     fig.add_hline(y=0, line_color="#8A8A8A", line_width=1)
-    fig.update_layout(yaxis_title="순매수(억원)", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=280)
+    # KIS 응답(*_ntby_tr_pbmn)의 정확한 단위(원/천원)를 문서로 확인 못 해 "억원" 등 구체적 단위는
+    # 표기하지 않는다 — 실거래 규모로 검증되면 축 라벨에 단위를 되돌린다.
+    fig.update_layout(yaxis_title="순매수대금", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=280)
     return fig

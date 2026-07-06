@@ -57,6 +57,8 @@ def render() -> None:
         )
 
     st.subheader("Flow Radar")
+    if snapshot.flow_radar_symbol is not None:
+        st.caption(f"대표 종목(체결이 가장 활발한 옵션): {snapshot.flow_radar_symbol}")
     st.plotly_chart(build_ofi_sparkline(snapshot.timestamps, snapshot.ofi_series), width='stretch')
     st.plotly_chart(build_vpin_chart(snapshot.timestamps, snapshot.vpin_series), width='stretch')
     st.plotly_chart(

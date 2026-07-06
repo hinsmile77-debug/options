@@ -21,6 +21,13 @@ _MARKET_RAW_1M_COLUMNS = (
     "usdkrw", "quality_flag",
 )
 
+_OPTION_ANALYSIS_1M_COLUMNS = (
+    "timestamp", "underlying", "expiry", "strike", "option_type",
+    "delta", "gamma", "theta", "vega", "vanna", "charm",
+    "iv", "rv_5d", "vrp", "skew_25d", "gex", "oi", "oi_change",
+    "volume", "spread_state",
+)
+
 
 class CursorLike(Protocol):
     def execute(self, query: str, params: Any = None) -> Any: ...
@@ -63,6 +70,103 @@ def insert_market_raw_1m(conn: ConnectionLike, row: dict) -> None:
               없는 컬럼에 한함) — 상위 레이어가 필수 필드를 채워야 한다.
     """
     _upsert(conn, "market_raw_1m", _MARKET_RAW_1M_COLUMNS, ("timestamp", "symbol"), row)
+
+
+def insert_option_analysis_1m(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: option_analysis_1m 컬럼과 동일한 키를 가진 dict — KIS get_quote() 응답(그릭스/IV/OI)을
+         REST 폴링 루프가 파싱한 결과 1레그(행사가+콜/풋 1건).
+    계산: INSERT ... ON CONFLICT (timestamp, underlying, expiry, strike, option_type) DO UPDATE.
+    """
+    _upsert(
+        conn, "option_analysis_1m", _OPTION_ANALYSIS_1M_COLUMNS,
+        ("timestamp", "underlying", "expiry", "strike", "option_type"), row,
+    )
+
+
+def insert_underlying_spot(conn: ConnectionLike, timestamp: datetime, underlying: str, spot: float) -> None:
+    """입력: 기초자산(지수) 현재가 — REST 응답 output3(지수 자체)에서 추출, 어느 옵션을 조회해도 동일한 값."""
+    row = {"timestamp": timestamp, "underlying": underlying, "spot": spot}
+    _upsert(conn, "underlying_spot_1m", ("timestamp", "underlying", "spot"), ("timestamp", "underlying"), row)
+
+
+def latest_underlying_spot(conn: ConnectionLike, underlying: str) -> float | None:
+    """가장 최근 기초자산 스팟 1건. 폴링 루프가 아직 한 번도 못 돌았으면 None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT spot FROM underlying_spot_1m WHERE underlying=%s ORDER BY timestamp DESC LIMIT 1",
+            (underlying,),
+        )
+        row = cur.fetchone()
+    return float(row[0]) if row else None
+
+
+def insert_investor_flow(
+    conn: ConnectionLike,
+    timestamp: datetime,
+    underlying: str,
+    foreign_net: float,
+    institution_net: float,
+    individual_net: float,
+) -> None:
+    """입력: KOSPI200 파생상품시장(선물+콜옵션+풋옵션 합산) 투자자별 순매수 거래대금 — 세션 누적치 스냅샷."""
+    row = {
+        "timestamp": timestamp,
+        "underlying": underlying,
+        "foreign_net": foreign_net,
+        "institution_net": institution_net,
+        "individual_net": individual_net,
+    }
+    _upsert(
+        conn, "investor_flow_1m",
+        ("timestamp", "underlying", "foreign_net", "institution_net", "individual_net"),
+        ("timestamp", "underlying"), row,
+    )
+
+
+def latest_investor_flow(conn: ConnectionLike, underlying: str) -> tuple[float, float, float] | None:
+    """가장 최근 투자자별 순매수(외국인, 기관계, 개인) 1건. 폴링 루프가 아직 안 돌았으면 None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT foreign_net, institution_net, individual_net FROM investor_flow_1m "
+            "WHERE underlying=%s ORDER BY timestamp DESC LIMIT 1",
+            (underlying,),
+        )
+        row = cur.fetchone()
+    return (float(row[0]), float(row[1]), float(row[2])) if row else None
+
+
+def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
+    """
+    계산: (strike, option_type) 레그별로 가장 최근 timestamp 1건씩만 골라 체인 스냅샷을 구성한다
+         (폴링 주기 중 레그마다 조회 시각이 조금씩 어긋날 수 있어 레그별 최신값을 취함).
+    해석: 반환된 dict는 mahdi.features.options_intel.OptionLeg 생성에 바로 쓸 수 있는 키를 가진다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (strike, option_type)
+                strike, option_type, oi, iv, gamma, gex, expiry, timestamp
+            FROM option_analysis_1m
+            WHERE underlying=%s
+            ORDER BY strike, option_type, timestamp DESC
+            """,
+            (underlying,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "strike": float(strike),
+            "option_type": option_type,
+            "oi": float(oi) if oi is not None else 0.0,
+            "iv": float(iv) if iv is not None else 0.0,
+            "gamma": float(gamma) if gamma is not None else 0.0,
+            "gex": float(gex) if gex is not None else 0.0,
+            "expiry": expiry,
+            "timestamp": timestamp,
+        }
+        for strike, option_type, oi, iv, gamma, gex, expiry, timestamp in rows
+    ]
 
 
 def insert_feature_store(conn: ConnectionLike, timestamp: datetime, symbol: str, features: dict, feature_version: str) -> None:

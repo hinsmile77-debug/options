@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import date, datetime
 
 from mahdi.data import db
 
@@ -86,3 +86,111 @@ def test_insert_regime_state_upserts_on_timestamp_only():
     assert "ON CONFLICT (timestamp) DO UPDATE" in conn.store["query"]
     assert conn.store["params"][0] == ts
     assert conn.store["params"][1] == 4
+
+
+def test_insert_option_analysis_1m_upserts_on_full_leg_key():
+    conn = FakeConnection()
+    row = {col: None for col in db._OPTION_ANALYSIS_1M_COLUMNS}
+    row.update(
+        timestamp=datetime(2026, 7, 6, 9, 31),
+        underlying="KOSPI200",
+        expiry=date(2026, 7, 9),
+        strike=1340.0,
+        option_type="C",
+        gamma=0.0047,
+        gex=123.4,
+    )
+
+    db.insert_option_analysis_1m(conn, row)
+
+    assert "ON CONFLICT (timestamp, underlying, expiry, strike, option_type) DO UPDATE" in conn.store["query"]
+
+
+def test_insert_underlying_spot_upserts_on_timestamp_underlying():
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 6, 9, 31)
+
+    db.insert_underlying_spot(conn, ts, "KOSPI200", 1333.77)
+
+    assert "ON CONFLICT (timestamp, underlying) DO UPDATE" in conn.store["query"]
+    assert conn.store["params"] == [ts, "KOSPI200", 1333.77]
+
+
+class FakeReadCursor:
+    def __init__(self, rows: list):
+        self._rows = rows
+
+    def execute(self, query: str, params=None) -> None:
+        pass
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeReadConnection:
+    def __init__(self, rows: list):
+        self._rows = rows
+
+    def cursor(self) -> FakeReadCursor:
+        return FakeReadCursor(self._rows)
+
+
+def test_latest_underlying_spot_returns_value():
+    conn = FakeReadConnection([(1333.77,)])
+    assert db.latest_underlying_spot(conn, "KOSPI200") == 1333.77
+
+
+def test_latest_underlying_spot_returns_none_when_no_rows():
+    conn = FakeReadConnection([])
+    assert db.latest_underlying_spot(conn, "KOSPI200") is None
+
+
+def test_insert_investor_flow_upserts_on_timestamp_underlying():
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 6, 10, 30)
+
+    db.insert_investor_flow(
+        conn, ts, "KOSPI200", foreign_net=-682279.0, institution_net=678405.0, individual_net=54565.0
+    )
+
+    assert "ON CONFLICT (timestamp, underlying) DO UPDATE" in conn.store["query"]
+    assert conn.store["params"] == [ts, "KOSPI200", -682279.0, 678405.0, 54565.0]
+
+
+def test_latest_investor_flow_returns_tuple():
+    conn = FakeReadConnection([(-682279.0, 678405.0, 54565.0)])
+    assert db.latest_investor_flow(conn, "KOSPI200") == (-682279.0, 678405.0, 54565.0)
+
+
+def test_latest_investor_flow_returns_none_when_no_rows():
+    conn = FakeReadConnection([])
+    assert db.latest_investor_flow(conn, "KOSPI200") is None
+
+
+def test_latest_option_chain_maps_rows_to_dicts():
+    rows = [(1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31))]
+    conn = FakeReadConnection(rows)
+
+    chain = db.latest_option_chain(conn, "KOSPI200")
+
+    assert chain == [
+        {
+            "strike": 1340.0,
+            "option_type": "C",
+            "oi": 363.0,
+            "iv": 0.9,
+            "gamma": 0.0047,
+            "gex": 123.4,
+            "expiry": date(2026, 7, 9),
+            "timestamp": datetime(2026, 7, 6, 9, 31),
+        }
+    ]

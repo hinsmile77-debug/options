@@ -99,6 +99,27 @@ def test_submit_order_includes_required_fields_kis_would_otherwise_reject():
     assert body["ORD_DVSN_CD"] == "01"
 
 
+def test_get_investor_flow_always_uses_real_domain_even_for_mock_account():
+    # "모의 TR_ID/Domain: 모의투자 미지원"이지만 계좌 무관 공개 데이터라 실전 도메인 호출이
+    # 그대로 성공한다(2026-07-06 실측) — 모의(vps) 설정으로 만든 클라이언트라도 이 호출만은
+    # REAL_REST_DOMAIN을 써야 한다.
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = request.headers
+        return httpx.Response(200, json={"output": [{"frgn_ntby_tr_pbmn": "-682279"}]})
+
+    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    result = client.get_investor_flow(tr_codes.FID_MRKT_DIV_DERIVATIVES, tr_codes.FID_INVESTOR_FLOW_FUTURES)
+
+    assert result == {"output": [{"frgn_ntby_tr_pbmn": "-682279"}]}
+    assert captured["url"].startswith(tr_codes.REAL_REST_DOMAIN)
+    assert "FID_INPUT_ISCD=K2I" in captured["url"]
+    assert "FID_INPUT_ISCD_2=F001" in captured["url"]
+    assert captured["headers"]["tr_id"] == tr_codes.TR_INVESTOR_FLOW_BY_MARKET
+
+
 def test_http_error_propagates():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "server error"})

@@ -39,6 +39,18 @@ PATH_FUTUREOPTION_BALANCE = "/uapi/domestic-futureoption/v1/trading/inquire-bala
 PATH_FUTUREOPTION_QUOTE = "/uapi/domestic-futureoption/v1/quotations/inquire-price"
 PATH_FUTUREOPTION_ASKING_PRICE = "/uapi/domestic-futureoption/v1/quotations/inquire-asking-price"
 
+# 시장별 투자자매매동향(시세) — "모의 TR_ID/Domain: 모의투자 미지원"이지만 계좌 무관 공개 시세성
+# 데이터라, 시세 WS와 같은 이유로 모의투자 앱키로도 REAL_REST_DOMAIN 호출이 그대로 성공한다
+# (2026-07-06 실측 확인, 200 OK). 그래서 실전/모의 분기 없이 TR ID 하나만 둔다.
+PATH_INVESTOR_FLOW_BY_MARKET = "/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market"
+TR_INVESTOR_FLOW_BY_MARKET = "FHPTJ04030000"
+
+# FID_INPUT_ISCD=K2I(선물/콜옵션/풋옵션 통합 시장구분)일 때 FID_INPUT_ISCD_2(업종구분) 값
+FID_INVESTOR_FLOW_FUTURES = "F001"
+FID_INVESTOR_FLOW_CALL_OPTION = "OC01"
+FID_INVESTOR_FLOW_PUT_OPTION = "OP01"
+FID_MRKT_DIV_DERIVATIVES = "K2I"
+
 # 주문 TR ID (실전 T / 모의 V 접두 관례) — "선물옵션 주문" 시트 실측
 TR_ORDER_NEW = {"real": "TTTO1101U", "vps": "VTTO1101U"}
 TR_ORDER_MODIFY_CANCEL = {"real": "TTTO1103U", "vps": "VTTO1103U"}

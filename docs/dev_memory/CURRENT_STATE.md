@@ -36,14 +36,38 @@ _최종 갱신: 2026-07-06_
 ### mahdi/data/ — 데이터 레이어
 - `collector.py`: `MinuteBarAggregator` — 틱→1분봉, quality_flag(틱 수 부족 시 저품질)
 - `subscription_manager.py`: `RollingSubscriptionManager` — ATM±N 구독 롤링, symbol_formatter가 None 반환 시 해당 strike 스킵
-- `db.py`: TimescaleDB 커넥션+upsert 헬퍼(market_raw_1m/feature_store/regime_state)
+- `db.py`: TimescaleDB 커넥션+upsert 헬퍼(market_raw_1m/feature_store/regime_state/option_analysis_1m/underlying_spot_1m) — 2026-07-06: `insert_option_analysis_1m`/`insert_underlying_spot`/`latest_underlying_spot`/`latest_option_chain` 추가
 - `symbol_master.py`: KIS 종목코드 마스터파일(`fo_idx_code_mts.mst`) 다운로드·파싱 — 최근월 선물코드, 옵션 체인(행사가 목록), 행사가→단축코드 조회 제공
   - **주의**: 이 파일의 실제 컬럼 순서는 KIS 공식 참고 스크립트와 다름(월물구분코드/행사가/ATM구분 위치가 다름). 옵션의 만기 판별은 `월물구분코드`가 아니라 `한글종목명`에서 정규식으로 추출한 YYYYMM 사용 — symbol_master.py 헤더 주석에 근거 상세 기록.
 
+### db/migrations/002_underlying_spot.sql — 2026-07-06 신규
+- `underlying_spot_1m(timestamp, underlying, spot)` 하이퍼테이블 — REST 폴링이 얻은 KOSPI200 지수 자체(output3.bstp_nmix_prpr)를 저장. `market_raw_1m`은 종목(옵션)별 틱 집계용이라 지수를 담기 부적절해 분리.
+- **주의**: 001에 이어 실행되는 새 마이그레이션 파일은 신선한 볼륨(다른 PC 최초 배포 등)에서는 `docker-entrypoint-initdb.d`가 자동 적용하지만, 이미 초기화된 기존 컨테이너에는 자동 적용 안 됨 — `docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < 새마이그레이션.sql`로 수동 적용 필요.
+
 ### mahdi/dashboard/ — COCKPIT v1 (Streamlit)
 - Regime/Gamma Map/Flow Radar/수급 패널, DB 데이터 없으면 합성 리플레이로 폴백
-- `streamlit.testing.v1.AppTest`로 예외 없이 렌더링 확인
 - 2026-07-06: `render()` 뒤 `time.sleep(REFRESH_INTERVAL_SECONDS)` → `st.rerun()` 폴링 추가 — 브라우저 수동 새로고침 없이 10초 간격 자동 갱신(외부 패키지 불필요)
+- **2026-07-06 데이터 소스 전면 개편** ([[DECISION_LOG]] 참고): `data_source.py`가 예전엔 고정 라벨 `symbol="KOSPI200_OPT"`로 `market_raw_1m`을 조회해 "기초자산 현재가"에 옵션 체결가를 잘못 표시하고 있었음(심볼 분리 수정 이후로는 그 라벨에 아무도 안 써서 완전히 멈춘 화석 데이터가 됨). 수정 후:
+  - 기초자산 현재가 = `underlying_spot_1m` 최신값(진짜 KOSPI200 지수)
+  - Gamma Map = `option_analysis_1m` 최신 체인 스냅샷(행사가별 콜+/풋- 순 GEX 합산) + `options_intel.find_gamma_flip`/`gamma_walls`로 실시간 계산
+  - Flow Radar = `market_raw_1m`에서 가장 최근 체결이 있었던 실제 종목을 자동 선택(화면에 "대표 종목: X" 캡션 표시) — 옛 고정 라벨은 명시적으로 제외
+  - 2026-07-06 추가: 수급(외국인/기관/개인)도 `investor_flow_1m`에서 실값을 읽어오도록 연결(아래 `poll_investor_flow` 참고). 축 라벨은 KIS 응답 단위(원/천원) 미확인이라 "순매수(억원)"에서 "순매수대금"으로 완화.
+  - **알려진 한계**: VPIN은 여전히 0.0 고정(BVC 미구현).
+- **2026-07-06 Streamlit 모듈 캐싱 주의** ([[DECISION_LOG]] 참고): `app.py`(엔트리)만 매 리런마다 디스크에서 새로 읽힌다 — `data_source.py`/`panels/*.py`처럼 `import`되는 하위 모듈은 파이썬 모듈 캐시에 남으므로, 그 파일들을 고치면 `st.rerun()` 폴링이나 브라우저 새로고침만으로는 반영 안 되고 **COCKPIT 프로세스 자체를 재시작**해야 한다. `_load_from_db`의 `except Exception`에 `logger.exception(...)` 추가해 향후 원인 추적 가능하게 함.
+
+### mahdi/main.py 옵션 체인 REST 폴링 — 2026-07-06 신규 (`poll_option_chain`)
+- WS 구독(ATM±3, `subscription_manager.desired_strikes`)과 동일한 행사가×콜/풋에 대해 60초 간격으로 `rest_client.get_quote()`를 반복 호출 → `option_analysis_1m`/`underlying_spot_1m` 적재.
+- **실측으로 확인한 KIS 필드명**(공식 문서 대신 실제 응답으로 검증, 2026-07-06): `output1.delta_val`/`gama`(그대로 "gama", gamma 아님)/`theta`/`vega`, `output1.hts_ints_vltl`(IV, %), `output1.hist_vltl`(과거변동성, rv_5d 근사로 사용), `output1.hts_otst_stpl_qty`/`otst_stpl_qty_icdc`(OI/OI변화), `output1.futs_last_tr_date`(만기일, YYYYMMDD), `output1.acml_vol`(거래량). **`output3.bstp_nmix_prpr`는 어느 옵션 종목을 조회하든 항상 KOSPI200 지수 자체를 반환** — 별도 지수 조회 없이 옵션 조회에 얹혀 기초자산 스팟을 얻는다.
+- `get_quote()`는 동기(블로킹) httpx 호출이라 `asyncio.to_thread`로 실행해 WS 수신 루프(run_observation_loop)를 막지 않음 — `asyncio.gather`로 둘을 동시 실행.
+- 개별 종목 조회 실패(예: 500 에러 — 2026-07-06 실운영 중 실제로 1개 종목에서 재현)는 로그만 남기고 다음 종목으로 계속 진행 — REST 폴링 하나 실패로 WS 관측 전체가 죽지 않음.
+- **알려진 한계**: skew_25d/spread_state는 아직 계산 안 함(NULL) — 25델타 스큐는 체인 전체 IV 곡선이 필요해 레그 단위 파싱만으로는 부족. rv_5d는 정확한 5일 realized vol이 아니라 KIS hist_vltl 근사치.
+
+### mahdi/main.py 투자자 수급 REST 폴링 — 2026-07-06 신규 (`poll_investor_flow`)
+- KIS "시장별 투자자매매동향(시세)"(TR `FHPTJ04030000`, `FID_INPUT_ISCD=K2I`) — 선물(F001)/콜옵션(OC01)/풋옵션(OP01) 3세그먼트를 조회해 외국인/기관계/개인 순매수 거래대금(`frgn_ntby_tr_pbmn`/`orgn_ntby_tr_pbmn`/`prsn_ntby_tr_pbmn`)을 합산 → `investor_flow_1m`에 적재.
+- **중요**: 이 API는 문서상 "모의 TR_ID/Domain: 모의투자 미지원"이지만, 계좌 무관 공개 시세성 데이터라 모의투자 앱키로 `REAL_REST_DOMAIN` 호출 시 실측으로 200 OK 확인됨(2026-07-06) — `rest_client.get_investor_flow()`는 `is_mock` 분기 없이 항상 REAL_REST_DOMAIN을 쓴다([[DECISION_LOG]] 참고). 시세 WS와 같은 패턴.
+- 이 데이터는 **세션 누적치**(1분간 델타 아님) — 폴링 시점까지의 누적 수급 우위 스냅샷을 그대로 저장.
+- 세그먼트 3개 중 일부 실패해도 나머지로 합산 계속(하나 실패했다고 전체를 버리지 않음), 셋 다 실패하면 그 사이클은 적재 스킵.
+- **알려진 한계**: 응답 필드(`*_ntby_tr_pbmn`)의 정확한 화폐 단위(원/천원)를 문서로 확인 못 해 COCKPIT 축 라벨에서 구체적 단위 표기를 뺌(`position_panel.py`).
 
 ### mahdi/main.py — 관측 전용 오케스트레이터
 - 기동 시 종목코드 마스터파일 다운로드 → 최근월 선물코드 확정 → REST 시세로 스팟 조회 → ATM 구독 → WS 리슨 루프
@@ -51,6 +75,9 @@ _최종 갱신: 2026-07-06_
 - 시세 WS는 계좌 무관 공개 데이터라 `MARKET_DATA_WS_DOMAIN`(실전 도메인, :21000) 고정 사용 — 모의투자 전용 시세 도메인 없음
 - Ctrl+C 시 트레이스백 없이 깔끔하게 종료(2026-07-06 수정)
 - **미구현**: `nearest_expiry_chain()`으로 심볼 목록은 뽑을 수 있지만, 각 심볼에 대해 `get_quote()`를 반복 호출해 `option_analysis_1m`(IV/Greeks/OI)을 채우는 루프는 아직 연결 안 됨
+- **2026-07-06 실거래 중 발견·수정한 버그 2건** ([[DECISION_LOG]] 참고):
+  1. ATM±3(콜/풋 합 최대 14종목) 구독인데 `MinuteBarAggregator` 인스턴스를 하나만 써서 서로 다른 옵션 종목의 체결가가 한 봉에 뒤섞임(OHLC가 60선→40선으로 33% 급락하는 등 실제 시장에 없는 값으로 관측됨) → 종목별 dict로 aggregator 분리, `_parse_tick`이 종목코드(0번 필드)도 함께 반환하도록 수정.
+  2. 1번을 고치는 과정에서 KIS WS 실시간 프레임이 `암호화유무|TR_ID|데이터건수|실제데이터(^구분)` 헤더를 앞에 붙여 온다는 사실이 드러남 — 헤더를 안 벗기고 0번 필드를 읽으니 `market_raw_1m.symbol VARCHAR(20)`을 넘겨 매 분 크래시. `raw.split("|", 3)[-1]`로 헤더 제거 후 `"^"` 분리하도록 수정(idx1 이후 필드는 헤더와 무관하게 원래도 맞았음 — 우연히 안 들켰던 것).
 
 ### 스케줄러(Windows 작업 스케줄러)
 - `scripts/start_mahdi_premarket.bat` + `Mahdi-PreMarket-Startup` 태스크: 평일 07:30, DB/Redis+COCKPIT+관측루프 기동
@@ -61,4 +88,4 @@ _최종 갱신: 2026-07-06_
 - 2026-07-06: `docker compose up -d` 실행 전 Docker 데몬 준비 여부를 확인하고, 없으면 `Docker Desktop.exe`를 직접 실행한 뒤 5초 간격 최대 3분 폴링하는 로직 추가(당일 07:30 기동 시 Docker Desktop이 안 켜져 있어 DB/Redis 없이 COCKPIT/관측루프만 뜬 사고 재발 방지). COCKPIT/관측루프 실행 줄에 `logs/cockpit.log`, `logs/observation_loop.log` 리다이렉션도 추가 — 이전엔 런타임 로그가 콘솔 창에만 출력되고 파일에 안 남았음.
 
 ### 테스트
-- `uv run pytest` — 109개 전부 통과 (2026-07-06 기준)
+- `uv run pytest` — 127개 전부 통과 (2026-07-06 기준)

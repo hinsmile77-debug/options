@@ -67,6 +67,26 @@ class KISRestClient:
         response.raise_for_status()
         return response.json()
 
+    def get_investor_flow(self, market_code: str, sector_code: str) -> dict:
+        """
+        시장별 투자자매매동향(시세) — 외국인/개인/기관계 등 순매수 수량·거래대금.
+
+        입력: FID_INPUT_ISCD(시장구분, 파생상품은 "K2I"), FID_INPUT_ISCD_2(업종구분 — K2I일 때
+             F001=선물/OC01=콜옵션/OP01=풋옵션).
+        계산: "모의 TR_ID/Domain: 모의투자 미지원"으로 문서화되어 있지만, 계좌 무관 공개
+             시세성 데이터라 실측 결과 모의투자 앱키로도 REAL_REST_DOMAIN 호출이 200 OK로
+             성공한다(2026-07-06 확인) — 시세 WS와 같은 이유로 실전 도메인을 고정 사용한다.
+        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 전파.
+        """
+        headers = self._headers(tr_codes.TR_INVESTOR_FLOW_BY_MARKET)
+        response = self._client.get(
+            f"{tr_codes.REAL_REST_DOMAIN}{tr_codes.PATH_INVESTOR_FLOW_BY_MARKET}",
+            headers=headers,
+            params={"FID_INPUT_ISCD": market_code, "FID_INPUT_ISCD_2": sector_code},
+        )
+        response.raise_for_status()
+        return response.json()
+
     def get_balance(self) -> dict:
         """
         계산: PATH_FUTUREOPTION_BALANCE GET 호출 (계좌번호는 설정에서 사용).
