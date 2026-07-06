@@ -176,6 +176,26 @@ def test_latest_investor_flow_returns_none_when_no_rows():
     assert db.latest_investor_flow(conn, "KOSPI200") is None
 
 
+def test_upsert_active_futures_symbol_upserts_on_underlying():
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 6, 12, 0)
+
+    db.upsert_active_futures_symbol(conn, "KOSPI200", "A01609", ts)
+
+    assert "ON CONFLICT (underlying) DO UPDATE" in conn.store["query"]
+    assert conn.store["params"] == ["KOSPI200", "A01609", ts]
+
+
+def test_get_active_futures_symbol_returns_value():
+    conn = FakeReadConnection([("A01609",)])
+    assert db.get_active_futures_symbol(conn, "KOSPI200") == "A01609"
+
+
+def test_get_active_futures_symbol_returns_none_when_no_rows():
+    conn = FakeReadConnection([])
+    assert db.get_active_futures_symbol(conn, "KOSPI200") is None
+
+
 def test_latest_option_chain_maps_rows_to_dicts():
     rows = [(1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31))]
     conn = FakeReadConnection(rows)

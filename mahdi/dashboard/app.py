@@ -56,9 +56,36 @@ def render() -> None:
             width='stretch',
         )
 
-    st.subheader("Flow Radar")
-    if snapshot.flow_radar_symbol is not None:
-        st.caption(f"대표 종목(체결이 가장 활발한 옵션): {snapshot.flow_radar_symbol}")
+    # 선물 시계열 범위를 옵션 차트에도 강제 적용 — 옵션은 거래가 뜸해 데이터가 1~2점뿐일 때가
+    # 많은데, 그러면 Plotly가 그 점 주위로만 확대해 x축이 마이크로초 단위로 깨진다(2026-07-06 발견).
+    futures_x_range = (snapshot.timestamps[0], snapshot.timestamps[-1]) if len(snapshot.timestamps) >= 2 else None
+
+    st.subheader("Flow Radar — 옵션(가장 활발한 종목)")
+    if snapshot.option_flow_symbol is not None:
+        st.caption(f"종목: {snapshot.option_flow_symbol}")
+        st.plotly_chart(
+            build_ofi_sparkline(snapshot.option_timestamps, snapshot.option_ofi_series, x_range=futures_x_range),
+            width='stretch',
+        )
+        st.plotly_chart(
+            build_vpin_chart(snapshot.option_timestamps, snapshot.option_vpin_series, x_range=futures_x_range),
+            width='stretch',
+        )
+        st.plotly_chart(
+            build_microprice_vs_price_chart(
+                snapshot.option_timestamps,
+                snapshot.option_price_series,
+                snapshot.option_microprice_series,
+                x_range=futures_x_range,
+            ),
+            width='stretch',
+        )
+    else:
+        st.caption("아직 활성 옵션 종목이 없습니다.")
+
+    st.subheader("Flow Radar — 선물(기초자산)")
+    if snapshot.futures_flow_symbol is not None:
+        st.caption(f"종목: {snapshot.futures_flow_symbol}")
     st.plotly_chart(build_ofi_sparkline(snapshot.timestamps, snapshot.ofi_series), width='stretch')
     st.plotly_chart(build_vpin_chart(snapshot.timestamps, snapshot.vpin_series), width='stretch')
     st.plotly_chart(

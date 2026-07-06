@@ -39,7 +39,7 @@ def test_load_snapshot_falls_back_to_synthetic_when_db_unavailable(monkeypatch):
 
 
 class _FakeCursor:
-    """쿼리 문자열 안의 테이블/조건 키워드로 어떤 조회인지 구분해 미리 준비한 결과를 돌려준다."""
+    """쿼리 문자열/파라미터로 어떤 조회인지 구분해 미리 준비한 결과를 돌려준다."""
 
     def __init__(self, responses: dict):
         self._responses = responses
@@ -54,10 +54,14 @@ class _FakeCursor:
             self._current = self._responses["chain"]
         elif "investor_flow_1m" in query:
             self._current = self._responses["investor_flow"]
+        elif "active_futures_symbol" in query:
+            self._current = self._responses["futures_symbol"]
         elif "GROUP BY symbol" in query:
-            self._current = self._responses["flow_symbol"]
+            self._current = self._responses["option_symbol"]
+        elif "market_raw_1m" in query and params and params[0] == self._responses.get("futures_symbol_value"):
+            self._current = self._responses["futures_rows"]
         elif "market_raw_1m" in query:
-            self._current = self._responses["market_rows"]
+            self._current = self._responses["option_rows"]
         else:
             self._current = []
 
@@ -82,20 +86,31 @@ class _FakeConnection:
         return _FakeCursor(self._responses)
 
 
+_BASE_RESPONSES = {
+    "regime": [(datetime(2026, 7, 6, 9, 31), 2, [0.1] * 8, None, False)],
+    "spot": [(1333.77,)],
+    "chain": [],
+    "futures_symbol": [],
+    "futures_symbol_value": None,
+    "futures_rows": [],
+    "option_symbol": [],
+    "option_rows": [],
+    "investor_flow": [],
+}
+
+
 def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch):
     # 2026-07-06 발견한 버그의 회귀 테스트: 기초자산 현재가는 underlying_spot_1m에서,
-    # Gamma Map은 option_analysis_1m 체인에서, Flow Radar는 가장 활발한 실제 종목에서 와야 한다
-    # (예전엔 market_raw_1m의 고정 라벨 "KOSPI200_OPT"를 잘못 "기초자산"으로 표시했었음).
+    # Gamma Map은 option_analysis_1m 체인에서 와야 한다(예전엔 market_raw_1m의 고정 라벨
+    # "KOSPI200_OPT"를 잘못 "기초자산"으로 표시했었음).
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
+        **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False)],
-        "spot": [(1333.77,)],
         "chain": [
             (1340.0, "C", 363, 0.9, 0.0047, 1000.0, date(2026, 7, 9), ts),
             (1340.0, "P", 200, 0.85, 0.0040, -800.0, date(2026, 7, 9), ts),
         ],
-        "flow_symbol": [("B01607B38",)],
-        "market_rows": [(ts, 40.65, 12.0, 40.7)],
         "investor_flow": [(-150.0, 250.0, -40.0)],
     }
 
@@ -109,7 +124,6 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
 
     assert snap.is_live is True
     assert snap.spot == 1333.77  # market_raw_1m의 옵션 체결가가 아니라 진짜 지수 스팟
-    assert snap.flow_radar_symbol == "B01607B38"
     assert len(snap.chain) == 1  # 같은 행사가의 콜/풋이 하나로 합산됨
     assert snap.chain[0].strike == 1340.0
     assert snap.chain[0].gex == pytest.approx(200.0)  # 1000.0 + (-800.0)
@@ -118,15 +132,68 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
     assert snap.individual_net == -40.0
 
 
+def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
+    # 2026-07-06 발견: 선물이 WS 구독 덕에 거의 매분 체결돼 "가장 최근 활동"만으로 대표 종목을
+    # 뽑으면 옵션이 영원히 안 뽑힌다 — Flow Radar는 선물/옵션 계열을 각각 따로 조회해야 한다.
+    # 선물 식별은 active_futures_symbol 레지스트리로 명시적으로 한다(vpin 유무 휴리스틱은
+    # 옵션에도 VPIN을 적용하면서 깨졌음).
+    ts = datetime(2026, 7, 6, 9, 31)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62)],
+        "option_symbol": [("B01607B38",)],
+        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55)],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    assert snap.futures_flow_symbol == "A01609"
+    assert snap.price_series == [1271.15]
+    assert snap.vpin_series == [0.62]
+
+    assert snap.option_flow_symbol == "B01607B38"
+    assert snap.option_price_series == [40.65]
+    assert snap.option_ofi_series == [12.0]
+    assert snap.option_microprice_series == [40.7]
+    assert snap.option_vpin_series == [0.55]  # 2026-07-06: 옵션도 VPIN이 실제로 계산됨
+
+
+def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):
+    # 아직 등거래량 버킷이 한 번도 안 닫혔으면 vpin은 NULL — 0.0으로 안전하게 처리돼야 한다.
+    ts = datetime(2026, 7, 6, 9, 31)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None)],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    assert snap.vpin_series == [0.0]
+
+
 def test_load_snapshot_defaults_investor_flow_to_zero_when_not_yet_polled(monkeypatch):
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
+        **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False)],
-        "spot": [(1333.77,)],
-        "chain": [],
-        "flow_symbol": [],
-        "market_rows": [],
-        "investor_flow": [],  # poll_investor_flow가 아직 한 번도 안 돈 경우
     }
 
     @contextmanager

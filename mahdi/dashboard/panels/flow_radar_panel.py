@@ -25,7 +25,9 @@ def _vpin_status_color(v: float) -> str:
     return _VPIN_GOOD
 
 
-def build_ofi_sparkline(timestamps: list[datetime], ofi_series: list[float]) -> go.Figure:
+def build_ofi_sparkline(
+    timestamps: list[datetime], ofi_series: list[float], x_range: tuple[datetime, datetime] | None = None
+) -> go.Figure:
     fig = go.Figure(
         go.Scatter(
             x=timestamps,
@@ -37,10 +39,14 @@ def build_ofi_sparkline(timestamps: list[datetime], ofi_series: list[float]) -> 
     )
     fig.add_hline(y=0, line_color="#8A8A8A", line_width=1)
     fig.update_layout(yaxis_title="OFI", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=180)
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
     return fig
 
 
-def build_vpin_chart(timestamps: list[datetime], vpin_series: list[float]) -> go.Figure:
+def build_vpin_chart(
+    timestamps: list[datetime], vpin_series: list[float], x_range: tuple[datetime, datetime] | None = None
+) -> go.Figure:
     colors = [_vpin_status_color(v) for v in vpin_series]
     fig = go.Figure(
         go.Scatter(
@@ -56,11 +62,16 @@ def build_vpin_chart(timestamps: list[datetime], vpin_series: list[float]) -> go
     fig.update_layout(
         yaxis=dict(title="VPIN", range=[0, 1]), showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=200
     )
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
     return fig
 
 
 def build_microprice_vs_price_chart(
-    timestamps: list[datetime], price_series: list[float], microprice_series: list[float]
+    timestamps: list[datetime],
+    price_series: list[float],
+    microprice_series: list[float],
+    x_range: tuple[datetime, datetime] | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=timestamps, y=price_series, mode="lines", name="체결가", line=dict(color="#8A8A8A", width=2)))
@@ -72,4 +83,6 @@ def build_microprice_vs_price_chart(
     fig.update_layout(
         yaxis_title="가격", legend=dict(orientation="h", y=1.15), margin=dict(l=10, r=10, t=30, b=10), height=220
     )
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
     return fig

@@ -136,6 +136,25 @@ def latest_investor_flow(conn: ConnectionLike, underlying: str) -> tuple[float, 
     return (float(row[0]), float(row[1]), float(row[2])) if row else None
 
 
+def upsert_active_futures_symbol(conn: ConnectionLike, underlying: str, symbol: str, updated_at: datetime) -> None:
+    """
+    입력: 현재 구독 중인 선물 단축코드(분기마다 바뀜).
+    계산: INSERT ... ON CONFLICT (underlying) DO UPDATE — underlying당 현재값 1개만 유지.
+    해석: 대시보드가 "이 종목이 선물인지 옵션인지"를 vpin 유무 같은 휴리스틱으로 추측하지 않고
+         바로 조회할 수 있게 한다.
+    """
+    row = {"underlying": underlying, "symbol": symbol, "updated_at": updated_at}
+    _upsert(conn, "active_futures_symbol", ("underlying", "symbol", "updated_at"), ("underlying",), row)
+
+
+def get_active_futures_symbol(conn: ConnectionLike, underlying: str) -> str | None:
+    """현재 구독 중인 선물 단축코드. 관측 루프가 아직 한 번도 안 돌았으면 None."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT symbol FROM active_futures_symbol WHERE underlying=%s", (underlying,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
     """
     계산: (strike, option_type) 레그별로 가장 최근 timestamp 1건씩만 골라 체인 스냅샷을 구성한다

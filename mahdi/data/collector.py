@@ -44,6 +44,61 @@ def _floor_to_minute(ts: datetime) -> datetime:
     return ts.replace(second=0, microsecond=0)
 
 
+@dataclass(frozen=True, slots=True)
+class VolumeBucket:
+    open_to_close_return: float
+    volume: float
+
+
+class VolumeBucketAggregator:
+    """등거래량(equal-volume) 버킷 — VPIN(Easley-Lopez de Prado-O'Hara, BVC) 계산용 입력을 만든다.
+
+    시간 기준으로 봉을 끊는 MinuteBarAggregator와 달리, 누적 체결량이 bucket_size에 도달할
+    때마다 버킷을 닫는다. VPIN은 유동성이 충분한 단일 종목(보통 선물)을 전제로 설계된 지표라,
+    이 클래스도 그런 종목 1개에 대해서만 인스턴스를 만들어 쓴다.
+    """
+
+    def __init__(self, bucket_size: float) -> None:
+        """
+        입력: 버킷 1개를 닫는 데 필요한 누적 거래량(계약수). 실거래 데이터로 보정 전까지는
+             근사치를 쓴다 — 일평균거래량/50이 학계 관례지만, 실제 관측치가 쌓이기 전에는
+             호출측이 임의 상수로 시작해도 된다.
+        실패 조건: bucket_size<=0이면 ValueError.
+        """
+        if bucket_size <= 0:
+            raise ValueError("bucket_size는 0보다 커야 합니다")
+        self._bucket_size = bucket_size
+        self._open_price: float | None = None
+        self._last_price: float | None = None
+        self._accumulated_volume: float = 0.0
+
+    def add_tick(self, price: float, volume: float) -> VolumeBucket | None:
+        """
+        입력: 체결가, 체결량(틱 1건).
+        계산: 누적 거래량이 bucket_size 이상이 되면 버킷을 닫아 (시가→종가 수익률, 버킷
+             거래량)을 반환하고 내부 상태를 리셋한다 — 도달 전이면 None. 버킷을 넘치게 하는
+             틱 1건이 다음 버킷으로 이월되지는 않는다(단순화).
+        실패 조건: volume<=0인 틱은 누적에 반영하지 않고 무시(의미 없는 틱).
+        """
+        if volume <= 0:
+            return None
+        if self._open_price is None:
+            self._open_price = price
+        self._last_price = price
+        self._accumulated_volume += volume
+
+        if self._accumulated_volume >= self._bucket_size:
+            open_price = self._open_price
+            close_price = self._last_price
+            bucket_volume = self._accumulated_volume
+            self._open_price = None
+            self._last_price = None
+            self._accumulated_volume = 0.0
+            ret = (close_price - open_price) / open_price if open_price else 0.0
+            return VolumeBucket(open_to_close_return=ret, volume=bucket_volume)
+        return None
+
+
 class MinuteBarAggregator:
     """symbol 1개에 대해 틱을 누적하고, 분이 바뀌면 완성된 1분봉을 flush한다."""
 

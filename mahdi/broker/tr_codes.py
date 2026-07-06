@@ -65,6 +65,7 @@ FID_MRKT_DIV_INDEX_OPTION = "O"    # 지수옵션
 # 실시간(WebSocket) TR ID — 계좌 무관, MARKET_DATA_WS_DOMAIN 하나로 접속
 WS_TR_OPTION_CONTRACT = "H0IOCNT0"  # 지수옵션 실시간체결가
 WS_TR_OPTION_ORDERBOOK = "H0IOASP0"  # 지수옵션 실시간호가
+WS_TR_FUTURES_CONTRACT = "H0IFCNT0"  # 지수선물 실시간체결가 — "모의 미지원" 문서에도 옵션과 같은 이유로 실전 도메인 구독 가능
 
 # 선물옵션 실시간체결통보 (계좌별 주문체결 알림 — Phase2에서 사용, 모의/실전 TR_ID·도메인 모두 분리)
 WS_TR_ORDER_NOTICE = {"real": "H0IFCNI0", "vps": "H0IFCNI9"}

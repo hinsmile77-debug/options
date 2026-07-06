@@ -27,7 +27,19 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       확인 필요.
 - [ ] 투자자매매동향 응답(`*_ntby_tr_pbmn`)의 정확한 화폐 단위(원/천원)를 공식 문서/실거래 규모 비교로 확인 —
       확인되면 `position_panel.py`의 "순매수대금" 라벨에 단위를 되돌림
-- [ ] VPIN(`market_raw_1m.vpin`) — BVC(Bulk Volume Classification) 미구현이라 COCKPIT Flow Radar에서 계속 0.0 고정
+- [x] VPIN(`market_raw_1m.vpin`) — 2026-07-06 선물(H0IFCNT0) 실시간체결가 신규 구독 + `VolumeBucketAggregator`로
+      구현, 이후 사용자 요청으로 **옵션에도 종목 구분 없이 통일 적용**([[SESSION_LOG]], [[DECISION_LOG]] 참고).
+      재시작 후 실운영 데이터로 선물/옵션 각각 VPIN 값이 0.5(중립) 근처에서 벗어나는 유의미한 변동을
+      보이는지 확인 필요.
+- [ ] `VPIN_BUCKET_SIZE=50`(등거래량 버킷 크기, 선물·옵션 공용)은 미보정 추정치 — 실거래량 패턴을
+      며칠 관찰한 뒤 "일평균거래량/50" 같은 근거로 재조정 검토(특히 옵션은 선물보다 훨씬 얇아 같은
+      크기가 적절한지 재검토 필요)
+- [x] Flow Radar가 선물만 계속 대표 종목으로 뽑는 문제(VPIN 도입의 부작용) — 2026-07-06 선물/옵션
+      계열 분리로 해결, 이후 UI 배치(옵션이 위)/x축 통일/옵션 VPIN 차트까지 2차 개편 완료
+      ([[SESSION_LOG]], [[DECISION_LOG]] 참고)
+- [ ] `find_gamma_flip`(options_intel.py)이 COCKPIT 리런마다 vollib에서 `RuntimeWarning: divide by
+      zero`/`invalid value encountered` 출력 — 크래시는 아니지만 원인 미조사(일부 레그의 t_years나
+      iv가 0에 가까운 것으로 추정, 2026-07-06 관찰)
 
 ## 운영 검증
 

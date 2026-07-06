@@ -52,7 +52,9 @@ _최종 갱신: 2026-07-06_
   - Gamma Map = `option_analysis_1m` 최신 체인 스냅샷(행사가별 콜+/풋- 순 GEX 합산) + `options_intel.find_gamma_flip`/`gamma_walls`로 실시간 계산
   - Flow Radar = `market_raw_1m`에서 가장 최근 체결이 있었던 실제 종목을 자동 선택(화면에 "대표 종목: X" 캡션 표시) — 옛 고정 라벨은 명시적으로 제외
   - 2026-07-06 추가: 수급(외국인/기관/개인)도 `investor_flow_1m`에서 실값을 읽어오도록 연결(아래 `poll_investor_flow` 참고). 축 라벨은 KIS 응답 단위(원/천원) 미확인이라 "순매수(억원)"에서 "순매수대금"으로 완화.
-  - **알려진 한계**: VPIN은 여전히 0.0 고정(BVC 미구현).
+  - 2026-07-06 추가: VPIN도 `market_raw_1m.vpin`에서 실값을 읽음(NULL이면 0.0).
+  - **2026-07-06 Flow Radar 선물/옵션 분리** (두 차례 개편): 선물(H0IFCNT0) 구독 추가 직후 "가장 최근 활동" 단일 선택 로직이 선물만 계속 고르는 문제를 사용자가 지적 — 선물은 WS로 거의 매분 체결되는 반면 옵션은 거래가 뜸해 공백이 생기므로 두 계열을 **각각 독립적으로** 조회하도록 분리. `DashboardSnapshot`에 `option_flow_symbol`/`option_timestamps`/`option_ofi_series`/`option_vpin_series`/`option_price_series`/`option_microprice_series` 필드 추가(`flow_radar_symbol`은 `futures_flow_symbol`로 개명). `app.py`는 "Flow Radar — 옵션(가장 활발한 종목)"을 위, "Flow Radar — 선물(기초자산)"을 아래로 배치(사용자 요청), 옵션 섹션에도 VPIN 차트 추가, 옵션 차트 x축을 선물 시계열 범위로 강제 통일(옵션은 데이터가 1~2점뿐일 때 Plotly가 마이크로초 단위로 확대하는 문제 수정).
+  - 선물/옵션 식별 방식도 2단계로 진화했다: 처음엔 `vpin IS NOT NULL`(선물만 채워짐 가정)로 구분했는데, 옵션에도 VPIN을 적용하면서 그 가정이 깨져 **`active_futures_symbol` 레지스트리 테이블**(신규, `db/migrations/004`)로 명시적 조회로 교체함([[DECISION_LOG]] 참고).
 - **2026-07-06 Streamlit 모듈 캐싱 주의** ([[DECISION_LOG]] 참고): `app.py`(엔트리)만 매 리런마다 디스크에서 새로 읽힌다 — `data_source.py`/`panels/*.py`처럼 `import`되는 하위 모듈은 파이썬 모듈 캐시에 남으므로, 그 파일들을 고치면 `st.rerun()` 폴링이나 브라우저 새로고침만으로는 반영 안 되고 **COCKPIT 프로세스 자체를 재시작**해야 한다. `_load_from_db`의 `except Exception`에 `logger.exception(...)` 추가해 향후 원인 추적 가능하게 함.
 
 ### mahdi/main.py 옵션 체인 REST 폴링 — 2026-07-06 신규 (`poll_option_chain`)
@@ -68,6 +70,13 @@ _최종 갱신: 2026-07-06_
 - 이 데이터는 **세션 누적치**(1분간 델타 아님) — 폴링 시점까지의 누적 수급 우위 스냅샷을 그대로 저장.
 - 세그먼트 3개 중 일부 실패해도 나머지로 합산 계속(하나 실패했다고 전체를 버리지 않음), 셋 다 실패하면 그 사이클은 적재 스킵.
 - **알려진 한계**: 응답 필드(`*_ntby_tr_pbmn`)의 정확한 화폐 단위(원/천원)를 문서로 확인 못 해 COCKPIT 축 라벨에서 구체적 단위 표기를 뺌(`position_panel.py`).
+
+### mahdi/main.py VPIN — 2026-07-06 신규 (`VolumeBucketAggregator` + H0IFCNT0 구독), 종목 구분 없이 통일
+- VPIN(Easley-Lopez de Prado-O'Hara, BVC)은 원래 유동성 높은 단일 종목을 전제로 설계된 지표라 처음엔 선물(기초자산)에만 적용했으나, 사용자가 "선물/옵션 둘 다 보여달라"고 요청해 **종목 구분 없이 통일 적용**하도록 재구조화([[DECISION_LOG]] 참고). 옵션은 거래량이 얇아(오늘 분당 1~10계약) 버킷이 느리게 완성되거나 VPIN이 0.5(중립) 근처에 자주 머물 수 있음을 알고 진행.
+- `run_observation_loop`가 옵션 ATM±3 구독과 별개로 선물 실시간체결가(H0IFCNT0, `futures_symbol`)를 함께 구독. `_parse_futures_tick`이 별도 필드 인덱스로 파싱(옵션 H0IOCNT0와 필드 순서가 다름 — 가격=idx5, 매도/매수호가=idx34/35, 공식 문서 실측). 구독 직후 `active_futures_symbol` 레지스트리에 현재 선물 단축코드를 등록.
+- `mahdi/data/collector.py`의 `VolumeBucketAggregator`(신규) — 시간 기준 `MinuteBarAggregator`와 별개로 등거래량(equal-volume) 버킷을 만들어 `calculate_vpin()`(이미 구현·테스트돼 있던 함수, 지금까지 아무도 안 불렀음) 입력을 생성. 버킷 크기 `VPIN_BUCKET_SIZE=50`은 실거래량 관찰 전까지 쓰는 잠정치(학계 관례 "일평균거래량/50"을 이 모의투자 환경에 아직 적용 못 함).
+- `handle_message`는 이제 선물/옵션을 구분하지 않고 **모든 종목**에 대해 aggregator·volume bucket·vpin 히스토리를 종목별 dict로 관리 — 어떤 종목이든 1분봉이 완성되면 그 종목의 VPIN을 계산해 `market_raw_1m.vpin`에 실어 적재한다(예전엔 선물 전용 특수 분기가 따로 있었으나 통합·단순화됨).
+- **알려진 한계**: 버킷 크기(50계약)는 미보정 추정치 — 실거래량 패턴 관찰 후 재조정 필요. 옵션은 거래가 뜸해 VPIN이 갱신되는 빈도가 선물보다 훨씬 낮을 수 있음.
 
 ### mahdi/main.py — 관측 전용 오케스트레이터
 - 기동 시 종목코드 마스터파일 다운로드 → 최근월 선물코드 확정 → REST 시세로 스팟 조회 → ATM 구독 → WS 리슨 루프
@@ -87,5 +96,13 @@ _최종 갱신: 2026-07-06_
   단, 스케줄러 Action 등록 자체는 Windows 제약상 절대경로 필요 → PC별 1회 등록 절차로 분리
 - 2026-07-06: `docker compose up -d` 실행 전 Docker 데몬 준비 여부를 확인하고, 없으면 `Docker Desktop.exe`를 직접 실행한 뒤 5초 간격 최대 3분 폴링하는 로직 추가(당일 07:30 기동 시 Docker Desktop이 안 켜져 있어 DB/Redis 없이 COCKPIT/관측루프만 뜬 사고 재발 방지). COCKPIT/관측루프 실행 줄에 `logs/cockpit.log`, `logs/observation_loop.log` 리다이렉션도 추가 — 이전엔 런타임 로그가 콘솔 창에만 출력되고 파일에 안 남았음.
 
+### db/migrations/004_active_futures_symbol.sql — 2026-07-06 신규
+- `active_futures_symbol(underlying, symbol, updated_at)` — 단일 현재값 레지스트리(하이퍼테이블 아님). 대시보드가 "이 종목이 지금 구독 중인 선물인지"를 vpin 유무 같은 휴리스틱 없이 바로 조회하게 함.
+
 ### 테스트
-- `uv run pytest` — 127개 전부 통과 (2026-07-06 기준)
+- `uv run pytest` — 142개 전부 통과 (2026-07-06 기준)
+
+### 알려진 자잘한 문제
+- `find_gamma_flip`(options_intel.py)이 매 COCKPIT 리런마다 `RuntimeWarning: divide by zero` /
+  `invalid value encountered in scalar divide`를 출력(vollib Black-Scholes 감마 계산) — 크래시는
+  아니지만 일부 옵션 레그의 `t_years`나 `iv`가 0에 가까워 발생하는 것으로 추정, 원인 미조사(2026-07-06 관찰).

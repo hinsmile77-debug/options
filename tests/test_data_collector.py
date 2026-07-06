@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 
-from mahdi.data.collector import MinuteBarAggregator, Tick
+from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
 
 
 def _tick(second: int, price: float, volume: float = 10.0, minute: int = 5) -> Tick:
@@ -83,3 +83,36 @@ def test_buy_sell_volume_uses_tick_rule():
     bar = agg.flush_final()
     assert bar.buy_volume == pytest.approx(15)  # 350(자기자신 baseline,>=prev) + 351
     assert bar.sell_volume == pytest.approx(3)
+
+
+def test_volume_bucket_returns_none_until_bucket_size_reached():
+    agg = VolumeBucketAggregator(bucket_size=50)
+    assert agg.add_tick(price=100.0, volume=20) is None
+    assert agg.add_tick(price=101.0, volume=20) is None
+
+
+def test_volume_bucket_closes_and_resets_on_reaching_size():
+    agg = VolumeBucketAggregator(bucket_size=50)
+    agg.add_tick(price=100.0, volume=20)
+    agg.add_tick(price=101.0, volume=20)
+    bucket = agg.add_tick(price=102.0, volume=15)  # 누적 55 >= 50 → 마감
+
+    assert bucket is not None
+    assert bucket.open_to_close_return == pytest.approx((102.0 - 100.0) / 100.0)
+    assert bucket.volume == pytest.approx(55)
+
+    # 리셋 확인 — 다음 틱부터 새 버킷
+    assert agg.add_tick(price=200.0, volume=10) is None
+
+
+def test_volume_bucket_ignores_non_positive_volume_ticks():
+    agg = VolumeBucketAggregator(bucket_size=10)
+    assert agg.add_tick(price=100.0, volume=0) is None
+    bucket = agg.add_tick(price=105.0, volume=10)  # 0짜리 틱은 시가에 영향 안 줌
+    assert bucket is not None
+    assert bucket.open_to_close_return == pytest.approx(0.0)  # 시가=종가=105.0
+
+
+def test_volume_bucket_invalid_size_raises():
+    with pytest.raises(ValueError):
+        VolumeBucketAggregator(bucket_size=0)
