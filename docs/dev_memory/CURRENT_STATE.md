@@ -95,6 +95,7 @@ _최종 갱신: 2026-07-06_
 - 배치파일 내부는 `%~dp0` 기준 상대경로로 프로젝트 루트를 계산 — 절대경로 하드코딩 없음(멀티 PC 이식성).
   단, 스케줄러 Action 등록 자체는 Windows 제약상 절대경로 필요 → PC별 1회 등록 절차로 분리
 - 2026-07-06: `docker compose up -d` 실행 전 Docker 데몬 준비 여부를 확인하고, 없으면 `Docker Desktop.exe`를 직접 실행한 뒤 5초 간격 최대 3분 폴링하는 로직 추가(당일 07:30 기동 시 Docker Desktop이 안 켜져 있어 DB/Redis 없이 COCKPIT/관측루프만 뜬 사고 재발 방지). COCKPIT/관측루프 실행 줄에 `logs/cockpit.log`, `logs/observation_loop.log` 리다이렉션도 추가 — 이전엔 런타임 로그가 콘솔 창에만 출력되고 파일에 안 남았음.
+- 2026-07-07: 위 07-06 수정으로 추가된 "Docker Desktop 미존재 경고" 분기(if 블록 안 echo)에 이스케이프 안 된 괄호가 있어, 이 분기가 실제로 실행될 때(Docker 꺼진 채 07:30 트리거) cmd.exe가 `- was unexpected at this time`으로 즉시 파싱 실패하는 버그 발견·수정(`^(...^)`로 이스케이프). PC가 트리거 4분 전(07:25:42)에 막 부팅된 상태였음. [[SESSION_LOG]]/[[DECISION_LOG]] 참고.
 
 ### db/migrations/004_active_futures_symbol.sql — 2026-07-06 신규
 - `active_futures_symbol(underlying, symbol, updated_at)` — 단일 현재값 레지스트리(하이퍼테이블 아님). 대시보드가 "이 종목이 지금 구독 중인 선물인지"를 vpin 유무 같은 휴리스틱 없이 바로 조회하게 함.

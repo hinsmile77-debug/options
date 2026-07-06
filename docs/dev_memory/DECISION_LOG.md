@@ -4,6 +4,16 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-07] 배치파일 IF 블록 안 echo에 괄호를 그대로 쓰면 cmd.exe가 파싱 실패 — `^()` 이스케이프로 수정
+
+**결정:** `scripts/start_mahdi_premarket.bat`의 `if not exist "%DOCKER_DESKTOP_EXE%" ( ... )` 블록 안 echo 문에서 `(%DOCKER_DESKTOP_EXE%)`처럼 괄호를 그대로 썼던 것을 `^(...^)`로 이스케이프했다.
+
+**Why:** 07-07 07:30 자동 기동이 실패(schtasks 반환코드 255, 로그엔 시작 줄 하나만 남고 끝)했고, 사용자 요청으로 수동 재현해도 `cmd.exe`가 `- was unexpected at this time` 파싱 에러로 즉시 죽는 걸 확인했다. 원인은 이 echo 줄이 `if not exist (...)` 블록 안에 있는데, 블록 안에서 괄호를 이스케이프 없이 쓰면(설령 개수가 짝이 맞아도) cmd.exe 파서가 블록 경계를 잘못 인식해 블록이 조기 종료되고 이어지는 토큰(`- 수동 확인 필요`, 닫는 `)`)이 블록 밖 명령으로 잘못 해석돼 구문 에러가 난다 — 전형적인 cmd.exe IF/FOR 블록 내 괄호 지뢰. 이 분기는 Docker가 이미 켜져 있으면 아예 실행되지 않으므로 07-06엔 안 걸렸다가(그날은 docker_ready 분기를 탔음), 07-07 아침 PC가 막 부팅돼(`LastBootUpTime` 07:25:42) Docker가 꺼진 채로 트리거되면서 이 분기가 처음 실제 실행되어 버그가 드러났다.
+
+**How to apply:** 배치파일에서 `if (...)`/`for (...)` 블록 안의 echo·set 등에 괄호나 특수문자(`&`,`|`,`<`,`>`,`^`)를 넣어야 하면 반드시 `^`로 이스케이프한다. 이런 "에러 처리/경고 로그" 분기는 평소(정상 상태)엔 안 타다가 장애 상황에서만 처음 실행되는 경우가 많아, 정상 경로만 검증하고 넘어가면 방치되기 쉽다는 점을 유의 — 배치 스크립트의 실패-분기(fallback branch)도 최소 한 번은 강제로 타보고 검증할 것.
+
+---
+
 ## [2026-07-06] Flow Radar "가장 활발한 옵션" 선정을 "최근 틱 1개"에서 "룩백 윈도 누적거래량"으로 변경
 
 **결정:** `data_source.py`의 옵션 계열 선정 쿼리를 `ORDER BY max(timestamp) DESC LIMIT 1`(타이브레이커 없음)에서 `ORDER BY sum(volume) DESC, max(timestamp) DESC, symbol ASC LIMIT 1` + `WHERE timestamp >= 최근 10분`으로 바꿨다. 룩백 기준 시각은 `datetime.now()`가 아니라 스냅샷 자체의 `regime_state.timestamp`를 쓴다(리플레이 시나리오에서도 윈도가 항상 데이터 시각 기준으로 맞게).

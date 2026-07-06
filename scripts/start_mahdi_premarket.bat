@@ -17,7 +17,7 @@ if not errorlevel 1 goto :docker_ready
 
 set "DOCKER_DESKTOP_EXE=%ProgramFiles%\Docker\Docker\Docker Desktop.exe"
 if not exist "%DOCKER_DESKTOP_EXE%" (
-    echo [%date% %time%] 경고: Docker Desktop.exe를 찾지 못함(%DOCKER_DESKTOP_EXE%) - 수동 확인 필요 >> "%LOG_FILE%"
+    echo [%date% %time%] 경고: Docker Desktop.exe를 찾지 못함 ^(%DOCKER_DESKTOP_EXE%^) - 수동 확인 필요 >> "%LOG_FILE%"
     goto :docker_wait_skip
 )
 

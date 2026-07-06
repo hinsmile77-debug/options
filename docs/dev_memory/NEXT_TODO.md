@@ -44,7 +44,7 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 ## 운영 검증
 
 - [x] 2026-07-06(월) 07:30 자동 기동 스케줄 실제 동작 확인 (Mahdi-PreMarket-Startup) — 실행은 됐으나 Docker Desktop 미기동으로 DB/Redis 없이 COCKPIT/관측루프만 뜸(수동으로 Docker 기동해 당일 대응, 배치파일에 자동 기동/대기 로직 추가함)
-- [ ] 2026-07-07(화) 07:30 기동 시 새로 추가한 Docker 자동 기동/폴링 로직이 실제로 동작하는지 확인(Docker Desktop이 꺼진 상태에서 스케줄러가 트리거되는 시나리오로)
+- [x] 2026-07-07(화) 07:30 기동 시 새로 추가한 Docker 자동 기동/폴링 로직이 실제로 동작하는지 확인 — **실패**: schtasks 반환코드 255로 즉시 종료(PC가 07:25:42에 막 부팅돼 Docker 꺼진 채 트리거되며, `start_mahdi_premarket.bat`의 IF 블록 내 미이스케이프 괄호로 인한 cmd.exe 파싱 버그가 처음 실제로 실행되어 노출됨). `^(...^)`로 수정 후 수동 재실행해 당일분 기동 완료([[SESSION_LOG]]/[[DECISION_LOG]] 참고). **다음 확인 필요**: 2026-07-08 이후 07:30 자동 기동이 수정된 배치파일로 실제 정상 동작하는지(Docker 꺼진 상태 재현 포함)
 - [ ] 같은 날 15:45 자동 종료 확인 (Mahdi-MarketClose-Shutdown)
 - [ ] 정규장 시간 중 `market_raw_1m`/`regime_state`에 실제 1분봉이 쌓이는지, `logs/observation_loop.log`에 에러 없이 insert가 찍히는지 확인
 - [ ] COCKPIT의 `st.rerun()` 10초 폴링이 브라우저에서 실제로 갱신되는지, 장시간(하루 종일) 방치 시 메모리/연결 누수 없는지 확인

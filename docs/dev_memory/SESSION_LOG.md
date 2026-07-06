@@ -4,6 +4,20 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-07] 07:30 장전 자동 기동 실패 원인 규명·수정, 당일분 수동 기동
+
+**트리거:** 사용자가 "07:30에 기동되지 않았다"고 보고.
+
+**진단:** `schtasks /Query`로 태스크가 07:30:00에 정상 트리거됐으나 50초 만에 반환코드 255로 실패한 것을 확인. `logs/premarket_startup.log`엔 시작 로그 한 줄만 남고 그 뒤가 전혀 없었음. `Get-CimInstance Win32_OperatingSystem`으로 PC `LastBootUpTime`이 07:25:42(트리거 4분 전 갓 부팅)임을 확인 — 세션이 막 준비되는 시점에 트리거된 정황. 이후 사용자 요청으로 `start_mahdi_premarket.bat`을 수동 재실행해 동일하게(즉시, `- was unexpected at this time`) 재현됨.
+
+**근본 원인:** 재부팅 타이밍이 아니라 배치파일 자체의 잠복 버그였음 — `if not exist "%DOCKER_DESKTOP_EXE%" ( ... )` 블록 안 echo문에 `(%DOCKER_DESKTOP_EXE%)`처럼 이스케이프 없는 괄호가 있어, 이 분기가 실제로 실행될 때(=Docker Desktop이 안 켜져 있을 때)만 cmd.exe 파서가 블록을 조기 종료시켜 즉시 구문 에러로 죽었다. 07-06엔 Docker가 이미 켜져 있어 이 분기를 안 타서 안 걸렸을 뿐. [[DECISION_LOG]] 참고.
+
+**수정:** `scripts/start_mahdi_premarket.bat`의 해당 줄 괄호를 `^(...^)`로 이스케이프.
+
+**결과:** 수정 후 재실행해 당일(07-07)분 수동 기동 완료 확인 — Docker Desktop 실행(07:52:50)→데몬 준비(07:53:03)→`docker compose up -d`(mahdi_redis/mahdi_timescaledb Running)→COCKPIT(streamlit)/관측 루프(python) 전부 기동, `docker ps`·프로세스 목록으로 재확인.
+
+---
+
 ## [2026-07-06] Phase 1.5 전체(①~④) 구현·실운영 반영 — RESEARCH_EXPIRY_SELECTION_v1 후속
 
 **트리거:** 바로 아래 세션에서 제안한 Phase 1.5 로드맵을 "반영하고 다음 작업을 진행해"라는 요청에 따라 실제 구현.
