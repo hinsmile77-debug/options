@@ -4,6 +4,45 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-06] Phase 1.5 전체(①~④) 구현·실운영 반영 — RESEARCH_EXPIRY_SELECTION_v1 후속
+
+**트리거:** 바로 아래 세션에서 제안한 Phase 1.5 로드맵을 "반영하고 다음 작업을 진행해"라는 요청에 따라 실제 구현.
+
+**구현 내용:**
+- ① `symbol_master.py`: 위클리(N/O) 조회 추가 — `options()`/`nearest_expiry_chain()`/`option_symbol()`에 `series="regular"|"mini"|"weekly"` 인자. 실측 결과 KIS 공식 문서(L/M)와 달리 실제 상품종류는 N/O임을 확인(테스트 12개).
+- ② `main.py`: `run_observation_loop`/`poll_option_chain`이 리스트(`subscription_managers`)/`books`(매니저,series 튜플)를 받도록 시그니처 변경, `main()`에서 먼슬리+위클리 두 `RollingSubscriptionManager`를 동시 구독(슬롯 29/41).
+- ③ `expiry_liquidity_1m` 테이블 신설(`005_expiry_liquidity.sql`) + `poll_expiry_liquidity()` — 사용자가 "정식 스펙대로"(%스프레드 포함) 선택, `get_asking_price()`로 Cao-Wei %스프레드·깊이·거래량 집계. 레이트리밋 우려로 폴링 주기를 옵션체인(60초)보다 긴 300초로 설정.
+- ④ `expiry_liquidity_panel.py`(Plotly Table) — COCKPIT에 "만기 유동성 비교(먼슬리 vs 위클리)" 섹션 추가.
+- 전체 157→159개 테스트 통과 확인.
+
+**재시작 중 실측 이슈(중요):** 기존 mahdi.main/COCKPIT이 2중 프로세스로 떠 있던 것을 정리 후 재시작했더니, 위클리 옵션의 비정상 IV 값이 `option_analysis_1m.iv DECIMAL(8,6)` 범위를 넘겨 `NumericValueOutOfRange`로 관측 루프 전체가 크래시함 — DB 삽입 실패를 레그/북 단위 `try/except`+`rollback`으로 격리하는 수정을 즉시 추가하고 재재시작해 정상화([[DECISION_LOG]] 참고).
+
+**결과 확인:** `market_raw_1m`에 위클리(BAFB*/CAFB*)·먼슬리(B0160*/C0160*)·선물(A01609) 전부 최신 봉 적재 확인, `expiry_liquidity_1m`에 regular 1행 적재 확인(weekly는 다음 5분 주기 대기).
+
+---
+
+## [2026-07-06] 거래 대상(만기·종목) 선발 체계 조사·제안 — RESEARCH_EXPIRY_SELECTION_v1
+
+**트리거:** 사용자가 (1) Flow Radar 옵션 대상이 무엇인지 질문(→ 현재 정규 월물 근월만 구독, 위클리 N/O는 조회 메서드 자체가 없음을 확인), (2) 향후 진입·청산 대상을 먼슬리+위클리(월/목) 중 활발한 종목으로 해야 하지 않는가, 당일 선발·운용 방법을 학술·기관 문헌으로 조사·제안하라고 요청.
+
+**조사 핵심 근거:**
+- KCMI Issue Report 19-11: KOSPI200 최근월물 일평균 거래량이 잔존만기 1~6일 195.6만 > 7~13일 158.0만 > 14~20일 127.2만 > 21~27일 108.6만 계약(전 구간 1% 유의) — 유동성은 최단만기에 구조적 집중. 단 Stoxx50/Nikkei 위클리 실패 사례도 있어 KRX 실측 필수.
+- Beckmeyer-Branger-Gayda(SSRN 4404704): 0DTE 개인 방향성 OTM 매수는 문서화된 손실 패턴 → 금지 규칙의 근거.
+- CBOE 리서치: 0DTE 딜러 순감마 헤지는 SPX 유동성의 ~0.2%(공포 과장), 그러나 pinning·헤지 플로우 집중은 실재.
+- Cao-Wei(2010): 유동성 지표는 달러 스프레드 금지, % 스프레드 사용(만기·머니니스에 의한 기계적 왜곡).
+- 기관 관행: 만기 선택은 장전 확정 후 하루 유지가 표준, 일중 만기 교체는 비표준.
+
+**제안 요지(문서: docs/Dev_md/RESEARCH_EXPIRY_SELECTION_v1.md):**
+- 선발 단위는 개별 종목이 아니라 **만기 북(book)** — 행사가는 기존 RollingSubscriptionManager가 ATM 추종 롤링(2계층 구조).
+- 장전(08:45) 복합 유동성 점수(전일 거래량·OI, ATM±2 % 스프레드, 호가 깊이, 잔존만기)로 주 거래 북 선발, 09:03~05 개장 실측으로 1회 재확인.
+- 만기 북은 하루 고정 + 예외 2개: 유동성 강등 트리거(ATM % 스프레드가 20일 동시간대 중앙값 2배를 M분 연속 초과 시 차점 북으로, 하루 1회 한정), 0DTE 플레이북 오버레이(v6 §11.4 기존 규정).
+- 진입은 ATM±1~2 한정, 깊은 OTM·OI=0 제외, 0DTE 방향성 네이키드 매수 금지.
+- 구현 로드맵: Phase1.5(위클리 N/O 조회 추가 → 2북 동시 구독[슬롯 29/41] → expiry_liquidity_1m 신설 → COCKPIT 패널) → Phase2(선발 스코어러+강등 트리거+북별 파라미터+섀도우 30일).
+
+**정정:** NEXT_TODO의 예전 기록 "위클리는 메서드는 있지만 main.py에서 안 씀"은 부정확 — 실제로는 위클리(N/O) 조회 경로 자체가 없음(미니 D/E만 `mini=True`로 지원). 정정 완료.
+
+---
+
 ## [2026-07-06] Flow Radar 개편 2차 — 옵션에도 VPIN 통일 적용 + UI 배치/x축 수정
 
 **트리거:** 사용자가 Flow Radar 분리 스크린샷을 보고 3가지 요청: (1) 옵션 "가장 활발한 종목" 기준 설명 (2) VPIN 차트가 옵션 섹션에 빠져있음 → 검토 후 삽입 (3) 옵션 섹션을 선물 위로 배치 + x축을 선물과 통일.

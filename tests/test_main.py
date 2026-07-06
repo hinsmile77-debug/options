@@ -9,9 +9,12 @@ from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.features.options_intel import OptionLeg, calculate_gex
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.main import (
+    _atm_liquidity_window,
+    _parse_asking_price_leg,
     _parse_futures_tick,
     _parse_option_quote,
     _parse_tick,
+    poll_expiry_liquidity,
     poll_investor_flow,
     poll_option_chain,
     run_observation_loop,
@@ -211,7 +214,7 @@ def test_run_observation_loop_writes_bar_and_regime_on_minute_rollover(monkeypat
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, subscription_manager, rest_client, futures_symbol="101S03"))
+        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol="101S03"))
 
     assert rest_client.calls == 1
     assert subscription_manager.desired_strikes  # 초기 ATM 구독이 수행됨
@@ -252,7 +255,7 @@ def test_run_observation_loop_keeps_different_symbols_in_separate_bars(monkeypat
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, subscription_manager, rest_client, futures_symbol="101S03"))
+        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol="101S03"))
 
     assert len(written_bars) == 1  # 09:00분 봉은 콜만 flush됨(풋은 아직 진행 중인 분이라 미완성)
     call_bar = next(b for b in written_bars if b["symbol"] == "201S03C325")
@@ -311,7 +314,9 @@ def test_parse_option_quote_missing_field_returns_none():
 
 
 class _FakeMaster:
-    def option_symbol(self, option_type: str, strike: float, underlying: str = "KOSPI200") -> str | None:
+    def option_symbol(
+        self, option_type: str, strike: float, underlying: str = "KOSPI200", series: str = "regular"
+    ) -> str | None:
         return f"SYM{int(strike)}{option_type}"
 
 
@@ -355,13 +360,67 @@ def test_poll_option_chain_writes_legs_and_spot_once_per_cycle(monkeypatch):
     with pytest.raises(RuntimeError, match="stop-loop"):
         _run(
             poll_option_chain(
-                rest_client, _FakeSubscriptionManagerWithStrikes(), _FakeMaster(), interval_seconds=1
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=1,
             )
         )
 
     assert len(rest_client.calls) == 2  # 1개 행사가 x (C, P)
     assert len(written_rows) == 2
     assert written_spots == [1333.77]  # 사이클당 한 번만 적재(레그마다 중복 적재 안 함)
+
+
+class _FakeConnWithRollback:
+    """단순 object()와 달리 rollback()을 지원 — DB 삽입 실패 시 트랜잭션 복구 경로를 검증한다."""
+
+    def __init__(self):
+        self.rollback_calls = 0
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+def test_poll_option_chain_skips_bad_leg_and_continues_after_db_error(monkeypatch):
+    # 2026-07-06 실운영 중 실제로 발생: 위클리 도입 후 얇은 종목의 IV 등이 DECIMAL(8,6) 범위를
+    # 넘겨 psycopg.errors.NumericValueOutOfRange가 나면서 관측 루프 전체(선물 틱 수신 포함)가
+    # 죽었다 — 레그 하나의 DB 삽입 실패가 rollback 후 다음 레그로 계속 이어져야 한다.
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+    written_rows: list[dict] = []
+    fake_conn = _FakeConnWithRollback()
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield fake_conn
+
+    call_count = {"n": 0}
+
+    def fake_insert(conn, row):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError("numeric field overflow")
+        written_rows.append(row)
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", fake_insert)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client, [(_FakeSubscriptionManagerWithStrikes(), "regular")], _FakeMaster(), interval_seconds=1
+            )
+        )
+
+    assert call_count["n"] == 2  # 1개 행사가 x (C, P) 둘 다 시도됨
+    assert len(written_rows) == 1  # 첫 레그만 실패, 둘째 레그는 정상 적재됨(루프가 안 죽음)
+    assert fake_conn.rollback_calls == 1
 
 
 class _FakeInvestorFlowRestClient:
@@ -494,7 +553,7 @@ def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, subscription_manager, rest_client, futures_symbol=futures_symbol))
+        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol))
 
     futures_bars = [b for b in written_bars if b["symbol"] == futures_symbol]
     assert len(futures_bars) == 1
@@ -543,7 +602,7 @@ def test_run_observation_loop_computes_vpin_for_option_symbol_too(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, subscription_manager, rest_client, futures_symbol=futures_symbol))
+        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol))
 
     assert len(written_bars) == 1
     bar = written_bars[0]
@@ -554,3 +613,175 @@ def test_run_observation_loop_computes_vpin_for_option_symbol_too(monkeypatch):
     expected_vpin = calculate_vpin([ret1, ret2], [55.0, 55.0])
     assert expected_vpin > 0
     assert bar["vpin"] == pytest.approx(expected_vpin)
+
+
+def test_atm_liquidity_window_trims_to_center_each_side():
+    # ATM±3(7개) 중에서 ATM±2(5개)만 남아야 함 — strikes_around_atm()이 만드는 대칭 격자를 가정.
+    strikes = frozenset({345.0, 347.5, 350.0, 352.5, 355.0, 357.5, 360.0})
+    assert _atm_liquidity_window(strikes, each_side=2) == [347.5, 350.0, 352.5, 355.0, 357.5]
+
+
+def test_atm_liquidity_window_empty_strikes_returns_empty():
+    assert _atm_liquidity_window(frozenset(), each_side=2) == []
+
+
+_SAMPLE_ASKING_PRICE = {
+    "output1": {"acml_vol": "120"},
+    "output2": {"futs_askp1": "10.10", "futs_bidp1": "9.90", "askp_rsqn1": "30", "bidp_rsqn1": "40"},
+}
+
+
+def test_parse_asking_price_leg_computes_pct_spread_not_dollar_spread():
+    parsed = _parse_asking_price_leg(_SAMPLE_ASKING_PRICE)
+    assert parsed is not None
+    spread_pct, depth, volume = parsed
+    assert spread_pct == pytest.approx((10.10 - 9.90) / 10.00)  # Cao-Wei: 달러 스프레드 아니라 %스프레드
+    assert depth == pytest.approx(70.0)
+    assert volume == pytest.approx(120.0)
+
+
+def test_parse_asking_price_leg_returns_none_when_no_quotes():
+    empty = {"output1": {"acml_vol": "0"}, "output2": {"futs_askp1": "0.00", "futs_bidp1": "0.00", "askp_rsqn1": "0", "bidp_rsqn1": "0"}}
+    assert _parse_asking_price_leg(empty) is None
+
+
+class _FakeMasterForLiquidity:
+    """C는 ATM 종목만 정상 응답, 그 외에는 SYM{strike}{type} 형태로 심볼을 낸다."""
+
+    def option_symbol(
+        self, option_type: str, strike: float, underlying: str = "KOSPI200", series: str = "regular"
+    ) -> str | None:
+        return f"SYM{int(strike)}{option_type}{series[0]}"
+
+
+class _FakeSubscriptionManagerForLiquidity:
+    def __init__(self, strikes: frozenset[float]):
+        self._strikes = strikes
+
+    @property
+    def desired_strikes(self) -> frozenset[float]:
+        return self._strikes
+
+
+class _FakeRestClientForLiquidity:
+    """get_quote는 만기 확인용 앵커 1건, get_asking_price는 각 레그마다 호출된다."""
+
+    def __init__(self, quote_resp: dict, asking_resp: dict):
+        self._quote_resp = quote_resp
+        self._asking_resp = asking_resp
+        self.quote_calls: list[str] = []
+        self.asking_calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.quote_calls.append(symbol)
+        return self._quote_resp
+
+    def get_asking_price(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.asking_calls.append(symbol)
+        return self._asking_resp
+
+
+def test_poll_expiry_liquidity_aggregates_one_row_per_book(monkeypatch):
+    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
+    written_rows: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: written_rows.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0, 1342.5, 1345.0})
+    books = [
+        (_FakeSubscriptionManagerForLiquidity(strikes), "regular"),
+        (_FakeSubscriptionManagerForLiquidity(strikes), "weekly"),
+    ]
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+
+    assert len(written_rows) == 2  # 북(regular, weekly)당 1행
+    series_seen = {row["series"] for row in written_rows}
+    assert series_seen == {"regular", "weekly"}
+    for row in written_rows:
+        assert row["expiry"] == date(2026, 7, 9)
+        assert row["atm_spread_pct"] == pytest.approx((10.10 - 9.90) / 10.00)
+        assert row["depth"] == pytest.approx(70.0 * 5 * 2)  # ATM±2(5개 행사가) x (C,P)
+        assert row["volume"] == pytest.approx(120.0 * 5 * 2)
+
+    # 만기 확인용 get_quote는 북당 1건만 호출돼야 함(ATM 앵커 1건, 레그마다 반복 호출 아님)
+    assert len(rest_client.quote_calls) == 2
+    assert len(rest_client.asking_calls) == 5 * 2 * 2  # 2북 x ATM±2(5) x (C,P)
+
+
+def test_poll_expiry_liquidity_skips_book_with_no_strikes(monkeypatch):
+    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
+    written_rows: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: written_rows.append(row))
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    books = [(_FakeSubscriptionManagerForLiquidity(frozenset()), "regular")]
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+
+    assert written_rows == []
+    assert sleep_calls == [2.0]  # 구독 행사가가 아직 없을 때는 2초 재확인 경로를 탄다
+
+
+def test_poll_expiry_liquidity_skips_bad_book_and_continues_after_db_error(monkeypatch):
+    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
+    written_rows: list[dict] = []
+    fake_conn = _FakeConnWithRollback()
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield fake_conn
+
+    call_count = {"n": 0}
+
+    def fake_insert(conn, row):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError("some db error")
+        written_rows.append(row)
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", fake_insert)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0, 1342.5, 1345.0})
+    books = [
+        (_FakeSubscriptionManagerForLiquidity(strikes), "regular"),
+        (_FakeSubscriptionManagerForLiquidity(strikes), "weekly"),
+    ]
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+
+    assert call_count["n"] == 2  # 북 2개 각각 1행씩 시도됨
+    assert len(written_rows) == 1  # 첫 북만 실패, 둘째 북은 정상 적재됨(루프가 안 죽음)
+    assert fake_conn.rollback_calls == 1

@@ -44,6 +44,15 @@ OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±3) 범위와 동일한
 VPIN_BUCKET_SIZE = 50
 _VPIN_HISTORY_LIMIT = 500  # calculate_vpin 기본 window(50)의 10배 — 무한정 누적 방지
 
+# Phase 1.5-③(만기 유동성 기준선, 2026-07-06 추가) — 연구문서(RESEARCH_EXPIRY_SELECTION_v1.md)가
+# 권고하는 "ATM±2 집중"(Cao-Wei %스프레드 기준, 스캘핑에 최적인 구간)은 WS 구독 범위(ATM±3)보다
+# 좁다. get_asking_price()는 북당 5행사가×2(C/P)=10건 신규 REST 호출이라, 오늘 이미 1x 부하에서
+# 403/500 레이트리밋을 관찰한 점을 고려해 폴링 주기를 옵션체인(60초)보다 훨씬 길게 잡았다 —
+# 어차피 이 지표의 용도는 실시간 판단이 아니라 20거래일 기준선 축적이라 촘촘히 볼 필요가 없다
+# (사용자 확인 후 %스프레드 포함 정식 스펙대로 진행하되, 호출빈도로 부하를 완화하기로 결정).
+LIQUIDITY_ATM_EACH_SIDE = 2
+EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 300
+
 
 class _WebsocketsAdapter(WSConnection):
     """websockets 라이브러리의 연결 객체를 KISWebSocketClient가 기대하는 프로토콜에 맞춘다."""
@@ -63,30 +72,33 @@ class _WebsocketsAdapter(WSConnection):
 
 async def run_observation_loop(
     ws_client: KISWebSocketClient,
-    subscription_manager: RollingSubscriptionManager,
+    subscription_managers: list[RollingSubscriptionManager],
     rest_client: KISRestClient,
     futures_symbol: str,
 ) -> None:
     """
-    입력: 이미 연결된 WS 클라이언트, 구독 롤링 매니저, REST 클라이언트, 최근월 지수선물 단축코드
-         (예: "101S03" — 분기마다 바뀌므로 종목코드 마스터파일/설정으로 최신화 필요).
-    계산: "선물옵션 시세"(inquire-price, F 시장)로 초기 스팟(KOSPI200 지수) 조회 → ATM 구독 →
-         선물 실시간체결가(H0IFCNT0)도 함께 구독(2026-07-06 추가) → 현재 선물 단축코드를
-         active_futures_symbol에 등록(대시보드가 "이 종목이 선물인지" 바로 조회 가능하게) →
-         WS 메시지 수신 → 종목(선물·옵션 구분 없이)별로 1분봉 완성 시 market_raw_1m 적재(각
-         틱에 실린 종목코드를 그대로 사용 — ATM±N 구독은 최대 14개 옵션 종목을 동시에 켜두므로
-         종목별 분리가 필수) → 워밍업 레짐을 regime_state에 기록. 모든 종목의 틱은 등거래량
-         버킷(VolumeBucketAggregator)에도 먹여 VPIN을 계산하고 그 종목의 봉에 실어 적재한다
-         (2026-07-06: 처음엔 선물에만 적용했으나, 옵션도 원한다는 사용자 요청으로 종목 구분 없이
-         통일 — 옵션은 거래량이 얇아 버킷이 느리게 완성되거나 VPIN이 0.5 근처에 자주 머물 수
-         있음을 알고 진행).
+    입력: 이미 연결된 WS 클라이언트, 구독 롤링 매니저 목록(2026-07-06부터 리스트 — 먼슬리/위클리
+         등 여러 만기 북을 동시에 굴리기 위함, 북마다 별도 인스턴스), REST 클라이언트, 최근월
+         지수선물 단축코드(예: "101S03" — 분기마다 바뀌므로 종목코드 마스터파일/설정으로 최신화
+         필요).
+    계산: "선물옵션 시세"(inquire-price, F 시장)로 초기 스팟(KOSPI200 지수) 조회 → 모든 구독
+         매니저를 그 스팟으로 롤링(각자 자기 만기 시리즈에서 ATM±N을 계산) → 선물 실시간체결가
+         (H0IFCNT0)도 함께 구독(2026-07-06 추가) → 현재 선물 단축코드를 active_futures_symbol에
+         등록(대시보드가 "이 종목이 선물인지" 바로 조회 가능하게) → WS 메시지 수신 → 종목(선물·
+         옵션·만기북 구분 없이)별로 1분봉 완성 시 market_raw_1m 적재(각 틱에 실린 종목코드를
+         그대로 사용 — 북마다 최대 14개 옵션 종목이 동시에 켜지므로 종목별 분리가 필수) → 워밍업
+         레짐을 regime_state에 기록. 모든 종목의 틱은 등거래량 버킷(VolumeBucketAggregator)에도
+         먹여 VPIN을 계산하고 그 종목의 봉에 실어 적재한다(2026-07-06: 처음엔 선물에만 적용했으나,
+         옵션도 원한다는 사용자 요청으로 종목 구분 없이 통일 — 옵션은 거래량이 얇아 버킷이 느리게
+         완성되거나 VPIN이 0.5 근처에 자주 머물 수 있음을 알고 진행).
     실패 조건: DB 연결 실패·WS 단절 시 예외가 위로 전파된다 — 재시작은 프로세스 관리자(Ops) 책임.
     """
     quote = rest_client.get_quote(futures_symbol, market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
     # output3 = KOSPI200 지수 자체, output1 = 조회한 선물 계약가(베이시스 존재) — 지수 우선, 없으면 선물가로 폴백
     spot = float(quote.get("output3", {}).get("bstp_nmix_prpr") or quote.get("output1", {}).get("futs_prpr") or 0.0)
     if spot > 0:
-        await subscription_manager.roll_to_spot(spot)
+        for subscription_manager in subscription_managers:
+            await subscription_manager.roll_to_spot(spot)
 
     # 시세(H0IFCNT0)도 계좌 무관 공개 데이터라 모의투자 전용 도메인이 없다 — MARKET_DATA_WS_DOMAIN
     # 하나로 옵션 구독과 함께 붙는다.
@@ -314,52 +326,216 @@ def _parse_option_quote(
 
 async def poll_option_chain(
     rest_client: KISRestClient,
-    subscription_manager: RollingSubscriptionManager,
+    books: list[tuple[RollingSubscriptionManager, str]],
     master: IndexDerivativesMaster,
     underlying: str = UNDERLYING,
     interval_seconds: float = OPTION_CHAIN_POLL_INTERVAL_SECONDS,
 ) -> None:
     """
-    입력: REST 클라이언트, ATM±N 구독 매니저(WS와 동일한 행사가 집합을 공유), 종목코드 마스터.
-    계산: WS 구독 중인 행사가×콜/풋 각각에 대해 주기적으로 get_quote()를 호출해 그릭스/IV/OI를
-         option_analysis_1m에, 기초자산 스팟을 underlying_spot_1m에 적재한다. get_quote()는
-         동기(블로킹) httpx 호출이라 asyncio.to_thread로 실행해 WS 수신 루프를 막지 않는다.
+    입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(2026-07-06부터 리스트 — 먼슬리
+         "regular" 북과 위클리 "weekly" 북을 동시에 폴링하기 위함. 각 북은 WS와 동일한 행사가
+         집합을 공유), 종목코드 마스터.
+    계산: 북마다 WS 구독 중인 행사가×콜/풋 각각에 대해 주기적으로 get_quote()를 호출해
+         그릭스/IV/OI를 option_analysis_1m에, 기초자산 스팟을 underlying_spot_1m에 적재한다.
+         get_quote()는 동기(블로킹) httpx 호출이라 asyncio.to_thread로 실행해 WS 수신 루프를
+         막지 않는다.
     실패 조건: 개별 종목 조회/파싱 실패는 건너뛰고 다음 종목을 계속 처리한다 — REST 폴링 중
-              하나가 실패했다고 WS 관측 전체가 죽으면 안 된다. 구독이 아직 없으면(기동 초입)
-              2초 뒤 재확인.
+              하나가 실패했다고 WS 관측 전체가 죽으면 안 된다. 북 전부가 아직 구독이 없으면
+              (기동 초입) 2초 뒤 재확인.
     """
     while True:
-        strikes = subscription_manager.desired_strikes
-        if not strikes:
-            await asyncio.sleep(2.0)
-            continue
-
         poll_time = datetime.now().replace(second=0, microsecond=0)
         latest_spot: float | None = None
         rows: list[dict] = []
-        for strike in strikes:
-            for option_type in ("C", "P"):
-                symbol = master.option_symbol(option_type, strike, underlying=underlying)
-                if symbol is None:
-                    continue
-                try:
-                    resp = await asyncio.to_thread(rest_client.get_quote, symbol)
-                except Exception:
-                    logger.warning("옵션 체인 폴링 실패: %s", symbol, exc_info=True)
-                    continue
-                parsed = _parse_option_quote(resp, strike, option_type, poll_time)
-                if parsed is None:
-                    continue
-                row, spot = parsed
-                rows.append(row)
-                latest_spot = spot
+        any_strikes = False
+        for subscription_manager, series in books:
+            strikes = subscription_manager.desired_strikes
+            if not strikes:
+                continue
+            any_strikes = True
+            for strike in strikes:
+                for option_type in ("C", "P"):
+                    symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
+                    if symbol is None:
+                        continue
+                    try:
+                        resp = await asyncio.to_thread(rest_client.get_quote, symbol)
+                    except Exception:
+                        logger.warning("옵션 체인 폴링 실패: %s", symbol, exc_info=True)
+                        continue
+                    parsed = _parse_option_quote(resp, strike, option_type, poll_time)
+                    if parsed is None:
+                        continue
+                    row, spot = parsed
+                    rows.append(row)
+                    latest_spot = spot
+
+        if not any_strikes:
+            await asyncio.sleep(2.0)
+            continue
 
         if rows:
             with db.get_connection() as conn:
                 for row in rows:
-                    db.insert_option_analysis_1m(conn, row)
+                    try:
+                        db.insert_option_analysis_1m(conn, row)
+                    except Exception:
+                        # 2026-07-06 위클리 도입 후 실측: 거래가 없는 얇은 종목이 IV 등에 비정상적으로
+                        # 큰 값을 돌려줘 DECIMAL(8,6) 컬럼 범위를 넘는 numeric field overflow가 발생함 —
+                        # 레그 하나가 죽는다고 사이클 전체(선물 틱 수신까지)가 죽으면 안 되므로 스킵.
+                        # rollback 필수: psycopg는 실패한 트랜잭션에서 커밋 없이 다음 execute를 허용 안 함.
+                        logger.warning(
+                            "옵션 체인 적재 실패(값 이상 등): strike=%s type=%s",
+                            row.get("strike"), row.get("option_type"), exc_info=True,
+                        )
+                        conn.rollback()
+                        continue
                 if latest_spot is not None:
-                    db.insert_underlying_spot(conn, poll_time, underlying, latest_spot)
+                    try:
+                        db.insert_underlying_spot(conn, poll_time, underlying, latest_spot)
+                    except Exception:
+                        logger.warning("기초자산 스팟 적재 실패", exc_info=True)
+                        conn.rollback()
+
+        await asyncio.sleep(interval_seconds)
+
+
+def _atm_liquidity_window(strikes: frozenset[float], each_side: int) -> list[float]:
+    """
+    입력: 구독 매니저의 ATM±STRIKES_EACH_SIDE 전체 행사가 집합(WS 구독 범위, 예: ATM±3=7개),
+         유동성 지표에 쓸 편측 개수(LIQUIDITY_ATM_EACH_SIDE=2).
+    계산: 오름차순 정렬 후 정중앙(ATM)을 기준으로 ±each_side만 잘라낸다 — strikes_around_atm()이
+         항상 ATM을 중앙에 두는 대칭 격자를 만들기 때문에 정렬 후 중앙 인덱스를 잡으면 된다.
+    실패 조건: strikes가 비어 있으면 빈 리스트(호출측이 이번 사이클을 건너뜀).
+    """
+    ordered = sorted(strikes)
+    if not ordered:
+        return []
+    mid = len(ordered) // 2
+    lo = max(mid - each_side, 0)
+    hi = min(mid + each_side + 1, len(ordered))
+    return ordered[lo:hi]
+
+
+def _parse_asking_price_leg(resp: dict) -> tuple[float, float, float] | None:
+    """
+    입력: KISRestClient.get_asking_price() 응답(output1=현재가/누적거래량, output2=5단계 호가).
+    계산: 최우선 매도/매수호가로 상대(%) 스프레드를 구한다 — Cao & Wei(2010)가 옵션은 만기·
+         머니니스에 따라 달러 스프레드가 기계적으로 달라지므로 유동성 지표로 부적합하다고 지적한
+         근거를 따라 %스프레드를 쓴다. 호가잔량 합(깊이)과 누적거래량도 함께 반환.
+    실패 조건: 필드 누락/숫자 변환 실패, 또는 양쪽 호가가 모두 비어 mid<=0(체결 자체가 없는
+              얇은 종목)이면 None — %스프레드 정의 자체가 불가하므로 이번 레그는 집계에서 제외.
+    """
+    output1 = resp.get("output1") or {}
+    output2 = resp.get("output2") or {}
+    try:
+        ask1 = float(output2["futs_askp1"])
+        bid1 = float(output2["futs_bidp1"])
+        ask_qty = float(output2["askp_rsqn1"])
+        bid_qty = float(output2["bidp_rsqn1"])
+        volume = float(output1["acml_vol"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    mid = (ask1 + bid1) / 2
+    if mid <= 0:
+        return None
+    spread_pct = (ask1 - bid1) / mid
+    depth = ask_qty + bid_qty
+    return spread_pct, depth, volume
+
+
+async def poll_expiry_liquidity(
+    rest_client: KISRestClient,
+    books: list[tuple[RollingSubscriptionManager, str]],
+    master: IndexDerivativesMaster,
+    underlying: str = UNDERLYING,
+    interval_seconds: float = EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS,
+) -> None:
+    """
+    입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(먼슬리 "regular" + 위클리 "weekly"),
+         종목코드 마스터.
+    계산: 북마다 ATM±2(_atm_liquidity_window) 구간의 콜/풋 각각에 get_asking_price()를 호출해
+         %스프레드·깊이·거래량을 집계하고, 만기일은 ATM 종목 1건만 get_quote()로 별도 확인해
+         (_parse_option_quote 재사용) expiry_liquidity_1m에 적재한다. 만기 확인용 get_quote()는
+         북당 사이클당 1건뿐이라 REST 부하에 미치는 영향은 무시할 만하다.
+    실패 조건: 개별 레그 조회/파싱 실패는 건너뛰고 나머지로 계속 집계한다. 유효한 레그가 하나도
+              없거나 만기를 확인하지 못하면 그 북은 이번 사이클을 건너뛴다. 모든 북에 구독 행사가가
+              없으면(기동 초입) 2초 뒤 재확인.
+    """
+    while True:
+        poll_time = datetime.now().replace(second=0, microsecond=0)
+        any_strikes = False
+        rows: list[dict] = []
+        for subscription_manager, series in books:
+            window = _atm_liquidity_window(subscription_manager.desired_strikes, LIQUIDITY_ATM_EACH_SIDE)
+            if not window:
+                continue
+            any_strikes = True
+
+            atm_strike = window[len(window) // 2]
+            anchor_symbol = master.option_symbol("C", atm_strike, underlying=underlying, series=series)
+            expiry = None
+            if anchor_symbol is not None:
+                try:
+                    anchor_resp = await asyncio.to_thread(rest_client.get_quote, anchor_symbol)
+                    parsed_anchor = _parse_option_quote(anchor_resp, atm_strike, "C", poll_time)
+                except Exception:
+                    parsed_anchor = None
+                if parsed_anchor is not None:
+                    expiry = parsed_anchor[0]["expiry"]
+            if expiry is None:
+                continue
+
+            spread_values: list[float] = []
+            depth_total = 0.0
+            volume_total = 0.0
+            for strike in window:
+                for option_type in ("C", "P"):
+                    symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
+                    if symbol is None:
+                        continue
+                    try:
+                        resp = await asyncio.to_thread(rest_client.get_asking_price, symbol)
+                    except Exception:
+                        logger.warning("만기 유동성 폴링 실패: %s", symbol, exc_info=True)
+                        continue
+                    parsed_leg = _parse_asking_price_leg(resp)
+                    if parsed_leg is None:
+                        continue
+                    spread_pct, depth, volume = parsed_leg
+                    spread_values.append(spread_pct)
+                    depth_total += depth
+                    volume_total += volume
+
+            if not spread_values:
+                continue
+
+            rows.append(
+                {
+                    "timestamp": poll_time,
+                    "underlying": underlying,
+                    "series": series,
+                    "expiry": expiry,
+                    "atm_spread_pct": sum(spread_values) / len(spread_values),
+                    "depth": depth_total,
+                    "volume": volume_total,
+                    "days_to_expiry": max((expiry - poll_time.date()).days, 0),
+                }
+            )
+
+        if not any_strikes:
+            await asyncio.sleep(2.0)
+            continue
+
+        if rows:
+            with db.get_connection() as conn:
+                for row in rows:
+                    try:
+                        db.insert_expiry_liquidity_1m(conn, row)
+                    except Exception:
+                        logger.warning("만기 유동성 적재 실패: series=%s", row.get("series"), exc_info=True)
+                        conn.rollback()
+                        continue
 
         await asyncio.sleep(interval_seconds)
 
@@ -437,16 +613,31 @@ async def main() -> None:
     # is_mock 여부와 상관없이 MARKET_DATA_WS_DOMAIN(실전 도메인) 하나로 접속한다.
     async with websockets.connect(tr_codes.MARKET_DATA_WS_DOMAIN) as raw_ws:
         ws_client = KISWebSocketClient(approval_key=approval_key, connection=_WebsocketsAdapter(raw_ws))
-        subscription_manager = RollingSubscriptionManager(
+        # 먼슬리(정규 월물)와 위클리를 별도 매니저로 동시에 굴린다(2026-07-06 추가) — 슬롯 예산:
+        # 14(먼슬리) + 14(위클리) + 1(선물) = 29 / MAX_SUBSCRIPTIONS(41), 여유 있음.
+        monthly_manager = RollingSubscriptionManager(
             ws_client,
             tr_id=tr_codes.WS_TR_OPTION_CONTRACT,
             strike_interval=KOSPI200_OPTION_STRIKE_INTERVAL,
             strikes_each_side=STRIKES_EACH_SIDE,
             symbol_formatter=lambda strike, opt: master.option_symbol(opt, strike, underlying="KOSPI200"),
         )
+        weekly_manager = RollingSubscriptionManager(
+            ws_client,
+            tr_id=tr_codes.WS_TR_OPTION_CONTRACT,
+            strike_interval=KOSPI200_OPTION_STRIKE_INTERVAL,
+            strikes_each_side=STRIKES_EACH_SIDE,
+            symbol_formatter=lambda strike, opt: master.option_symbol(
+                opt, strike, underlying="KOSPI200", series="weekly"
+            ),
+        )
+        books = [(monthly_manager, "regular"), (weekly_manager, "weekly")]
         await asyncio.gather(
-            run_observation_loop(ws_client, subscription_manager, rest_client, futures_symbol=futures_symbol),
-            poll_option_chain(rest_client, subscription_manager, master),
+            run_observation_loop(
+                ws_client, [monthly_manager, weekly_manager], rest_client, futures_symbol=futures_symbol
+            ),
+            poll_option_chain(rest_client, books, master),
+            poll_expiry_liquidity(rest_client, books, master),
             poll_investor_flow(rest_client),
         )
 

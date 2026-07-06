@@ -20,6 +20,13 @@ import httpx
 import pandas as pd
 
 _EXPIRY_FROM_NAME = re.compile(r"^[CP]\s*(\d{6})")
+# 위클리는 한글종목명이 "위클리M C 2607W1 1,300.0" 형식 — C/P 앞에 "위클리M" 접두어가 붙고
+# 만기는 6자리 YYYYMM이 아니라 4자리 YYMM+주차(W1/W2)로 표기된다(2026-07-06 실측, 상품종류
+# N/O). 정확한 달력상 만기일(월/목 등 요일)은 이 이름만으로 확정할 수 없어 파싱하지 않는다 —
+# main.py가 실제 get_quote() 응답의 futs_last_tr_date로 확정한다. 여기서는 "가장 가까운
+# 위클리부터 정렬"에만 쓸 수 있으면 충분하므로 YYMM+주차 문자열을 그대로 정렬키로 쓴다
+# (같은 자릿수라 사전식 비교가 시간순과 일치 — W10 이상은 KOSPI200에 없어 안전).
+_WEEKLY_EXPIRY_FROM_NAME = re.compile(r"[CP]\s+(\d{4}W\d)")
 
 MASTER_FILE_URL = "https://new.real.download.dws.co.kr/common/master/fo_idx_code_mts.mst.zip"
 MASTER_FILE_NAME = "fo_idx_code_mts.mst"
@@ -43,13 +50,24 @@ _COLUMNS = [
 ]
 
 # 상품종류 코드 (기초자산명="KOSPI200" 행 기준 실측)
+# 주의(2026-07-06): KIS 공식 헤더(종목마스터정보(지수선물옵션).h, github.com/koreainvestment/
+# open-trading-api)는 위클리콜/풋을 "L"/"M"으로 문서화하지만, 실제 다운로드한 마스터파일에는
+# L/M이 단 한 행도 없고 대신 N/O가 위클리로 쓰인다(9,635행 전수 확인). N/O 종목을 실제
+# get_quote()로 만기일을 실측한 결과 7일 간격(예: 2026-07-06 → 2026-07-13)으로 확인됨 —
+# 문서-실물 드리프트로 판단, 실물(N/O)을 신뢰한다.
 PRODUCT_TYPE_FUTURES = "1"  # 지수선물 (정규)
 PRODUCT_TYPE_OPTION_CALL = "5"  # 지수옵션 콜 (정규, 월물)
 PRODUCT_TYPE_OPTION_PUT = "6"  # 지수옵션 풋 (정규, 월물)
 PRODUCT_TYPE_MINI_OPTION_CALL = "D"  # 미니옵션 콜
 PRODUCT_TYPE_MINI_OPTION_PUT = "E"  # 미니옵션 풋
-PRODUCT_TYPE_WEEKLY_OPTION_CALL = "N"  # 위클리옵션 콜 (0DTE 플레이북용)
-PRODUCT_TYPE_WEEKLY_OPTION_PUT = "O"  # 위클리옵션 풋
+PRODUCT_TYPE_WEEKLY_OPTION_CALL = "N"  # 위클리옵션 콜 (실물 실측 — 공식 문서는 "L"로 오기)
+PRODUCT_TYPE_WEEKLY_OPTION_PUT = "O"  # 위클리옵션 풋 (실물 실측 — 공식 문서는 "M"으로 오기)
+
+_SERIES_PRODUCT_TYPES = {
+    "regular": (PRODUCT_TYPE_OPTION_CALL, PRODUCT_TYPE_OPTION_PUT),
+    "mini": (PRODUCT_TYPE_MINI_OPTION_CALL, PRODUCT_TYPE_MINI_OPTION_PUT),
+    "weekly": (PRODUCT_TYPE_WEEKLY_OPTION_CALL, PRODUCT_TYPE_WEEKLY_OPTION_PUT),
+}
 
 
 def download_master_zip(dest_dir: Path, client: httpx.Client | None = None) -> Path:
@@ -123,29 +141,34 @@ class IndexDerivativesMaster:
             return None
         return str(rows.iloc[0]["단축코드"])
 
-    def options(self, option_type: str, underlying: str = "KOSPI200", mini: bool = False) -> pd.DataFrame:
+    def options(self, option_type: str, underlying: str = "KOSPI200", series: str = "regular") -> pd.DataFrame:
         """
-        option_type: "C" 또는 "P". mini=True면 미니옵션(D/E, 승수 50,000원) 조회.
+        option_type: "C" 또는 "P". series: "regular"(정규 월물, 기본값) | "mini"(미니, 승수
+        50,000원) | "weekly"(위클리, 상품종류 N/O — 2026-07-06 추가, 실물 실측 근거는
+        PRODUCT_TYPE_WEEKLY_OPTION_* 주석 참고).
 
-        해석: 반환 DataFrame에 "만기YYYYMM" 컬럼을 추가해서 준다 — 옵션은 월물구분코드가
+        해석: 반환 DataFrame에 "만기YYYYMM" 컬럼을 추가해서 준다 — regular/mini는 월물구분코드가
              실제로는 만기 순번을 뜻하지 않는다(실측 결과 11개 서로 다른 만기월에 걸쳐 단
              3개 값(1/2/3)만 나타남 — 아마 유동성/분류 코드). 대신 한글종목명에 항상 박혀
              있는 "C 202607   545.0" 형식에서 만기(YYYYMM)를 정규식으로 뽑아 신뢰한다.
+             weekly는 이름 형식이 달라(_WEEKLY_EXPIRY_FROM_NAME 주석 참고) 별도 정규식을 쓴다.
+        실패 조건: series가 알 수 없는 값이면 ValueError.
         """
         if option_type not in ("C", "P"):
             raise ValueError("option_type은 'C' 또는 'P'여야 합니다")
-        if mini:
-            product_type = PRODUCT_TYPE_MINI_OPTION_CALL if option_type == "C" else PRODUCT_TYPE_MINI_OPTION_PUT
-        else:
-            product_type = PRODUCT_TYPE_OPTION_CALL if option_type == "C" else PRODUCT_TYPE_OPTION_PUT
+        if series not in _SERIES_PRODUCT_TYPES:
+            raise ValueError(f"series는 {sorted(_SERIES_PRODUCT_TYPES)} 중 하나여야 합니다")
+        call_type, put_type = _SERIES_PRODUCT_TYPES[series]
+        product_type = call_type if option_type == "C" else put_type
         df = self._df
         rows = df[(df["상품종류"] == product_type) & (df["기초자산명"] == underlying)].copy()
-        rows["만기YYYYMM"] = rows["한글종목명"].str.extract(_EXPIRY_FROM_NAME)[0]
+        expiry_pattern = _WEEKLY_EXPIRY_FROM_NAME if series == "weekly" else _EXPIRY_FROM_NAME
+        rows["만기YYYYMM"] = rows["한글종목명"].str.extract(expiry_pattern)[0]
         return rows.sort_values(["만기YYYYMM", "행사가"])
 
-    def nearest_expiry_chain(self, underlying: str = "KOSPI200") -> list[dict]:
+    def nearest_expiry_chain(self, underlying: str = "KOSPI200", series: str = "regular") -> list[dict]:
         """
-        계산: 콜/풋 각각에서 만기(YYYYMM, 한글종목명에서 추출)가 가장 빠른 달의 전 행사가 목록을 반환.
+        계산: 콜/풋 각각에서 만기(한글종목명에서 추출한 정렬키)가 가장 빠른 값의 전 행사가 목록을 반환.
         해석: 반환된 각 dict({option_type, strike, symbol, month_label})가 옵션 체인 스냅샷의
              기초 재료다 — 실시간 값(IV/Greeks/OI)은 각 symbol로 KISRestClient.get_quote()를
              호출해 채워야 한다(REST에는 체인 전체를 한 번에 주는 호출이 없음).
@@ -153,7 +176,7 @@ class IndexDerivativesMaster:
         """
         result: list[dict] = []
         for opt_type in ("C", "P"):
-            rows = self.options(opt_type, underlying).dropna(subset=["만기YYYYMM"])
+            rows = self.options(opt_type, underlying, series=series).dropna(subset=["만기YYYYMM"])
             if rows.empty:
                 continue
             nearest_expiry = rows["만기YYYYMM"].min()
@@ -169,14 +192,16 @@ class IndexDerivativesMaster:
                 )
         return sorted(result, key=lambda r: (r["option_type"], r["strike"]))
 
-    def option_symbol(self, option_type: str, strike: float, underlying: str = "KOSPI200") -> str | None:
+    def option_symbol(
+        self, option_type: str, strike: float, underlying: str = "KOSPI200", series: str = "regular"
+    ) -> str | None:
         """
-        계산: 만기가 가장 빠른 달(YYYYMM) 기준으로 option_type/strike가 일치하는 단축코드를 찾는다.
+        계산: 만기가 가장 빠른 값(정렬키 기준) 중 option_type/strike가 일치하는 단축코드를 찾는다.
         해석: 요청한 strike가 실제 상장된 행사가 격자에 없으면(예: 임의 그리드 근사) None —
              호출측(RollingSubscriptionManager)이 해당 strike 구독을 건너뛰어야 한다.
         실패 조건: 일치하는 행이 없으면 None.
         """
-        rows = self.options(option_type, underlying).dropna(subset=["만기YYYYMM"])
+        rows = self.options(option_type, underlying, series=series).dropna(subset=["만기YYYYMM"])
         if rows.empty:
             return None
         nearest_expiry = rows["만기YYYYMM"].min()

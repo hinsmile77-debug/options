@@ -13,6 +13,11 @@ _SAMPLE_ROWS = [
     "6|C0160350|STD020|P 202607|1|350.0| |2001|KOSPI200",
     "6|C0160352|STD021|P 202607|1|352.5| |2001|KOSPI200",
     "1|Z09609|STD030|F 202609|1|0.0| |3003|KSQ150",
+    # 위클리(상품종류 N/O) — 한글종목명이 "위클리M C 2607W1 1,300.0" 형식(2026-07-06 실측)
+    "N|BAFBLWA41|STDW01|위클리M C 2607W1 1,100.0|2|1100.0| |2001|KOSPI200",
+    "N|BAFBLWA73|STDW02|위클리M C 2607W1 1,180.0|2|1180.0| |2001|KOSPI200",
+    "N|BAFBMWA73|STDW03|위클리M C 2607W2 1,180.0|1|1180.0| |2001|KOSPI200",
+    "O|CAFBLWA41|STDW04|위클리M P 2607W1 1,100.0|2|1100.0| |2001|KOSPI200",
 ]
 
 
@@ -92,3 +97,39 @@ def test_option_symbol_matches_nearest_expiry_and_strike(tmp_path):
 def test_option_symbol_returns_none_for_unlisted_strike(tmp_path):
     master = _master(tmp_path)
     assert master.option_symbol("C", 999.0) is None
+
+
+def test_options_weekly_series_filters_by_product_type_N_O(tmp_path):
+    master = _master(tmp_path)
+    calls = master.options("C", series="weekly")
+    puts = master.options("P", series="weekly")
+    assert set(calls["단축코드"]) == {"BAFBLWA41", "BAFBLWA73", "BAFBMWA73"}
+    assert set(puts["단축코드"]) == {"CAFBLWA41"}
+    # regular(기본값)에는 위클리 행이 섞여 들면 안 됨
+    assert "BAFBLWA41" not in set(master.options("C")["단축코드"])
+
+
+def test_nearest_expiry_chain_weekly_picks_w1_over_w2(tmp_path):
+    master = _master(tmp_path)
+    chain = master.nearest_expiry_chain("KOSPI200", series="weekly")
+    symbols = {entry["symbol"] for entry in chain}
+    # BAFBMWA73(W2, 다음주)는 제외되고 W1(BAFBLWA41/73, CAFBLWA41)만 남아야 함
+    assert "BAFBMWA73" not in symbols
+    assert symbols == {"BAFBLWA41", "BAFBLWA73", "CAFBLWA41"}
+
+
+def test_option_symbol_weekly_series_matches_nearest_week_and_strike(tmp_path):
+    master = _master(tmp_path)
+    assert master.option_symbol("C", 1100.0, series="weekly") == "BAFBLWA41"
+    assert master.option_symbol("P", 1100.0, series="weekly") == "CAFBLWA41"
+    # W2에만 있는 조합(1180.0 자체는 W1에도 있어 대신 없는 strike로 검증)
+    assert master.option_symbol("C", 9999.0, series="weekly") is None
+
+
+def test_options_invalid_series_raises(tmp_path):
+    master = _master(tmp_path)
+    try:
+        master.options("C", series="quarterly")
+        assert False, "ValueError를 기대했으나 발생하지 않음"
+    except ValueError:
+        pass

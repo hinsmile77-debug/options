@@ -59,6 +59,9 @@ class DashboardSnapshot:
     foreign_net: float
     institution_net: float
     individual_net: float
+    # Phase 1.5-④(2026-07-06 추가) — 먼슬리/위클리 북별 ATM±2 유동성 스냅샷(북당 최신 1건).
+    # 각 dict 키: series, expiry, atm_spread_pct, depth, volume, days_to_expiry.
+    expiry_liquidity: list[dict]
 
 
 def load_snapshot(underlying: str = "KOSPI200") -> DashboardSnapshot:
@@ -84,6 +87,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
 
             chain_rows = db.latest_option_chain(conn, underlying)
             investor_flow = db.latest_investor_flow(conn, underlying)
+            expiry_liquidity = db.latest_expiry_liquidity(conn, underlying)
 
             # 선물 계열: active_futures_symbol 레지스트리로 현재 구독 중인 선물 단축코드를
             # 명시적으로 조회한다(vpin 유무 같은 휴리스틱에 더 이상 의존하지 않음 — 2026-07-06,
@@ -182,6 +186,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         foreign_net=foreign_net,
         institution_net=institution_net,
         individual_net=individual_net,
+        expiry_liquidity=expiry_liquidity,
     )
 
 
@@ -239,4 +244,22 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         foreign_net=float(rng.normal(0, 300)),
         institution_net=float(rng.normal(0, 200)),
         individual_net=float(rng.normal(0, 250)),
+        expiry_liquidity=[
+            {
+                "series": "regular",
+                "expiry": (now + timedelta(days=23)).date(),
+                "atm_spread_pct": float(abs(rng.normal(0.04, 0.01))),
+                "depth": float(abs(rng.normal(200, 40))),
+                "volume": float(abs(rng.normal(500, 100))),
+                "days_to_expiry": 23,
+            },
+            {
+                "series": "weekly",
+                "expiry": (now + timedelta(days=2)).date(),
+                "atm_spread_pct": float(abs(rng.normal(0.09, 0.02))),
+                "depth": float(abs(rng.normal(80, 20))),
+                "volume": float(abs(rng.normal(150, 40))),
+                "days_to_expiry": 2,
+            },
+        ],
     )

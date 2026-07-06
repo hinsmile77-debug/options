@@ -147,6 +147,25 @@ def upsert_active_futures_symbol(conn: ConnectionLike, underlying: str, symbol: 
     _upsert(conn, "active_futures_symbol", ("underlying", "symbol", "updated_at"), ("underlying",), row)
 
 
+_EXPIRY_LIQUIDITY_1M_COLUMNS = (
+    "timestamp", "underlying", "series", "expiry",
+    "atm_spread_pct", "depth", "volume", "days_to_expiry",
+)
+
+
+def insert_expiry_liquidity_1m(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: 만기북(series="regular"|"weekly")별 ATM±2 구간 유동성 스냅샷 — % 호가스프레드(Cao-Wei
+         기준, 달러 스프레드 아님)·호가잔량 합(깊이)·누적거래량·잔존일수.
+    계산: INSERT ... ON CONFLICT (timestamp, underlying, series, expiry) DO UPDATE — 장전 선발
+         점수의 20거래일 기준선(전일 중앙값) 산출에 쓰인다(docs/Dev_md/RESEARCH_EXPIRY_SELECTION_v1.md).
+    """
+    _upsert(
+        conn, "expiry_liquidity_1m", _EXPIRY_LIQUIDITY_1M_COLUMNS,
+        ("timestamp", "underlying", "series", "expiry"), row,
+    )
+
+
 def get_active_futures_symbol(conn: ConnectionLike, underlying: str) -> str | None:
     """현재 구독 중인 선물 단축코드. 관측 루프가 아직 한 번도 안 돌았으면 None."""
     with conn.cursor() as cur:
@@ -185,6 +204,39 @@ def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
             "timestamp": timestamp,
         }
         for strike, option_type, oi, iv, gamma, gex, expiry, timestamp in rows
+    ]
+
+
+def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]:
+    """
+    입력: 기초자산 라벨.
+    계산: series(regular/weekly)별로 가장 최근 timestamp 1건씩만 골라 반환한다 — 폴링 주기(5분)
+         중 두 북의 조회 시각이 조금씩 어긋날 수 있어 북별 최신값을 취한다.
+    해석: 반환된 dict는 COCKPIT 만기 유동성 비교 패널(Phase 1.5-④)이 바로 렌더링에 쓸 수 있는
+         키를 가진다. 아직 폴링이 한 번도 안 돌았으면 빈 리스트.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (series)
+                series, expiry, atm_spread_pct, depth, volume, days_to_expiry
+            FROM expiry_liquidity_1m
+            WHERE underlying=%s
+            ORDER BY series, timestamp DESC
+            """,
+            (underlying,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "series": series,
+            "expiry": expiry,
+            "atm_spread_pct": float(atm_spread_pct) if atm_spread_pct is not None else None,
+            "depth": float(depth) if depth is not None else None,
+            "volume": float(volume) if volume is not None else None,
+            "days_to_expiry": int(days_to_expiry) if days_to_expiry is not None else None,
+        }
+        for series, expiry, atm_spread_pct, depth, volume, days_to_expiry in rows
     ]
 
 

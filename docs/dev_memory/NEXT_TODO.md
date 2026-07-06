@@ -64,4 +64,49 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 ## 기타
 
 - [ ] KIS 토큰 폐기(`/oauth2/revokeP`) 호출 경로 없음 — 필요 시 `token_daemon.py`에 추가
-- [ ] 선물 미니/위클리옵션(D/E/N/O 상품종류) 지원은 `symbol_master.py`에 메서드는 있지만 main.py에서 안 씀
+- [x] (2026-07-06 해소) 위클리옵션(N/O) 조회 — `symbol_master.py`의 `options()`/`nearest_expiry_chain()`/
+      `option_symbol()`이 `series="weekly"` 인자를 받도록 확장 완료(만기일의 월/목 여부는 이름만으로 확정
+      불가라 파싱 안 함 — `main.py`가 실제 `get_quote()` 응답의 `futs_last_tr_date`로 확정).
+
+## 만기·종목 선발 체계 (2026-07-06 조사 완료 — [[RESEARCH_EXPIRY_SELECTION_v1]] 참고)
+
+- [x] Phase 1.5-①: `symbol_master`에 위클리(N/O) 조회 추가 — 2026-07-06 완료, 테스트 12개 통과
+      (실측 상품종류가 공식 문서(L/M)와 다르고 N/O임을 확인, `symbol_master.py` 주석 참고)
+- [x] Phase 1.5-②: 관측 북 2개(최근월 먼슬리 + 최근접 위클리) 동시 구독 — 2026-07-06 완료.
+      `main.py`의 `run_observation_loop`가 `subscription_managers: list[...]`를, `poll_option_chain`이
+      `books: list[tuple[manager, series]]`을 받도록 시그니처 변경. `main()`이 `monthly_manager`/
+      `weekly_manager` 두 개를 만들어 같은 `ws_client`에 동시 구독(슬롯 29/41). 테스트 148개 전체 통과.
+      **아직 재시작 안 함** — 반영하려면 관측 루프 프로세스 재시작 필요(사용자 확인 후 진행).
+- [x] Phase 1.5-③: `expiry_liquidity_1m` 테이블 신설 — 2026-07-06 완료. 사용자가 "정식 스펙대로"
+      선택(%스프레드 포함) — `poll_expiry_liquidity()`가 북(regular/weekly)마다 ATM±2×(C,P)에
+      `get_asking_price()`로 Cao-Wei %스프레드·깊이·거래량을 집계, 만기는 ATM 1건만 `get_quote()`로
+      확인(북당 사이클당 1건). 레이트리밋 우려 때문에 폴링 주기를 옵션체인(60초)의 5배인 300초로
+      완화([[DECISION_LOG]] 참고). 마이그레이션 `005_expiry_liquidity.sql` 적용 완료, 테스트 6개 통과.
+      **아직 재시작 안 함** — 실운영 데이터로 레이트리밋 회피 여부/값 범위 확인 필요.
+- [x] Phase 1.5-④: COCKPIT 만기별 유동성 비교 패널 — 2026-07-06 완료. `expiry_liquidity_panel.py`
+      (Plotly Table, 먼슬리/위클리 %스프레드·깊이·거래량·잔존일수 나란히 표시)를 `app.py`의
+      "만기 유동성 비교" 섹션에 배치, `data_source.py`에 `expiry_liquidity` 필드/`db.latest_expiry_liquidity()`
+      추가. 테스트 4개 통과. **아직 COCKPIT 재시작 안 함**(모듈 캐싱 — [[DECISION_LOG]] 참고).
+- [x] **재시작 완료(2026-07-06 14:2x)**: Phase 1.5-①~④ 전체가 실운영에 반영됨. 재시작 과정에서
+      기존 mahdi.main/COCKPIT이 각각 2중 프로세스(.venv python.exe가 anaconda python.exe 자식을
+      스폰하는 구조 — 이 PC의 venv 특성으로 보이며 정상, 의도치 않은 중복 세션은 아니었음)로 떠
+      있던 것을 정리하고 `uv run` 표준 경로로 1개씩 재시작함. 재시작 직후 위클리 도입으로
+      NumericValueOutOfRange 크래시가 실제로 발생 → 바로 위 DECISION_LOG 항목대로 수정 후 재재시작,
+      정상화 확인함(`market_raw_1m`에 BAFB*/CAFB*(위클리)와 A01609(선물)/B0160*·C0160*(먼슬리)
+      전부 최신 봉 적재 확인, `expiry_liquidity_1m`에 regular 1행 적재 확인, weekly 행은 다음
+      폴링 사이클(5분) 대기 중).
+- [ ] 다음 확인: (1) `expiry_liquidity_1m`에 weekly series 행도 실제로 쌓이는지 (2) 레이트리밋
+      (403/500) 발생 빈도가 300초 주기로 완화됐는지 — 여전히 잦으면 주기를 더 늘리거나 ATM±2를
+      ±1로 좁히는 것 검토 (3) COCKPIT "만기 유동성 비교" 패널이 브라우저에서 실제로 두 북을
+      보여주는지 육안 확인 (4) 오늘 이전에 있었던 mode="lines+markers" Flow Radar 수정도 이번
+      COCKPIT 재시작으로 함께 반영됐으니 별도 재시작 불필요.
+- [ ] Phase 2: 장전 선발 스코어러 + 일중 강등 트리거 + 북별 파라미터 세트 + 섀도우 30일 검증
+      (핵심 규칙: 만기 북은 하루 고정·행사가만 ATM 롤링, 0DTE 방향성 네이키드 매수 금지 — 근거는 연구 문서 참고)
+- [ ] **위클리(목) 확인 필요(2026-07-06 HTS 캡처로 발견)**: eFriend "선물/옵션 종목안내장"에서
+      "KOSPI200 위클리(월)"과 "KOSPI200 위클리(목)"이 별도 기초자산으로 분리돼 있음을 확인.
+      현재 `symbol_master.py`가 구현한 위클리(N/O, "위클리M " 접두어, W1/W2)는 실측 만기가 전부
+      월요일(2026-07-06, 2026-07-13)이라 **"위클리(월)"** 쪽만 커버한 것으로 보임. "위클리(목)"
+      체인은 이 시점 기준 상장 전(빈 화면) — 사용자 관찰로는 내일(2026-07-07) 상장 가능성.
+      **상장 확인되면**: 마스터파일 재다운로드 후 (1) 목요일 위클리가 N/O를 공유하는지 새 상품종류
+      코드를 쓰는지 (2) 기초자산명 컬럼이 "KOSPI200"으로 남는지 "KOSPI200 위클리(목)"처럼 달라지는지
+      전수 확인 후 반영 — 상장 전 추측 구현 금지(이번 세션 L/M vs N/O 문서-실물 드리프트 전례 참고).

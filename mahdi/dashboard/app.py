@@ -16,6 +16,7 @@ from mahdi.dashboard.panels.flow_radar_panel import (
     build_ofi_sparkline,
     build_vpin_chart,
 )
+from mahdi.dashboard.panels.expiry_liquidity_panel import build_expiry_liquidity_table
 from mahdi.dashboard.panels.gamma_map_panel import build_gamma_profile_chart
 from mahdi.dashboard.panels.position_panel import build_position_flow_chart
 from mahdi.dashboard.panels.regime_panel import REGIME_LABEL_KO, build_regime_probability_chart
@@ -55,6 +56,12 @@ def render() -> None:
             build_position_flow_chart(snapshot.foreign_net, snapshot.institution_net, snapshot.individual_net),
             width='stretch',
         )
+
+    st.subheader("만기 유동성 비교 (먼슬리 vs 위클리)")
+    if snapshot.expiry_liquidity:
+        st.plotly_chart(build_expiry_liquidity_table(snapshot.expiry_liquidity), width='stretch')
+    else:
+        st.caption("아직 만기 유동성 폴링 데이터가 없습니다.")
 
     # 선물 시계열 범위를 옵션 차트에도 강제 적용 — 옵션은 거래가 뜸해 데이터가 1~2점뿐일 때가
     # 많은데, 그러면 Plotly가 그 점 주위로만 확대해 x축이 마이크로초 단위로 깨진다(2026-07-06 발견).

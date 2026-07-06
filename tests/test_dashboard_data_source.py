@@ -58,6 +58,8 @@ class _FakeCursor:
             self._current = self._responses["futures_symbol"]
         elif "GROUP BY symbol" in query:
             self._current = self._responses["option_symbol"]
+        elif "expiry_liquidity_1m" in query:
+            self._current = self._responses.get("expiry_liquidity", [])
         elif "market_raw_1m" in query and params and params[0] == self._responses.get("futures_symbol_value"):
             self._current = self._responses["futures_rows"]
         elif "market_raw_1m" in query:
@@ -187,6 +189,35 @@ def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):
     snap = load_snapshot()
 
     assert snap.vpin_series == [0.0]
+
+
+def test_load_snapshot_reads_expiry_liquidity_per_series(monkeypatch):
+    # Phase 1.5-④(2026-07-06 추가): 먼슬리/위클리 두 북의 최신 유동성 스냅샷이 그대로 실려야 함.
+    ts = datetime(2026, 7, 6, 9, 31)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "expiry_liquidity": [
+            ("regular", date(2026, 7, 30), 0.041, 220.0, 480.0, 24),
+            ("weekly", date(2026, 7, 9), 0.093, 70.0, 140.0, 3),
+        ],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    assert len(snap.expiry_liquidity) == 2
+    by_series = {row["series"]: row for row in snap.expiry_liquidity}
+    assert by_series["regular"]["expiry"] == date(2026, 7, 30)
+    assert by_series["regular"]["atm_spread_pct"] == pytest.approx(0.041)
+    assert by_series["regular"]["days_to_expiry"] == 24
+    assert by_series["weekly"]["depth"] == pytest.approx(70.0)
+    assert by_series["weekly"]["volume"] == pytest.approx(140.0)
 
 
 def test_load_snapshot_defaults_investor_flow_to_zero_when_not_yet_polled(monkeypatch):
