@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -41,11 +41,13 @@ def test_load_snapshot_falls_back_to_synthetic_when_db_unavailable(monkeypatch):
 class _FakeCursor:
     """쿼리 문자열/파라미터로 어떤 조회인지 구분해 미리 준비한 결과를 돌려준다."""
 
-    def __init__(self, responses: dict):
+    def __init__(self, responses: dict, query_log: list | None = None):
         self._responses = responses
         self._current: list = []
+        self._query_log = query_log if query_log is not None else []
 
     def execute(self, query: str, params=None) -> None:
+        self._query_log.append((query, params))
         if "regime_state" in query:
             self._current = self._responses["regime"]
         elif "underlying_spot_1m" in query:
@@ -83,9 +85,10 @@ class _FakeCursor:
 class _FakeConnection:
     def __init__(self, responses: dict):
         self._responses = responses
+        self.query_log: list = []
 
     def cursor(self) -> _FakeCursor:
-        return _FakeCursor(self._responses)
+        return _FakeCursor(self._responses, self.query_log)
 
 
 _BASE_RESPONSES = {
@@ -167,6 +170,37 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
     assert snap.option_ofi_series == [12.0]
     assert snap.option_microprice_series == [40.7]
     assert snap.option_vpin_series == [0.55]  # 2026-07-06: 옵션도 VPIN이 실제로 계산됨
+
+
+def test_load_snapshot_picks_option_flow_symbol_by_windowed_volume_with_deterministic_tiebreak(monkeypatch):
+    # 2026-07-06 위클리 북 추가 후 실측: 여러 위클리 종목이 같은 1분봉 timestamp로 동시에 찍혀서
+    # "ORDER BY max(timestamp) DESC"만 쓰면 동률 처리가 비결정적이라 COCKPIT 리런(10초)마다
+    # 뽑히는 종목이 계속 바뀌었다(차트가 매번 다른 종목으로 바뀌어 보임). 최근 룩백 윈도 누적
+    # 거래량 + symbol 오름차순 타이브레이커로 쿼리가 바뀌었는지 검증한다.
+    ts = datetime(2026, 7, 6, 9, 31)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+    }
+    conn = _FakeConnection(responses)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield conn
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    load_snapshot()
+
+    option_queries = [(q, p) for q, p in conn.query_log if "GROUP BY symbol" in q]
+    assert len(option_queries) == 1
+    query, params = option_queries[0]
+    assert "sum(volume) DESC" in query
+    assert "symbol ASC" in query  # 동률(거래량·시각 모두 같음)까지 결정론적으로 고정하는 최종 타이브레이커
+    assert "timestamp >=" in query  # 단일 최근 틱이 아니라 룩백 윈도 내 누적 활동 기준
+    # 룩백 기준 시각은 datetime.now()가 아니라 스냅샷 자체의 시각(regime_state.timestamp)이어야
+    # 리플레이/재현 시나리오에서도 윈도가 항상 실제 데이터 시각 기준으로 맞는다.
+    assert params[-1] == ts - timedelta(minutes=10)
 
 
 def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):

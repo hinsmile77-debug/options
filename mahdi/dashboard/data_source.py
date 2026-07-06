@@ -22,6 +22,13 @@ logger = logging.getLogger("mahdi.dashboard.data_source")
 # 화석 데이터라 Flow Radar "가장 활발한 종목" 선정에서 제외한다.
 _LEGACY_MIXED_SYMBOL = "KOSPI200_OPT"
 
+# Flow Radar "가장 활발한 옵션" 선정 룩백 윈도 — 2026-07-06 위클리 북 추가 후 실측: 여러 위클리
+# 종목이 같은 1분봉 timestamp로 동시에 찍혀("ORDER BY max(timestamp) DESC"에 동률), COCKPIT이
+# 10초마다 리런될 때마다 임의로 다른 종목이 뽑혀 차트가 매번 완전히 다른 종목(다른 가격대)으로
+# 바뀌어 보이는 문제가 실제로 발생함. "가장 최근 틱 1개"가 아니라 "최근 N분간 누적거래량"으로
+# 기준을 바꿔, 단일 틱의 우연한 타이밍이 아니라 실제 상대적 활발함이 선정을 좌우하게 한다.
+FLOW_RADAR_OPTION_LOOKBACK_MINUTES = 10
+
 
 @dataclass(frozen=True, slots=True)
 class ChainPoint:
@@ -80,6 +87,10 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 regime_row = cur.fetchone()
                 if regime_row is None:
                     return None
+                # 리런 시각(datetime.now())이 아니라 스냅샷 자체의 최신 시각을 룩백 기준으로 쓴다 —
+                # 장 마감 후 리플레이/재현 시나리오에서도 "최근 N분"이 항상 실제 데이터 시각 기준으로
+                # 맞아야 하기 때문(datetime.now() 기준이면 지난 데이터를 볼 때 항상 윈도가 텅 빈다).
+                as_of_ts = regime_row[0]
 
             spot = db.latest_underlying_spot(conn, underlying)
             if spot is None:
@@ -105,12 +116,16 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                     futures_rows = cur.fetchall()
 
                 # 옵션 계열: 선물이 WS 구독 덕에 거의 매분 체결돼 "가장 최근 활동"만으로 뽑으면
-                # 옵션이 영원히 안 뽑힌다 — 선물 심볼과 화석 라벨을 명시적으로 제외한다.
+                # 옵션이 영원히 안 뽑힌다 — 선물 심볼과 화석 라벨을 명시적으로 제외한다. 단일 최근
+                # 틱이 아니라 최근 룩백 윈도 누적거래량 기준으로 뽑아야 동률 타이밍에 매 리런마다
+                # 종목이 바뀌는 문제(2026-07-06 위클리 도입 후 실측)가 없다. symbol ASC는 남은
+                # 동률(거래량·시각 모두 같음)까지 결정론적으로 고정하기 위한 최종 타이브레이커.
                 excluded_symbols = (_LEGACY_MIXED_SYMBOL, futures_flow_symbol or _LEGACY_MIXED_SYMBOL)
+                lookback_cutoff = as_of_ts - timedelta(minutes=FLOW_RADAR_OPTION_LOOKBACK_MINUTES)
                 cur.execute(
-                    "SELECT symbol FROM market_raw_1m WHERE symbol NOT IN (%s, %s) "
-                    "GROUP BY symbol ORDER BY max(timestamp) DESC LIMIT 1",
-                    excluded_symbols,
+                    "SELECT symbol FROM market_raw_1m WHERE symbol NOT IN (%s, %s) AND timestamp >= %s "
+                    "GROUP BY symbol ORDER BY sum(volume) DESC, max(timestamp) DESC, symbol ASC LIMIT 1",
+                    (*excluded_symbols, lookback_cutoff),
                 )
                 option_row = cur.fetchone()
                 option_flow_symbol = option_row[0] if option_row else None

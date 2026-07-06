@@ -4,6 +4,16 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-06] Flow Radar "가장 활발한 옵션" 선정을 "최근 틱 1개"에서 "룩백 윈도 누적거래량"으로 변경
+
+**결정:** `data_source.py`의 옵션 계열 선정 쿼리를 `ORDER BY max(timestamp) DESC LIMIT 1`(타이브레이커 없음)에서 `ORDER BY sum(volume) DESC, max(timestamp) DESC, symbol ASC LIMIT 1` + `WHERE timestamp >= 최근 10분`으로 바꿨다. 룩백 기준 시각은 `datetime.now()`가 아니라 스냅샷 자체의 `regime_state.timestamp`를 쓴다(리플레이 시나리오에서도 윈도가 항상 데이터 시각 기준으로 맞게).
+
+**Why:** 사용자가 스크린샷으로 "Flow Radar 차트가 순간순간 극적으로 다른 모양(다른 종목)으로 올라온다"고 지적. 실측(`market_raw_1m`)해보니 위클리 북 추가 후 여러 위클리 옵션 종목이 같은 1분봉 timestamp로 동시에 찍혀("14:37:00"에 5개 종목 동률), 타이브레이커 없는 `ORDER BY max(timestamp) DESC`가 COCKPIT 10초 리런마다 동률 처리를 사실상 무작위로 바꿔 완전히 다른 종목(다른 가격대·OFI·VPIN)이 뽑히고 있었다. 2북(먼슬리+위클리) 동시 구독으로 후보 종목 수가 거의 2배가 되면서 동률 빈도가 크게 늘어 이 문제가 눈에 띄게 심해진 것 — Phase 1.5 2북 작업의 직접적인 부작용.
+
+**How to apply:** "가장 최근에 활동한 것"을 고르는 로직에 후보가 여러 개고 동률이 흔하면, 단일 최근 이벤트가 아니라 윈도 집계(여기선 거래량 합)로 바꾸고 마지막에 `symbol ASC` 같은 완전 결정론적 타이브레이커를 반드시 넣는다 — 그래야 데이터가 정말 안 바뀌었는데 화면만 깜빡이는 걸 막는다. 리런마다 다시 계산하는 대시보드 쿼리는 "지금 이 순간의 승자"가 조회할 때마다 바뀔 수 있다는 걸 항상 의심할 것.
+
+---
+
 ## [2026-07-06] Phase 1.5 재시작 중 실측 버그: 위클리 도입 후 옵션 레그 DB 삽입 실패가 관측 루프 전체를 죽임 — DB insert에 개별 try/except+rollback 추가
 
 **결정:** `poll_option_chain()`/`poll_expiry_liquidity()`의 DB 삽입 루프(`db.insert_option_analysis_1m`, `db.insert_expiry_liquidity_1m`)를 각각 레그/북 단위 `try/except`로 감쌌다. 실패 시 `conn.rollback()`을 반드시 호출한 뒤 다음 레그로 계속 진행한다.
