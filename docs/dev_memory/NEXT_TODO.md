@@ -40,6 +40,9 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 - [ ] `find_gamma_flip`(options_intel.py)이 COCKPIT 리런마다 vollib에서 `RuntimeWarning: divide by
       zero`/`invalid value encountered` 출력 — 크래시는 아니지만 원인 미조사(일부 레그의 t_years나
       iv가 0에 가까운 것으로 추정, 2026-07-06 관찰)
+- [ ] Flow Radar x축 `rangebreaks`(전일 장마감~당일 개장 공백 제거) — 2026-07-07 코드 수정 완료,
+      테스트 통과([[SESSION_LOG]] 참고). **COCKPIT 재시작 후 브라우저에서 실제로 공백이 압축돼
+      보이는지 육안 확인 아직 안 함**.
 
 ## 운영 검증
 

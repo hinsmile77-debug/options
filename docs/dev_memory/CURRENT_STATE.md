@@ -1,6 +1,6 @@
 # CURRENT_STATE — 마흐디(options) 현재 개발 상태
 
-_최종 갱신: 2026-07-06_
+_최종 갱신: 2026-07-07_
 
 ---
 
@@ -56,6 +56,7 @@ _최종 갱신: 2026-07-06_
   - **2026-07-06 Flow Radar 선물/옵션 분리** (두 차례 개편): 선물(H0IFCNT0) 구독 추가 직후 "가장 최근 활동" 단일 선택 로직이 선물만 계속 고르는 문제를 사용자가 지적 — 선물은 WS로 거의 매분 체결되는 반면 옵션은 거래가 뜸해 공백이 생기므로 두 계열을 **각각 독립적으로** 조회하도록 분리. `DashboardSnapshot`에 `option_flow_symbol`/`option_timestamps`/`option_ofi_series`/`option_vpin_series`/`option_price_series`/`option_microprice_series` 필드 추가(`flow_radar_symbol`은 `futures_flow_symbol`로 개명). `app.py`는 "Flow Radar — 옵션(가장 활발한 종목)"을 위, "Flow Radar — 선물(기초자산)"을 아래로 배치(사용자 요청), 옵션 섹션에도 VPIN 차트 추가, 옵션 차트 x축을 선물 시계열 범위로 강제 통일(옵션은 데이터가 1~2점뿐일 때 Plotly가 마이크로초 단위로 확대하는 문제 수정).
   - 선물/옵션 식별 방식도 2단계로 진화했다: 처음엔 `vpin IS NOT NULL`(선물만 채워짐 가정)로 구분했는데, 옵션에도 VPIN을 적용하면서 그 가정이 깨져 **`active_futures_symbol` 레지스트리 테이블**(신규, `db/migrations/004`)로 명시적 조회로 교체함([[DECISION_LOG]] 참고).
 - **2026-07-06 Streamlit 모듈 캐싱 주의** ([[DECISION_LOG]] 참고): `app.py`(엔트리)만 매 리런마다 디스크에서 새로 읽힌다 — `data_source.py`/`panels/*.py`처럼 `import`되는 하위 모듈은 파이썬 모듈 캐시에 남으므로, 그 파일들을 고치면 `st.rerun()` 폴링이나 브라우저 새로고침만으로는 반영 안 되고 **COCKPIT 프로세스 자체를 재시작**해야 한다. `_load_from_db`의 `except Exception`에 `logger.exception(...)` 추가해 향후 원인 추적 가능하게 함.
+- **2026-07-07 Flow Radar x축 장외 시간공백 제거**: `flow_radar_panel.py`의 세 차트(OFI/VPIN/체결가) 전부에 Plotly `rangebreaks` 적용 — 주말 전체 + 매일 15:45~09:00(v6 §16.1 거래시간 09:00~15:45 기준)을 x축에서 건너뛴다. 이전엔 전일 장마감~당일 개장 사이 공백이 x축 대부분을 차지해 체결이 뜸한 옵션 계열이 거의 안 보였음([[SESSION_LOG]] 참고). **COCKPIT 재시작 후 브라우저 육안 확인 아직 안 함**.
 
 ### mahdi/main.py 옵션 체인 REST 폴링 — 2026-07-06 신규 (`poll_option_chain`)
 - WS 구독(ATM±3, `subscription_manager.desired_strikes`)과 동일한 행사가×콜/풋에 대해 60초 간격으로 `rest_client.get_quote()`를 반복 호출 → `option_analysis_1m`/`underlying_spot_1m` 적재.

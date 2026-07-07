@@ -4,6 +4,27 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-07] Flow Radar x축 장외 시간공백 제거 (rangebreaks)
+
+**트리거:** 사용자가 COCKPIT 스크린샷을 보여주며 "Flow Radar 시간축이 전날 장마감 후 다음날 장시작
+시간공백을 포함하고 있어 시인성이 없다"고 지적 — 옵션 종목처럼 체결이 뜸한 계열은 대부분의 점이
+차트 양쪽 끝(전일 장마감 직전/당일 개장 직후)에 몰려 찍히고 그 사이 15~16시간의 빈 공백이 x축의
+대부분을 차지해 그래프가 거의 안 보였음.
+
+**수정:** `mahdi/dashboard/panels/flow_radar_panel.py`에 `_TRADING_HOURS_RANGEBREAKS`
+(주말 전체 + 매일 15:45~09:00) 상수와 `_apply_trading_hours_rangebreaks()` 헬퍼를 추가,
+`build_ofi_sparkline`/`build_vpin_chart`/`build_microprice_vs_price_chart` 세 함수 모두에 적용.
+거래시간 09:00~15:45는 v6 §16.1에 이미 고정값으로 문서화돼 있어 그 값을 그대로 재사용함(야간거래
+세션 없음 확인). Plotly `rangebreaks`는 실제 데이터 포인트 개수·간격과 무관하게 동작하므로 옵션처럼
+점이 희소한 계열에도 그대로 적용 가능.
+
+**검증:** 기존 `tests/test_dashboard_panels.py` 10개 전부 통과(회귀 없음). 전일 15:00~당일 09:00에
+걸친 합성 타임스탬프로 `fig.layout.xaxis.rangebreaks`가 의도대로 설정됨을 스크립트로 직접 확인.
+**미확인**: 브라우저에서 실제로 공백이 압축돼 보이는지는 COCKPIT 재시작 후 육안 확인 필요
+([[NEXT_TODO]] 참고 — 대시보드 하위 모듈 수정 후 COCKPIT 재시작 필요 관행 적용).
+
+---
+
 ## [2026-07-07] 07:30 장전 자동 기동 실패 원인 규명·수정, 당일분 수동 기동
 
 **트리거:** 사용자가 "07:30에 기동되지 않았다"고 보고.

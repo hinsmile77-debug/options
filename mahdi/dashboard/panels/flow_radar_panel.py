@@ -16,6 +16,18 @@ _VPIN_CRITICAL = "#D55E00"
 _VPIN_CRISIS_THRESHOLD = 0.7
 _VPIN_WARNING_THRESHOLD = 0.4
 
+# 파생 거래시간은 09:00~15:45로 고정(v6 §16.1) — 전일 장마감부터 익일 개장까지, 그리고 주말은
+# 항상 거래가 없으므로 x축에서 건너뛴다. 그래야 실제 체결이 뜸한 옵션 종목도 시간축이 빈 공백에
+# 눌리지 않고 거래시간끼리 이어 붙어 보인다(2026-07-07 사용자 지적).
+_TRADING_HOURS_RANGEBREAKS = [
+    dict(bounds=["sat", "mon"]),
+    dict(bounds=[15.75, 9], pattern="hour"),
+]
+
+
+def _apply_trading_hours_rangebreaks(fig: go.Figure) -> None:
+    fig.update_xaxes(rangebreaks=_TRADING_HOURS_RANGEBREAKS)
+
 
 def _vpin_status_color(v: float) -> str:
     if v >= _VPIN_CRISIS_THRESHOLD:
@@ -42,6 +54,7 @@ def build_ofi_sparkline(
     )
     fig.add_hline(y=0, line_color="#8A8A8A", line_width=1)
     fig.update_layout(yaxis_title="OFI", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=180)
+    _apply_trading_hours_rangebreaks(fig)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     return fig
@@ -65,6 +78,7 @@ def build_vpin_chart(
     fig.update_layout(
         yaxis=dict(title="VPIN", range=[0, 1]), showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=200
     )
+    _apply_trading_hours_rangebreaks(fig)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     return fig
@@ -94,6 +108,7 @@ def build_microprice_vs_price_chart(
     fig.update_layout(
         yaxis_title="가격", legend=dict(orientation="h", y=1.15), margin=dict(l=10, r=10, t=30, b=10), height=220
     )
+    _apply_trading_hours_rangebreaks(fig)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     return fig
