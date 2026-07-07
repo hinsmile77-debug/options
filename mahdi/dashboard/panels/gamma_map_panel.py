@@ -35,8 +35,18 @@ def build_gamma_profile_chart(
     fig.add_vline(x=spot, line_dash="dot", line_color=_NEUTRAL_COLOR, annotation_text="현재가")
     if gamma_flip is not None:
         fig.add_vline(x=gamma_flip, line_dash="dash", line_color=_FLIP_COLOR, annotation_text="Gamma Flip")
-    for wall in gamma_walls:
-        fig.add_vline(x=wall, line_color=_WALL_COLOR, opacity=0.4)
+    # gamma_walls는 |Gamma x OI| 노출 내림차순(1번이 가장 강한 Pinning 후보) — 라벨에 순위를 붙여
+    # "세 노란 선이 다 똑같아 구분이 안 된다"는 문제를 없앤다. annotation_position을 항목마다
+    # 바꿔 행사가가 서로 가까울 때 라벨끼리 겹치는 것도 방지한다.
+    _WALL_ANNOTATION_POSITIONS = ["top", "top left", "top right"]
+    for i, wall in enumerate(gamma_walls):
+        fig.add_vline(
+            x=wall,
+            line_color=_WALL_COLOR,
+            opacity=0.4,
+            annotation_text=f"Gamma Wall {i + 1}",
+            annotation_position=_WALL_ANNOTATION_POSITIONS[i % len(_WALL_ANNOTATION_POSITIONS)],
+        )
 
     fig.update_layout(
         xaxis_title="행사가",
