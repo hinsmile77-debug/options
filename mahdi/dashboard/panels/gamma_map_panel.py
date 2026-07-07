@@ -44,7 +44,7 @@ def build_gamma_profile_chart(
             x=wall,
             line_color=_WALL_COLOR,
             opacity=0.4,
-            annotation_text=f"Gamma Wall {i + 1}",
+            annotation_text=f"GW{i + 1}",
             annotation_position=_WALL_ANNOTATION_POSITIONS[i % len(_WALL_ANNOTATION_POSITIONS)],
         )
 
