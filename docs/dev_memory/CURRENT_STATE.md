@@ -1,6 +1,6 @@
 # CURRENT_STATE — 마흐디(options) 현재 개발 상태
 
-_최종 갱신: 2026-07-07_
+_최종 갱신: 2026-07-09_
 
 ---
 
@@ -102,9 +102,12 @@ _최종 갱신: 2026-07-07_
 - `active_futures_symbol(underlying, symbol, updated_at)` — 단일 현재값 레지스트리(하이퍼테이블 아님). 대시보드가 "이 종목이 지금 구독 중인 선물인지"를 vpin 유무 같은 휴리스틱 없이 바로 조회하게 함.
 
 ### 테스트
-- `uv run pytest` — 142개 전부 통과 (2026-07-06 기준)
+- `uv run pytest` — 167개 전부 통과 (2026-07-09 기준)
+
+### 2026-07-09 REST 폴링 안정화 (7/8 하루치 실측 기반, [[SESSION_LOG]]/[[DECISION_LOG]] 참고)
+- `mahdi/broker/rest_client.py`: `KISRestClient`에 스레드 안전 공유 레이트리미터(기본 2건/초) 추가 — 옵션체인/수급/유동성 폴링 3개 루프가 동시에 REST를 쏘면서 KIS 앱키 TPS 한도를 넘겨 정규장 405분 중 203분치 `option_analysis_1m`이 통째로 유실됐던 문제 대응.
+- `mahdi/main.py`: `poll_option_chain`/`poll_investor_flow`에 사이클 전체 실패 시 5초 후 1회 재시도 추가(`CYCLE_RETRY_BACKOFF_SECONDS`).
+- **다음 확인 필요**: 정규장 하루 운영 후 데이터 공백 비율이 실제로 줄었는지 DB로 재확인(NEXT_TODO 참고).
 
 ### 알려진 자잘한 문제
-- `find_gamma_flip`(options_intel.py)이 매 COCKPIT 리런마다 `RuntimeWarning: divide by zero` /
-  `invalid value encountered in scalar divide`를 출력(vollib Black-Scholes 감마 계산) — 크래시는
-  아니지만 일부 옵션 레그의 `t_years`나 `iv`가 0에 가까워 발생하는 것으로 추정, 원인 미조사(2026-07-06 관찰).
+- (해소, 2026-07-09) `find_gamma_flip`의 vollib RuntimeWarning/빈 줄 출력 — 원인은 `vollib.ref_python.d1()`의 디버그용 `print('')`(iv/t_years=0 경계 조건). `redirect_stdout`+`catch_warnings`로 국소 억제 완료.

@@ -1,3 +1,6 @@
+import threading
+import time
+
 import httpx
 import pytest
 
@@ -28,7 +31,12 @@ def test_get_quote_sends_expected_headers_and_params():
         captured["headers"] = request.headers
         return httpx.Response(200, json={"output1": {}})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     result = client.get_quote("201S03", market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
 
     assert result == {"output1": {}}
@@ -45,7 +53,12 @@ def test_get_asking_price_sends_expected_tr_id():
         captured["headers"] = request.headers
         return httpx.Response(200, json={"output2": {}})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     client.get_asking_price("201S11305")
 
     assert captured["headers"]["tr_id"] == tr_codes.TR_OPTION_ASKING_PRICE["vps"]
@@ -58,7 +71,12 @@ def test_get_balance_uses_account_settings():
         captured["url"] = str(request.url)
         return httpx.Response(200, json={"output": {}})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     client.get_balance()
 
     assert "CANO=12345678" in captured["url"]
@@ -73,7 +91,12 @@ def test_submit_order_maps_sell_and_buy_direction_codes():
         captured.append(json.loads(request.content))
         return httpx.Response(200, json={"rt_cd": "0"})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     client.submit_order(symbol="201W09", side="SELL", qty=1, price=350.0)
     client.submit_order(symbol="201W09", side="BUY", qty=1, price=350.0)
 
@@ -91,7 +114,12 @@ def test_submit_order_includes_required_fields_kis_would_otherwise_reject():
         captured.append(json.loads(request.content))
         return httpx.Response(200, json={"rt_cd": "0"})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     client.submit_order(symbol="201W09", side="BUY", qty=1, price=350.0, order_dvsn_cd="01")
 
     body = captured[0]
@@ -110,7 +138,12 @@ def test_get_investor_flow_always_uses_real_domain_even_for_mock_account():
         captured["headers"] = request.headers
         return httpx.Response(200, json={"output": [{"frgn_ntby_tr_pbmn": "-682279"}]})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     result = client.get_investor_flow(tr_codes.FID_MRKT_DIV_DERIVATIVES, tr_codes.FID_INVESTOR_FLOW_FUTURES)
 
     assert result == {"output": [{"frgn_ntby_tr_pbmn": "-682279"}]}
@@ -124,7 +157,12 @@ def test_http_error_propagates():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "server error"})
 
-    client = KISRestClient(_settings(), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
     with pytest.raises(httpx.HTTPStatusError):
         client.get_balance()
 
@@ -137,8 +175,67 @@ def test_uses_real_domain_when_env_is_prod():
         return httpx.Response(200, json={"output": {}})
 
     client = KISRestClient(
-        _settings(KIS_ENV="prod"), _token_daemon(), client=httpx.Client(transport=httpx.MockTransport(handler))
+        _settings(KIS_ENV="prod"),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
     )
     client.get_balance()
     assert "openapi.koreainvestment.com" in captured["url"]
     assert "vts" not in captured["url"]
+
+
+def test_requests_are_paced_to_respect_shared_rate_limit():
+    # 2026-07-08 실측: 옵션체인/수급 폴링 루프가 동시에 REST를 쏘면 KIS가 500을 대량 반환함
+    # ([[DECISION_LOG]] 참고) — min_request_interval이 실제로 호출 사이를 벌리는지 검증한다.
+    call_times: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_times.append(time.monotonic())
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.2,
+    )
+    for _ in range(3):
+        client.get_balance()
+
+    assert len(call_times) == 3
+    # 개별 간격이 아니라 총 스팬으로 검증 — 타이머 해상도 지터에 흔들리지 않게 한다.
+    assert call_times[-1] - call_times[0] >= 0.2 * 2 * 0.8
+
+
+def test_rate_limiter_serializes_concurrent_threads():
+    # asyncio.to_thread로 여러 폴링 루프가 동시에 호출하는 실제 상황을 스레드로 재현 —
+    # 스레드 두 개가 거의 동시에 호출해도 최소 간격이 지켜져야 한다.
+    call_times: list[float] = []
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with lock:
+            call_times.append(time.monotonic())
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.15,
+    )
+
+    threads = [threading.Thread(target=client.get_balance) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    call_times.sort()
+    assert len(call_times) == 4
+    # 예약(reservation)은 락 밑에서 정확히 min_interval 간격으로 결정되지만, 실제 time.sleep()
+    # 기상 시각은 스레드별로 몇 ms씩 흔들릴 수 있다(Windows 타이머 해상도) — 개별 간격 하나하나가
+    # 아니라 첫 호출~마지막 호출 총 스팬으로 검증해 그 지터에 흔들리지 않게 한다.
+    total_span = call_times[-1] - call_times[0]
+    assert total_span >= 0.15 * 3 * 0.8

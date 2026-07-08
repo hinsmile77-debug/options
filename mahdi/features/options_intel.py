@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import warnings
 from dataclasses import dataclass
 from datetime import time
 from typing import Sequence
@@ -57,7 +60,12 @@ def find_gamma_flip(
     입력: 옵션 체인 레그(행사가·IV·잔존만기 포함), 현재 스팟, 계약승수.
     계산: 스팟 ±search_pct 구간을 steps개 그리드로 나눠 각 지점에서 Black-Scholes 감마를
          재계산(행사가·IV·잔존만기는 고정, 스팟만 이동)해 GEX(S)를 구성한 뒤, 부호가 바뀌는
-         구간을 선형보간해 flip 레벨을 추정한다.
+         구간을 선형보간해 flip 레벨을 추정한다. steps x legs번 vollib.gamma()를 호출하는데,
+         vollib.ref_python(C 확장 미설치 시 폴백되는 순수 파이썬 구현)의 d1()에 디버그용
+         print('')이 남아 있어(2026-07-08 실측: COCKPIT 하루 로그의 99%가 이 빈 줄이었음)
+         stdout을 로컬로 흡수한다 — 그리드 경계(t_years/iv≈0)에서 나는 0-나눗셈 RuntimeWarning도
+         같은 이유로 억제(값 계산 자체는 정상, numpy가 nan/inf를 반환할 뿐이고 그 지점은 그대로
+         GEX 부호 비교에 들어가 flip 계산에 영향 없음).
     해석: 이 레벨을 이탈하면 딜러 헤지가 안정화<->증폭으로 전환 — 변동성 폭발 준비 신호.
     실패 조건: legs가 비어있으면 None. 그리드 전 구간에서 부호가 바뀌지 않으면 None
               (flip 레벨이 탐색 범위 밖에 있음을 의미).
@@ -76,7 +84,9 @@ def find_gamma_flip(
             total += _CALL_PUT_SIGN[leg.option_type] * g * leg.oi * multiplier * s_term
         return total
 
-    values = [gex_at(s) for s in grid]
+    with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        values = [gex_at(s) for s in grid]
     for i in range(1, len(grid)):
         if values[i - 1] == 0:
             return grid[i - 1]

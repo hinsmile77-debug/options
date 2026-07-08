@@ -4,6 +4,37 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-09] 7/8 기동~종료 흐름 점검 → REST 500 대량 유실·로그 인코딩·vollib 빈줄 4건 발견·수정
+
+**트리거:** 사용자가 "7/8 마흐디 기동부터 종료까지 작동 흐름을 점검하고 이상점 및 개선점을 조사해" 요청.
+
+**조사:** `logs/premarket_startup.log`(기동 07:30/종료 15:45 정상), `logs/cockpit.log`(7/8 구간 667,663줄), `logs/observation_loop.log`(토큰 재발급 마커로 7/8 구간 106667~189969행 추출, 83,303줄)를 직접 분석하고 `mahdi_timescaledb`를 DB 쿼리로 교차검증.
+
+**발견 (4건):**
+1. **REST 500 대량 유실**: 정규장(09:00~15:44) 405분 중 203분(50%)치 `option_analysis_1m`이 통째로 0건. REST 호출 실패율 옵션체인 38%/수급 36%/유동성 26%, 500 에러가 평균 2.5·최대 17회 연속으로 뭉쳐서 발생 — `poll_option_chain`/`poll_investor_flow`/`poll_expiry_liquidity` 3개 루프가 레이트리밋 없이 동시에 REST를 쏘는 게 원인으로 추정([[DECISION_LOG]] 참고).
+2. **배치 로그 mojibake**: `premarket_startup.log`의 taskkill/docker 출력이 깨진 바이트로 남음 — 배치파일이 UTF-8인데 cmd.exe가 시스템 코드페이지(949)로 읽어서 발생.
+3. **COCKPIT 로그 빈 줄 폭증**: 7/8 하루치 cockpit.log 667,663줄 중 667,651줄(99.9%)이 빈 줄.
+4. (기존에 알려진 항목 재확인) `find_gamma_flip`의 vollib RuntimeWarning — CURRENT_STATE.md "알려진 자잘한 문제"에 이미 기록돼 있었으나 원인 미조사 상태였음.
+
+**빈 줄 원인 규명 과정**: 헤드리스 Chrome으로 실제 브라우저 세션을 흉내내 COCKPIT을 재현(세션 없이는 `render()`가 아예 안 돎을 먼저 확인) → `sys.stdout.write`를 몽키패치해 콜스택을 남기는 트레이서 스크립트로 정확한 발생 지점 특정 → `vollib/ref_python/black_scholes/__init__.py`의 `d1()` 안 `if not denominator: print('')`(디버그 잔재)로 확정. `find_gamma_flip`이 그리드(41점)마다 이 함수를 호출해서, `iv`나 `t_years`가 0에 가까운 레그 하나만 있어도 리런 1회당 수십~수백 줄이 찍힘.
+
+**구현 (4건, 상세 근거는 각 [[DECISION_LOG]] 항목 참고):**
+- `mahdi/broker/rest_client.py`: 스레드 안전 공유 레이트리미터(`_RateLimiter`, 기본 2건/초) 추가, 모든 REST 호출이 `_get`/`_post` 단일 진입점을 거치도록 리팩터링.
+- `mahdi/main.py`: `poll_option_chain`/`poll_investor_flow`에 사이클 전체 실패 시 5초 후 1회 재시도(`_collect_option_chain_cycle`/`_collect_investor_flow_cycle` 헬퍼로 분리).
+- `scripts/start_mahdi_premarket.bat`/`stop_mahdi_marketclose.bat`: `chcp 65001 >nul` 추가.
+- `mahdi/features/options_intel.py`: `find_gamma_flip`의 vollib 호출 구간을 `redirect_stdout`+`catch_warnings`로 국소 억제.
+
+**검증:**
+- `pytest` 167개 전부 통과(신규 7개: 레이트리미터 페이싱/동시성 2개, 옵션체인/수급 재시도 3개, vollib stdout/warning 억제 2개) — 신규 테스트는 전부 "수정을 일시적으로 되돌리면 실패하는지"까지 역검증함(1차로 만든 vollib stdout 테스트가 정상 레그를 써서 회귀를 못 잡는 거짓 통과였던 것도 이 과정에서 발견해 경계값 레그로 교체).
+- 두 배치파일을 실제로 실행 — 수정 전/후 `premarket_startup.log`를 직접 비교해 mojibake가 사라짐을 확인.
+- 헤드리스 Chrome으로 COCKPIT을 40초간 재현 — 수정 전 4,112줄(빈 줄 4,099) → 수정 후 8줄(빈 줄 3, 배너뿐)로 확인.
+- 실제 `mahdi.main` 관측 루프를 75초 구동해 레이트리미터·재시도 경로가 실거래 파이프라인에서도 정상 동작하고 DB(`option_analysis_1m`)에 계속 적재됨을 확인. 단, 장전(08시대) 시간대라 일부 종목 500이 여전히 관측됨 — 레이트리밋 완화 효과의 정확한 재확인은 정규장 하루 운영 결과로 봐야 함.
+- 테스트 중 생성한 모든 프로세스(streamlit/chrome/observation loop 등) 정리 확인, DB/Redis 컨테이너만 정상 유지.
+
+**다음 확인 필요:** 정규장(09:00~15:45) 중 하루 운영 후 `option_analysis_1m` 분당 데이터 공백 비율이 실제로 줄었는지 DB로 재확인.
+
+---
+
 ## [2026-07-07] Flow Radar x축 장외 시간공백 제거 (rangebreaks)
 
 **트리거:** 사용자가 COCKPIT 스크린샷을 보여주며 "Flow Radar 시간축이 전날 장마감 후 다음날 장시작

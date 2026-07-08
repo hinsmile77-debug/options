@@ -1,3 +1,5 @@
+import contextlib
+import io
 from datetime import time
 
 import pytest
@@ -42,6 +44,26 @@ def test_find_gamma_flip_detects_sign_change():
     flip = find_gamma_flip(legs, spot=350)
     assert flip is not None
     assert 335 < flip < 345
+
+
+def test_find_gamma_flip_does_not_leak_vollib_print_to_stdout():
+    # 2026-07-08 실측: vollib.ref_python(C 확장 미설치 폴백)의 d1()이 sigma*sqrt(t)==0일 때
+    # (iv=0 또는 t_years=0 — 얇거나 만기 임박 레그에서 실제로 발생) print('')을 실행해 COCKPIT
+    # 하루 로그(667,663줄)의 99% 이상이 이 빈 줄이었다. iv=0.18/t_years=0.05처럼 정상적인 레그로는
+    # 이 조건이 아예 트리거되지 않으므로(회귀를 못 잡는 거짓 통과), 경계 조건 레그를 써야 한다.
+    legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.0, t_years=0.0, gamma=0.0)]
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        find_gamma_flip(legs, spot=350)
+    assert captured.getvalue() == ""
+
+
+def test_find_gamma_flip_handles_zero_time_to_expiry_without_warning_noise(recwarn):
+    # 그리드 경계에서 t_years/iv가 0에 가까우면 vollib 내부에서 0-나눗셈이 발생한다 — 계산 자체는
+    # 그대로 두되(nan/inf가 부호 비교에 들어가도 flip 로직은 안전) RuntimeWarning만 억제한다.
+    legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.0, t_years=0.0, gamma=0.0)]
+    find_gamma_flip(legs, spot=350)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in recwarn.list)
 
 
 def test_gamma_walls_ranks_by_exposure():

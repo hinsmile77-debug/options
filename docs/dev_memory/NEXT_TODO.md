@@ -37,9 +37,10 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 - [x] Flow Radar가 선물만 계속 대표 종목으로 뽑는 문제(VPIN 도입의 부작용) — 2026-07-06 선물/옵션
       계열 분리로 해결, 이후 UI 배치(옵션이 위)/x축 통일/옵션 VPIN 차트까지 2차 개편 완료
       ([[SESSION_LOG]], [[DECISION_LOG]] 참고)
-- [ ] `find_gamma_flip`(options_intel.py)이 COCKPIT 리런마다 vollib에서 `RuntimeWarning: divide by
-      zero`/`invalid value encountered` 출력 — 크래시는 아니지만 원인 미조사(일부 레그의 t_years나
-      iv가 0에 가까운 것으로 추정, 2026-07-06 관찰)
+- [x] `find_gamma_flip`(options_intel.py)이 COCKPIT 리런마다 vollib에서 `RuntimeWarning: divide by
+      zero`/`invalid value encountered` 출력 — 2026-07-09 원인 규명(vollib.ref_python.d1()의 디버그용
+      `print('')`, iv/t_years=0 경계) 및 `redirect_stdout`+`catch_warnings`로 수정 완료([[SESSION_LOG]],
+      [[DECISION_LOG]] 참고). 이게 COCKPIT 하루 로그 99.9%를 차지하던 빈 줄의 정체였음.
 - [ ] Flow Radar x축 `rangebreaks`(전일 장마감~당일 개장 공백 제거) — 2026-07-07 코드 수정 완료,
       테스트 통과([[SESSION_LOG]] 참고). **COCKPIT 재시작 후 브라우저에서 실제로 공백이 압축돼
       보이는지 육안 확인 아직 안 함**.
@@ -47,9 +48,10 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 ## 운영 검증
 
 - [x] 2026-07-06(월) 07:30 자동 기동 스케줄 실제 동작 확인 (Mahdi-PreMarket-Startup) — 실행은 됐으나 Docker Desktop 미기동으로 DB/Redis 없이 COCKPIT/관측루프만 뜸(수동으로 Docker 기동해 당일 대응, 배치파일에 자동 기동/대기 로직 추가함)
-- [x] 2026-07-07(화) 07:30 기동 시 새로 추가한 Docker 자동 기동/폴링 로직이 실제로 동작하는지 확인 — **실패**: schtasks 반환코드 255로 즉시 종료(PC가 07:25:42에 막 부팅돼 Docker 꺼진 채 트리거되며, `start_mahdi_premarket.bat`의 IF 블록 내 미이스케이프 괄호로 인한 cmd.exe 파싱 버그가 처음 실제로 실행되어 노출됨). `^(...^)`로 수정 후 수동 재실행해 당일분 기동 완료([[SESSION_LOG]]/[[DECISION_LOG]] 참고). **다음 확인 필요**: 2026-07-08 이후 07:30 자동 기동이 수정된 배치파일로 실제 정상 동작하는지(Docker 꺼진 상태 재현 포함)
-- [ ] 같은 날 15:45 자동 종료 확인 (Mahdi-MarketClose-Shutdown)
-- [ ] 정규장 시간 중 `market_raw_1m`/`regime_state`에 실제 1분봉이 쌓이는지, `logs/observation_loop.log`에 에러 없이 insert가 찍히는지 확인
+- [x] 2026-07-07(화) 07:30 기동 시 새로 추가한 Docker 자동 기동/폴링 로직이 실제로 동작하는지 확인 — **실패**: schtasks 반환코드 255로 즉시 종료(PC가 07:25:42에 막 부팅돼 Docker 꺼진 채 트리거되며, `start_mahdi_premarket.bat`의 IF 블록 내 미이스케이프 괄호로 인한 cmd.exe 파싱 버그가 처음 실제로 실행되어 노출됨). `^(...^)`로 수정 후 수동 재실행해 당일분 기동 완료([[SESSION_LOG]]/[[DECISION_LOG]] 참고). 2026-07-08 07:30 자동 기동은 정상 동작 확인(2026-07-09 로그 점검, 크래시성 재시작 없이 하루 종일 안정).
+- [x] 2026-07-08(수) 15:45 자동 종료 확인 (Mahdi-MarketClose-Shutdown) — 정상 동작 확인(2026-07-09 로그 점검, COCKPIT/관측루프 프로세스 트리 에러 없이 종료, DB/Redis는 유지).
+- [x] 정규장 시간 중 `market_raw_1m`/`regime_state`에 실제 1분봉이 쌓이는지 확인 — 2026-07-09 DB 쿼리로 확인. 단, `option_analysis_1m`은 정규장 405분 중 203분(50%)치가 REST 500 대량 유실로 통째로 비어 있었음([[SESSION_LOG]], [[DECISION_LOG]] 참고) — 원인으로 추정되는 레이트리밋 미대응을 2026-07-09 레이트리미터+재시도로 수정. **다음 확인 필요**: 정규장 하루 운영 후 이 공백 비율이 실제로 줄었는지 재확인.
+- [ ] 정규장 시간 중 `logs/observation_loop.log`에 에러 없이 insert가 찍히는지 확인
 - [ ] COCKPIT의 `st.rerun()` 10초 폴링이 브라우저에서 실제로 갱신되는지, 장시간(하루 종일) 방치 시 메모리/연결 누수 없는지 확인
 - [x] `mahdi/dashboard/` 하위 모듈 수정 후 COCKPIT을 재시작해야 반영된다는 사실을 실제로 겪고 확인함
       (2026-07-06, [[DECISION_LOG]] 참고) — 앞으로 대시보드 코드를 고치는 세션에서는 체크리스트에 "COCKPIT

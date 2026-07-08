@@ -4,6 +4,47 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-09] REST 폴링 4개 루프에 공유 레이트리미터 도입 — TPS 초과로 정규장 절반 데이터 유실
+
+**결정:** `KISRestClient`에 스레드 안전 `_RateLimiter`(최소 호출 간격 0.5초=2건/초)를 추가하고, 모든 GET/POST가 이를 거치는 `_get`/`_post` 단일 진입점으로 리팩터링했다. `min_request_interval` 생성자 인자로 조정 가능.
+
+**Why:** 2026-07-08 하루치 로그/DB를 실측한 결과, 정규장 405분 중 203분(50%)치 `option_analysis_1m`이 통째로 비어 있었다. 원인은 `poll_option_chain`(60초 주기, ~28콜)·`poll_investor_flow`(60초, 3콜)·`poll_expiry_liquidity`(300초, ~11콜) 세 루프가 `asyncio.gather`로 동시에 돌면서 각자는 순차 호출이라도 서로 다른 `asyncio.to_thread` 스레드가 겹치는 순간 KIS 앱키의 초당 호출 한도를 넘겨 500 Internal Server Error가 대량 발생했기 때문(전체 REST 호출의 38%가 실패, 그중 500 에러는 평균 2.5회·최대 17회 연속으로 뭉쳐서 발생 — 순수 랜덤 장애가 아니라 버스트 패턴). 공식 문서에 모의투자 TPS 한도가 명시돼 있지 않아 보수적으로 2건/초로 잡았다 — 사이클당 필요한 최대 호출(옵션체인+수급=31건)도 15.5초면 끝나 60초 주기 안에 여유 있게 들어간다.
+
+**How to apply:** 새로운 REST 폴링 루프를 추가할 때는 반드시 기존 `rest_client` 인스턴스를 공유해서 쓴다(레이트리미터가 인스턴스 단위 상태이므로 별도 `KISRestClient()`를 새로 만들면 페이싱이 깨진다). 레이트리밋 여전히 잦으면 `min_request_interval`을 늘리거나, `main()`에서 인스턴스 생성 시 값을 낮춰(예: 0.3초=3.3TPS) 대역폭을 넓히는 것부터 검토 — 다만 KIS 쪽 실측 없이 낮추면 다시 500이 늘어날 수 있음.
+
+---
+
+## [2026-07-09] 옵션체인/수급 폴링, 사이클 전체 실패 시 짧은 backoff 후 1회 재시도
+
+**결정:** `poll_option_chain`/`poll_investor_flow`에서 그 사이클의 모든 종목/세그먼트가 실패해 적재할 게 하나도 없으면, 정규 주기(60초)를 기다리지 않고 `CYCLE_RETRY_BACKOFF_SECONDS`(5초) 후 그 사이클을 한 번만 재시도한다. 재시도까지 실패하면 조용히 포기하고 다음 정규 사이클로 넘어간다.
+
+**Why:** 위 레이트리미터로 TPS 버스트는 완화되지만, KIS 서버 자체의 일시적 500(레이트리밋과 무관한 장애)까지 없앨 수는 없다 — 그 경우 사이클 하나가 완전히 비면 그 1분치 데이터가 영구 유실된다. 60초 뒤 다음 정규 사이클을 기다리는 대신 5초 뒤 짧게 재시도하면 일시적 장애 구간을 대부분 건너뛸 수 있다. 무한 재시도가 아니라 1회로 제한한 이유는, 진짜 장애(서버 다운 등)일 때 재시도 루프가 정규 주기를 계속 잠식하지 않게 하기 위함.
+
+**How to apply:** 재시도는 `_collect_option_chain_cycle`/`_collect_investor_flow_cycle` 헬퍼를 그대로 재호출하는 방식이라, 두 함수의 시그니처를 바꿀 때는 재시도 호출부도 함께 수정해야 한다. `poll_expiry_liquidity`에는 이 재시도를 적용하지 않았다 — 이 지표는 20거래일 기준선 축적용이라 한 사이클 유실이 실시간 판단에 영향을 안 주고, 폴링 주기도 이미 300초로 넉넉해 우선순위가 낮다고 판단.
+
+---
+
+## [2026-07-09] vollib `find_gamma_flip` stdout/RuntimeWarning 국소 억제
+
+**결정:** `find_gamma_flip`이 그리드 스캔 중 `vollib.gamma()`를 호출하는 구간만 `contextlib.redirect_stdout(io.StringIO())` + `warnings.catch_warnings()`(RuntimeWarning ignore)로 감쌌다. vollib 패키지 자체(`.venv/site-packages`)는 건드리지 않았다.
+
+**Why:** COCKPIT `cockpit.log` 하루치(667,663줄)의 99.9%(667,651줄)가 빈 줄이었던 원인을 `sys.stdout.write`에 콜스택 트레이싱을 붙여 직접 추적한 결과, `vollib.ref_python.black_scholes.d1()`에 `if not denominator: print('')`(디버그 잔재로 추정)가 있었다 — `denominator = sigma*sqrt(t)`가 0이 되는 경우(레그의 `iv`나 `t_years`가 0에 가까운, 얇거나 만기 임박 종목)마다 실행된다. `find_gamma_flip`은 스팟 그리드(기본 41점)마다 이 값을 재계산하므로, 그런 레그가 하나만 섞여 있어도 COCKPIT 리런 1회당 수십~수백 개의 빈 줄이 나온다. 같은 조건이 `RuntimeWarning: divide by zero`/`invalid value encountered`도 함께 유발한다(계산 자체는 nan/inf를 반환할 뿐 GEX 부호 비교 로직에는 영향 없음 — 억제해도 안전).
+site-packages를 직접 고치는 대신 호출부에서 흡수한 이유: 벤더 패키지 수정은 git에 안 잡히고 `uv sync`/재설치 시 사라진다.
+
+**How to apply:** vollib를 호출하는 새 코드를 추가할 때(예: 다른 Greeks 계산 함수) 동일한 `iv=0`/`t_years=0` 경계에서 같은 문제가 재발할 수 있다 — 새 호출부도 필요하면 같은 패턴(`redirect_stdout` + `catch_warnings`)으로 감쌀 것. 테스트에서 이 조건을 검증할 때는 반드시 `iv=0.0, t_years=0.0` 같은 경계값 레그를 써야 한다 — 정상 레그(`iv=0.18, t_years=0.05`)로는 `denominator != 0`이라 print/warning이 애초에 안 나서 회귀를 못 잡는 거짓 통과 테스트가 된다(실제로 이번에 이 실수를 했다가 고쳤음).
+
+---
+
+## [2026-07-09] 배치파일에 `chcp 65001` 추가 — premarket_startup.log 한글 mojibake 수정
+
+**결정:** `start_mahdi_premarket.bat`/`stop_mahdi_marketclose.bat` 둘 다 `setlocal` 직후 `chcp 65001 >nul`을 추가했다.
+
+**Why:** 두 배치파일은 BOM 없는 UTF-8로 저장돼 있는데, cmd.exe는 기본 시스템 코드페이지(한국어 Windows 기준 949)로 배치파일을 읽고 콘솔에 출력한다 — UTF-8 바이트를 949로 잘못 해석해 `echo`의 한글 문구가 부분 mojibake로, `taskkill` 등 OS 자체 출력은 완전히 깨진 바이트로 `premarket_startup.log`에 남았다(예: `????: PID 1234의 프로세스...`). 배치파일이 CRLF+UTF-8(BOM 없음)인 것은 이미 확인된 전제라 `chcp 65001`만 추가하면 별도 재인코딩 없이 바로 해결됨.
+
+**How to apply:** 두 스크립트를 직접 실행해 검증함 — 수정 전엔 taskkill 출력이 `????...`로 깨졌고, 수정 후엔 `SUCCESS: The process...`로 정상 출력됨(이 시스템은 코드페이지 65001에서 taskkill 리소스 문자열이 영어로 나옴 — 한글이 아니어도 mojibake만 없으면 목적 달성). 앞으로 이 두 파일에 새 `echo` 문구를 추가할 때는 UTF-8 인코딩만 유지하면 되고 별도 조치 불필요. 다른 새 배치파일을 추가할 때도(특히 한글 문구가 콘솔에 출력되는 경우) 상단에 `chcp 65001 >nul`을 습관적으로 넣을 것.
+
+---
+
 ## [2026-07-07] 배치파일 IF 블록 안 echo에 괄호를 그대로 쓰면 cmd.exe가 파싱 실패 — `^()` 이스케이프로 수정
 
 **결정:** `scripts/start_mahdi_premarket.bat`의 `if not exist "%DOCKER_DESKTOP_EXE%" ( ... )` 블록 안 echo 문에서 `(%DOCKER_DESKTOP_EXE%)`처럼 괄호를 그대로 썼던 것을 `^(...^)`로 이스케이프했다.

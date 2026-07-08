@@ -423,6 +423,96 @@ def test_poll_option_chain_skips_bad_leg_and_continues_after_db_error(monkeypatc
     assert fake_conn.rollback_calls == 1
 
 
+class _FakeRestClientChainFlaky:
+    """처음 fail_calls건은 실패, 이후는 성공 — 사이클 전체 실패 후 재시도 복구를 재현한다."""
+
+    def __init__(self, resp: dict, fail_calls: int):
+        self._resp = resp
+        self._fail_calls = fail_calls
+        self.calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        if len(self.calls) <= self._fail_calls:
+            raise RuntimeError("KIS 500")
+        return self._resp
+
+
+def test_poll_option_chain_retries_once_when_entire_cycle_fails(monkeypatch):
+    # 2026-07-08 실측: 레이트리밋 버스트로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우가
+    # 있었다 — 다음 60초 사이클까지 기다리지 않고 짧게 대기 후 재시도해 복구되는지 검증한다.
+    rest_client = _FakeRestClientChainFlaky(_SAMPLE_OPTION_QUOTE, fail_calls=2)  # 1차 시도(2건) 전부 실패
+    written_rows: list[dict] = []
+    written_spots: list[float] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: written_rows.append(row))
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_underlying_spot",
+        lambda conn, timestamp, underlying, spot: written_spots.append(spot),
+    )
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if seconds != 5.0:  # retry_backoff_seconds가 아니라 정규 interval_seconds 사이클이면 루프 종료
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=1,
+            )
+        )
+
+    assert len(rest_client.calls) == 4  # 1차 시도 2건 실패 + 재시도 2건 성공
+    assert len(written_rows) == 2  # 재시도로 복구된 데이터가 결국 적재됨
+    assert written_spots == [1333.77]
+    assert 5.0 in sleep_calls  # 재시도 backoff가 실제로 대기했다
+
+
+def test_poll_option_chain_gives_up_after_retry_still_fails(monkeypatch):
+    rest_client = _FakeRestClientChainFlaky(_SAMPLE_OPTION_QUOTE, fail_calls=999)  # 항상 실패
+    written_rows: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: written_rows.append(row))
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    async def fake_sleep(seconds):
+        if seconds != 5.0:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=1,
+            )
+        )
+
+    assert len(rest_client.calls) == 4  # 1차 2건 + 재시도 2건, 전부 실패 시도
+    assert written_rows == []  # 재시도까지 실패하면 이번 사이클은 조용히 포기(다음 사이클엔 정상 진행)
+
+
 class _FakeInvestorFlowRestClient:
     """섹터(F001/OC01/OP01)별로 다른 응답을 돌려주고, 지정한 섹터는 예외를 던진다."""
 
@@ -519,6 +609,62 @@ def test_poll_investor_flow_continues_when_one_segment_fails(monkeypatch):
     assert len(rest_client.calls) == 3  # 실패한 OC01도 시도는 함
     assert len(written) == 1
     assert written[0]["foreign_net"] == pytest.approx(-120.0)  # F001 + OP01만 합산(OC01 실패분 제외)
+
+
+class _FakeInvestorFlowRestClientFlaky:
+    """처음 fail_calls건은 (섹터 무관) 실패, 이후는 성공 — 사이클 전체 실패 후 재시도 복구를 재현."""
+
+    def __init__(self, responses: dict, fail_calls: int):
+        self._responses = responses
+        self._fail_calls = fail_calls
+        self.calls: list[tuple[str, str]] = []
+
+    def get_investor_flow(self, market_code: str, sector_code: str) -> dict:
+        self.calls.append((market_code, sector_code))
+        if len(self.calls) <= self._fail_calls:
+            raise RuntimeError("KIS 500")
+        return self._responses[sector_code]
+
+
+def test_poll_investor_flow_retries_once_when_all_segments_fail(monkeypatch):
+    # 2026-07-08 실측: 레이트리밋 버스트로 세 세그먼트가 한꺼번에 실패하는 경우가 있었다 —
+    # 다음 60초 사이클까지 기다리지 않고 짧게 대기 후 재시도해 복구되는지 검증한다.
+    rest_client = _FakeInvestorFlowRestClientFlaky(
+        {
+            "F001": _investor_flow_response(-100.0, 200.0, -50.0),
+            "OC01": _investor_flow_response(-30.0, 40.0, -5.0),
+            "OP01": _investor_flow_response(-20.0, 10.0, 15.0),
+        },
+        fail_calls=3,  # 1차 시도(3개 세그먼트) 전부 실패
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    def fake_insert_investor_flow(conn, timestamp, underlying, foreign_net, institution_net, individual_net):
+        written.append({"foreign_net": foreign_net})
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_investor_flow", fake_insert_investor_flow)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if seconds != 5.0:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_investor_flow(rest_client, interval_seconds=1))
+
+    assert len(rest_client.calls) == 6  # 1차 3건 실패 + 재시도 3건 성공
+    assert len(written) == 1
+    assert written[0]["foreign_net"] == pytest.approx(-150.0)
+    assert 5.0 in sleep_calls  # 재시도 backoff가 실제로 대기했다
 
 
 def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
