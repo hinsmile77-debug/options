@@ -513,6 +513,58 @@ def test_poll_option_chain_gives_up_after_retry_still_fails(monkeypatch):
     assert written_rows == []  # 재시도까지 실패하면 이번 사이클은 조용히 포기(다음 사이클엔 정상 진행)
 
 
+class _FakeLoop:
+    """asyncio.get_running_loop()를 대체 — .time() 호출마다 미리 정한 값을 순서대로 반환한다."""
+
+    def __init__(self, times: list[float]):
+        self._times = iter(times)
+
+    def time(self) -> float:
+        return next(self._times)
+
+
+def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeypatch):
+    # 2026-07-09: "작업 후 interval만큼 sleep"이면 사이클 소요시간만큼 실제 주기가 매번 밀려
+    # poll_time(분 단위)이 분 경계를 건너뛰는 유실이 발생했다 — 절대시각 고정 틱(next_tick)으로
+    # 바꿔, 사이클이 예정보다 늦게 끝나면 그만큼 다음 대기를 짧게 잡아 스케줄을 보정하는지 검증한다.
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    # 1번째 사이클 종료 시각=1000.0 -> next_tick=1000+60=1060(정상 60초 대기 예상).
+    # 2번째 사이클 종료 시각=1200.0(가상으로 사이클이 오래 걸려 next_tick 1060을 이미 지나침)
+    # -> 밀린 걸 따라잡지 않고 그 시점으로 재기준, delay=0.0이어야 한다.
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=60,
+            )
+        )
+
+    assert sleep_calls == [60.0, 0.0]  # 정상 사이클은 60초 대기, 밀린 사이클은 따라잡지 않고 즉시 재기준
+
+
 class _FakeInvestorFlowRestClient:
     """섹터(F001/OC01/OP01)별로 다른 응답을 돌려주고, 지정한 섹터는 예외를 던진다."""
 
@@ -931,3 +983,66 @@ def test_poll_expiry_liquidity_skips_bad_book_and_continues_after_db_error(monke
     assert call_count["n"] == 2  # 북 2개 각각 1행씩 시도됨
     assert len(written_rows) == 1  # 첫 북만 실패, 둘째 북은 정상 적재됨(루프가 안 죽음)
     assert fake_conn.rollback_calls == 1
+
+
+def test_poll_expiry_liquidity_waits_startup_offset_before_first_cycle(monkeypatch):
+    # 2026-07-09: poll_option_chain과 동시에 기동하면 두 폴러의 정규 사이클이 같은 순간에 겹쳐
+    # 공유 레이트리미터 큐가 길어지는 것을 완화하기 위해 최초 사이클을 startup_offset_seconds만큼
+    # 지연시킨다 — 지연이 정확히 한 번, 사이클 진입보다 먼저 일어나는지 검증한다.
+    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: None)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    books = [(_FakeSubscriptionManagerForLiquidity(frozenset()), "regular")]
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_expiry_liquidity(
+                rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1, startup_offset_seconds=30.0
+            )
+        )
+
+    # 오프셋 대기가 먼저 일어나고(30.0), 그 뒤에야 사이클 진입 -> 구독 행사가 없어 2초 재확인 경로.
+    # fake_sleep이 첫 호출에서 바로 예외를 던지므로 오프셋 대기만 기록되고 루프에 도달하지 못한다.
+    assert sleep_calls == [30.0]
+
+
+def test_poll_expiry_liquidity_default_offset_is_zero_and_skips_wait(monkeypatch):
+    # startup_offset_seconds 기본값(main.py 시그니처 기준 0.0)일 때는 기존 동작(오프셋 없이 바로
+    # 사이클 진입)을 그대로 유지해야 한다 — main() 밖 호출부(테스트 등)의 하위호환 보장.
+    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: None)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    books = [(_FakeSubscriptionManagerForLiquidity(frozenset()), "regular")]
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+
+    assert sleep_calls == [2.0]  # 오프셋 없이 바로 "구독 없음 -> 2초 재확인" 경로

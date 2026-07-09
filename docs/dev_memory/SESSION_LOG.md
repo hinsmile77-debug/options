@@ -4,6 +4,20 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-09] Gamma Wall 5분 간격 4분 유실 조사 → 폴링 3개 루프 고정 틱 스케줄링 전환
+
+**트리거:** 사용자가 COCKPIT의 Gamma Wall을 보다가 09:03/09:08/09:13/09:18 — 정확히 5분 간격으로 `option_analysis_1m`의 특정 분이 통째로 비는 패턴을 발견해 "이득/손실을 조사하고, 개선할 경우 방향을 설명해"라고 요청.
+
+**조사:** `mahdi/main.py`의 `poll_option_chain`/`poll_expiry_liquidity`/`poll_investor_flow`와 `mahdi/broker/rest_client.py`의 `_RateLimiter`를 코드로 직접 분석. 두 겹의 원인을 확인: ① `poll_option_chain`이 "작업 후 sleep(60)" 패턴이라 사이클 자체 소요시간(~14초, 28콜×0.5초 페이싱)이 매 사이클 실제 주기에 그대로 더해져(~74초) `poll_time`(분 단위로 자른 타임스탬프)이 누적 드리프트로 분 경계를 종종 두 번 건너뛴다. ② `poll_expiry_liquidity`(300초 주기, ~11콜)가 같은 `KISRestClient`의 공유 `_RateLimiter` 큐에 5분마다 끼어들어 그 순간의 `poll_option_chain` 사이클을 추가로 늦춰, 드리프트가 분 경계를 넘는 시점이 정확히 5분 간격으로 규칙화됨을 확인 — 유실 규모는 405분 중 4분(~1%)으로, 07-08에 고친 203분(50%) 유실보다 훨씬 작은 잔여 이슈. 사용자에게 이득/손실을 보고한 뒤 "제안된 개선방향으로 구현해" 승인 받음.
+
+**구현:** `mahdi/main.py`의 세 폴러 전부를 "작업 후 interval만큼 sleep"에서 절대시각 `next_tick` 기반 고정 틱 스케줄링으로 전환(`asyncio.get_running_loop().time()` 기준, 사이클이 밀려도 캐치업 안 하고 그 시점으로 재기준). `poll_expiry_liquidity`에 `startup_offset_seconds`(기본 0, `main()`에서 `EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS=30.0` 전달) 추가해 `poll_option_chain`과 정규 사이클이 계속 겹치지 않게 어긋냄. 레이트리미터(`_RateLimiter`, 0.5초/콜) 자체는 07-08에 이미 고친 대형 유실 재현 위험 때문에 건드리지 않음([[DECISION_LOG]] 참고).
+
+**검증:** `tests/test_main.py`에 신규 테스트 4개 추가 — 고정 틱 스케줄이 정상 사이클엔 예정된 간격을, 밀린 사이클엔 즉시 재기준(0초 대기)을 하는지 `asyncio.get_running_loop`를 페이크 시계로 몽키패치해 검증. `startup_offset_seconds` 지정/미지정(기본값 0, 하위호환) 둘 다 검증. 전체 테스트 스위트 170개 전부 통과(`.venv`의 pytest, py37 conda 환경은 `typing.Protocol` 미지원으로 이 프로젝트에 안 맞음 — 반드시 프로젝트 로컬 `.venv`로 실행할 것).
+
+**다음 확인 필요:** 정규장 하루 운영 후 이 5분 간격 유실 패턴이 실제로 사라졌는지 DB(`option_analysis_1m`)로 재확인([[NEXT_TODO]] 참고).
+
+---
+
 ## [2026-07-09] 7/8 기동~종료 흐름 점검 → REST 500 대량 유실·로그 인코딩·vollib 빈줄 4건 발견·수정
 
 **트리거:** 사용자가 "7/8 마흐디 기동부터 종료까지 작동 흐름을 점검하고 이상점 및 개선점을 조사해" 요청.

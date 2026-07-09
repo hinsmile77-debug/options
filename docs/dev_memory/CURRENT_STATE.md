@@ -102,12 +102,13 @@ _최종 갱신: 2026-07-09_
 - `active_futures_symbol(underlying, symbol, updated_at)` — 단일 현재값 레지스트리(하이퍼테이블 아님). 대시보드가 "이 종목이 지금 구독 중인 선물인지"를 vpin 유무 같은 휴리스틱 없이 바로 조회하게 함.
 
 ### 테스트
-- `uv run pytest` — 167개 전부 통과 (2026-07-09 기준)
+- `uv run pytest` — 170개 전부 통과 (2026-07-09 기준). **주의**: 이 PC의 기본 `python`(conda `py37_32`, 3.7)은 `typing.Protocol` 미지원이라 `tests/test_main.py` 임포트부터 실패한다 — 반드시 프로젝트 로컬 `.venv/Scripts/python.exe -m pytest`로 실행할 것.
 
 ### 2026-07-09 REST 폴링 안정화 (7/8 하루치 실측 기반, [[SESSION_LOG]]/[[DECISION_LOG]] 참고)
 - `mahdi/broker/rest_client.py`: `KISRestClient`에 스레드 안전 공유 레이트리미터(기본 2건/초) 추가 — 옵션체인/수급/유동성 폴링 3개 루프가 동시에 REST를 쏘면서 KIS 앱키 TPS 한도를 넘겨 정규장 405분 중 203분치 `option_analysis_1m`이 통째로 유실됐던 문제 대응.
 - `mahdi/main.py`: `poll_option_chain`/`poll_investor_flow`에 사이클 전체 실패 시 5초 후 1회 재시도 추가(`CYCLE_RETRY_BACKOFF_SECONDS`).
-- **다음 확인 필요**: 정규장 하루 운영 후 데이터 공백 비율이 실제로 줄었는지 DB로 재확인(NEXT_TODO 참고).
+- (해소, 2026-07-09 2차 수정) 레이트리미터 도입 후에도 남아있던 잔여 유실(5분 간격, 405분 중 4분) — `poll_option_chain`/`poll_expiry_liquidity`/`poll_investor_flow` 세 루프를 "작업 후 sleep"에서 절대시각 고정 틱(`next_tick`) 스케줄링으로 전환, `poll_expiry_liquidity`에 `startup_offset_seconds=30.0`(`EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS`) 추가해 `poll_option_chain`과의 레이트리미터 큐 충돌 빈도를 낮춤([[DECISION_LOG]] 참고).
+- **다음 확인 필요**: 정규장 하루 운영 후 데이터 공백 비율(원래의 대량 유실 + 이번 5분 간격 잔여 유실 둘 다)이 실제로 줄었는지 DB로 재확인(NEXT_TODO 참고).
 
 ### 알려진 자잘한 문제
 - (해소, 2026-07-09) `find_gamma_flip`의 vollib RuntimeWarning/빈 줄 출력 — 원인은 `vollib.ref_python.d1()`의 디버그용 `print('')`(iv/t_years=0 경계 조건). `redirect_stdout`+`catch_warnings`로 국소 억제 완료.
