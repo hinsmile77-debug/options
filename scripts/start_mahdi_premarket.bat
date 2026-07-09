@@ -1,6 +1,13 @@
 @echo off
 setlocal
 chcp 65001 >nul
+REM chcp는 cmd.exe 콘솔/외부 EXE(taskkill 등) 출력에만 적용된다 — start로 띄우는 COCKPIT/관측
+REM 루프는 별도 cmd 창(콘솔)이라 이 chcp를 상속하지 않고, 게다가 Python이 리다이렉트된 파일에
+REM 쓰는 인코딩은 콘솔 코드페이지가 아니라 OS 시스템 로캘(ANSI 코드페이지)을 따르므로 chcp로는
+REM 애초에 못 고친다 — logs\cockpit.log/observation_loop.log의 한글 로그가 깨지는 걸 실측 확인
+REM (2026-07-09) 후 PYTHONUTF8=1로 해결. 이 값은 set으로 지정하면 하위(start로 띄우는) 프로세스에도
+REM 환경변수로 상속된다.
+set PYTHONUTF8=1
 
 REM 배치파일 자기 위치 기준으로 프로젝트 루트를 계산(절대경로 하드코딩 금지 — 다른 PC/경로에서도 동작)
 for %%I in ("%~dp0..") do set "PROJECT_DIR=%%~fI"
