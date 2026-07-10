@@ -4,6 +4,14 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] 화석 `series='weekly'` 179건 DB에서 완전 삭제
+
+**트리거:** 바로 아래 세션에서 COCKPIT 노출은 코드 필터로 막았지만 DB에는 179건이 그대로 남아있다고 보고했더니, 사용자가 "완전히 지워"라고 명시적으로 요청.
+
+**실행:** `docker exec mahdi_timescaledb psql -U mahdi -d mahdi -c "DELETE FROM expiry_liquidity_1m WHERE series='weekly';"` — 삭제 전 179건 재확인 후 실행, `DELETE 179` 확인. 삭제 후 `series`별 집계로 `regular`/`weekly_mon`/`weekly_thu` 세 값만 남았음을 확인.
+
+---
+
 ## [2026-07-10] 위클리 분리 반영 후 재시작 → 화석 "weekly" 행 발견·차단, N/O=월·L/M=목 실측 재확인
 
 **트리거:** 바로 아래 세션의 위클리 월/목 분리를 반영하려고 재시작한 뒤, 사용자가 COCKPIT

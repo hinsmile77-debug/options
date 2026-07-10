@@ -134,6 +134,6 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       `series='weekly'`는 분리 전 구코드가 남긴 화석 데이터(재시작 전 마지막 폴링에서 멈춤)였다.
       `db.latest_expiry_liquidity()`에 `_VALID_EXPIRY_LIQUIDITY_SERIES` 화이트리스트 필터를 추가해
       차단([[DECISION_LOG]] 참고).
-  - [ ] DB에 남은 옛 `series='weekly'` 179건은 필터로 화면엔 안 보이지만 테이블엔 그대로 있음 —
-        완전히 지우려면 `DELETE FROM expiry_liquidity_1m WHERE series='weekly'` 필요, 파괴적
-        작업이라 사용자 확인 후 진행할 것(원하면 다음 대화에서 요청).
+  - [x] (2026-07-10 완료) DB에 남아있던 옛 `series='weekly'` 179건을 사용자 확인 후
+        `DELETE FROM expiry_liquidity_1m WHERE series='weekly'`로 완전 삭제 —
+        `expiry_liquidity_1m`엔 이제 regular/weekly_mon/weekly_thu 세 series만 존재.
