@@ -487,31 +487,46 @@ def _atm_liquidity_window(strikes: frozenset[float], each_side: int) -> list[flo
     return ordered[lo:hi]
 
 
-def _parse_asking_price_leg(resp: dict) -> tuple[float, float, float] | None:
+def _parse_asking_price_leg(resp: dict) -> dict | None:
     """
     입력: KISRestClient.get_asking_price() 응답(output1=현재가/누적거래량, output2=5단계 호가).
-    계산: 최우선 매도/매수호가로 상대(%) 스프레드를 구한다 — Cao & Wei(2010)가 옵션은 만기·
-         머니니스에 따라 달러 스프레드가 기계적으로 달라지므로 유동성 지표로 부적합하다고 지적한
-         근거를 따라 %스프레드를 쓴다. 호가잔량 합(깊이)과 누적거래량도 함께 반환.
-    실패 조건: 필드 누락/숫자 변환 실패, 또는 양쪽 호가가 모두 비어 mid<=0(체결 자체가 없는
-              얇은 종목)이면 None — %스프레드 정의 자체가 불가하므로 이번 레그는 집계에서 제외.
+    계산: %스프레드(호가잔량 포함)와 누적거래량을 서로 독립적으로 파싱한다 — Cao & Wei(2010)가
+         옵션은 만기·머니니스에 따라 달러 스프레드가 기계적으로 달라지므로 유동성 지표로 부적합
+         하다고 지적한 근거를 따라 %스프레드를 쓴다.
+    해석: 원래는 호가(ask1/bid1)가 없어 %스프레드를 못 구하면 acml_vol이 이미 찍혀 있어도 레그
+         전체를 버렸다 — 2026-07-10 위클리(목)의 누적거래량이 매 사이클 0으로만 나와 조사한
+         결과, 얇은 신규 위클리 종목은 순간적으로 양쪽 호가가 비는 경우가 잦아(체결은 있었지만
+         지금 이 순간 MM 호가가 없는 상태) 그 레그의 실제 누적거래량까지 통째로 누락되고
+         있었다. 스프레드/깊이와 거래량을 독립적으로 얻어, 호가가 없어도 거래량만은 살린다.
+    실패 조건: 스프레드/깊이/거래량 셋 다 파싱 불가(필드 누락·숫자 변환 실패, 양쪽 호가 모두
+              비어 mid<=0 등)면 None — 이번 레그에서 아무 것도 못 건진 경우만 집계에서 제외.
     """
     output1 = resp.get("output1") or {}
     output2 = resp.get("output2") or {}
+
+    volume: float | None
+    try:
+        volume = float(output1["acml_vol"])
+    except (KeyError, ValueError, TypeError):
+        volume = None
+
+    spread_pct: float | None = None
+    depth: float | None = None
     try:
         ask1 = float(output2["futs_askp1"])
         bid1 = float(output2["futs_bidp1"])
         ask_qty = float(output2["askp_rsqn1"])
         bid_qty = float(output2["bidp_rsqn1"])
-        volume = float(output1["acml_vol"])
+        mid = (ask1 + bid1) / 2
+        if mid > 0:
+            spread_pct = (ask1 - bid1) / mid
+            depth = ask_qty + bid_qty
     except (KeyError, ValueError, TypeError):
+        pass
+
+    if volume is None and spread_pct is None:
         return None
-    mid = (ask1 + bid1) / 2
-    if mid <= 0:
-        return None
-    spread_pct = (ask1 - bid1) / mid
-    depth = ask_qty + bid_qty
-    return spread_pct, depth, volume
+    return {"spread_pct": spread_pct, "depth": depth, "volume": volume}
 
 
 async def poll_expiry_liquidity(
@@ -582,10 +597,12 @@ async def poll_expiry_liquidity(
                     parsed_leg = _parse_asking_price_leg(resp)
                     if parsed_leg is None:
                         continue
-                    spread_pct, depth, volume = parsed_leg
-                    spread_values.append(spread_pct)
-                    depth_total += depth
-                    volume_total += volume
+                    if parsed_leg["spread_pct"] is not None:
+                        spread_values.append(parsed_leg["spread_pct"])
+                    if parsed_leg["depth"] is not None:
+                        depth_total += parsed_leg["depth"]
+                    if parsed_leg["volume"] is not None:
+                        volume_total += parsed_leg["volume"]
 
             if not spread_values:
                 continue

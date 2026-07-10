@@ -4,6 +4,16 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] `_parse_asking_price_leg`가 호가 없어도 누적거래량은 살리도록 스프레드/거래량 파싱 분리
+
+**결정:** `main.py`의 `_parse_asking_price_leg()` 반환 타입을 `tuple[float,float,float] | None`에서 `dict | None`(`{"spread_pct", "depth", "volume"}`, 각 값은 개별적으로 `None`일 수 있음)으로 바꿨다. 호가(ask/bid)가 없어 %스프레드·깊이를 못 구해도 `acml_vol`(누적거래량)은 별도로 파싱해 살린다. 셋 다 못 구할 때만 `None`. `poll_expiry_liquidity()`의 호출부도 세 값을 각각 `is not None`일 때만 집계에 더하도록 수정.
+
+**Why:** 위클리(월/목) 분리를 반영한 뒤 COCKPIT 만기유동성비교에서 위클리(목) 누적거래량이 두 사이클 연속 0.00으로 나와 사용자가 "확인해"라고 요청. 실거래 REST로 직접 조회해보니 얇은 위클리 종목은 순간적으로 양쪽 호가가 비는 경우가 흔한데, 기존 `_parse_asking_price_leg`는 호가 파싱에 실패하면(`mid<=0` 포함) `acml_vol`이 이미 정상적으로 파싱됐어도 레그 전체를 버리고 있었다 — 스프레드 계산과 거래량 집계가 서로 무관한 데이터인데 하나의 성공/실패 판정에 얽혀 있던 설계 결함. %스프레드는 Cao-Wei 기준상 2방향 호가가 반드시 있어야 하지만, 거래량은 호가 유무와 무관하게 그 자체로 유효한 값이다.
+
+**How to apply:** `_parse_asking_price_leg`를 호출하는 코드는 이제 튜플 언패킹이 아니라 `parsed_leg["spread_pct"]`/`["depth"]`/`["volume"]`으로 각각 `None` 여부를 확인해야 한다. `acml_vol="0"`(문자열 "0")은 "그날 정말 0계약"이라는 유효한 값이지 파싱 실패가 아니므로 `0.0`으로 정상 반환된다 — `None`(파싱 불가)과 절대 혼동하지 말 것(테스트 `test_parse_asking_price_leg_keeps_zero_volume_as_valid_value`가 이 구분을 검증). 재시작(관측 루프만, COCKPIT은 이 변경과 무관) 후 위클리(목) 누적거래량이 실제로 0이 아닌 값을 보이는지, 아니면 정말 오늘 그 행사가들에 체결이 없었던 것뿐인지는 다음 몇 사이클을 더 지켜봐야 확정된다([[NEXT_TODO]] 참고).
+
+---
+
 ## [2026-07-10] `latest_expiry_liquidity()`에 유효 series 화이트리스트 필터 추가 — 화석 라벨 영구 노출 방지
 
 **결정:** `mahdi/data/db.py`에 `_VALID_EXPIRY_LIQUIDITY_SERIES = ("regular", "weekly_mon", "weekly_thu")`를 추가하고, `latest_expiry_liquidity()`의 SQL에 `WHERE underlying=%s AND series = ANY(%s)` 필터를 넣었다.

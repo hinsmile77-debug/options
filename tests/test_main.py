@@ -832,15 +832,49 @@ _SAMPLE_ASKING_PRICE = {
 def test_parse_asking_price_leg_computes_pct_spread_not_dollar_spread():
     parsed = _parse_asking_price_leg(_SAMPLE_ASKING_PRICE)
     assert parsed is not None
-    spread_pct, depth, volume = parsed
-    assert spread_pct == pytest.approx((10.10 - 9.90) / 10.00)  # Cao-Wei: 달러 스프레드 아니라 %스프레드
-    assert depth == pytest.approx(70.0)
-    assert volume == pytest.approx(120.0)
+    assert parsed["spread_pct"] == pytest.approx((10.10 - 9.90) / 10.00)  # Cao-Wei: %스프레드
+    assert parsed["depth"] == pytest.approx(70.0)
+    assert parsed["volume"] == pytest.approx(120.0)
 
 
-def test_parse_asking_price_leg_returns_none_when_no_quotes():
-    empty = {"output1": {"acml_vol": "0"}, "output2": {"futs_askp1": "0.00", "futs_bidp1": "0.00", "askp_rsqn1": "0", "bidp_rsqn1": "0"}}
+def test_parse_asking_price_leg_returns_none_when_nothing_usable():
+    # acml_vol 필드 자체가 없고(파싱 불가) 양쪽 호가도 0이라 mid<=0(스프레드도 못 구함) —
+    # 이 레그에서 얻을 게 정말 하나도 없는 경우만 None이어야 한다.
+    empty = {"output1": {}, "output2": {"futs_askp1": "0.00", "futs_bidp1": "0.00", "askp_rsqn1": "0", "bidp_rsqn1": "0"}}
     assert _parse_asking_price_leg(empty) is None
+
+
+def test_parse_asking_price_leg_keeps_zero_volume_as_valid_value():
+    # acml_vol="0"은 "그날 정말 0계약 체결"이라는 유효한 값이지 파싱 실패가 아니다 —
+    # None(unparseable)과 혼동해 버리면 안 된다.
+    resp = {"output1": {"acml_vol": "0"}, "output2": {"futs_askp1": "0.00", "futs_bidp1": "0.00", "askp_rsqn1": "0", "bidp_rsqn1": "0"}}
+    parsed = _parse_asking_price_leg(resp)
+    assert parsed is not None
+    assert parsed["volume"] == pytest.approx(0.0)
+    assert parsed["spread_pct"] is None
+
+
+def test_parse_asking_price_leg_keeps_volume_when_quote_missing():
+    # 2026-07-10 발견: 위클리(목)처럼 얇은 종목은 순간적으로 양쪽 호가가 비어도 그날 누적거래량
+    # (acml_vol)은 이미 찍혀 있을 수 있다 — 호가가 없다고 거래량까지 버리면 안 된다.
+    resp = {"output1": {"acml_vol": "4"}, "output2": {"futs_askp1": None, "futs_bidp1": None}}
+    parsed = _parse_asking_price_leg(resp)
+    assert parsed is not None
+    assert parsed["volume"] == pytest.approx(4.0)
+    assert parsed["spread_pct"] is None
+    assert parsed["depth"] is None
+
+
+def test_parse_asking_price_leg_keeps_spread_when_volume_missing():
+    resp = {
+        "output1": {},
+        "output2": {"futs_askp1": "10.10", "futs_bidp1": "9.90", "askp_rsqn1": "30", "bidp_rsqn1": "40"},
+    }
+    parsed = _parse_asking_price_leg(resp)
+    assert parsed is not None
+    assert parsed["spread_pct"] == pytest.approx((10.10 - 9.90) / 10.00)
+    assert parsed["depth"] == pytest.approx(70.0)
+    assert parsed["volume"] is None
 
 
 class _FakeMasterForLiquidity:
