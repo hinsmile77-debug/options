@@ -117,11 +117,14 @@ def test_insert_underlying_spot_upserts_on_timestamp_underlying():
 
 
 class FakeReadCursor:
-    def __init__(self, rows: list):
+    def __init__(self, rows: list, store: dict | None = None):
         self._rows = rows
+        self._store = store
 
     def execute(self, query: str, params=None) -> None:
-        pass
+        if self._store is not None:
+            self._store["query"] = query
+            self._store["params"] = params
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -139,9 +142,10 @@ class FakeReadCursor:
 class FakeReadConnection:
     def __init__(self, rows: list):
         self._rows = rows
+        self.store: dict = {}
 
     def cursor(self) -> FakeReadCursor:
-        return FakeReadCursor(self._rows)
+        return FakeReadCursor(self._rows, self.store)
 
 
 def test_latest_underlying_spot_returns_value():
@@ -194,6 +198,37 @@ def test_get_active_futures_symbol_returns_value():
 def test_get_active_futures_symbol_returns_none_when_no_rows():
     conn = FakeReadConnection([])
     assert db.get_active_futures_symbol(conn, "KOSPI200") is None
+
+
+def test_latest_expiry_liquidity_filters_query_to_valid_series_only():
+    # 2026-07-10: 위클리를 weekly_mon/weekly_thu로 분리하며, 그 전 버전이 쓰던 병합 라벨
+    # "weekly"처럼 더 이상 아무도 안 쓰는 series 값이 DB에 화석으로 남아 있어도 COCKPIT에
+    # 영원히 다시 나타나지 않도록 쿼리 자체가 유효한 series로 필터링하는지 검증한다.
+    conn = FakeReadConnection([])
+
+    db.latest_expiry_liquidity(conn, "KOSPI200")
+
+    assert conn.store["params"][0] == "KOSPI200"
+    assert set(conn.store["params"][1]) == {"regular", "weekly_mon", "weekly_thu"}
+    assert "series = ANY(%s)" in conn.store["query"]
+
+
+def test_latest_expiry_liquidity_maps_rows_to_dicts():
+    rows = [("weekly_thu", date(2026, 7, 16), 0.4136, 36.0, 0.0, 6)]
+    conn = FakeReadConnection(rows)
+
+    result = db.latest_expiry_liquidity(conn, "KOSPI200")
+
+    assert result == [
+        {
+            "series": "weekly_thu",
+            "expiry": date(2026, 7, 16),
+            "atm_spread_pct": 0.4136,
+            "depth": 36.0,
+            "volume": 0.0,
+            "days_to_expiry": 6,
+        }
+    ]
 
 
 def test_latest_option_chain_maps_rows_to_dicts():

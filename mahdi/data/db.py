@@ -208,11 +208,20 @@ def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
     ]
 
 
+# 현재 코드가 실제로 기록하는 series 값만 조회한다 — 과거 버전이 쓰던 이름(예: 2026-07-10
+# 위클리 월/목 분리 이전의 병합 라벨 "weekly")이 남아있으면 그 뒤로 아무도 안 써도 DISTINCT ON
+# (series)에 계속 잡혀 COCKPIT에 화석 행으로 영원히 남는다(Flow Radar의 _LEGACY_MIXED_SYMBOL과
+# 같은 패턴 — mahdi/dashboard/data_source.py 참고). 새 series를 추가하면 이 튜플도 함께 갱신할 것.
+_VALID_EXPIRY_LIQUIDITY_SERIES = ("regular", "weekly_mon", "weekly_thu")
+
+
 def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]:
     """
     입력: 기초자산 라벨.
-    계산: series(regular/weekly_mon/weekly_thu)별로 가장 최근 timestamp 1건씩만 골라 반환한다 — 폴링 주기(5분)
-         중 두 북의 조회 시각이 조금씩 어긋날 수 있어 북별 최신값을 취한다.
+    계산: series(regular/weekly_mon/weekly_thu, _VALID_EXPIRY_LIQUIDITY_SERIES로 고정)별로 가장
+         최근 timestamp 1건씩만 골라 반환한다 — 폴링 주기(5분) 중 북마다 조회 시각이 조금씩
+         어긋날 수 있어 북별 최신값을 취한다. 더 이상 코드가 쓰지 않는 옛 series 값(화석 데이터)은
+         과거에 몇 건이 쌓여 있든 결과에서 제외한다.
     해석: 반환된 dict는 COCKPIT 만기 유동성 비교 패널(Phase 1.5-④)이 바로 렌더링에 쓸 수 있는
          키를 가진다. 아직 폴링이 한 번도 안 돌았으면 빈 리스트.
     """
@@ -222,10 +231,10 @@ def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]
             SELECT DISTINCT ON (series)
                 series, expiry, atm_spread_pct, depth, volume, days_to_expiry
             FROM expiry_liquidity_1m
-            WHERE underlying=%s
+            WHERE underlying=%s AND series = ANY(%s)
             ORDER BY series, timestamp DESC
             """,
-            (underlying,),
+            (underlying, list(_VALID_EXPIRY_LIQUIDITY_SERIES)),
         )
         rows = cur.fetchall()
     return [

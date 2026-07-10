@@ -122,8 +122,18 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       요청대로 `symbol_master.py`의 series를 `"weekly_mon"`(N/O)/`"weekly_thu"`(L/M)로 분리하고
       `main.py`도 두 북으로 나눠 COCKPIT/Flow Radar에서 월/목이 각각 표시되도록 완료
       ([[DECISION_LOG]]/[[SESSION_LOG]] 2026-07-10 항목 참고).
-  - [ ] N/O=월·L/M=목 매핑은 COCKPIT 표시값 하나로 추론한 것 — 실거래 중 `get_quote()`의
-        `futs_last_tr_date` 요일로 교차검증해 `symbol_master.py` 주석에 확정 기록 권장.
+  - [x] (2026-07-10 교차검증 완료) N/O=월·L/M=목 매핑 — 위클리 분리 반영 재시작 후 실제
+        `poll_expiry_liquidity()`가 `weekly_thu`(L/M) 행을 적재했고, 만기가 2026-07-16(목요일,
+        달력으로 직접 확인)·잔존일수 6(정확)으로 나와 REST `get_quote()` 기반 실데이터로도
+        N/O=위클리(월)/L/M=위클리(목)이 확정됐다.
   - [ ] 위클리를 3번째 북으로 분리하며 `STRIKES_EACH_SIDE`를 3→2로 낮췄다(세 북 모두 ATM±2,
         31/41 슬롯) — 재시작 후 실운영에서 ATM±2로도 관측 품질(감마/유동성 판단)이 충분한지,
         아니면 먼슬리만 ±3으로 복원하는 차등 배분이 필요한지 확인.
+- [x] (2026-07-10 해소) **화석 `series='weekly'` 행이 COCKPIT에 영구 노출**: 위클리 분리 반영
+      재시작 직후 사용자가 COCKPIT에서 "먼슬리/weekly/위클리(월)" 3행을 보고 정체 확인 요청 —
+      `series='weekly'`는 분리 전 구코드가 남긴 화석 데이터(재시작 전 마지막 폴링에서 멈춤)였다.
+      `db.latest_expiry_liquidity()`에 `_VALID_EXPIRY_LIQUIDITY_SERIES` 화이트리스트 필터를 추가해
+      차단([[DECISION_LOG]] 참고).
+  - [ ] DB에 남은 옛 `series='weekly'` 179건은 필터로 화면엔 안 보이지만 테이블엔 그대로 있음 —
+        완전히 지우려면 `DELETE FROM expiry_liquidity_1m WHERE series='weekly'` 필요, 파괴적
+        작업이라 사용자 확인 후 진행할 것(원하면 다음 대화에서 요청).

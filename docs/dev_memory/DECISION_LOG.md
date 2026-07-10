@@ -4,6 +4,16 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] `latest_expiry_liquidity()`에 유효 series 화이트리스트 필터 추가 — 화석 라벨 영구 노출 방지
+
+**결정:** `mahdi/data/db.py`에 `_VALID_EXPIRY_LIQUIDITY_SERIES = ("regular", "weekly_mon", "weekly_thu")`를 추가하고, `latest_expiry_liquidity()`의 SQL에 `WHERE underlying=%s AND series = ANY(%s)` 필터를 넣었다.
+
+**Why:** 바로 위 항목(위클리 월/목 분리)을 반영·재시작한 뒤 사용자가 COCKPIT에서 "먼슬리/weekly/위클리(월)" 3행을 보고 정체를 물어왔다. 조사 결과 `series='weekly'`는 분리 전 구코드가 마지막으로 쓴 화석 데이터(재시작 전 10:16 타임스탬프에서 멈춤)였다 — `DISTINCT ON (series)`로 series별 최신 1건을 뽑는 기존 쿼리는 "그 series를 지금 코드가 쓰는지"를 전혀 모르므로, 과거에 한 번이라도 쓰인 series 값은 영원히 결과에 남는다. 이 패턴은 Flow Radar가 이미 `_LEGACY_MIXED_SYMBOL`로 겪고 고친 적 있는 문제와 동일하다 — series 이름을 바꾸거나 없앨 때마다 매번 재발할 수 있으므로, 이번엔 "지금 유효한 값만 화이트리스트"하는 방식으로 근본 차단했다(개별 화석 라벨을 하나씩 예외 처리하는 대신).
+
+**How to apply:** 앞으로 series 값을 추가/개명할 때는 `_VALID_EXPIRY_LIQUIDITY_SERIES`도 함께 갱신할 것 — 안 하면 새 series가 조용히 필터링돼 COCKPIT에 안 보인다(에러 없이 그냥 빠짐, 원인 파악이 어려움에 주의). DB에 실제로 쌓인 옛 `series='weekly'` 행(179건, 2026-07-10 기준)은 이 필터로 화면엔 안 보이지만 테이블엔 그대로 남아있다 — 지우려면 `DELETE FROM expiry_liquidity_1m WHERE series='weekly'`가 필요하고 파괴적 작업이라 사용자 확인 후 진행.
+
+---
+
 ## [2026-07-10] 위클리를 "weekly_mon"(N/O)/"weekly_thu"(L/M) 두 북으로 분리, WS 슬롯은 3북×ATM±2로 통일
 
 **결정:** `symbol_master.py`의 병합된 `_SERIES_PRODUCT_TYPES["weekly"]`(N/O+L/M)를 `"weekly_mon"`(N/O만)과 `"weekly_thu"`(L/M만) 두 개로 다시 분리했다. `main.py`는 `weekly_manager` 하나 대신 `weekly_mon_manager`/`weekly_thu_manager` 둘을 만들어 먼슬리까지 3개 북을 동시에 굴리고, `STRIKES_EACH_SIDE`를 3에서 2로 낮췄다(사용자에게 "먼슬리만 ±3 유지 + 위클리 둘만 ±2"와 "세 북 모두 ±2 통일" 중 선택지를 제시해 후자로 확정).

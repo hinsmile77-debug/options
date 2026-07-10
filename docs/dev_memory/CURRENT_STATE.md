@@ -61,6 +61,7 @@ _최종 갱신: 2026-07-10_
 - **2026-07-06 만기 유동성 비교 패널**(Phase 1.5-④): `expiry_liquidity_panel.py`(Plotly Table)가 먼슬리/위클리 두 북의 ATM±2 %스프레드·깊이·거래량·잔존일수를 나란히 표시, `app.py` "만기 유동성 비교" 섹션에 배치. `data_source.py`의 `expiry_liquidity` 필드/`db.latest_expiry_liquidity()`가 공급.
 - **2026-07-10 먼슬리 만기 주 안내 추가**: `build_expiry_liquidity_table(rows, today=...)`에 regular 북 만기가 오늘과 같은 ISO주에 속하는지 판정하는 `_is_monthly_expiry_week()` 추가 — 해당되면 표 제목에 "이번 주는 먼슬리 만기 주 — 위클리(목) 신규 상장 없음(위클리(월)은 영향 없음)" 안내 표시(`app.py`가 `snapshot.as_of.date()` 전달). 사용자가 eFriend 캡처로 "먼슬리 만기 주엔 목요일 위클리가 대신 먼슬리로 나온다"를 지적한 데서 비롯.
 - **2026-07-10 위클리 월/목 분리**: 사용자가 COCKPIT 만기유동성비교 결과를 보고 "위클리를 월요일/목요일로 나눠 표시해달라" 요청 — `_SERIES_LABEL_KO`에 "위클리(월)"/"위클리(목)" 추가, 세 번째 행으로 나란히 표시. `data_source.py`의 합성 폴백 스냅샷에도 위클리(목) 행 추가. 상세는 위 `symbol_master.py`/`main.py` 항목, [[DECISION_LOG]]/[[SESSION_LOG]] 참고.
+- **2026-07-10 화석 series 필터**: 위 분리를 반영해 재시작한 뒤 분리 전 구코드가 쓰던 `series='weekly'` 화석 행이 COCKPIT에 계속 노출되는 문제 발견 — `db.latest_expiry_liquidity()`에 `_VALID_EXPIRY_LIQUIDITY_SERIES`(regular/weekly_mon/weekly_thu) 화이트리스트 필터 추가로 차단(Flow Radar의 `_LEGACY_MIXED_SYMBOL`과 동일 패턴). DB에 남은 옛 행 자체는 안 지워짐 — 완전 삭제는 사용자 확인 필요([[NEXT_TODO]] 참고).
 
 ### mahdi/main.py 옵션 체인 REST 폴링 — 2026-07-06 신규 (`poll_option_chain`)
 - WS 구독(ATM±3, `subscription_manager.desired_strikes`)과 동일한 행사가×콜/풋에 대해 60초 간격으로 `rest_client.get_quote()`를 반복 호출 → `option_analysis_1m`/`underlying_spot_1m` 적재.
