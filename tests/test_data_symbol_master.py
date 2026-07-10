@@ -13,13 +13,13 @@ _SAMPLE_ROWS = [
     "6|C0160350|STD020|P 202607|1|350.0| |2001|KOSPI200",
     "6|C0160352|STD021|P 202607|1|352.5| |2001|KOSPI200",
     "1|Z09609|STD030|F 202609|1|0.0| |3003|KSQ150",
-    # 위클리(상품종류 N/O) — 한글종목명이 "위클리M C 2607W1 1,300.0" 형식(2026-07-06 실측)
+    # 위클리(월)(상품종류 N/O) — 한글종목명이 "위클리M C 2607W1 1,300.0" 형식(2026-07-06 실측)
     "N|BAFBLWA41|STDW01|위클리M C 2607W1 1,100.0|2|1100.0| |2001|KOSPI200",
     "N|BAFBLWA73|STDW02|위클리M C 2607W1 1,180.0|2|1180.0| |2001|KOSPI200",
     "N|BAFBMWA73|STDW03|위클리M C 2607W2 1,180.0|1|1180.0| |2001|KOSPI200",
     "O|CAFBLWA41|STDW04|위클리M P 2607W1 1,100.0|2|1100.0| |2001|KOSPI200",
-    # 위클리 코드풀 B(상품종류 L/M) — 2026-07-10 실측: N/O 풀과 격주로 교대 배정되며 한글종목명에
-    # "M"이 끼지 않는다("위클리C 2607W0" 형식). 두 풀 모두 위클리로 집계돼야 한다.
+    # 위클리(목)(상품종류 L/M) — 2026-07-10 실측: N/O와 별개 상품(위클리(월) vs 위클리(목))이며
+    # 한글종목명에 "M"이 끼지 않는다("위클리C 2607W0" 형식).
     "L|BAFCLWA10|STDW05|위클리C 2607W0 1,100.0|2|1100.0| |2001|KOSPI200",
     "M|CAFCLWA10|STDW06|위클리P 2607W0 1,100.0|2|1100.0| |2001|KOSPI200",
 ]
@@ -103,32 +103,49 @@ def test_option_symbol_returns_none_for_unlisted_strike(tmp_path):
     assert master.option_symbol("C", 999.0) is None
 
 
-def test_options_weekly_series_filters_by_product_type_N_O_and_L_M(tmp_path):
+def test_options_weekly_mon_series_filters_by_product_type_N_O(tmp_path):
     master = _master(tmp_path)
-    calls = master.options("C", series="weekly")
-    puts = master.options("P", series="weekly")
-    # N/O 풀(BAFB*)과 L/M 풀(BAFCLWA10/CAFCLWA10)이 모두 위클리로 잡혀야 함
-    assert set(calls["단축코드"]) == {"BAFBLWA41", "BAFBLWA73", "BAFBMWA73", "BAFCLWA10"}
-    assert set(puts["단축코드"]) == {"CAFBLWA41", "CAFCLWA10"}
-    # regular(기본값)에는 위클리 행이 섞여 들면 안 됨
+    calls = master.options("C", series="weekly_mon")
+    puts = master.options("P", series="weekly_mon")
+    assert set(calls["단축코드"]) == {"BAFBLWA41", "BAFBLWA73", "BAFBMWA73"}
+    assert set(puts["단축코드"]) == {"CAFBLWA41"}
+    # regular(기본값)/weekly_thu(L/M)에는 위클리(월) 행이 섞여 들면 안 됨
     assert "BAFBLWA41" not in set(master.options("C")["단축코드"])
+    assert "BAFBLWA41" not in set(master.options("C", series="weekly_thu")["단축코드"])
+
+
+def test_options_weekly_thu_series_filters_by_product_type_L_M(tmp_path):
+    master = _master(tmp_path)
+    calls = master.options("C", series="weekly_thu")
+    puts = master.options("P", series="weekly_thu")
+    assert set(calls["단축코드"]) == {"BAFCLWA10"}
+    assert set(puts["단축코드"]) == {"CAFCLWA10"}
+    # regular(기본값)/weekly_mon(N/O)에는 위클리(목) 행이 섞여 들면 안 됨
     assert "BAFCLWA10" not in set(master.options("C")["단축코드"])
+    assert "BAFCLWA10" not in set(master.options("C", series="weekly_mon")["단축코드"])
 
 
-def test_nearest_expiry_chain_weekly_picks_nearest_week_across_pools(tmp_path):
+def test_nearest_expiry_chain_weekly_mon_picks_w1_over_w2(tmp_path):
     master = _master(tmp_path)
-    chain = master.nearest_expiry_chain("KOSPI200", series="weekly")
+    chain = master.nearest_expiry_chain("KOSPI200", series="weekly_mon")
     symbols = {entry["symbol"] for entry in chain}
-    # W0(BAFCLWA10/CAFCLWA10, L/M 풀)가 W1(N/O 풀)보다 가까우므로 W0만 남아야 함 —
-    # 즉 두 코드풀을 섞어 봤을 때도 진짜 최근접 위클리를 놓치지 않는다는 검증.
-    assert symbols == {"BAFCLWA10", "CAFCLWA10"}
+    # BAFBMWA73(W2, 다음주)는 제외되고 W1(BAFBLWA41/73, CAFBLWA41)만 남아야 함
+    assert "BAFBMWA73" not in symbols
+    assert symbols == {"BAFBLWA41", "BAFBLWA73", "CAFBLWA41"}
 
 
-def test_option_symbol_weekly_series_matches_nearest_week_and_strike(tmp_path):
+def test_option_symbol_weekly_mon_series_matches_nearest_week_and_strike(tmp_path):
     master = _master(tmp_path)
-    assert master.option_symbol("C", 1100.0, series="weekly") == "BAFCLWA10"
-    assert master.option_symbol("P", 1100.0, series="weekly") == "CAFCLWA10"
-    assert master.option_symbol("C", 9999.0, series="weekly") is None
+    assert master.option_symbol("C", 1100.0, series="weekly_mon") == "BAFBLWA41"
+    assert master.option_symbol("P", 1100.0, series="weekly_mon") == "CAFBLWA41"
+    assert master.option_symbol("C", 9999.0, series="weekly_mon") is None
+
+
+def test_option_symbol_weekly_thu_series_matches_strike(tmp_path):
+    master = _master(tmp_path)
+    assert master.option_symbol("C", 1100.0, series="weekly_thu") == "BAFCLWA10"
+    assert master.option_symbol("P", 1100.0, series="weekly_thu") == "CAFCLWA10"
+    assert master.option_symbol("C", 9999.0, series="weekly_thu") is None
 
 
 def test_options_invalid_series_raises(tmp_path):

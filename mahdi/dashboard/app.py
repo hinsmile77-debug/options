@@ -57,7 +57,7 @@ def render() -> None:
             width='stretch',
         )
 
-    st.subheader("만기 유동성 비교 (먼슬리 vs 위클리)")
+    st.subheader("만기 유동성 비교 (먼슬리 vs 위클리(월) vs 위클리(목))")
     if snapshot.expiry_liquidity:
         st.plotly_chart(
             build_expiry_liquidity_table(snapshot.expiry_liquidity, today=snapshot.as_of.date()),

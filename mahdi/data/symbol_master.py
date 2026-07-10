@@ -20,12 +20,15 @@ import httpx
 import pandas as pd
 
 _EXPIRY_FROM_NAME = re.compile(r"^[CP]\s*(\d{6})")
-# 위클리는 한글종목명이 "위클리M C 2607W1 1,300.0" 형식 — C/P 앞에 "위클리M" 접두어가 붙고
-# 만기는 6자리 YYYYMM이 아니라 4자리 YYMM+주차(W1/W2)로 표기된다(2026-07-06 실측, 상품종류
-# N/O). 정확한 달력상 만기일(월/목 등 요일)은 이 이름만으로 확정할 수 없어 파싱하지 않는다 —
-# main.py가 실제 get_quote() 응답의 futs_last_tr_date로 확정한다. 여기서는 "가장 가까운
-# 위클리부터 정렬"에만 쓸 수 있으면 충분하므로 YYMM+주차 문자열을 그대로 정렬키로 쓴다
-# (같은 자릿수라 사전식 비교가 시간순과 일치 — W10 이상은 KOSPI200에 없어 안전).
+# 위클리는 한글종목명이 "위클리M C 2607W1 1,300.0"(상품종류 N/O, 위클리(월))이나
+# "위클리C 2607W3 1,170.0"(상품종류 L/M, 위클리(목)) 형식 — C/P 앞에 "위클리" 또는 "위클리M"
+# 접두어가 붙고 만기는 6자리 YYYYMM이 아니라 4자리 YYMM+주차(W1/W2/...)로 표기된다(2026-07-06
+# N/O 실측, 2026-07-10 L/M 추가 확인). 이 정규식은 접두어의 "M" 유무와 무관하게 마지막
+# C/P + 공백 + YYMM+주차만 잡아내므로 두 상품(N/O·L/M) 모두에 그대로 쓴다. 정확한 달력상
+# 만기일(월/목 등 요일)은 이 이름만으로 확정할 수 없어 파싱하지 않는다 — main.py가 실제
+# get_quote() 응답의 futs_last_tr_date로 확정한다. 여기서는 "가장 가까운 위클리부터 정렬"에만
+# 쓸 수 있으면 충분하므로 YYMM+주차 문자열을 그대로 정렬키로 쓴다(같은 자릿수라 사전식 비교가
+# 시간순과 일치 — W10 이상은 KOSPI200에 없어 안전).
 _WEEKLY_EXPIRY_FROM_NAME = re.compile(r"[CP]\s+(\d{4}W\d)")
 
 MASTER_FILE_URL = "https://new.real.download.dws.co.kr/common/master/fo_idx_code_mts.mst.zip"
@@ -53,28 +56,31 @@ _COLUMNS = [
 # 정정(2026-07-10): 2026-07-06 당시엔 "L/M이 단 한 행도 없다"고 결론 냈으나, 그건 그 주(週)
 # 우연히 N/O 풀만 살아있었을 뿐이었다. 2026-07-10 재실측(먼슬리 만기 다음날, 두 위클리 만기가
 # 동시에 상장된 시점) 결과 L/M 행이 실제로 존재하며(위클리C/P, 예: "위클리C 2607W3"), N/O
-# 행(위클리M C/P, 예: "위클리M C 2607W2")과 동시에 살아있었다 — 즉 KRX는 위클리 콜/풋에
-# 주차마다 두 코드풀(N/O ↔ L/M)을 번갈아 배정한다("위클리M"의 "M"은 상품 구분이 아니라 이
-# 코드풀의 이름 표기 관례일 뿐, 행사가 간격·범위 모두 L/M과 동일해 별도 상품이 아님을 확인).
-# 한쪽 풀만 조회하면 그 풀이 아닌 주의 최근접 위클리를 통째로 놓쳐 위클리 시세가 통째로
-# 비는(대시) 버그가 난다 — 두 풀을 모두 위클리로 취급해야 한다.
+# 행(위클리M C/P, 예: "위클리M C 2607W2")과 동시에 살아있었다. 처음엔 "같은 상품의 코드풀이
+# 주차마다 N/O↔L/M로 교대"라고 추측했으나, COCKPIT 만기유동성비교 패널이 그날 표시한 위클리
+# 만기(2026-07-13=월요일)가 N/O 쪽(그때 기준 더 가까운 2607W2)에서 나온 것으로 확인돼, eFriend가
+# 이미 별도 기초자산으로 분리해 보여주던 "KOSPI200 위클리(월)"/"위클리(목)"(2026-07-06 발견,
+# 상장 전이라 그땐 확인 못 함)와 정확히 일치한다 — 즉 N/O="위클리(월)", L/M="위클리(목)"인
+# **서로 다른 두 상품**이지 교대 배정되는 같은 상품의 코드풀이 아니다("위클리M"의 "M"이 그때는
+# 의미불명이었으나 지금 보면 "월"의 약자로 보인다). 요일 대응은 이 실측 하나로 확정한 것이라
+# 만기 개편 등으로 어긋날 수 있음 — 의심되면 `get_quote()`의 `futs_last_tr_date` 요일로 재확인.
 PRODUCT_TYPE_FUTURES = "1"  # 지수선물 (정규)
 PRODUCT_TYPE_OPTION_CALL = "5"  # 지수옵션 콜 (정규, 월물)
 PRODUCT_TYPE_OPTION_PUT = "6"  # 지수옵션 풋 (정규, 월물)
 PRODUCT_TYPE_MINI_OPTION_CALL = "D"  # 미니옵션 콜
 PRODUCT_TYPE_MINI_OPTION_PUT = "E"  # 미니옵션 풋
-PRODUCT_TYPE_WEEKLY_OPTION_CALL = "N"  # 위클리옵션 콜 — 코드풀 A(2026-07-06 최초 실측)
-PRODUCT_TYPE_WEEKLY_OPTION_PUT = "O"  # 위클리옵션 풋 — 코드풀 A
-PRODUCT_TYPE_WEEKLY_OPTION_CALL_ALT = "L"  # 위클리옵션 콜 — 코드풀 B(2026-07-10 재실측, 격주 교대)
-PRODUCT_TYPE_WEEKLY_OPTION_PUT_ALT = "M"  # 위클리옵션 풋 — 코드풀 B
+PRODUCT_TYPE_WEEKLY_MON_OPTION_CALL = "N"  # 위클리(월) 콜 — 2026-07-06 최초 실측, 2026-07-10 요일 확정
+PRODUCT_TYPE_WEEKLY_MON_OPTION_PUT = "O"  # 위클리(월) 풋
+PRODUCT_TYPE_WEEKLY_THU_OPTION_CALL = "L"  # 위클리(목) 콜 — 2026-07-10 실측(먼슬리 만기 주 목요일엔 상장 없음)
+PRODUCT_TYPE_WEEKLY_THU_OPTION_PUT = "M"  # 위클리(목) 풋
+
+_WEEKLY_SERIES = ("weekly_mon", "weekly_thu")
 
 _SERIES_PRODUCT_TYPES = {
     "regular": ((PRODUCT_TYPE_OPTION_CALL,), (PRODUCT_TYPE_OPTION_PUT,)),
     "mini": ((PRODUCT_TYPE_MINI_OPTION_CALL,), (PRODUCT_TYPE_MINI_OPTION_PUT,)),
-    "weekly": (
-        (PRODUCT_TYPE_WEEKLY_OPTION_CALL, PRODUCT_TYPE_WEEKLY_OPTION_CALL_ALT),
-        (PRODUCT_TYPE_WEEKLY_OPTION_PUT, PRODUCT_TYPE_WEEKLY_OPTION_PUT_ALT),
-    ),
+    "weekly_mon": ((PRODUCT_TYPE_WEEKLY_MON_OPTION_CALL,), (PRODUCT_TYPE_WEEKLY_MON_OPTION_PUT,)),
+    "weekly_thu": ((PRODUCT_TYPE_WEEKLY_THU_OPTION_CALL,), (PRODUCT_TYPE_WEEKLY_THU_OPTION_PUT,)),
 }
 
 
@@ -152,15 +158,17 @@ class IndexDerivativesMaster:
     def options(self, option_type: str, underlying: str = "KOSPI200", series: str = "regular") -> pd.DataFrame:
         """
         option_type: "C" 또는 "P". series: "regular"(정규 월물, 기본값) | "mini"(미니, 승수
-        50,000원) | "weekly"(위클리, 상품종류 N/O 또는 L/M — 2026-07-06 추가·2026-07-10 확장,
-        실물 실측 근거는 PRODUCT_TYPE_WEEKLY_OPTION_* 주석 참고. KRX가 위클리 콜/풋 코드를
-        주차마다 두 풀 사이에서 번갈아 배정하므로 둘 다 봐야 최근접 위클리를 놓치지 않는다).
+        50,000원) | "weekly_mon"(위클리 월요일 만기, 상품종류 N/O) | "weekly_thu"(위클리 목요일
+        만기, 상품종류 L/M) — 2026-07-06 N/O 추가, 2026-07-10 L/M을 별도 요일(목)로 분리
+        (eFriend가 "위클리(월)"/"위클리(목)"을 애초에 별도 상품으로 구분해온 것과 일치, 근거는
+        PRODUCT_TYPE_WEEKLY_*_OPTION_* 주석 참고).
 
         해석: 반환 DataFrame에 "만기YYYYMM" 컬럼을 추가해서 준다 — regular/mini는 월물구분코드가
              실제로는 만기 순번을 뜻하지 않는다(실측 결과 11개 서로 다른 만기월에 걸쳐 단
              3개 값(1/2/3)만 나타남 — 아마 유동성/분류 코드). 대신 한글종목명에 항상 박혀
              있는 "C 202607   545.0" 형식에서 만기(YYYYMM)를 정규식으로 뽑아 신뢰한다.
-             weekly는 이름 형식이 달라(_WEEKLY_EXPIRY_FROM_NAME 주석 참고) 별도 정규식을 쓴다.
+             weekly_mon/weekly_thu는 이름 형식이 달라(_WEEKLY_EXPIRY_FROM_NAME 주석 참고) 별도
+             정규식을 쓴다.
         실패 조건: series가 알 수 없는 값이면 ValueError.
         """
         if option_type not in ("C", "P"):
@@ -171,7 +179,7 @@ class IndexDerivativesMaster:
         product_types = call_types if option_type == "C" else put_types
         df = self._df
         rows = df[(df["상품종류"].isin(product_types)) & (df["기초자산명"] == underlying)].copy()
-        expiry_pattern = _WEEKLY_EXPIRY_FROM_NAME if series == "weekly" else _EXPIRY_FROM_NAME
+        expiry_pattern = _WEEKLY_EXPIRY_FROM_NAME if series in _WEEKLY_SERIES else _EXPIRY_FROM_NAME
         rows["만기YYYYMM"] = rows["한글종목명"].str.extract(expiry_pattern)[0]
         return rows.sort_values(["만기YYYYMM", "행사가"])
 

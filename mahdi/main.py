@@ -32,10 +32,13 @@ from mahdi.features.orderflow import calculate_vpin
 logger = logging.getLogger("mahdi.main")
 
 KOSPI200_OPTION_STRIKE_INTERVAL = 2.5
-STRIKES_EACH_SIDE = 3  # (2*3+1)*2(C/P) = 14 슬롯, MAX_SUBSCRIPTIONS(41) 여유 확보
+# 2026-07-10: 위클리를 월/목 두 북으로 분리하며 3(먼슬리+위클리월+위클리목)으로 늘어난
+# 북 수에 맞춰 ATM±3에서 ATM±2로 축소 — (2*2+1)*2(C/P)=10슬롯×3북+1(선물)=31/MAX_SUBSCRIPTIONS(41).
+# ATM±3 유지 시 14×3+1=43으로 한도 초과(RESEARCH_EXPIRY_SELECTION_v1.md §3.1 예상대로).
+STRIKES_EACH_SIDE = 2
 SYMBOL_MASTER_CACHE_DIR = Path("data/symbol_master_cache")  # KIS 마스터파일은 매일 갱신됨
 UNDERLYING = "KOSPI200"
-OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±3) 범위와 동일한 종목을 REST로 주기 조회
+OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범위와 동일한 종목을 REST로 주기 조회
 
 # 2026-07-08 실측: 레이트리밋 버스트 등으로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
@@ -50,11 +53,14 @@ VPIN_BUCKET_SIZE = 50
 _VPIN_HISTORY_LIMIT = 500  # calculate_vpin 기본 window(50)의 10배 — 무한정 누적 방지
 
 # Phase 1.5-③(만기 유동성 기준선, 2026-07-06 추가) — 연구문서(RESEARCH_EXPIRY_SELECTION_v1.md)가
-# 권고하는 "ATM±2 집중"(Cao-Wei %스프레드 기준, 스캘핑에 최적인 구간)은 WS 구독 범위(ATM±3)보다
-# 좁다. get_asking_price()는 북당 5행사가×2(C/P)=10건 신규 REST 호출이라, 오늘 이미 1x 부하에서
-# 403/500 레이트리밋을 관찰한 점을 고려해 폴링 주기를 옵션체인(60초)보다 훨씬 길게 잡았다 —
-# 어차피 이 지표의 용도는 실시간 판단이 아니라 20거래일 기준선 축적이라 촘촘히 볼 필요가 없다
-# (사용자 확인 후 %스프레드 포함 정식 스펙대로 진행하되, 호출빈도로 부하를 완화하기로 결정).
+# 권고하는 "ATM±2 집중"(Cao-Wei %스프레드 기준, 스캘핑에 최적인 구간). 도입 당시엔 WS 구독 범위
+# (ATM±3)보다 좁았으나, 2026-07-10 위클리 월/목 분리로 STRIKES_EACH_SIDE 자체가 2로 줄어
+# 지금은 WS 구독 범위와 폭이 같다(그래도 별도 상수로 유지 — 의미가 달라 향후 STRIKES_EACH_SIDE가
+# 다시 늘어나도 유동성 관측 구간은 ATM±2로 고정하고 싶을 수 있음). get_asking_price()는 북당
+# 5행사가×2(C/P)=10건 신규 REST 호출이라, 오늘 이미 1x 부하에서 403/500 레이트리밋을 관찰한
+# 점을 고려해 폴링 주기를 옵션체인(60초)보다 훨씬 길게 잡았다 — 어차피 이 지표의 용도는 실시간
+# 판단이 아니라 20거래일 기준선 축적이라 촘촘히 볼 필요가 없다(사용자 확인 후 %스프레드 포함
+# 정식 스펙대로 진행하되, 호출빈도로 부하를 완화하기로 결정).
 LIQUIDITY_ATM_EACH_SIDE = 2
 EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 300
 
@@ -388,7 +394,8 @@ async def poll_option_chain(
 ) -> None:
     """
     입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(2026-07-06부터 리스트 — 먼슬리
-         "regular" 북과 위클리 "weekly" 북을 동시에 폴링하기 위함. 각 북은 WS와 동일한 행사가
+         "regular" 북과 위클리(월) "weekly_mon"/위클리(목) "weekly_thu" 북을 동시에 폴링하기
+         위함, 2026-07-10 위클리 분리). 각 북은 WS와 동일한 행사가
          집합을 공유), 종목코드 마스터.
     계산: 북마다 WS 구독 중인 행사가×콜/풋 각각에 대해 주기적으로 get_quote()를 호출해
          그릭스/IV/OI를 option_analysis_1m에, 기초자산 스팟을 underlying_spot_1m에 적재한다.
@@ -464,8 +471,9 @@ async def poll_option_chain(
 
 def _atm_liquidity_window(strikes: frozenset[float], each_side: int) -> list[float]:
     """
-    입력: 구독 매니저의 ATM±STRIKES_EACH_SIDE 전체 행사가 집합(WS 구독 범위, 예: ATM±3=7개),
-         유동성 지표에 쓸 편측 개수(LIQUIDITY_ATM_EACH_SIDE=2).
+    입력: 구독 매니저의 ATM±STRIKES_EACH_SIDE 전체 행사가 집합(WS 구독 범위, 2026-07-10부터
+         ATM±2=5개), 유동성 지표에 쓸 편측 개수(LIQUIDITY_ATM_EACH_SIDE=2 — 현재는 WS 구독
+         범위와 폭이 같아 사실상 전체를 그대로 씀).
     계산: 오름차순 정렬 후 정중앙(ATM)을 기준으로 ±each_side만 잘라낸다 — strikes_around_atm()이
          항상 ATM을 중앙에 두는 대칭 격자를 만들기 때문에 정렬 후 중앙 인덱스를 잡으면 된다.
     실패 조건: strikes가 비어 있으면 빈 리스트(호출측이 이번 사이클을 건너뜀).
@@ -515,7 +523,8 @@ async def poll_expiry_liquidity(
     startup_offset_seconds: float = 0.0,
 ) -> None:
     """
-    입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(먼슬리 "regular" + 위클리 "weekly"),
+    입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(먼슬리 "regular" + 위클리(월)
+         "weekly_mon" + 위클리(목) "weekly_thu", 2026-07-10 위클리 분리),
          종목코드 마스터, 기동 시 최초 사이클을 지연시킬 초(startup_offset_seconds — 2026-07-09
          추가: poll_option_chain과 동시에 기동하면 두 폴러의 정규 사이클이 계속 같은 순간에
          겹쳐 공유 레이트리미터 큐가 길어지므로, 오프셋으로 사이클 시작 시각을 어긋나게 둔다).
@@ -732,8 +741,11 @@ async def main() -> None:
     # is_mock 여부와 상관없이 MARKET_DATA_WS_DOMAIN(실전 도메인) 하나로 접속한다.
     async with websockets.connect(tr_codes.MARKET_DATA_WS_DOMAIN) as raw_ws:
         ws_client = KISWebSocketClient(approval_key=approval_key, connection=_WebsocketsAdapter(raw_ws))
-        # 먼슬리(정규 월물)와 위클리를 별도 매니저로 동시에 굴린다(2026-07-06 추가) — 슬롯 예산:
-        # 14(먼슬리) + 14(위클리) + 1(선물) = 29 / MAX_SUBSCRIPTIONS(41), 여유 있음.
+        # 먼슬리(정규 월물)·위클리(월)·위클리(목) 세 북을 별도 매니저로 동시에 굴린다(2026-07-06
+        # 먼슬리+위클리 2북 도입, 2026-07-10 위클리를 월/목 두 상품으로 분리) — 3북×ATM±2(10슬롯)
+        # + 1(선물) = 31 / MAX_SUBSCRIPTIONS(41). ATM±3(14슬롯)을 유지하면 3북 합계가 43으로
+        # 한도를 넘겨(RESEARCH_EXPIRY_SELECTION_v1.md §3.1이 미리 지적한 트레이드오프) 세 북
+        # 모두 ATM±2로 축소하기로 결정(사용자 확인, [[DECISION_LOG]] 참고).
         monthly_manager = RollingSubscriptionManager(
             ws_client,
             tr_id=tr_codes.WS_TR_OPTION_CONTRACT,
@@ -741,19 +753,35 @@ async def main() -> None:
             strikes_each_side=STRIKES_EACH_SIDE,
             symbol_formatter=lambda strike, opt: master.option_symbol(opt, strike, underlying="KOSPI200"),
         )
-        weekly_manager = RollingSubscriptionManager(
+        weekly_mon_manager = RollingSubscriptionManager(
             ws_client,
             tr_id=tr_codes.WS_TR_OPTION_CONTRACT,
             strike_interval=KOSPI200_OPTION_STRIKE_INTERVAL,
             strikes_each_side=STRIKES_EACH_SIDE,
             symbol_formatter=lambda strike, opt: master.option_symbol(
-                opt, strike, underlying="KOSPI200", series="weekly"
+                opt, strike, underlying="KOSPI200", series="weekly_mon"
             ),
         )
-        books = [(monthly_manager, "regular"), (weekly_manager, "weekly")]
+        weekly_thu_manager = RollingSubscriptionManager(
+            ws_client,
+            tr_id=tr_codes.WS_TR_OPTION_CONTRACT,
+            strike_interval=KOSPI200_OPTION_STRIKE_INTERVAL,
+            strikes_each_side=STRIKES_EACH_SIDE,
+            symbol_formatter=lambda strike, opt: master.option_symbol(
+                opt, strike, underlying="KOSPI200", series="weekly_thu"
+            ),
+        )
+        books = [
+            (monthly_manager, "regular"),
+            (weekly_mon_manager, "weekly_mon"),
+            (weekly_thu_manager, "weekly_thu"),
+        ]
         await asyncio.gather(
             run_observation_loop(
-                ws_client, [monthly_manager, weekly_manager], rest_client, futures_symbol=futures_symbol
+                ws_client,
+                [monthly_manager, weekly_mon_manager, weekly_thu_manager],
+                rest_client,
+                futures_symbol=futures_symbol,
             ),
             poll_option_chain(rest_client, books, master),
             poll_expiry_liquidity(

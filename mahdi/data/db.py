@@ -155,8 +155,9 @@ _EXPIRY_LIQUIDITY_1M_COLUMNS = (
 
 def insert_expiry_liquidity_1m(conn: ConnectionLike, row: dict) -> None:
     """
-    입력: 만기북(series="regular"|"weekly")별 ATM±2 구간 유동성 스냅샷 — % 호가스프레드(Cao-Wei
-         기준, 달러 스프레드 아님)·호가잔량 합(깊이)·누적거래량·잔존일수.
+    입력: 만기북(series="regular"|"weekly_mon"|"weekly_thu", 2026-07-10 위클리 분리)별 ATM±2
+         구간 유동성 스냅샷 — % 호가스프레드(Cao-Wei 기준, 달러 스프레드 아님)·호가잔량 합(깊이)·
+         누적거래량·잔존일수.
     계산: INSERT ... ON CONFLICT (timestamp, underlying, series, expiry) DO UPDATE — 장전 선발
          점수의 20거래일 기준선(전일 중앙값) 산출에 쓰인다(docs/Dev_md/RESEARCH_EXPIRY_SELECTION_v1.md).
     """
@@ -210,7 +211,7 @@ def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
 def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]:
     """
     입력: 기초자산 라벨.
-    계산: series(regular/weekly)별로 가장 최근 timestamp 1건씩만 골라 반환한다 — 폴링 주기(5분)
+    계산: series(regular/weekly_mon/weekly_thu)별로 가장 최근 timestamp 1건씩만 골라 반환한다 — 폴링 주기(5분)
          중 두 북의 조회 시각이 조금씩 어긋날 수 있어 북별 최신값을 취한다.
     해석: 반환된 dict는 COCKPIT 만기 유동성 비교 패널(Phase 1.5-④)이 바로 렌더링에 쓸 수 있는
          키를 가진다. 아직 폴링이 한 번도 안 돌았으면 빈 리스트.

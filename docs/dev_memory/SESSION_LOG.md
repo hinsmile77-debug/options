@@ -4,6 +4,24 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] 위클리를 월/목 두 북으로 분리 (COCKPIT이 실측으로 N/O="위클리(월)" 확정해준 덕)
+
+**트리거:** 바로 아래 세션에서 고친 COCKPIT 만기유동성비교 패널을 사용자가 직접 열어보고 스크린샷으로 결과를 보여줌 — 위클리 행이 만기 2026-07-13(월요일)로 하나만 떠 있는 걸 보고 "위클리를 월요일 위클리와 목요일 위클리로 분리해서 표시해" 요청.
+
+**중요한 부수 확인:** 이 스크린샷 자체가 바로 아래 세션에서 남겨둔 미해결 질문("N/O·L/M 중 어느 쪽이 월/목인지 실측 필요")에 대한 답이 됐다 — 표시된 만기 2026-07-13은 실제로 월요일이고, 그 값은 당시 더 가까운 쪽이던 N/O 풀에서 나온 것이므로 **N/O=위클리(월), L/M=위클리(목)**로 확정. 이는 2026-07-06에 eFriend에서 발견했던 "KOSPI200 위클리(월)"/"위클리(목)" 별도 상품 분리와 정확히 일치 — "N/O↔L/M이 같은 상품의 교대 코드풀"이라는 전날 가설을 "서로 다른 두 상품"으로 정정.
+
+**구현:**
+- `symbol_master.py`: `_SERIES_PRODUCT_TYPES`를 병합된 `"weekly"` 하나에서 `"weekly_mon"`(N/O)·`"weekly_thu"`(L/M) 두 개로 분리. 관련 주석·docstring 전부 갱신.
+- `main.py`: `weekly_manager` 하나를 `weekly_mon_manager`/`weekly_thu_manager` 둘로 분리, `books`/`run_observation_loop`에 3북 전달. WS 슬롯 예산 재계산 결과 ATM±3 유지 시 14×3+1=43으로 `MAX_SUBSCRIPTIONS`(41) 초과 — 사용자에게 "먼슬리만 ±3 유지"와 "세 북 모두 ±2 통일" 중 선택지를 물어 후자로 결정(연구문서 권장안과 동일). `STRIKES_EACH_SIDE`를 3→2로 낮춰 10×3+1=31/41로 확정.
+- `expiry_liquidity_panel.py`/`data_source.py`/`app.py`: `_SERIES_LABEL_KO`에 "위클리(월)"/"위클리(목)" 추가, 먼슬리 만기 주 안내 문구를 "위클리(목)만 영향받고 위클리(월)은 그대로"로 정교화, 합성 폴백 스냅샷에도 위클리(목) 행 추가.
+- `db.py`/`005_expiry_liquidity.sql`: 주석만 갱신 — `series` 컬럼이 VARCHAR(10)인데 "weekly_mon"/"weekly_thu" 둘 다 정확히 10자라 스키마 변경 없이 그대로 수용됨.
+
+**검증:** `test_data_symbol_master.py`를 weekly_mon/weekly_thu 개별 테스트로 재구성, `test_dashboard_expiry_liquidity_panel.py`에 3행(먼슬리+위클리월+위클리목) 케이스로 갱신. 전체 174개 통과.
+
+**다음 확인 필요:** N/O=월/L/M=목 매핑은 COCKPIT 표시값 하나로 추론한 것이라, 실거래 중 `get_quote()`의 `futs_last_tr_date` 요일로 한 번 더 교차검증 권장 — [[NEXT_TODO]] 참고. 재시작 전까지는 `mahdi.main`이 옛 `weekly_manager`(단일, ATM±3) 로직으로 계속 돈다.
+
+---
+
 ## [2026-07-10] 위클리 콜/풋 코드풀(N/O만 조회하던 버그) 발견·수정 + 먼슬리 만기 주 COCKPIT 안내 추가
 
 **트리거:** 사용자가 eFriend에서 캡처한 목요일 위클리 콜/풋 종목코드 화면(C09F6WA69=풋/B09F6WA69=콜, "위클리P/C 2607W3")을 첨부하며 "어제(목요일)는 먼슬리 만기 주라 위클리가 먼슬리 가격을 대신 보여줬다(대시됐다)"고 알려주고, 이 내용을 만기유동성비교·Flow Radar에 반영해달라고 요청.

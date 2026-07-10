@@ -66,7 +66,8 @@ class DashboardSnapshot:
     foreign_net: float
     institution_net: float
     individual_net: float
-    # Phase 1.5-④(2026-07-06 추가) — 먼슬리/위클리 북별 ATM±2 유동성 스냅샷(북당 최신 1건).
+    # Phase 1.5-④(2026-07-06 추가, 2026-07-10 위클리를 월/목 두 상품으로 분리) — 먼슬리/위클리(월)/
+    # 위클리(목) 북별 ATM±2 유동성 스냅샷(북당 최신 1건). series 값: "regular"|"weekly_mon"|"weekly_thu".
     # 각 dict 키: series, expiry, atm_spread_pct, depth, volume, days_to_expiry.
     expiry_liquidity: list[dict]
 
@@ -269,12 +270,20 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
                 "days_to_expiry": 23,
             },
             {
-                "series": "weekly",
+                "series": "weekly_mon",
                 "expiry": (now + timedelta(days=2)).date(),
                 "atm_spread_pct": float(abs(rng.normal(0.09, 0.02))),
                 "depth": float(abs(rng.normal(80, 20))),
                 "volume": float(abs(rng.normal(150, 40))),
                 "days_to_expiry": 2,
+            },
+            {
+                "series": "weekly_thu",
+                "expiry": (now + timedelta(days=5)).date(),
+                "atm_spread_pct": float(abs(rng.normal(0.10, 0.02))),
+                "depth": float(abs(rng.normal(75, 20))),
+                "volume": float(abs(rng.normal(140, 40))),
+                "days_to_expiry": 5,
             },
         ],
     )
