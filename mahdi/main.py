@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
+import httpx
 import websockets
 
 from mahdi.broker import tr_codes
@@ -26,6 +27,7 @@ from mahdi.config.settings import get_db_settings, get_kis_settings
 from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
 from mahdi.data.subscription_manager import RollingSubscriptionManager
+from mahdi.data.overseas_future_master import OverseasFutureMaster, load_overseas_future_master
 from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivatives_master
 from mahdi.engines.regime_pipeline import RegimeStateMachine
 from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp
@@ -39,6 +41,14 @@ KOSPI200_OPTION_STRIKE_INTERVAL = 2.5
 # ATM±3 유지 시 14×3+1=43으로 한도 초과(RESEARCH_EXPIRY_SELECTION_v1.md §3.1 예상대로).
 STRIKES_EACH_SIDE = 2
 SYMBOL_MASTER_CACHE_DIR = Path("data/symbol_master_cache")  # KIS 마스터파일은 매일 갱신됨
+OVERSEAS_FUTURE_MASTER_CACHE_DIR = Path("data/overseas_future_master_cache")
+
+# Cross-asset stress(v6 §7.3) 매크로 스냅샷 — 스펙이 요구하는 "5분" 주기(§5.1 표).
+MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS = 300
+# US10Y는 계좌에 CBOT 거래소 신청이 안 된 동안 일봉 API로만 얻을 수 있어(tr_codes.py 상단 주석
+# 참고) 매 사이클 짧은 기간을 조회해 최신 종가 1건만 취한다 — 10일이면 공휴일이 며칠 껴도
+# 최소 1건은 반환된다.
+US10Y_LOOKBACK_DAYS = 10
 UNDERLYING = "KOSPI200"
 OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범위와 동일한 종목을 REST로 주기 조회
 
@@ -674,6 +684,167 @@ async def poll_expiry_liquidity(
         await asyncio.sleep(delay)
 
 
+def _parse_overseas_future_last_price(resp: dict) -> float | None:
+    """입력: get_overseas_future_price() 응답. 계산: output1.last_price를 float로(KIS 필드는
+    앞에 공백 패딩이 있으나 float()가 알아서 무시한다). 실패 조건: 필드 없음/변환 불가면 None."""
+    try:
+        return float(resp["output1"]["last_price"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _parse_us10y_yield(resp: dict) -> float | None:
+    """입력: get_overseas_daily_chartprice() 응답(국채구분 I, Y0202). 계산: output1.ovrs_nmix_prpr
+    (최신 종가=수익률%)를 float로. 실패 조건: 필드 없음/변환 불가면 None."""
+    try:
+        return float(resp["output1"]["ovrs_nmix_prpr"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _log_kis_call_failure(message: str, exc: Exception) -> None:
+    """
+    입력: 로그 메시지, 발생한 예외.
+    계산: httpx.HTTPStatusError는 KIS의 실제 에러 코드/메시지(rt_cd/msg_cd/msg1)가 응답 바디에
+         있는데, raise_for_status()가 만드는 예외 메시지 자체엔 그게 안 실려 그냥 재로깅하면
+         "Server error 500"만 남고 원인(레이트리밋/계좌 미신청/일시 장애 등)을 구분할 수 없다
+         (2026-07-10 CBOT 신청 후에도 ZN 조회가 500을 반복해 원인 확인 중 필요해짐) — 바디
+         텍스트를 함께 남긴다.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        logger.warning("%s — %s", message, exc.response.text, exc_info=True)
+    else:
+        logger.warning(message, exc_info=True)
+
+
+async def _collect_macro_snapshot_cycle(
+    rest_client: KISRestClient, overseas_master: OverseasFutureMaster, poll_time: datetime
+) -> dict | None:
+    """
+    입력: REST 클라이언트, 해외선물 종목코드 마스터, 폴링 시각(분 단위로 자름).
+    계산: VIX 선물(CBOE VX) 근월·차근월, USDCNH 선물(HKEx CNH) 근월 현재가를 조회해 콘탱고/
+         백워데이션(vix_term_structure = vix_next/vix_front - 1)을 계산하고, US10Y는 일봉
+         API(국채구분 I)로 최신 종가(us10y_yield, 실제 수익률 %)를, ZN 선물(CME/CBOT 10년
+         국채선물) 근월물 현재가(zn_front)로 5분 주기 급변 감지용 값을 함께 담는다(2026-07-10
+         사용자가 계좌에 CBOT 거래소 신청을 완료해 추가 — 신청 전에는 EGW00552로 항상 실패해
+         zn_front가 계속 None이었다). 종목코드를 마스터에서 못 찾거나 개별 조회가 실패해도
+         나머지 필드는 계속 채운다(부분 실패 허용).
+    실패 조건: vix_front/vix_next/usdcnh 셋 다 실패하면(레이트리밋 버스트 등) None을 반환해
+              호출측이 이번 사이클 적재를 건너뛰게 한다 — us10y_yield/zn_front만 성공한 상태로
+              5분 행을 남기는 건 의미가 없다.
+    """
+    vix_front_code, vix_next_code = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_VIX)
+    cnh_front_code, _ = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_CNH)
+    zn_front_code, _ = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_ZN)
+
+    vix_front = vix_next = usdcnh = None
+    if vix_front_code is not None:
+        try:
+            vix_front = _parse_overseas_future_last_price(
+                await asyncio.to_thread(rest_client.get_overseas_future_price, vix_front_code)
+            )
+        except Exception as exc:
+            _log_kis_call_failure(f"VIX 근월물 조회 실패: {vix_front_code}", exc)
+    if vix_next_code is not None:
+        try:
+            vix_next = _parse_overseas_future_last_price(
+                await asyncio.to_thread(rest_client.get_overseas_future_price, vix_next_code)
+            )
+        except Exception as exc:
+            _log_kis_call_failure(f"VIX 차근월물 조회 실패: {vix_next_code}", exc)
+    if cnh_front_code is not None:
+        try:
+            usdcnh = _parse_overseas_future_last_price(
+                await asyncio.to_thread(rest_client.get_overseas_future_price, cnh_front_code)
+            )
+        except Exception as exc:
+            _log_kis_call_failure(f"USDCNH 선물 조회 실패: {cnh_front_code}", exc)
+
+    if vix_front is None and vix_next is None and usdcnh is None:
+        return None
+
+    us10y_yield = None
+    try:
+        date_to = poll_time.strftime("%Y%m%d")
+        date_from = (poll_time - timedelta(days=US10Y_LOOKBACK_DAYS)).strftime("%Y%m%d")
+        us10y_yield = _parse_us10y_yield(
+            await asyncio.to_thread(
+                rest_client.get_overseas_daily_chartprice,
+                tr_codes.FID_MRKT_DIV_OVERSEAS_TREASURY,
+                tr_codes.FID_INPUT_ISCD_US10Y,
+                date_from,
+                date_to,
+            )
+        )
+    except Exception as exc:
+        _log_kis_call_failure("US10Y 일봉 조회 실패", exc)
+
+    zn_front = None
+    if zn_front_code is not None:
+        try:
+            zn_front = _parse_overseas_future_last_price(
+                await asyncio.to_thread(rest_client.get_overseas_future_price, zn_front_code)
+            )
+        except Exception as exc:
+            _log_kis_call_failure(f"ZN(10년 국채선물) 근월물 조회 실패: {zn_front_code}", exc)
+
+    vix_term_structure = (vix_next / vix_front - 1) if (vix_front and vix_next) else None
+
+    return {
+        "timestamp": poll_time,
+        "vix_front": vix_front,
+        "vix_next": vix_next,
+        "vix_term_structure": vix_term_structure,
+        "usdcnh": usdcnh,
+        "us10y_yield": us10y_yield,
+        "zn_front": zn_front,
+        "quality_flag": 0 if (vix_front is not None and vix_next is not None and usdcnh is not None) else 1,
+    }
+
+
+async def poll_macro_snapshot(
+    rest_client: KISRestClient,
+    overseas_master: OverseasFutureMaster,
+    interval_seconds: float = MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS,
+) -> None:
+    """
+    입력: REST 클라이언트, 해외선물 종목코드 마스터(main() 기동 시 1회 로드).
+    계산: Cross-asset stress 원시값(VIX 기간구조·USDCNH·US10Y, v6 §7.3)을 5분 주기로
+         macro_snapshot_5m에 적재한다. poll_option_chain/poll_investor_flow와 동일하게 절대시각
+         고정 틱(next_tick)으로 다음 사이클을 예약해 사이클 소요시간에 따라 실제 주기가 밀리지
+         않게 한다.
+    실패 조건: 이번 사이클 전체가 실패하면(_collect_macro_snapshot_cycle이 None) 적재를
+              건너뛰고 다음 정규 사이클을 기다린다 — 재시도 백오프는 두지 않는다(사이클당
+              REST 호출이 4건뿐이라 다른 폴러만큼 레이트리밋에 취약하지 않음).
+    """
+    next_tick: float | None = None
+    while True:
+        poll_time = datetime.now().replace(second=0, microsecond=0)
+        row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time)
+
+        if row is None:
+            logger.warning("매크로 스냅샷 폴링 전체 실패 — 이번 사이클 건너뜀")
+        else:
+            with db.get_connection() as conn:
+                try:
+                    db.insert_macro_snapshot_5m(conn, row)
+                except Exception:
+                    logger.warning("매크로 스냅샷 적재 실패", exc_info=True)
+                    conn.rollback()
+
+        loop_now = asyncio.get_running_loop().time()
+        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
+        delay = next_tick - loop_now
+        if delay < 0:
+            logger.warning(
+                "매크로 스냅샷 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
+                interval_seconds, -delay,
+            )
+            next_tick = loop_now
+            delay = 0.0
+        await asyncio.sleep(delay)
+
+
 _INVESTOR_FLOW_SECTORS = (
     tr_codes.FID_INVESTOR_FLOW_FUTURES,
     tr_codes.FID_INVESTOR_FLOW_CALL_OPTION,
@@ -776,6 +947,15 @@ async def main() -> None:
     if futures_symbol is None:
         raise RuntimeError("종목코드 마스터파일에서 KOSPI200 선물 최근월물을 찾지 못했습니다")
 
+    # 해외선물 마스터(VX/CNH 근월·차근월)는 국내 마스터와 별개 파일 — 하나가 실패해도 다른
+    # 하나는 관측을 계속할 수 있어야 하므로 별도로 로드한다(2026-07-10 신규, Cross-asset
+    # stress §7.3). 다운로드 실패 시(네트워크 등) 매크로 폴링만 건너뛰고 나머지 관측은 계속한다.
+    try:
+        overseas_future_master = load_overseas_future_master(OVERSEAS_FUTURE_MASTER_CACHE_DIR)
+    except Exception:
+        logger.warning("해외선물 종목코드 마스터 로드 실패 — 매크로 스냅샷 폴링을 건너뜁니다", exc_info=True)
+        overseas_future_master = None
+
     token_daemon = TokenDaemon(kis_settings)
     rest_client = KISRestClient(kis_settings, token_daemon)
     approval_key = ApprovalKeyIssuer(kis_settings).issue()
@@ -820,7 +1000,7 @@ async def main() -> None:
             (weekly_mon_manager, "weekly_mon"),
             (weekly_thu_manager, "weekly_thu"),
         ]
-        await asyncio.gather(
+        tasks = [
             run_observation_loop(
                 ws_client,
                 [monthly_manager, weekly_mon_manager, weekly_thu_manager],
@@ -833,7 +1013,10 @@ async def main() -> None:
                 rest_client, books, master, startup_offset_seconds=EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS
             ),
             poll_investor_flow(rest_client),
-        )
+        ]
+        if overseas_future_master is not None:
+            tasks.append(poll_macro_snapshot(rest_client, overseas_future_master))
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

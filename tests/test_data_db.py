@@ -106,6 +106,95 @@ def test_insert_option_analysis_1m_upserts_on_full_leg_key():
     assert "ON CONFLICT (timestamp, underlying, expiry, strike, option_type) DO UPDATE" in conn.store["query"]
 
 
+def test_insert_macro_snapshot_5m_upserts_on_timestamp():
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 10, 8, 5)
+    row = {
+        "timestamp": ts,
+        "vix_front": 17.50,
+        "vix_next": 17.80,
+        "vix_term_structure": 0.017143,
+        "usdcnh": 6.7803,
+        "us10y_yield": 4.54,
+        "zn_front": 110.25,
+        "quality_flag": 0,
+    }
+
+    db.insert_macro_snapshot_5m(conn, row)
+
+    assert conn.committed is True
+    assert "ON CONFLICT (timestamp) DO UPDATE" in conn.store["query"]
+    assert conn.store["params"][0] == ts
+    assert len(conn.store["params"]) == len(db._MACRO_SNAPSHOT_5M_COLUMNS)
+
+
+class _FakeSequentialCursor:
+    def __init__(self, results: list):
+        self._results = results
+
+    def execute(self, query: str, params=None) -> None:
+        pass
+
+    def fetchone(self):
+        return self._results.pop(0) if self._results else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeSequentialConnection:
+    """cursor() 호출마다 다른 결과를 순서대로 반환 — latest_macro_snapshot의 2단계(최신행 조회 →
+    us10y_yield가 NULL이면 LOCF 폴백 조회) 쿼리를 서로 다른 응답으로 검증하는 데 쓴다."""
+
+    def __init__(self, *fetchone_results):
+        self._queue = list(fetchone_results)
+
+    def cursor(self):
+        return _FakeSequentialCursor([self._queue.pop(0)] if self._queue else [])
+
+
+def test_latest_macro_snapshot_returns_none_when_no_rows():
+    conn = _FakeSequentialConnection(None)
+    assert db.latest_macro_snapshot(conn) is None
+
+
+def test_latest_macro_snapshot_returns_row_when_us10y_present():
+    ts = datetime(2026, 7, 10, 8, 5)
+    conn = _FakeSequentialConnection((ts, 17.50, 17.80, 0.017143, 6.7803, 4.54, 110.25))
+
+    result = db.latest_macro_snapshot(conn)
+
+    assert result == {
+        "timestamp": ts,
+        "vix_front": 17.50,
+        "vix_next": 17.80,
+        "vix_term_structure": 0.017143,
+        "usdcnh": 6.7803,
+        "us10y_yield": 4.54,
+        "zn_front": 110.25,
+    }
+
+
+def test_latest_macro_snapshot_forward_fills_us10y_when_null():
+    # 최신 5분 행은 US10Y(일봉 레벨)가 아직 안 갱신돼 NULL이지만, 그 전에 일봉으로 한 번 채워진
+    # 값이 있으면 그 값을 LOCF로 들고 와야 한다. zn_front는 CBOT 신청 후 5분마다 갱신되므로
+    # 별도 폴백 없이 그대로 반환돼야 한다.
+    ts = datetime(2026, 7, 10, 8, 10)
+    conn = _FakeSequentialConnection(
+        (ts, 17.55, 17.85, 0.017094, 6.7810, None, 110.30),  # 최신 행: us10y_yield NULL, zn_front는 값 있음
+        (4.54,),  # 폴백 쿼리 결과
+    )
+
+    result = db.latest_macro_snapshot(conn)
+
+    assert result["us10y_yield"] == 4.54
+    assert result["vix_front"] == 17.55
+    assert result["zn_front"] == 110.30
+
+
 def test_insert_underlying_spot_upserts_on_timestamp_underlying():
     conn = FakeConnection()
     ts = datetime(2026, 7, 6, 9, 31)

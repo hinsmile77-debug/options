@@ -137,6 +137,55 @@ class KISRestClient:
             params={"FID_INPUT_ISCD": market_code, "FID_INPUT_ISCD_2": sector_code},
         )
 
+    def get_overseas_future_price(self, srs_cd: str) -> dict:
+        """
+        해외선물 현재가(inquire-price) — VIX 선물(VX)·USDCNH 선물(CNH) 등 Cross-asset stress
+        프록시에 쓴다(v6 §7.3).
+
+        입력: 해외선물 단축코드(예: "VXN26" — 종목코드 마스터파일에서 최근월물/차근월물로 찾음,
+             mahdi.data.overseas_future_master 참고).
+        계산: PATH_OVERSEAS_FUTUREOPTION_PRICE GET 호출. 이 엔드포인트는 계좌 파라미터가 없어
+             계좌 무관 공개 시세로 보이지만, 상품(거래소)에 따라 계좌에 별도 거래소 신청이 걸려
+             있어야 한다(2026-07-10 실측: CBOE(VX)·HKEx(CNH)는 모의계좌로 바로 성공, CME/CBOT
+             (ZN 등)는 "EGW00552: CBOT SUB거래소 신청 계좌가 아닙니다"로 거부됨 — 코드가 아니라
+             계좌 설정 문제이므로 호출측이 이 에러를 구분해 재시도하지 말아야 한다).
+        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 그대로 전파.
+        """
+        tr_id = tr_codes.TR_OVERSEAS_FUTUREOPTION_PRICE
+        return self._get(
+            f"{self._domain}{tr_codes.PATH_OVERSEAS_FUTUREOPTION_PRICE}",
+            headers=self._headers(tr_id),
+            params={"SRS_CD": srs_cd},
+        )
+
+    def get_overseas_daily_chartprice(
+        self, market_div_code: str, symbol: str, date_from: str, date_to: str, period_div_code: str = "D"
+    ) -> dict:
+        """
+        해외주식 종목_지수_환율기간별시세(일_주_월_년) — US10Y(국채구분 I, 심볼 Y0202) 등
+        해외선물옵션 계좌 신청 없이도 얻을 수 있는 일봉 대체 경로(v6 §7.3).
+
+        입력: FID_COND_MRKT_DIV_CODE(N=해외지수, X=환율, I=국채, S=금선물), 종목코드(예: "Y0202"),
+             조회 시작/종료일(YYYYMMDD), 기간 구분(D=일 기본값).
+        계산: PATH_OVERSEAS_INDEX_DAILY_CHARTPRICE GET 호출.
+        해석: 2026-07-10 실측 — 같은 API 계열의 분봉 엔드포인트(inquire-time-indexchartprice)는
+             I(국채) 구분을 "ERROR INVALID FID_COND_MRKT_DIV_CODE"로 거부해 분봉 미지원이 확정됐다
+             — 이 함수(일봉)만이 US10Y를 계좌 제약 없이 얻는 유일한 경로다.
+        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 그대로 전파.
+        """
+        tr_id = tr_codes.TR_OVERSEAS_INDEX_DAILY_CHARTPRICE
+        return self._get(
+            f"{self._domain}{tr_codes.PATH_OVERSEAS_INDEX_DAILY_CHARTPRICE}",
+            headers=self._headers(tr_id),
+            params={
+                "FID_COND_MRKT_DIV_CODE": market_div_code,
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_DATE_1": date_from,
+                "FID_INPUT_DATE_2": date_to,
+                "FID_PERIOD_DIV_CODE": period_div_code,
+            },
+        )
+
     def get_balance(self) -> dict:
         """
         계산: PATH_FUTUREOPTION_BALANCE GET 호출 (계좌번호는 설정에서 사용).

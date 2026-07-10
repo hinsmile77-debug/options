@@ -70,6 +70,9 @@ class DashboardSnapshot:
     # 위클리(목) 북별 ATM±2 유동성 스냅샷(북당 최신 1건). series 값: "regular"|"weekly_mon"|"weekly_thu".
     # 각 dict 키: series, expiry, atm_spread_pct, depth, volume, days_to_expiry.
     expiry_liquidity: list[dict]
+    # Cross-asset stress(v6 §7.3, 2026-07-10 신규) — db.latest_macro_snapshot() 반환 형태 그대로:
+    # {vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield} 또는 폴링이 아직 안 돌았으면 None.
+    macro_snapshot: dict | None
 
 
 def load_snapshot(underlying: str = "KOSPI200") -> DashboardSnapshot:
@@ -100,6 +103,14 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
             chain_rows = db.latest_option_chain(conn, underlying)
             investor_flow = db.latest_investor_flow(conn, underlying)
             expiry_liquidity = db.latest_expiry_liquidity(conn, underlying)
+            # 매크로 폴러(poll_macro_snapshot)는 다른 폴러들과 별개 실패 도메인(해외선물옵션
+            # 계좌 제약 등)이라, 이 조회 하나가 실패해도 대시보드 전체가 합성 폴백으로 떨어지면
+            # 안 된다 — 독립적으로 감싸 None으로만 처리한다.
+            try:
+                macro_snapshot = db.latest_macro_snapshot(conn)
+            except Exception:
+                logger.warning("매크로 스냅샷 조회 실패", exc_info=True)
+                macro_snapshot = None
 
             # 선물 계열: active_futures_symbol 레지스트리로 현재 구독 중인 선물 단축코드를
             # 명시적으로 조회한다(vpin 유무 같은 휴리스틱에 더 이상 의존하지 않음 — 2026-07-06,
@@ -203,7 +214,21 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         institution_net=institution_net,
         individual_net=individual_net,
         expiry_liquidity=expiry_liquidity,
+        macro_snapshot=macro_snapshot,
     )
+
+
+def _synthetic_macro_snapshot(rng: np.random.Generator) -> dict:
+    vix_front = float(abs(rng.normal(18.0, 3.0)))
+    vix_next = float(vix_front + rng.normal(0.3, 1.0))  # 평상시엔 살짝 콘탱고가 흔함
+    return {
+        "vix_front": vix_front,
+        "vix_next": vix_next,
+        "vix_term_structure": vix_next / vix_front - 1,
+        "usdcnh": float(7.05 + rng.normal(0, 0.05)),
+        "us10y_yield": float(4.3 + rng.normal(0, 0.15)),
+        "zn_front": float(110.0 + rng.normal(0, 0.5)),
+    }
 
 
 def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
@@ -286,4 +311,5 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
                 "days_to_expiry": 5,
             },
         ],
+        macro_snapshot=_synthetic_macro_snapshot(rng),
     )

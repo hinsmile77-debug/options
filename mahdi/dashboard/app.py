@@ -18,6 +18,7 @@ from mahdi.dashboard.panels.flow_radar_panel import (
 )
 from mahdi.dashboard.panels.expiry_liquidity_panel import build_expiry_liquidity_table
 from mahdi.dashboard.panels.gamma_map_panel import build_gamma_profile_chart
+from mahdi.dashboard.panels.macro_panel import build_macro_snapshot_table
 from mahdi.dashboard.panels.position_panel import build_position_flow_chart
 from mahdi.dashboard.panels.regime_panel import REGIME_LABEL_KO, build_regime_probability_chart
 
@@ -56,6 +57,13 @@ def render() -> None:
             build_position_flow_chart(snapshot.foreign_net, snapshot.institution_net, snapshot.individual_net),
             width='stretch',
         )
+
+    st.subheader("Cross-asset Stress (VIX 기간구조·USDCNH·US10Y)")
+    st.plotly_chart(build_macro_snapshot_table(snapshot.macro_snapshot), width='stretch')
+    if snapshot.macro_snapshot is None:
+        st.caption("아직 매크로 스냅샷 폴링 데이터가 없습니다.")
+    elif snapshot.macro_snapshot.get("us10y_yield") is None:
+        st.caption("US10Y는 계좌에 CBOT 거래소 신청이 안 되어 있는 동안 일봉으로만 갱신됩니다 — 값이 채워지기 전까지는 정상적으로 비어 있습니다.")
 
     st.subheader("만기 유동성 비교 (먼슬리 vs 위클리(월) vs 위클리(목))")
     if snapshot.expiry_liquidity:

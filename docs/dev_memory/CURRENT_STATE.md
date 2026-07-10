@@ -39,8 +39,11 @@ _최종 갱신: 2026-07-10_
 - `RegimeStateMachine`: 매분 `feature_store`에 피처를 적재하고, `data/models/regime_engine.pkl`(있으면)로
   `RegimeEngine.predict()`, 없으면 실데이터 `warmup_fallback()`을 반환. `main.py`는 선물봉 완성 시에만
   `step()`을 호출한다(이전엔 옵션봉 완성 때도 매번 갱신하던 부수 버그가 있었음).
-- **범위 제약(의도적)**: `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 데이터 소스가 없어 0.0 고정 스텁,
+- **범위 제약(의도적)**: `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 0.0 고정 스텁,
   `macro_score`는 완전한 매크로 나침반(§8) 대신 외국인 순매수 부호 근사치 — 둘 다 TODO로 명시됨.
+  (2026-07-10 갱신: USDCNH/US10Y/VIX 원시 데이터 자체는 `macro_snapshot_5m`으로 수집되기 시작했지만
+  — 아래 "mahdi/data/overseas_future_master.py + macro_snapshot_5m" 절 참고 — `cross_asset_stress()`
+  함수를 그 데이터로 교체하는 배선은 아직 안 됨.)
 - `scripts/fit_regime_engine.py`(신규): `feature_store` 축적 데이터로 `RegimeEngine.fit()`을 오프라인
   실행하는 배치. main.py는 refit하지 않고 결과 파일 존재 여부만 본다. 20영업일(~8,000행) 이상 쌓인 뒤
   수동 실행 권장.
@@ -127,7 +130,33 @@ _최종 갱신: 2026-07-10_
 - `active_futures_symbol(underlying, symbol, updated_at)` — 단일 현재값 레지스트리(하이퍼테이블 아님). 대시보드가 "이 종목이 지금 구독 중인 선물인지"를 vpin 유무 같은 휴리스틱 없이 바로 조회하게 함.
 
 ### 테스트
-- `.venv/Scripts/python.exe -m pytest` — 199개 전부 통과 (2026-07-10 기준, 레짐 파이프라인 배선으로 신규 32개 추가). **주의**: 이 PC의 기본 `python`(conda `py37_32`, 3.7)은 `typing.Protocol` 미지원이고 `hmmlearn`도 없어 `tests/test_engines_regime.py`/`tests/test_regime_pipeline.py` 임포트부터 실패한다 — 반드시 프로젝트 로컬 `.venv/Scripts/python.exe -m pytest`로 실행할 것.
+- `.venv/Scripts/python.exe -m pytest` — 225개 전부 통과 (2026-07-10 기준, cross-asset stress 매크로
+  스냅샷 신규 구현으로 레짐 파이프라인 배선(199개) 이후 26개 추가). **주의**: 이 PC의 기본
+  `python`(conda `py37_32`, 3.7)은 `typing.Protocol` 미지원이고 `hmmlearn`도 없어
+  `tests/test_engines_regime.py`/`tests/test_regime_pipeline.py` 임포트부터 실패한다 — 반드시 프로젝트
+  로컬 `.venv/Scripts/python.exe -m pytest`로 실행할 것.
+
+### mahdi/data/overseas_future_master.py + macro_snapshot_5m — Cross-asset stress 원시 데이터 (2026-07-10 신규)
+- `overseas_future_master.py`: KIS 해외선물 마스터파일(`ffcode.mst`, 고정폭 포맷) 다운로드·파싱 —
+  품목코드(VX/CNH/ZN 등)별 근월·차근월 단축코드를 최근월물여부 플래그로 자동 산출(`symbol_master.py`와
+  같은 패턴, 만기 롤오버 코드 하드코딩 불필요).
+- `db/migrations/006_macro_snapshot.sql` + `007_macro_snapshot_zn.sql`: `macro_snapshot_5m` 하이퍼테이블
+  — `vix_front`/`vix_next`/`vix_term_structure`(CBOE VX 선물)/`usdcnh`(HKEx CNH 선물)/`us10y_yield`
+  (해외주식 국채구분 I 일봉, 실제 수익률 %)/`zn_front`(CME/CBOT 10년 국채선물 근월가, 007에서 추가 —
+  수익률과 역상관이라 `us10y_yield`와 단위가 달라 별도 컬럼).
+- `mahdi/main.py` `poll_macro_snapshot()`: 5분 주기 폴러, VIX/USDCNH/ZN 개별 실패를 허용하고 VIX·USDCNH
+  셋 다 실패할 때만 그 사이클 적재를 건너뜀. `_log_kis_call_failure()`가 실패 시 KIS 에러 바디(rt_cd/
+  msg_cd/msg1)까지 로깅.
+- `mahdi/dashboard/panels/macro_panel.py`: COCKPIT "Cross-asset Stress" 섹션, 콘탱고/백워데이션 부호 표시.
+- **CBOT 계좌 게이트(미해결)**: `zn_front`는 계좌에 CME/CBOT 거래소 신청이 완료돼야 조회된다. 사용자가
+  2026-07-10 신청을 완료했다고 확인했지만, 재시작 후 세 사이클(13:12/13:17/13:21) 모두 여전히
+  `EGW00552: CBOT SUB거래소 신청 상태가 아닙니다`로 거부됨(실제 KIS 에러 바디로 확인) — KIS 쪽 처리
+  지연으로 추정. **코드는 완성 상태**라 실제로 열리면 재시작 없이 다음 5분 사이클부터 자동으로
+  채워진다([[NEXT_TODO]] 참고).
+- **아직 안 된 것**: `mahdi/features/regime_features.py`의 `cross_asset_stress()`는 여전히 0.0 고정
+  스텁이다 — 이번 작업은 원시 매크로 데이터를 `macro_snapshot_5m`에 모으고 COCKPIT에 표시하는 것까지만
+  했고, 레짐 엔진 §7.3 입력으로 실제 배선하는 건 별도 작업으로 남아있다([[NEXT_TODO]]/[[DECISION_LOG]]
+  참고).
 
 ### 2026-07-09 REST 폴링 안정화 (7/8 하루치 실측 기반, [[SESSION_LOG]]/[[DECISION_LOG]] 참고)
 - `mahdi/broker/rest_client.py`: `KISRestClient`에 스레드 안전 공유 레이트리미터(기본 2건/초) 추가 — 옵션체인/수급/유동성 폴링 3개 루프가 동시에 REST를 쏘면서 KIS 앱키 TPS 한도를 넘겨 정규장 405분 중 203분치 `option_analysis_1m`이 통째로 유실됐던 문제 대응.

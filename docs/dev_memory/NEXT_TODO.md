@@ -6,21 +6,37 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ## 레짐(Regime) 실데이터 파이프라인 — 2026-07-10 배선 완료, 재시작 및 후속 확인 필요
 
-- [ ] 관측 루프 재시작 필요 — 재시작 전까지는 옛 하드코딩 `warmup_fallback(RANGE_BALANCED, 0, 0)`
-      로직이 계속 돈다([[SESSION_LOG]]/[[DECISION_LOG]] 2026-07-10 항목 참고).
-- [ ] 재시작 후 큰 갭이 있는 날 `compute_gap_zscore` 기반 TREND_UP/DOWN·VOL_EXPANSION·CRISIS_DEFENSE
+- [x] 관측 루프 재시작 — 2026-07-10 중 Cross-asset stress 작업으로 여러 차례 재시작됨(아래 새 절 참고).
+- [ ] 큰 갭이 있는 날 `compute_gap_zscore` 기반 TREND_UP/DOWN·VOL_EXPANSION·CRISIS_DEFENSE
       전환이 실제로 동작하는지 확인. 갭이 작은 평상시엔 전일 마감 레짐을 그대로 물려받는 게 정상 동작.
 - [ ] `feature_store`에 §7.3 6개 피처가 매분 실제로 쌓이는지 DB로 확인(`symbol="KOSPI200"`,
       `feature_version="v1"`).
 - [ ] `feature_store`가 20영업일 이상(대략 8,000행) 쌓이면 `python scripts/fit_regime_engine.py` 실행 →
       `data/models/regime_engine.pkl` 생성 → 다음 재시작부터 `RegimeStateMachine`이 자동으로 predict()
       모드로 전환되는지 확인.
-- [ ] `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 현재 0.0 고정 스텁 — 데이터 소스 연동 필요(§7.3 완전
-      구현의 남은 부분).
-- [ ] `macro_score`는 현재 외국인 순매수 부호 근사치(`compute_macro_score_proxy`) — VIX 기간구조·
-      S&P선물 등을 포함한 완전한 매크로 나침반(§8)으로 교체 검토.
+- [ ] `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 여전히 0.0 고정 스텁 — **원시 데이터는 2026-07-10
+      `macro_snapshot_5m`으로 수집되기 시작함**(아래 새 절 참고). 남은 일은 `regime_features.py`의
+      `cross_asset_stress()`를 `db.latest_macro_snapshot()` 기반 실계산으로 교체하는 배선뿐([[DECISION_LOG]]
+      2026-07-10 "Cross-asset stress는 스팟/지수가 아니라..." 항목이 "How to apply"에 이 부분 언급).
+      USDKRW는 아직 아무 경로로도 안 채워짐 — `market_raw_1m.usdkrw` 컬럼도 계속 비어있는 채로 남음,
+      별도 확인 필요.
+- [ ] `macro_score`는 현재 외국인 순매수 부호 근사치(`compute_macro_score_proxy`) — 이제 `macro_snapshot_5m`에
+      VIX 기간구조가 있으니 이걸 포함한 완전한 매크로 나침반(§8)으로 교체 검토.
 - [ ] `rv_ratio`(RV5d/RV20d)는 선물 심볼이 분기 롤오버될 때마다 일별 종가 이력이 끊긴다(현재 심볼
       기준으로만 `daily_closes` 조회) — 롤오버 연속성 처리 필요 여부 검토.
+
+## Cross-asset stress 매크로 스냅샷 — 2026-07-10 구현, ZN(US10Y)만 CBOT 계좌 승인 대기
+
+- [ ] **CBOT 신청 처리 여부 재확인** — 사용자가 신청 완료했다고 확인했지만 재시작 후 세 사이클 연속
+      `EGW00552: CBOT SUB거래소 신청 상태가 아닙니다`로 계속 거부됨([[SESSION_LOG]]/[[DECISION_LOG]]
+      2026-07-10 항목 참고). KIS 앱/HTS에서 신청 상태가 실제로 "승인 완료"인지, 모의투자 계좌 쪽에도
+      반영되는 신청인지 확인 필요. 열리면 `macro_snapshot_5m.zn_front`가 재시작 없이 다음 5분
+      사이클부터 자동으로 채워진다(코드 변경 불필요).
+- [ ] `regime_features.cross_asset_stress()` 배선(위 레짐 절 항목과 동일 — 여기서도 교차 참조).
+- [ ] `poll_macro_snapshot`이 정규장 하루 운영 후 실제로 5분 간격을 안정적으로 지키는지, 다른 폴러들과의
+      레이트리밋 경합으로 유실되는 사이클이 있는지 DB로 확인(다른 세 폴러는 2026-07-09에 이미 이 문제를
+      겪고 고정틱 스케줄링으로 고쳤음 — `poll_macro_snapshot`도 같은 패턴을 이미 쓰고 있지만 실운영
+      검증은 아직 안 함).
 
 ## 관측 인프라(Phase 1) 마무리
 

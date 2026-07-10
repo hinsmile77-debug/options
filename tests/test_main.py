@@ -14,9 +14,12 @@ from mahdi.main import (
     _parse_asking_price_leg,
     _parse_futures_tick,
     _parse_option_quote,
+    _parse_overseas_future_last_price,
     _parse_tick,
+    _parse_us10y_yield,
     poll_expiry_liquidity,
     poll_investor_flow,
+    poll_macro_snapshot,
     poll_option_chain,
     run_observation_loop,
 )
@@ -1113,3 +1116,233 @@ def test_poll_expiry_liquidity_default_offset_is_zero_and_skips_wait(monkeypatch
         _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
 
     assert sleep_calls == [2.0]  # 오프셋 없이 바로 "구독 없음 -> 2초 재확인" 경로
+
+
+def test_parse_overseas_future_last_price_strips_padding():
+    # KIS는 숫자 필드를 앞공백으로 패딩해 돌려준다(실측: "          17.50") — float()가 알아서 처리.
+    assert _parse_overseas_future_last_price({"output1": {"last_price": "          17.50"}}) == 17.50
+
+
+def test_parse_overseas_future_last_price_missing_field_returns_none():
+    assert _parse_overseas_future_last_price({}) is None
+    assert _parse_overseas_future_last_price({"output1": {"last_price": "N/A"}}) is None
+
+
+def test_parse_us10y_yield_valid_response():
+    assert _parse_us10y_yield({"output1": {"ovrs_nmix_prpr": "4.5400"}}) == pytest.approx(4.54)
+
+
+def test_parse_us10y_yield_missing_field_returns_none():
+    assert _parse_us10y_yield({}) is None
+
+
+class _FakeOverseasFutureMaster:
+    def __init__(self, mapping: dict[str, tuple[str | None, str | None]]):
+        self._mapping = mapping
+
+    def front_two_codes(self, product_code: str) -> tuple[str | None, str | None]:
+        return self._mapping.get(product_code, (None, None))
+
+
+class _FakeOverseasRestClient:
+    def __init__(self, future_prices: dict[str, dict], daily_chart: dict | None = None, failing: set[str] = frozenset()):
+        self._future_prices = future_prices
+        self._daily_chart = daily_chart
+        self._failing = failing
+        self.future_calls: list[str] = []
+        self.daily_calls: list[tuple[str, str]] = []
+
+    def get_overseas_future_price(self, srs_cd: str) -> dict:
+        self.future_calls.append(srs_cd)
+        if srs_cd in self._failing:
+            raise RuntimeError("KIS 500")
+        return self._future_prices[srs_cd]
+
+    def get_overseas_daily_chartprice(self, market_div_code, symbol, date_from, date_to, period_div_code="D") -> dict:
+        self.daily_calls.append((market_div_code, symbol))
+        if "US10Y" in self._failing:
+            raise RuntimeError("KIS 500")
+        return self._daily_chart
+
+
+def _future_price_response(last_price: float) -> dict:
+    return {"output1": {"last_price": str(last_price)}, "rt_cd": "0"}
+
+
+def _daily_chart_response(prpr: float) -> dict:
+    return {"output1": {"ovrs_nmix_prpr": str(prpr)}, "rt_cd": "0"}
+
+
+def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch):
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert set(rest_client.future_calls) == {"VXN26", "VXQ26", "CNHN26"}
+    assert len(written) == 1
+    row = written[0]
+    assert row["vix_front"] == 17.50
+    assert row["vix_next"] == 17.80
+    assert row["vix_term_structure"] == pytest.approx(17.80 / 17.50 - 1)
+    assert row["usdcnh"] == 6.7803
+    assert row["us10y_yield"] == pytest.approx(4.54)
+    assert row["zn_front"] is None  # 마스터에 ZN 매핑이 없으면(CBOT 미신청 등) 조회 자체를 건너뜀
+    assert row["quality_flag"] == 0
+
+
+def test_poll_macro_snapshot_includes_zn_front_when_cbot_enabled(monkeypatch):
+    # 2026-07-10 사용자가 계좌에 CBOT 거래소 신청을 완료한 뒤의 경로 — ZN 근월물이 마스터에
+    # 매핑되면 5분마다 zn_front도 함께 조회·적재돼야 한다.
+    master = _FakeOverseasFutureMaster(
+        {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ZN": ("ZNU26", "ZNZ26")}
+    )
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+            "ZNU26": _future_price_response(110.25),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert "ZNU26" in rest_client.future_calls
+    assert "ZNZ26" not in rest_client.future_calls  # 차근월물은 조회하지 않음(VIX와 달리 급변 감지엔 근월물 하나면 충분)
+    assert len(written) == 1
+    assert written[0]["zn_front"] == 110.25
+
+
+def test_poll_macro_snapshot_continues_when_zn_fails_but_others_succeed(monkeypatch):
+    # CBOT 신청 직후 일시적 오류 등으로 ZN만 실패해도 나머지 필드는 그대로 적재돼야 한다.
+    master = _FakeOverseasFutureMaster(
+        {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ZN": ("ZNU26", "ZNZ26")}
+    )
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+        failing={"ZNU26"},
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["zn_front"] is None
+    assert written[0]["vix_front"] == 17.50  # ZN 실패가 다른 필드를 막지 않음
+
+
+def test_poll_macro_snapshot_continues_when_us10y_fails(monkeypatch):
+    # CBOT 미신청 계좌 등으로 US10Y만 실패해도 VIX/USDCNH는 그대로 적재돼야 한다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", None)})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=None,
+        failing={"US10Y"},
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["us10y_yield"] is None
+    assert written[0]["vix_front"] == 17.50
+
+
+def test_poll_macro_snapshot_skips_write_when_all_futures_fail(monkeypatch):
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", None)})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={},
+        daily_chart=_daily_chart_response(4.54),
+        failing={"VXN26", "VXQ26", "CNHN26"},
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert written == []
+    assert rest_client.daily_calls == []  # 선물 3건이 전부 실패하면 US10Y 조회 자체를 시도하지 않음

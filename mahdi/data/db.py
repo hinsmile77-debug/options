@@ -21,6 +21,10 @@ _MARKET_RAW_1M_COLUMNS = (
     "usdkrw", "quality_flag",
 )
 
+_MACRO_SNAPSHOT_5M_COLUMNS = (
+    "timestamp", "vix_front", "vix_next", "vix_term_structure", "usdcnh", "us10y_yield", "zn_front", "quality_flag",
+)
+
 _OPTION_ANALYSIS_1M_COLUMNS = (
     "timestamp", "underlying", "expiry", "strike", "option_type",
     "delta", "gamma", "theta", "vega", "vanna", "charm",
@@ -82,6 +86,55 @@ def insert_option_analysis_1m(conn: ConnectionLike, row: dict) -> None:
         conn, "option_analysis_1m", _OPTION_ANALYSIS_1M_COLUMNS,
         ("timestamp", "underlying", "expiry", "strike", "option_type"), row,
     )
+
+
+def insert_macro_snapshot_5m(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: macro_snapshot_5m 컬럼과 동일한 키를 가진 dict(Cross-asset stress 원시값, v6 §7.3) —
+         vix_front/vix_next(CBOE VX 선물 근월·차근월 현재가), vix_term_structure(vix_next/
+         vix_front - 1, 양수면 콘탱고), usdcnh(HKEx CNH 선물 현재가), us10y_yield(해외주식
+         국채구분 일봉 API — 실제 수익률(%) 레벨, 대부분의 5분 행에서 None일 수 있음),
+         zn_front(2026-07-10 CBOT 거래소 신청 완료 후 추가 — CME 10년 국채선물 근월물 현재가,
+         5분마다 갱신되는 "급변" 감지용. 가격은 수익률과 역상관이므로 us10y_yield와 단위가 다름).
+    계산: INSERT ... ON CONFLICT (timestamp) DO UPDATE — 재처리에도 멱등.
+    """
+    _upsert(conn, "macro_snapshot_5m", _MACRO_SNAPSHOT_5M_COLUMNS, ("timestamp",), row)
+
+
+def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
+    """
+    계산: us10y_yield는 하루 대부분 NULL이라(위 insert_macro_snapshot_5m 설명 참고), 최신 행에
+         값이 없으면 값이 채워진 마지막 행에서 하나 더 가져와 LOCF(forward-fill)한다. zn_front는
+         CBOT 신청 완료 후 5분마다 갱신되므로 별도 폴백이 필요 없다.
+    해석: 대시보드/레짐 피처가 "지금 시점의 매크로 상태"를 한 번에 조회할 수 있게 한다.
+    실패 조건: 폴링이 한 번도 안 돌았으면 None.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, zn_front "
+            "FROM macro_snapshot_5m ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, zn_front = row
+    if us10y_yield is None:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT us10y_yield FROM macro_snapshot_5m "
+                "WHERE us10y_yield IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+            )
+            fallback = cur.fetchone()
+        us10y_yield = fallback[0] if fallback else None
+    return {
+        "timestamp": timestamp,
+        "vix_front": float(vix_front) if vix_front is not None else None,
+        "vix_next": float(vix_next) if vix_next is not None else None,
+        "vix_term_structure": float(vix_term_structure) if vix_term_structure is not None else None,
+        "usdcnh": float(usdcnh) if usdcnh is not None else None,
+        "us10y_yield": float(us10y_yield) if us10y_yield is not None else None,
+        "zn_front": float(zn_front) if zn_front is not None else None,
+    }
 
 
 def insert_underlying_spot(conn: ConnectionLike, timestamp: datetime, underlying: str, spot: float) -> None:

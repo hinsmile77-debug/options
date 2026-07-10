@@ -64,6 +64,54 @@ def test_get_asking_price_sends_expected_tr_id():
     assert captured["headers"]["tr_id"] == tr_codes.TR_OPTION_ASKING_PRICE["vps"]
 
 
+def test_get_overseas_future_price_sends_expected_tr_id_and_params():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = request.headers
+        return httpx.Response(200, json={"output1": {"last_price": "17.50"}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    result = client.get_overseas_future_price("VXN26")
+
+    assert result == {"output1": {"last_price": "17.50"}}
+    assert "SRS_CD=VXN26" in captured["url"]
+    assert captured["headers"]["tr_id"] == tr_codes.TR_OVERSEAS_FUTUREOPTION_PRICE
+    assert captured["url"].startswith(tr_codes.VPS_REST_DOMAIN)
+
+
+def test_get_overseas_daily_chartprice_sends_expected_params():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = request.headers
+        return httpx.Response(200, json={"output1": {}, "output2": []})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    client.get_overseas_daily_chartprice(
+        tr_codes.FID_MRKT_DIV_OVERSEAS_TREASURY, tr_codes.FID_INPUT_ISCD_US10Y, "20260601", "20260710"
+    )
+
+    assert captured["headers"]["tr_id"] == tr_codes.TR_OVERSEAS_INDEX_DAILY_CHARTPRICE
+    assert "FID_COND_MRKT_DIV_CODE=I" in captured["url"]
+    assert "FID_INPUT_ISCD=Y0202" in captured["url"]
+    assert "FID_INPUT_DATE_1=20260601" in captured["url"]
+    assert "FID_INPUT_DATE_2=20260710" in captured["url"]
+    assert "FID_PERIOD_DIV_CODE=D" in captured["url"]
+
+
 def test_get_balance_uses_account_settings():
     captured = {}
 

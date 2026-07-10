@@ -4,6 +4,62 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] Cross-asset stress(VIX 기간구조·USDCNH·US10Y) KIS 데이터 소스 조사·구현 — ZN(US10Y)만 CBOT 계좌 신청 대기로 미완
+
+**트리거:** 사용자가 "§7.3 Cross-asset stress 피처(USDKRW·USDCNH·US10Y 급변)를 KIS API로 구성할 수 있게
+수집하자, KIS github(stocks_info)로 확보 방안을 조사해"라고 요청. 이 코드베이스엔 USDCNH/US10Y/VIX 수집
+경로가 전혀 없었고(`market_raw_1m.usdkrw` 컬럼도 아무도 안 채움), 위 레짐 배선 작업 때도 데이터 소스가
+없어 `cross_asset_stress()`를 0.0 스텁으로 남겼던 바로 그 항목([[DECISION_LOG]] 2026-07-10 레짐 항목 참고).
+
+**조사(KIS GitHub `open-trading-api` 실제 클론 + 마스터파일 다운로드로 검증):**
+- VIX 현물지수는 KIS에 아예 없음 — 대신 CBOE VIX 선물(품목코드 `VX`)이 해외선물옵션 도메인에 있어
+  근월·차근월 스프레드로 기간구조(콘탱고/백워데이션)를 구성(이게 오히려 학계 표준 정의).
+- USDCNH도 온셰어 CNY 환율(해외주식 X구분)이 아니라 HKEx 상장 `CNH` 선물로 "USDCNH(HKEX)" 라벨 그대로 존재.
+- US10Y는 두 경로 확인: ① 해외주식 국채구분(I) 일봉 API — 계좌 제약 없이 실제 수익률(%, 심볼 `Y0202`)을
+  주지만 분봉은 `ERROR INVALID FID_COND_MRKT_DIV_CODE`로 거부돼 일봉이 한계. ② CME/CBOT `ZN`(10년 국채선물)
+  — 5분봉 가능하지만 **CBOT은 별도 거래소 신청이 계좌에 걸려 있어야** 함(모의투자 앱키로 VX/CNH는 즉시
+  성공, ZN만 `EGW00552: CBOT SUB거래소 신청 계좌가 아닙니다`로 거부됨을 실측 확인).
+- `ffcode.mst`(해외선물 마스터)에 최근월물여부 플래그가 있어 `symbol_master.py`와 같은 패턴으로 만기
+  롤오버를 자동화할 수 있음을 확인.
+
+**구현:**
+- `mahdi/data/overseas_future_master.py`(신규): `ffcode.mst`(고정폭 포맷) 다운로드·파싱, 품목코드별
+  근월·차근월 단축코드 조회(`front_two_codes`).
+- `mahdi/broker/tr_codes.py`: 해외선물옵션 시세(`HHDFC55010000`)·해외주식 국채일봉(`FHKST03030100`) 상수 추가.
+- `mahdi/broker/rest_client.py`: `get_overseas_future_price()`/`get_overseas_daily_chartprice()` 추가.
+- `db/migrations/006_macro_snapshot.sql`: `macro_snapshot_5m` 하이퍼테이블(vix_front/vix_next/
+  vix_term_structure/usdcnh/us10y_yield/quality_flag) 신규.
+- `mahdi/data/db.py`: `insert_macro_snapshot_5m`/`latest_macro_snapshot`(us10y_yield가 하루 대부분 NULL이라
+  LOCF 폴백 포함) 추가.
+- `mahdi/main.py`: `poll_macro_snapshot()` 5분 폴러 신규(VX 근월·차근월, CNH 근월, US10Y 일봉을 부분 실패
+  허용으로 수집) — `main()`의 `asyncio.gather`에 배선, 해외선물 마스터 로드 실패 시 이 폴러만 건너뜀.
+- `mahdi/dashboard/panels/macro_panel.py`(신규) + `data_source.py`/`app.py` 연동 — COCKPIT에 "Cross-asset
+  Stress" 표 섹션 추가(콘탱고/백워데이션 라벨, US10Y 없을 때 안내 캡션).
+- (CBOT 승인 후 추가) `db/migrations/007_macro_snapshot_zn.sql`: `zn_front` 컬럼 추가 — ZN 선물가는
+  수익률과 역상관이라 `us10y_yield`(실제 %)와 단위가 달라 별도 컬럼으로 분리. `poll_macro_snapshot`에
+  ZN 근월물 조회 추가, `_log_kis_call_failure()` 헬퍼로 실패 시 KIS 에러 바디(rt_cd/msg_cd/msg1)를 함께
+  로깅하도록 개선(500만 봐서는 레이트리밋/계좌 미신청/일시 장애를 구분할 수 없었음).
+
+**운영 조치:** 이미 실행 중이던 `mahdi.main`(사용자가 별도로 띄워둔 프로세스, PID로 발견)을 새 코드
+반영을 위해 총 세 차례 재시작 — 매번 `docker exec ... psql < 마이그레이션.sql`로 먼저 스키마를 적용한
+뒤 재시작. KIS 토큰은 분당 1회 발급 제한이 있어, 재시작 직후 검증용 별도 스크립트를 바로 돌리면 방금
+재발급된 프로세스 토큰과 충돌할 수 있음을 인지하고 별도 스크립트 실행은 피하고 재시작 자체의 로그로만
+검증(재시작 한 번으로 검증까지 겸함).
+
+**검증:** pytest 218→225개 전부 통과. 실제 KIS 모의투자로 VX(`VXN26`/`VXQ26`)·CNH(`CNHN26`)·US10Y 일봉
+전부 200 OK 응답과 `macro_snapshot_5m` 실제 적재 확인(`vix_term_structure=+6.8%` 등 정상 계산). COCKPIT도
+Streamlit으로 실제 기동해 새 패널이 에러 없이 렌더링됨을 확인.
+
+**알려진 한계(다음 확인 필요):** ① 사용자가 KIS 앱/HTS에서 "CBOT 거래소 신청을 완료했다"고 했지만,
+재시작 후 세 번의 5분 사이클(13:12/13:17/13:21) 모두 여전히 `EGW00552`로 거부됨 — 신청이 KIS 쪽에서
+아직 처리되지 않은 것으로 보임(익영업일 배치 처리 가능성, 계좌 종류 불일치 가능성 등). 코드는 이미
+완성돼 있어 KIS 쪽에서 실제로 열리면 재시작 없이 다음 사이클부터 자동으로 채워진다. ② 이번 작업은
+"원시 매크로 데이터 수집·표시"까지만 — `mahdi/features/regime_features.py`의 `cross_asset_stress()`
+스텁(레짐 엔진 입력)을 `macro_snapshot_5m`을 쓰도록 실데이터로 교체하는 배선은 아직 안 함
+([[NEXT_TODO]] 참고).
+
+---
+
 ## [2026-07-10] 레짐이 하루종일 "평균회귀"/REGIME_UNSTABLE에 고정되는 문제 조사 → 실데이터 파이프라인 배선
 
 **트리거:** 사용자가 COCKPIT 스크린샷(현재 레짐=평균회귀, 레짐 안정성=REGIME_UNSTABLE, 확률 막대가
