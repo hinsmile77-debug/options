@@ -1,6 +1,6 @@
 # CURRENT_STATE — 마흐디(options) 현재 개발 상태
 
-_최종 갱신: 2026-07-09_
+_최종 갱신: 2026-07-10_
 
 ---
 
@@ -39,6 +39,7 @@ _최종 갱신: 2026-07-09_
 - `db.py`: TimescaleDB 커넥션+upsert 헬퍼(market_raw_1m/feature_store/regime_state/option_analysis_1m/underlying_spot_1m) — 2026-07-06: `insert_option_analysis_1m`/`insert_underlying_spot`/`latest_underlying_spot`/`latest_option_chain` 추가
 - `symbol_master.py`: KIS 종목코드 마스터파일(`fo_idx_code_mts.mst`) 다운로드·파싱 — 최근월 선물코드, 옵션 체인(행사가 목록), 행사가→단축코드 조회 제공
   - **주의**: 이 파일의 실제 컬럼 순서는 KIS 공식 참고 스크립트와 다름(월물구분코드/행사가/ATM구분 위치가 다름). 옵션의 만기 판별은 `월물구분코드`가 아니라 `한글종목명`에서 정규식으로 추출한 YYYYMM 사용 — symbol_master.py 헤더 주석에 근거 상세 기록.
+  - **2026-07-10 정정**: 위클리 콜/풋은 상품종류 N/O 단독이 아니라 N/O·L/M 두 코드풀을 주차마다 번갈아 쓴다(2026-07-06엔 그 주 우연히 N/O만 있어 "L/M 없음"으로 오판). `options(series="weekly")`가 두 풀을 모두 조회하도록 수정 완료 — 상세는 [[DECISION_LOG]]/[[SESSION_LOG]] 2026-07-10 항목, 요일(월/목) 확정은 [[NEXT_TODO]]에 남은 미해결 항목.
 
 ### db/migrations/002_underlying_spot.sql — 2026-07-06 신규
 - `underlying_spot_1m(timestamp, underlying, spot)` 하이퍼테이블 — REST 폴링이 얻은 KOSPI200 지수 자체(output3.bstp_nmix_prpr)를 저장. `market_raw_1m`은 종목(옵션)별 틱 집계용이라 지수를 담기 부적절해 분리.
@@ -57,6 +58,8 @@ _최종 갱신: 2026-07-09_
   - 선물/옵션 식별 방식도 2단계로 진화했다: 처음엔 `vpin IS NOT NULL`(선물만 채워짐 가정)로 구분했는데, 옵션에도 VPIN을 적용하면서 그 가정이 깨져 **`active_futures_symbol` 레지스트리 테이블**(신규, `db/migrations/004`)로 명시적 조회로 교체함([[DECISION_LOG]] 참고).
 - **2026-07-06 Streamlit 모듈 캐싱 주의** ([[DECISION_LOG]] 참고): `app.py`(엔트리)만 매 리런마다 디스크에서 새로 읽힌다 — `data_source.py`/`panels/*.py`처럼 `import`되는 하위 모듈은 파이썬 모듈 캐시에 남으므로, 그 파일들을 고치면 `st.rerun()` 폴링이나 브라우저 새로고침만으로는 반영 안 되고 **COCKPIT 프로세스 자체를 재시작**해야 한다. `_load_from_db`의 `except Exception`에 `logger.exception(...)` 추가해 향후 원인 추적 가능하게 함.
 - **2026-07-07 Flow Radar x축 장외 시간공백 제거**: `flow_radar_panel.py`의 세 차트(OFI/VPIN/체결가) 전부에 Plotly `rangebreaks` 적용 — 주말 전체 + 매일 15:45~09:00(v6 §16.1 거래시간 09:00~15:45 기준)을 x축에서 건너뛴다. 이전엔 전일 장마감~당일 개장 사이 공백이 x축 대부분을 차지해 체결이 뜸한 옵션 계열이 거의 안 보였음([[SESSION_LOG]] 참고). **COCKPIT 재시작 후 브라우저 육안 확인 아직 안 함**.
+- **2026-07-06 만기 유동성 비교 패널**(Phase 1.5-④): `expiry_liquidity_panel.py`(Plotly Table)가 먼슬리/위클리 두 북의 ATM±2 %스프레드·깊이·거래량·잔존일수를 나란히 표시, `app.py` "만기 유동성 비교" 섹션에 배치. `data_source.py`의 `expiry_liquidity` 필드/`db.latest_expiry_liquidity()`가 공급.
+- **2026-07-10 먼슬리 만기 주 안내 추가**: `build_expiry_liquidity_table(rows, today=...)`에 regular 북 만기가 오늘과 같은 ISO주에 속하는지 판정하는 `_is_monthly_expiry_week()` 추가 — 해당되면 표 제목에 "이번 주는 먼슬리 만기 주 — 위클리 신규 상장 없음" 안내 표시(`app.py`가 `snapshot.as_of.date()` 전달). 사용자가 eFriend 캡처로 "먼슬리 만기 주엔 목요일 위클리가 대신 먼슬리로 나온다"를 지적한 데서 비롯 — 이 조사 과정에서 위클리 상품종류 N/O·L/M 코드풀 버그도 함께 발견·수정함(위 `symbol_master.py` 항목, [[DECISION_LOG]]/[[SESSION_LOG]] 참고).
 
 ### mahdi/main.py 옵션 체인 REST 폴링 — 2026-07-06 신규 (`poll_option_chain`)
 - WS 구독(ATM±3, `subscription_manager.desired_strikes`)과 동일한 행사가×콜/풋에 대해 60초 간격으로 `rest_client.get_quote()`를 반복 호출 → `option_analysis_1m`/`underlying_spot_1m` 적재.

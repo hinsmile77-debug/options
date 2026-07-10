@@ -18,6 +18,10 @@ _SAMPLE_ROWS = [
     "N|BAFBLWA73|STDW02|위클리M C 2607W1 1,180.0|2|1180.0| |2001|KOSPI200",
     "N|BAFBMWA73|STDW03|위클리M C 2607W2 1,180.0|1|1180.0| |2001|KOSPI200",
     "O|CAFBLWA41|STDW04|위클리M P 2607W1 1,100.0|2|1100.0| |2001|KOSPI200",
+    # 위클리 코드풀 B(상품종류 L/M) — 2026-07-10 실측: N/O 풀과 격주로 교대 배정되며 한글종목명에
+    # "M"이 끼지 않는다("위클리C 2607W0" 형식). 두 풀 모두 위클리로 집계돼야 한다.
+    "L|BAFCLWA10|STDW05|위클리C 2607W0 1,100.0|2|1100.0| |2001|KOSPI200",
+    "M|CAFCLWA10|STDW06|위클리P 2607W0 1,100.0|2|1100.0| |2001|KOSPI200",
 ]
 
 
@@ -99,30 +103,31 @@ def test_option_symbol_returns_none_for_unlisted_strike(tmp_path):
     assert master.option_symbol("C", 999.0) is None
 
 
-def test_options_weekly_series_filters_by_product_type_N_O(tmp_path):
+def test_options_weekly_series_filters_by_product_type_N_O_and_L_M(tmp_path):
     master = _master(tmp_path)
     calls = master.options("C", series="weekly")
     puts = master.options("P", series="weekly")
-    assert set(calls["단축코드"]) == {"BAFBLWA41", "BAFBLWA73", "BAFBMWA73"}
-    assert set(puts["단축코드"]) == {"CAFBLWA41"}
+    # N/O 풀(BAFB*)과 L/M 풀(BAFCLWA10/CAFCLWA10)이 모두 위클리로 잡혀야 함
+    assert set(calls["단축코드"]) == {"BAFBLWA41", "BAFBLWA73", "BAFBMWA73", "BAFCLWA10"}
+    assert set(puts["단축코드"]) == {"CAFBLWA41", "CAFCLWA10"}
     # regular(기본값)에는 위클리 행이 섞여 들면 안 됨
     assert "BAFBLWA41" not in set(master.options("C")["단축코드"])
+    assert "BAFCLWA10" not in set(master.options("C")["단축코드"])
 
 
-def test_nearest_expiry_chain_weekly_picks_w1_over_w2(tmp_path):
+def test_nearest_expiry_chain_weekly_picks_nearest_week_across_pools(tmp_path):
     master = _master(tmp_path)
     chain = master.nearest_expiry_chain("KOSPI200", series="weekly")
     symbols = {entry["symbol"] for entry in chain}
-    # BAFBMWA73(W2, 다음주)는 제외되고 W1(BAFBLWA41/73, CAFBLWA41)만 남아야 함
-    assert "BAFBMWA73" not in symbols
-    assert symbols == {"BAFBLWA41", "BAFBLWA73", "CAFBLWA41"}
+    # W0(BAFCLWA10/CAFCLWA10, L/M 풀)가 W1(N/O 풀)보다 가까우므로 W0만 남아야 함 —
+    # 즉 두 코드풀을 섞어 봤을 때도 진짜 최근접 위클리를 놓치지 않는다는 검증.
+    assert symbols == {"BAFCLWA10", "CAFCLWA10"}
 
 
 def test_option_symbol_weekly_series_matches_nearest_week_and_strike(tmp_path):
     master = _master(tmp_path)
-    assert master.option_symbol("C", 1100.0, series="weekly") == "BAFBLWA41"
-    assert master.option_symbol("P", 1100.0, series="weekly") == "CAFBLWA41"
-    # W2에만 있는 조합(1180.0 자체는 W1에도 있어 대신 없는 strike로 검증)
+    assert master.option_symbol("C", 1100.0, series="weekly") == "BAFCLWA10"
+    assert master.option_symbol("P", 1100.0, series="weekly") == "CAFCLWA10"
     assert master.option_symbol("C", 9999.0, series="weekly") is None
 
 

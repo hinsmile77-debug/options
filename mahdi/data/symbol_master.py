@@ -50,23 +50,31 @@ _COLUMNS = [
 ]
 
 # 상품종류 코드 (기초자산명="KOSPI200" 행 기준 실측)
-# 주의(2026-07-06): KIS 공식 헤더(종목마스터정보(지수선물옵션).h, github.com/koreainvestment/
-# open-trading-api)는 위클리콜/풋을 "L"/"M"으로 문서화하지만, 실제 다운로드한 마스터파일에는
-# L/M이 단 한 행도 없고 대신 N/O가 위클리로 쓰인다(9,635행 전수 확인). N/O 종목을 실제
-# get_quote()로 만기일을 실측한 결과 7일 간격(예: 2026-07-06 → 2026-07-13)으로 확인됨 —
-# 문서-실물 드리프트로 판단, 실물(N/O)을 신뢰한다.
+# 정정(2026-07-10): 2026-07-06 당시엔 "L/M이 단 한 행도 없다"고 결론 냈으나, 그건 그 주(週)
+# 우연히 N/O 풀만 살아있었을 뿐이었다. 2026-07-10 재실측(먼슬리 만기 다음날, 두 위클리 만기가
+# 동시에 상장된 시점) 결과 L/M 행이 실제로 존재하며(위클리C/P, 예: "위클리C 2607W3"), N/O
+# 행(위클리M C/P, 예: "위클리M C 2607W2")과 동시에 살아있었다 — 즉 KRX는 위클리 콜/풋에
+# 주차마다 두 코드풀(N/O ↔ L/M)을 번갈아 배정한다("위클리M"의 "M"은 상품 구분이 아니라 이
+# 코드풀의 이름 표기 관례일 뿐, 행사가 간격·범위 모두 L/M과 동일해 별도 상품이 아님을 확인).
+# 한쪽 풀만 조회하면 그 풀이 아닌 주의 최근접 위클리를 통째로 놓쳐 위클리 시세가 통째로
+# 비는(대시) 버그가 난다 — 두 풀을 모두 위클리로 취급해야 한다.
 PRODUCT_TYPE_FUTURES = "1"  # 지수선물 (정규)
 PRODUCT_TYPE_OPTION_CALL = "5"  # 지수옵션 콜 (정규, 월물)
 PRODUCT_TYPE_OPTION_PUT = "6"  # 지수옵션 풋 (정규, 월물)
 PRODUCT_TYPE_MINI_OPTION_CALL = "D"  # 미니옵션 콜
 PRODUCT_TYPE_MINI_OPTION_PUT = "E"  # 미니옵션 풋
-PRODUCT_TYPE_WEEKLY_OPTION_CALL = "N"  # 위클리옵션 콜 (실물 실측 — 공식 문서는 "L"로 오기)
-PRODUCT_TYPE_WEEKLY_OPTION_PUT = "O"  # 위클리옵션 풋 (실물 실측 — 공식 문서는 "M"으로 오기)
+PRODUCT_TYPE_WEEKLY_OPTION_CALL = "N"  # 위클리옵션 콜 — 코드풀 A(2026-07-06 최초 실측)
+PRODUCT_TYPE_WEEKLY_OPTION_PUT = "O"  # 위클리옵션 풋 — 코드풀 A
+PRODUCT_TYPE_WEEKLY_OPTION_CALL_ALT = "L"  # 위클리옵션 콜 — 코드풀 B(2026-07-10 재실측, 격주 교대)
+PRODUCT_TYPE_WEEKLY_OPTION_PUT_ALT = "M"  # 위클리옵션 풋 — 코드풀 B
 
 _SERIES_PRODUCT_TYPES = {
-    "regular": (PRODUCT_TYPE_OPTION_CALL, PRODUCT_TYPE_OPTION_PUT),
-    "mini": (PRODUCT_TYPE_MINI_OPTION_CALL, PRODUCT_TYPE_MINI_OPTION_PUT),
-    "weekly": (PRODUCT_TYPE_WEEKLY_OPTION_CALL, PRODUCT_TYPE_WEEKLY_OPTION_PUT),
+    "regular": ((PRODUCT_TYPE_OPTION_CALL,), (PRODUCT_TYPE_OPTION_PUT,)),
+    "mini": ((PRODUCT_TYPE_MINI_OPTION_CALL,), (PRODUCT_TYPE_MINI_OPTION_PUT,)),
+    "weekly": (
+        (PRODUCT_TYPE_WEEKLY_OPTION_CALL, PRODUCT_TYPE_WEEKLY_OPTION_CALL_ALT),
+        (PRODUCT_TYPE_WEEKLY_OPTION_PUT, PRODUCT_TYPE_WEEKLY_OPTION_PUT_ALT),
+    ),
 }
 
 
@@ -144,8 +152,9 @@ class IndexDerivativesMaster:
     def options(self, option_type: str, underlying: str = "KOSPI200", series: str = "regular") -> pd.DataFrame:
         """
         option_type: "C" 또는 "P". series: "regular"(정규 월물, 기본값) | "mini"(미니, 승수
-        50,000원) | "weekly"(위클리, 상품종류 N/O — 2026-07-06 추가, 실물 실측 근거는
-        PRODUCT_TYPE_WEEKLY_OPTION_* 주석 참고).
+        50,000원) | "weekly"(위클리, 상품종류 N/O 또는 L/M — 2026-07-06 추가·2026-07-10 확장,
+        실물 실측 근거는 PRODUCT_TYPE_WEEKLY_OPTION_* 주석 참고. KRX가 위클리 콜/풋 코드를
+        주차마다 두 풀 사이에서 번갈아 배정하므로 둘 다 봐야 최근접 위클리를 놓치지 않는다).
 
         해석: 반환 DataFrame에 "만기YYYYMM" 컬럼을 추가해서 준다 — regular/mini는 월물구분코드가
              실제로는 만기 순번을 뜻하지 않는다(실측 결과 11개 서로 다른 만기월에 걸쳐 단
@@ -158,10 +167,10 @@ class IndexDerivativesMaster:
             raise ValueError("option_type은 'C' 또는 'P'여야 합니다")
         if series not in _SERIES_PRODUCT_TYPES:
             raise ValueError(f"series는 {sorted(_SERIES_PRODUCT_TYPES)} 중 하나여야 합니다")
-        call_type, put_type = _SERIES_PRODUCT_TYPES[series]
-        product_type = call_type if option_type == "C" else put_type
+        call_types, put_types = _SERIES_PRODUCT_TYPES[series]
+        product_types = call_types if option_type == "C" else put_types
         df = self._df
-        rows = df[(df["상품종류"] == product_type) & (df["기초자산명"] == underlying)].copy()
+        rows = df[(df["상품종류"].isin(product_types)) & (df["기초자산명"] == underlying)].copy()
         expiry_pattern = _WEEKLY_EXPIRY_FROM_NAME if series == "weekly" else _EXPIRY_FROM_NAME
         rows["만기YYYYMM"] = rows["한글종목명"].str.extract(expiry_pattern)[0]
         return rows.sort_values(["만기YYYYMM", "행사가"])

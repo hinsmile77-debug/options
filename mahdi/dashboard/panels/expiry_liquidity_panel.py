@@ -7,18 +7,43 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import plotly.graph_objects as go
 
 _SERIES_LABEL_KO = {"regular": "먼슬리", "weekly": "위클리"}
 
+_MONTHLY_EXPIRY_WEEK_NOTE = (
+    "※ 이번 주는 먼슬리 만기 주 — 목요일 위클리 신규 상장이 없어 먼슬리가 그 역할을 대신합니다"
+    "(위클리 행은 차주 위클리를 관측 중)."
+)
 
-def build_expiry_liquidity_table(rows: list[dict]) -> go.Figure:
+
+def _is_monthly_expiry_week(rows: list[dict], today: date) -> bool:
+    """
+    계산: "regular" 북의 만기가 today와 같은 (연도, ISO주차)에 속하면 이번 주가 먼슬리
+         만기 주라고 판단한다. KRX는 먼슬리 만기 주의 목요일에는 위클리를 별도 상장하지
+         않으므로(2026-07-10 확인), 이 경우 "weekly" 행은 자동으로 차주 위클리를 가리키게
+         된다 — 사용자가 데이터 누락(대시)으로 오인하지 않도록 명시적으로 알려준다.
+    """
+    for r in rows:
+        if r.get("series") != "regular":
+            continue
+        expiry = r.get("expiry")
+        if expiry is not None and expiry.isocalendar()[:2] == today.isocalendar()[:2]:
+            return True
+    return False
+
+
+def build_expiry_liquidity_table(rows: list[dict], today: date | None = None) -> go.Figure:
     """
     입력: [{"series", "expiry", "atm_spread_pct", "depth", "volume", "days_to_expiry"}, ...]
-         (data_source.DashboardSnapshot.expiry_liquidity — 북당 최신 1행씩).
+         (data_source.DashboardSnapshot.expiry_liquidity — 북당 최신 1행씩). today는 "이번 주가
+         먼슬리 만기 주인가" 판정 기준(기본값 오늘) — 테스트에서 고정 날짜 주입용으로도 쓴다.
     계산: Plotly 표로 렌더링. %스프레드는 Cao & Wei(2010) 권고에 따른 상대(%) 스프레드이지
          달러 스프레드가 아니므로 "%" 단위로 표시한다.
     """
+    today = today if today is not None else date.today()
     labels = [_SERIES_LABEL_KO.get(r["series"], r["series"]) for r in rows]
     expiries = [r["expiry"].isoformat() if r.get("expiry") else "-" for r in rows]
     spreads = [f"{r['atm_spread_pct'] * 100:.2f}%" if r.get("atm_spread_pct") is not None else "-" for r in rows]
@@ -35,5 +60,12 @@ def build_expiry_liquidity_table(rows: list[dict]) -> go.Figure:
             cells=dict(values=[labels, expiries, spreads, depths, volumes, days], align="center"),
         )
     )
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=160)
+    if _is_monthly_expiry_week(rows, today):
+        fig.update_layout(
+            margin=dict(l=10, r=10, t=36, b=10),
+            height=196,
+            title=dict(text=_MONTHLY_EXPIRY_WEEK_NOTE, font=dict(size=12), x=0, xanchor="left"),
+        )
+    else:
+        fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=160)
     return fig

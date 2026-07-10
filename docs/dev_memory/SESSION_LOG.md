@@ -4,6 +4,25 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] 위클리 콜/풋 코드풀(N/O만 조회하던 버그) 발견·수정 + 먼슬리 만기 주 COCKPIT 안내 추가
+
+**트리거:** 사용자가 eFriend에서 캡처한 목요일 위클리 콜/풋 종목코드 화면(C09F6WA69=풋/B09F6WA69=콜, "위클리P/C 2607W3")을 첨부하며 "어제(목요일)는 먼슬리 만기 주라 위클리가 먼슬리 가격을 대신 보여줬다(대시됐다)"고 알려주고, 이 내용을 만기유동성비교·Flow Radar에 반영해달라고 요청.
+
+**조사:** 캡처만으로는 두 코드가 콜/풋 중 뭔지, "대시"가 어디서 관측된 현상인지 불명확해 먼저 `AskUserQuestion`으로 확인(→ 먼슬리 만기 주엔 목요일 위클리 신규 상장이 없고 먼슬리가 대신한다는 뜻, 두 코드는 하나는 콜·하나는 풋, 원하는 반영 방식은 "먼슬리 만기 주 판별 로직 추가"). 이후 `symbol_master.load_index_derivatives_master()`로 KIS 마스터파일을 실제로 내려받아 직접 조사:
+- 정규 먼슬리 최근월이 이미 202608로 넘어가 있고 위클리 쪽엔 이번 주(7/9, 먼슬리 만기 목요일) 몫이 아예 없음 → "먼슬리 만기 주엔 위클리 미상장" 확인.
+- **더 크게 중요한 발견**: 상품종류 `L`/`M`에 "위클리C/P 2607W3"(102 strikes/side) 행이 실제로 존재했다 — 2026-07-06 당시 "L/M은 단 한 행도 없다"고 결론 낸 전제가 틀렸음(그날은 그 주 위클리가 우연히 N/O 풀이었을 뿐). `symbol_master.py`의 `options(series="weekly")`는 N/O만 필터링하므로, L/M 풀이 그 주의 활성 위클리일 때는 최근접 위클리를 통째로 못 찾는 버그였다 — "위클리 시세가 대시됐다"의 실제 원인 후보. 이 발견은 NEXT_TODO의 미해결 항목("위클리(목)"이 N/O를 공유하는지 새 상품종류를 쓰는지 확인 필요, 2026-07-06)과도 직접 연결됨 — L/M이 그 "위클리(목)" 상품일 가능성이 높으나, 정확한 만기 요일(월/목) 대응은 실측 `get_quote()` 없이는 이름만으로 확정 불가(기존 코드 주석과 동일한 제약).
+
+**구현:**
+- `mahdi/data/symbol_master.py`: `_SERIES_PRODUCT_TYPES["weekly"]`가 콜/풋 각각 상품종류 코드 튜플(`("N","L")`/`("O","M")`)을 갖도록 확장, `options()` 필터를 `==`에서 `.isin(...)`으로 변경. `PRODUCT_TYPE_WEEKLY_OPTION_CALL_ALT`("L")/`PUT_ALT`("M") 상수 추가, 2026-07-06 주석의 "L/M 없음" 결론을 정정하는 주석으로 교체.
+- `mahdi/dashboard/panels/expiry_liquidity_panel.py` + `app.py`: `build_expiry_liquidity_table(rows, today=...)`에 `_is_monthly_expiry_week()` 판정 추가 — regular 북 만기가 오늘과 같은 ISO주에 속하면 표 제목에 "이번 주는 먼슬리 만기 주 — 위클리 신규 상장 없음" 안내를 표시. `app.py`는 `snapshot.as_of.date()`를 넘겨줌.
+- Flow Radar(`data_source.py`)는 별도 수정 없음 — "가장 활발한 옵션" 선정이 `master.option_symbol()`을 거치는 `RollingSubscriptionManager` 구독에 의존하므로 위 심볼마스터 수정으로 자동 해결됨.
+
+**검증:** `tests/test_data_symbol_master.py`에 L/M 풀 픽스처 행 추가 + 두 풀이 함께 잡히는지/두 풀 중 진짜 최근접만 남는지 테스트 갱신, `tests/test_dashboard_expiry_liquidity_panel.py`에 먼슬리 만기 주 안내 노출/비노출 테스트 2개 추가. 전체 172개 통과(주의: 이 PC의 기본 `python`은 `anaconda3/envs/py37_32`(3.7)를 가리켜 `Path.write_text(newline=...)` 등에서 즉시 실패함 — 반드시 프로젝트 `.venv/Scripts/python.exe`로 실행할 것, 이미 알려진 사항이나 이번에도 처음에 걸림).
+
+**다음 확인 필요:** L/M 풀이 정말 "위클리(목)"이고 N/O가 "위클리(월)"인지(또는 단순 격주 교대 풀인지) 실거래 중 `get_quote()`의 `futs_last_tr_date`로 요일 확정 필요 — [[NEXT_TODO]] 참고.
+
+---
+
 ## [2026-07-09] Gamma Wall 5분 간격 4분 유실 조사 → 폴링 3개 루프 고정 틱 스케줄링 전환
 
 **트리거:** 사용자가 COCKPIT의 Gamma Wall을 보다가 09:03/09:08/09:13/09:18 — 정확히 5분 간격으로 `option_analysis_1m`의 특정 분이 통째로 비는 패턴을 발견해 "이득/손실을 조사하고, 개선할 경우 방향을 설명해"라고 요청.

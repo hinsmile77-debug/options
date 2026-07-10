@@ -59,7 +59,10 @@ def render() -> None:
 
     st.subheader("만기 유동성 비교 (먼슬리 vs 위클리)")
     if snapshot.expiry_liquidity:
-        st.plotly_chart(build_expiry_liquidity_table(snapshot.expiry_liquidity), width='stretch')
+        st.plotly_chart(
+            build_expiry_liquidity_table(snapshot.expiry_liquidity, today=snapshot.as_of.date()),
+            width='stretch',
+        )
     else:
         st.caption("아직 만기 유동성 폴링 데이터가 없습니다.")
 

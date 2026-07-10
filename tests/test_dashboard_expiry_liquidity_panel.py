@@ -45,3 +45,55 @@ def test_build_expiry_liquidity_table_handles_missing_values():
     assert list(labels) == ["위클리"]
     assert list(expiries) == ["-"]
     assert list(spreads) == ["-"]
+
+
+def test_build_expiry_liquidity_table_notes_monthly_expiry_week():
+    # regular 만기가 today와 같은 ISO주(2026-07-09, 목)에 속함 — 이번 주가 먼슬리 만기 주라서
+    # 위클리 신규 상장이 없는 경우(2026-07-10 실측 근거)를 사람이 바로 알아볼 수 있어야 한다.
+    rows = [
+        {
+            "series": "regular",
+            "expiry": date(2026, 7, 9),
+            "atm_spread_pct": 0.02,
+            "depth": 300.0,
+            "volume": 900.0,
+            "days_to_expiry": 0,
+        },
+        {
+            "series": "weekly",
+            "expiry": date(2026, 7, 16),  # 이번 주가 아니라 차주 위클리
+            "atm_spread_pct": 0.05,
+            "depth": 90.0,
+            "volume": 200.0,
+            "days_to_expiry": 7,
+        },
+    ]
+
+    fig = build_expiry_liquidity_table(rows, today=date(2026, 7, 8))
+
+    assert "먼슬리 만기 주" in fig.layout.title.text
+
+
+def test_build_expiry_liquidity_table_no_note_outside_monthly_expiry_week():
+    rows = [
+        {
+            "series": "regular",
+            "expiry": date(2026, 8, 13),
+            "atm_spread_pct": 0.02,
+            "depth": 300.0,
+            "volume": 900.0,
+            "days_to_expiry": 34,
+        },
+        {
+            "series": "weekly",
+            "expiry": date(2026, 7, 16),
+            "atm_spread_pct": 0.05,
+            "depth": 90.0,
+            "volume": 200.0,
+            "days_to_expiry": 7,
+        },
+    ]
+
+    fig = build_expiry_liquidity_table(rows, today=date(2026, 7, 8))
+
+    assert fig.layout.title.text is None
