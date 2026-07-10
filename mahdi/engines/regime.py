@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import pickle
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
 
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
@@ -173,6 +175,35 @@ class RegimeEngine:
         for state, p in enumerate(proba):
             prob_vector[self._state_to_label[state]] = float(p)
         return prob_vector
+
+    def save(self, path: str | Path) -> None:
+        """
+        입력: 저장 경로.
+        계산: fit()으로 캘리브레이션된 model/state_to_label을 pickle로 직렬화한다 — 오프라인
+             배치(scripts/fit_regime_engine.py)가 만든 결과를 실시간 프로세스가 재학습 없이 로드.
+        실패 조건: fit() 이전이면 RuntimeError(미캘리브레이션 상태 저장 방지).
+        """
+        if not self._fitted:
+            raise RuntimeError("fit() 이전에는 save()할 수 없습니다")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump({"model": self.model, "state_to_label": self._state_to_label}, f)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RegimeEngine":
+        """
+        입력: save()가 만든 pickle 경로.
+        계산: model/state_to_label을 복원한 fitted RegimeEngine을 반환한다.
+        실패 조건: 파일이 없으면 FileNotFoundError(호출측이 잡아서 warmup_fallback으로 폴백해야 함).
+        """
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        engine = cls()
+        engine.model = payload["model"]
+        engine._state_to_label = payload["state_to_label"]
+        engine._fitted = True
+        return engine
 
 
 _GAP_ZSCORE_THRESHOLD = 2.0

@@ -1,8 +1,10 @@
 """관측 전용 오케스트레이터 (Phase1 범위) — 토큰 데몬 -> WS 수집기 -> 1분 집계 -> DB 적재.
 
-Regime 갱신은 §7.4/§16.1 워밍업 규칙을 따른다: 세션 초반에는 warmup_fallback()을 사용하고,
-Hurst/ADX 등 레짐 입력 피처를 축적해 RegimeEngine.fit()을 실행하는 것은 연속 세션 데이터가
-쌓인 뒤(Research 단계) 진행하는 다음 단계다 — 이 스크립트는 그 전환 지점까지의 배선을 담당한다.
+Regime 갱신은 mahdi.engines.regime_pipeline.RegimeStateMachine에 위임한다(2026-07-10 실배선
+완료) — 선물봉마다 §7.3 6개 피처를 실데이터로 계산해 feature_store에 축적하고, data/models/에
+캘리브레이션된 모델이 있으면 predict(), 없으면 실제 gap_zscore/투자자수급 기반 macro_score/전일
+마감 레짐을 넣은 warmup_fallback()을 쓴다. HMM fit()은 feature_store가 충분히(수십 세션) 쌓인
+뒤 scripts/fit_regime_engine.py로 오프라인 실행한다.
 
 주문 실행/리스크 게이트는 Phase2 범위이므로 여기서는 다루지 않는다.
 """
@@ -25,7 +27,7 @@ from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
 from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivatives_master
-from mahdi.engines.regime import RegimeLabel, warmup_fallback
+from mahdi.engines.regime_pipeline import RegimeStateMachine
 from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp
 from mahdi.features.orderflow import calculate_vpin
 
@@ -94,22 +96,26 @@ async def run_observation_loop(
     subscription_managers: list[RollingSubscriptionManager],
     rest_client: KISRestClient,
     futures_symbol: str,
+    regime_state_machine: RegimeStateMachine,
 ) -> None:
     """
     입력: 이미 연결된 WS 클라이언트, 구독 롤링 매니저 목록(2026-07-06부터 리스트 — 먼슬리/위클리
          등 여러 만기 북을 동시에 굴리기 위함, 북마다 별도 인스턴스), REST 클라이언트, 최근월
          지수선물 단축코드(예: "101S03" — 분기마다 바뀌므로 종목코드 마스터파일/설정으로 최신화
-         필요).
+         필요), 레짐 상태머신(mahdi.engines.regime_pipeline.RegimeStateMachine).
     계산: "선물옵션 시세"(inquire-price, F 시장)로 초기 스팟(KOSPI200 지수) 조회 → 모든 구독
          매니저를 그 스팟으로 롤링(각자 자기 만기 시리즈에서 ATM±N을 계산) → 선물 실시간체결가
          (H0IFCNT0)도 함께 구독(2026-07-06 추가) → 현재 선물 단축코드를 active_futures_symbol에
          등록(대시보드가 "이 종목이 선물인지" 바로 조회 가능하게) → WS 메시지 수신 → 종목(선물·
          옵션·만기북 구분 없이)별로 1분봉 완성 시 market_raw_1m 적재(각 틱에 실린 종목코드를
-         그대로 사용 — 북마다 최대 14개 옵션 종목이 동시에 켜지므로 종목별 분리가 필수) → 워밍업
-         레짐을 regime_state에 기록. 모든 종목의 틱은 등거래량 버킷(VolumeBucketAggregator)에도
-         먹여 VPIN을 계산하고 그 종목의 봉에 실어 적재한다(2026-07-06: 처음엔 선물에만 적용했으나,
-         옵션도 원한다는 사용자 요청으로 종목 구분 없이 통일 — 옵션은 거래량이 얇아 버킷이 느리게
-         완성되거나 VPIN이 0.5 근처에 자주 머물 수 있음을 알고 진행).
+         그대로 사용 — 북마다 최대 14개 옵션 종목이 동시에 켜지므로 종목별 분리가 필수). 레짐은
+         선물봉이 완성될 때만 regime_state_machine.step()으로 갱신한다(2026-07-10 — 레짐은
+         기초자산 하나에 대한 판단이라 옵션 레그 봉 완성 타이밍과는 무관해야 함; 이전에는 모든
+         종목의 봉 완성마다 재계산해 같은 분에 여러 번 덮어쓰고 있었다). 모든 종목의 틱은
+         등거래량 버킷(VolumeBucketAggregator)에도 먹여 VPIN을 계산하고 그 종목의 봉에 실어
+         적재한다(2026-07-06: 처음엔 선물에만 적용했으나, 옵션도 원한다는 사용자 요청으로 종목
+         구분 없이 통일 — 옵션은 거래량이 얇아 버킷이 느리게 완성되거나 VPIN이 0.5 근처에 자주
+         머물 수 있음을 알고 진행).
     실패 조건: DB 연결 실패·WS 단절 시 예외가 위로 전파된다 — 재시작은 프로세스 관리자(Ops) 책임.
     """
     quote = rest_client.get_quote(futures_symbol, market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
@@ -185,15 +191,17 @@ async def run_observation_loop(
                     "quality_flag": bar.quality_flag,
                 },
             )
-            state = warmup_fallback(RegimeLabel.RANGE_BALANCED, macro_score=0.0, gap_zscore=0.0)
-            db.insert_regime_state(
-                conn,
-                timestamp=bar.minute,
-                regime=int(state.regime),
-                prob_vector=list(state.prob_vector),
-                higher_tf_regime=None,
-                stability_flag=state.stability_flag,
-            )
+            if tick_symbol == futures_symbol:
+                regime_state_machine.update_bar(bar)
+                state = regime_state_machine.step(conn, bar.minute)
+                db.insert_regime_state(
+                    conn,
+                    timestamp=bar.minute,
+                    regime=int(state.regime),
+                    prob_vector=list(state.prob_vector),
+                    higher_tf_regime=int(state.higher_tf_regime) if state.higher_tf_regime is not None else None,
+                    stability_flag=state.stability_flag,
+                )
 
     await ws_client.listen(handle_message)
 
@@ -384,6 +392,21 @@ async def _collect_option_chain_cycle(
     return rows, latest_spot, any_strikes
 
 
+def _update_atm_iv(regime_state_machine: RegimeStateMachine | None, rows: list[dict], latest_spot: float | None) -> None:
+    """
+    입력: 레짐 상태머신(없으면 아무 것도 안 함), 이번 사이클에서 파싱된 옵션체인 행들, 최신 스팟.
+    계산: 스팟에 가장 가까운 행사가를 ATM으로 보고 그 행사가의 콜/풋 IV 평균을 구해
+         RegimeFeatureBuilder의 iv_chg 롤링 윈도에 흘려넣는다(§7.3 ATM IV 변화율 근사 입력).
+    실패 조건: rows나 latest_spot이 없으면 건너뛴다.
+    """
+    if regime_state_machine is None or not rows or latest_spot is None:
+        return
+    atm_strike = min(rows, key=lambda r: abs(r["strike"] - latest_spot))["strike"]
+    ivs = [r["iv"] for r in rows if r["strike"] == atm_strike and r.get("iv") is not None]
+    if ivs:
+        regime_state_machine.update_iv(sum(ivs) / len(ivs))
+
+
 async def poll_option_chain(
     rest_client: KISRestClient,
     books: list[tuple[RollingSubscriptionManager, str]],
@@ -391,6 +414,7 @@ async def poll_option_chain(
     underlying: str = UNDERLYING,
     interval_seconds: float = OPTION_CHAIN_POLL_INTERVAL_SECONDS,
     retry_backoff_seconds: float = CYCLE_RETRY_BACKOFF_SECONDS,
+    regime_state_machine: RegimeStateMachine | None = None,
 ) -> None:
     """
     입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(2026-07-06부터 리스트 — 먼슬리
@@ -432,6 +456,8 @@ async def poll_option_chain(
             )
             if not rows:
                 logger.warning("옵션 체인 폴링 재시도도 실패 — 이번 사이클 포기")
+
+        _update_atm_iv(regime_state_machine, rows, latest_spot)
 
         if rows:
             with db.get_connection() as conn:
@@ -753,6 +779,7 @@ async def main() -> None:
     token_daemon = TokenDaemon(kis_settings)
     rest_client = KISRestClient(kis_settings, token_daemon)
     approval_key = ApprovalKeyIssuer(kis_settings).issue()
+    regime_state_machine = RegimeStateMachine(underlying=UNDERLYING, futures_symbol=futures_symbol)
 
     # 시세(H0IOCNT0/H0IOASP0)는 계좌 무관 공개 데이터라 모의투자 전용 도메인이 없다 —
     # is_mock 여부와 상관없이 MARKET_DATA_WS_DOMAIN(실전 도메인) 하나로 접속한다.
@@ -799,8 +826,9 @@ async def main() -> None:
                 [monthly_manager, weekly_mon_manager, weekly_thu_manager],
                 rest_client,
                 futures_symbol=futures_symbol,
+                regime_state_machine=regime_state_machine,
             ),
-            poll_option_chain(rest_client, books, master),
+            poll_option_chain(rest_client, books, master, regime_state_machine=regime_state_machine),
             poll_expiry_liquidity(
                 rest_client, books, master, startup_offset_seconds=EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS
             ),

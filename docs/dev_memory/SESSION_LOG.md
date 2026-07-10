@@ -4,6 +4,60 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] 레짐이 하루종일 "평균회귀"/REGIME_UNSTABLE에 고정되는 문제 조사 → 실데이터 파이프라인 배선
+
+**트리거:** 사용자가 COCKPIT 스크린샷(현재 레짐=평균회귀, 레짐 안정성=REGIME_UNSTABLE, 확률 막대가
+평균회귀만 100%·나머지 7개 전부 0%)을 두 차례(시간차를 두고 기초자산가만 다름) 보여주며 "레짐
+데이터가 정상수집되고 판정되어 올바른 레짐이 표시되고 있는지 점검해"라고 요청.
+
+**조사:** Explore 서브에이전트로 `mahdi/engines/regime.py`/`mahdi/main.py`/`mahdi/dashboard/`를 훑어
+근본 원인을 확정: `main.py`의 `run_observation_loop`가 매 분봉마다 `RegimeEngine.predict()`(실제
+HMM 분류기)를 전혀 호출하지 않고, `warmup_fallback(RegimeLabel.RANGE_BALANCED, macro_score=0.0,
+gap_zscore=0.0)`을 **하드코딩된 인자**로만 반복 호출하고 있었다. `gap_zscore`가 항상 0이라
+`warmup_fallback`의 갭 판정 분기(`abs(gap_zscore)>=2.0`)가 절대 참이 될 수 없어 늘 `prior_close_regime`
+(하드코딩된 RANGE_BALANCED)을 그대로 반환하고, `stability_flag=False`도 조건 없이 고정 — 스크린샷과
+정확히 일치. 재조회 시점(코드 변경 없음, 시세만 이동)에도 동일 증상이 재현돼 스테일 데이터가 아니라
+배선 자체가 안 돼 있음을 재확인.
+
+**계획 수립:** `predict()` 완전 전환에는 `fit()`에 "수십 세션 분량" 피처 이력이 필요한데(regime.py
+주석) 지금은 축적된 게 전혀 없다는 제약, `cross_asset_stress`(USDKRW/USDCNH/US10Y)·완전한
+`macro_score`(VIX 기간구조·S&P선물 등, §8 나침반)는 이 코드베이스에 데이터 소스 자체가 없다는 제약을
+사용자와 확인한 뒤, EnterPlanMode로 범위를 명시한 계획을 세우고 승인받음 — 오늘 실데이터로 계산
+가능한 부분만 정직하게 구현하고, 안 되는 부분은 중립 스텁+TODO로 남기기로 확정.
+
+**구현:**
+- `mahdi/features/regime_features.py`(신규): §7.3 6개 피처(hurst_exponent/adx/rv_ratio/iv_change_rate/
+  book_thinning/cross_asset_stress) 순수 함수. book_thinning은 원 스펙(호가 잔량 급감)이 요구하는
+  잔량 절대치가 스키마에 없어 `bid_ask_spread` 급확대 z-score로 대리, cross_asset_stress는 데이터
+  소스가 없어 0.0 중립 스텁+TODO.
+- `mahdi/engines/regime.py`: `RegimeEngine.save()`/`load()` 추가(pickle) — 오프라인 fit 결과를 실시간
+  프로세스가 재학습 없이 로드.
+- `mahdi/data/db.py`: `get_feature_history`/`latest_regime_before`/`daily_closes` 헬퍼 추가.
+- `mahdi/engines/regime_pipeline.py`(신규): `RegimeFeatureBuilder`(선물봉 롤링 윈도), `compute_gap_zscore`
+  (전일 마지막 스팟·오늘 첫 스팟·전일 ATM 스트래들 IV로 실계산), `compute_macro_score_proxy`(외국인
+  순매수 부호를 매크로 나침반 근사치로 사용, TODO로 완전한 나침반 필요성 명시), `latest_prior_close_regime`
+  (하드코딩 대신 DB 조회), `RegimeStateMachine`(모델 파일 있으면 predict(), 없으면 실데이터
+  warmup_fallback()).
+- `mahdi/main.py`: 하드코딩 호출 제거하고 `RegimeStateMachine.step()`으로 교체. **레짐 갱신을 선물봉
+  완성 시에만** 하도록 수정(기존엔 옵션 봉 완성 때도 매번 재계산해 같은 분에 여러 번 덮어쓰던 부수
+  버그도 같이 정리). 옵션체인 폴링에서 ATM 근사 IV를 뽑아 상태머신에 흘려주는 배선 추가.
+- `scripts/fit_regime_engine.py`(신규): `feature_store` 축적 데이터로 `RegimeEngine.fit()`을 오프라인
+  실행해 `data/models/regime_engine.pkl`에 저장하는 배치 — 20영업일 이상 쌓인 뒤 수동 실행.
+
+**검증:** 신규 테스트 32개(`test_features_regime_features.py`/`test_engines_regime.py` save/load
+라운드트립/`test_regime_pipeline.py`) 추가, 기존 `test_main.py` 4개는 시그니처 변경(신규
+`regime_state_machine` 인자)·"레짐은 선물봉에서만 갱신" 정정에 맞춰 갱신. 전체 199개 통과
+(`.venv/Scripts/python.exe -m pytest` — 이 PC 기본 `python`은 conda `py37_32`라 여전히 안 맞음, 매번
+확인 필요).
+
+**다음 확인 필요:** (1) 관측 루프 재시작 전까지는 옛 하드코딩 로직이 계속 돈다 — 재시작 필요.
+(2) 재시작 후 큰 갭이 있는 날 gap_zscore 기반 TREND/VOL_EXPANSION/CRISIS_DEFENSE 전환이 실제로
+동작하는지 확인. (3) `feature_store`가 20영업일 이상 쌓이면 `scripts/fit_regime_engine.py` 실행해
+`predict()` 전환이 실제로 되는지 확인. (4) cross_asset_stress/완전한 macro_score는 USDKRW·USDCNH·
+US10Y·VIX 기간구조 등 외부 데이터 소스 연동이 필요 — 아직 미착수([[NEXT_TODO]] 참고).
+
+---
+
 ## [2026-07-10] 위클리(목) 누적거래량이 계속 0으로 나오는 문제 조사 → 스프레드/거래량 파싱 결합 버그 발견·수정
 
 **트리거:** 화석 `weekly` 행 정리 후 COCKPIT을 다시 본 사용자가 위클리(목) 행의 누적거래량이 0인 걸 보고 "확인해"라고 요청.

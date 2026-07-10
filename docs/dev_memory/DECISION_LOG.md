@@ -4,6 +4,38 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-10] 레짐 워밍업 실데이터화 — cross_asset_stress/macro_score는 근사치·스텁으로 제한, HMM fit은 오프라인 배치로 분리
+
+**결정:** `main.py`가 매 선물봉마다 `RegimeStateMachine.step()`을 호출하도록 배선하되, 스펙(§7.3/§8)이
+요구하는 입력 중 이 코드베이스에 데이터 소스가 없는 부분은 **정직하게 근사치/중립 스텁으로 제한**했다:
+`cross_asset_stress`(USDKRW·USDCNH·US10Y)는 0.0 고정 반환, `macro_score`(VIX 기간구조·S&P선물 등 완전한
+나침반)는 이미 수집 중인 `investor_flow_1m`의 외국인 순매수 부호로 근사. 반대로 `gap_zscore`·
+`prior_close_regime`은 이미 수집 중인 실데이터(`underlying_spot_1m`/`option_analysis_1m`/`regime_state`)로
+완전히 실계산했다. `RegimeEngine.fit()`은 main.py가 직접 호출하지 않고 `scripts/fit_regime_engine.py`
+오프라인 배치로 분리해, `data/models/regime_engine.pkl` 존재 여부만으로 `RegimeStateMachine`이
+predict()/warmup_fallback()을 자동 판단하게 했다.
+
+**Why:** 사용자가 "완벽하게 개선 구현해"라고 요청했지만, 실제로는 세 가지 하드 제약이 있었다.
+① `RegimeEngine.fit()`은 "수십 세션 분량" 피처 이력이 필요한데(regime.py 원 주석) 지금은 feature_store가
+텅 비어 있어 오늘 당장 fit()해도 무의미하다 — 데이터가 쌓이는 시간 자체를 코드로 대체할 수 없다.
+② USDCNH/US10Y/VIX 기간구조는 KIS API 범위 밖이라 별도 데이터 소스 연동이 필요한 별개의 큰 작업이다.
+③ 완전한 macro_score도 마찬가지로 외부 매크로 데이터가 필요하다. 이 제약을 무시하고 대충 지어낸 값을
+넣으면 "고쳐진 것처럼 보이지만 실제로는 근거 없는 신호"가 되어 나중에 디버깅을 더 어렵게 만든다 —
+그래서 계산 가능한 부분(gap/prior_regime)은 실데이터로 완전히 배선하고, 안 되는 부분(cross_asset_stress/
+macro_score)은 명시적 근사치·스텁+TODO로 남겨 "이 값은 아직 근사치다"가 코드에서 바로 보이게 했다.
+EnterPlanMode로 이 범위를 사용자에게 먼저 제시하고 승인받은 뒤 구현했다.
+
+**How to apply:** 앞으로 USDKRW/USDCNH/US10Y나 VIX 기간구조 데이터 소스를 연동하게 되면
+`mahdi/features/regime_features.py`의 `cross_asset_stress()` 스텁과 `mahdi/engines/regime_pipeline.py`의
+`compute_macro_score_proxy()`를 실데이터 버전으로 교체할 것 — 함수 시그니처는 유지하고 내부 구현만
+바꾸면 `RegimeStateMachine`/HMM 피처 차원은 그대로 재사용된다. `feature_store`가 20영업일 이상 쌓이면
+`python scripts/fit_regime_engine.py` 실행 → `data/models/regime_engine.pkl` 생성 → 다음 관측 루프
+재시작부터 자동으로 predict() 모드로 전환된다(코드 변경 불필요). 레짐 갱신 트리거를 "모든 종목 봉
+완성"에서 "선물봉 완성만"으로도 함께 좁혔다(레짐은 기초자산 하나에 대한 판단이라 옵션 레그 봉 타이밍과
+무관해야 함) — `tests/test_main.py`의 관련 테스트도 이 정정에 맞춰 갱신했다.
+
+---
+
 ## [2026-07-10] `_parse_asking_price_leg`가 호가 없어도 누적거래량은 살리도록 스프레드/거래량 파싱 분리
 
 **결정:** `main.py`의 `_parse_asking_price_leg()` 반환 타입을 `tuple[float,float,float] | None`에서 `dict | None`(`{"spread_pct", "depth", "volume"}`, 각 값은 개별적으로 `None`일 수 있음)으로 바꿨다. 호가(ask/bid)가 없어 %스프레드·깊이를 못 구해도 `acml_vol`(누적거래량)은 별도로 파싱해 살린다. 셋 다 못 구할 때만 `None`. `poll_expiry_liquidity()`의 호출부도 세 값을 각각 `is not None`일 때만 집계에 더하도록 수정.

@@ -24,7 +24,27 @@ _최종 갱신: 2026-07-10_
 - `GaussianHMM`(hmmlearn, 8-state), `n_restarts`회 재시작 후 최고 로그우도 모델 채택(EM 지역해 방지)
 - 상태→레짐 라벨 매핑은 rv_ratio/stress/thinning/hurst 기반 결정론적 휴리스틱
 - `warmup_fallback()`: 장 초반 데이터 부족 시 전일 마감 레짐+갭 z-score로 대체
+- `save()`/`load()`(2026-07-10 신규): pickle로 `model`/`state_to_label`을 직렬화 — 오프라인 fit 배치가
+  만든 결과를 실시간 프로세스가 재학습 없이 로드
 - **알려진 한계**: §7.3 입력 피처에 방향(상승/하락) 신호가 없어 TREND_UP/DOWN 구분은 hurst만으로 확정 불가 (테스트에서도 이 둘은 "트렌드 계열"로만 검증)
+
+### mahdi/engines/regime_pipeline.py — Regime 실시간 배선 (2026-07-10 신규)
+- **배경**: `main.py`가 매 분봉마다 `warmup_fallback(RANGE_BALANCED, macro_score=0.0, gap_zscore=0.0)`을
+  하드코딩된 인자로만 호출해 레짐이 하루종일 "평균회귀"/`REGIME_UNSTABLE`에 고정되는 버그를 사용자가
+  COCKPIT에서 발견해 조사 요청([[SESSION_LOG]]/[[DECISION_LOG]] 2026-07-10 항목 참고).
+- `RegimeFeatureBuilder`: 선물봉 롤링 윈도(고/저/종가·스프레드·ATM IV)로 `mahdi/features/regime_features.py`의
+  §7.3 6개 피처를 매분 계산.
+- `compute_gap_zscore`/`compute_macro_score_proxy`/`latest_prior_close_regime`: `warmup_fallback()` 입력을
+  실데이터(`underlying_spot_1m`/`option_analysis_1m`/`investor_flow_1m`/`regime_state`)로 계산.
+- `RegimeStateMachine`: 매분 `feature_store`에 피처를 적재하고, `data/models/regime_engine.pkl`(있으면)로
+  `RegimeEngine.predict()`, 없으면 실데이터 `warmup_fallback()`을 반환. `main.py`는 선물봉 완성 시에만
+  `step()`을 호출한다(이전엔 옵션봉 완성 때도 매번 갱신하던 부수 버그가 있었음).
+- **범위 제약(의도적)**: `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 데이터 소스가 없어 0.0 고정 스텁,
+  `macro_score`는 완전한 매크로 나침반(§8) 대신 외국인 순매수 부호 근사치 — 둘 다 TODO로 명시됨.
+- `scripts/fit_regime_engine.py`(신규): `feature_store` 축적 데이터로 `RegimeEngine.fit()`을 오프라인
+  실행하는 배치. main.py는 refit하지 않고 결과 파일 존재 여부만 본다. 20영업일(~8,000행) 이상 쌓인 뒤
+  수동 실행 권장.
+- **아직 재시작 안 함** — 반영하려면 관측 루프 프로세스 재시작 필요([[NEXT_TODO]] 참고).
 
 ### mahdi/broker/ — KIS OpenAPI 클라이언트
 - `token_daemon.py`: 접근토큰 발급/캐싱/만료 자동 갱신 — 모의투자 실제 토큰 발급 확인됨
@@ -107,7 +127,7 @@ _최종 갱신: 2026-07-10_
 - `active_futures_symbol(underlying, symbol, updated_at)` — 단일 현재값 레지스트리(하이퍼테이블 아님). 대시보드가 "이 종목이 지금 구독 중인 선물인지"를 vpin 유무 같은 휴리스틱 없이 바로 조회하게 함.
 
 ### 테스트
-- `uv run pytest` — 170개 전부 통과 (2026-07-09 기준). **주의**: 이 PC의 기본 `python`(conda `py37_32`, 3.7)은 `typing.Protocol` 미지원이라 `tests/test_main.py` 임포트부터 실패한다 — 반드시 프로젝트 로컬 `.venv/Scripts/python.exe -m pytest`로 실행할 것.
+- `.venv/Scripts/python.exe -m pytest` — 199개 전부 통과 (2026-07-10 기준, 레짐 파이프라인 배선으로 신규 32개 추가). **주의**: 이 PC의 기본 `python`(conda `py37_32`, 3.7)은 `typing.Protocol` 미지원이고 `hmmlearn`도 없어 `tests/test_engines_regime.py`/`tests/test_regime_pipeline.py` 임포트부터 실패한다 — 반드시 프로젝트 로컬 `.venv/Scripts/python.exe -m pytest`로 실행할 것.
 
 ### 2026-07-09 REST 폴링 안정화 (7/8 하루치 실측 기반, [[SESSION_LOG]]/[[DECISION_LOG]] 참고)
 - `mahdi/broker/rest_client.py`: `KISRestClient`에 스레드 안전 공유 레이트리미터(기본 2건/초) 추가 — 옵션체인/수급/유동성 폴링 3개 루프가 동시에 REST를 쏘면서 KIS 앱키 TPS 한도를 넘겨 정규장 405분 중 203분치 `option_analysis_1m`이 통째로 유실됐던 문제 대응.

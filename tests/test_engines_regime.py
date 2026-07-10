@@ -177,6 +177,45 @@ def test_fit_smoke_runs_end_to_end_on_separable_data():
     assert sum(state.prob_vector) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_save_before_fit_raises(tmp_path):
+    engine = RegimeEngine()
+    with pytest.raises(RuntimeError):
+        engine.save(tmp_path / "model.pkl")
+
+
+def test_save_load_roundtrip_predicts_identically(tmp_path):
+    rng = np.random.default_rng(0)
+    centers = [
+        (0.5, 25, 3.0, 0.05, 1.0, 1.0),
+        (0.5, 15, 0.3, -0.02, 1.0, 1.0),
+        (0.4, 30, 1.2, 0.10, 5.0, 1.5),
+        (0.4, 15, 1.0, 0.0, 1.0, 5.0),
+        (0.9, 35, 1.0, 0.0, 0.5, 0.5),
+        (0.75, 30, 1.0, 0.0, 0.7, 0.7),
+        (0.45, 14, 1.0, 0.0, 0.4, 0.4),
+        (0.05, 6, 1.0, 0.0, 0.9, 1.3),
+    ]
+    blocks = [np.asarray(c) + rng.normal(scale=1e-6, size=(10, len(c))) for c in centers]
+    features = np.vstack(blocks)
+
+    engine = RegimeEngine(random_state=0, n_restarts=3, n_iter=50)
+    engine.fit(features)
+    model_path = tmp_path / "regime_engine.pkl"
+    engine.save(model_path)
+
+    loaded = RegimeEngine.load(model_path)
+    original_state = engine.predict(features[-5:])
+    loaded_state = loaded.predict(features[-5:])
+
+    assert loaded_state.regime == original_state.regime
+    assert loaded_state.prob_vector == original_state.prob_vector
+
+
+def test_load_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        RegimeEngine.load(tmp_path / "does_not_exist.pkl")
+
+
 def test_warmup_fallback_returns_prior_when_gap_small():
     state = warmup_fallback(RegimeLabel.RANGE_BALANCED, macro_score=0.5, gap_zscore=0.3)
     assert state.regime == RegimeLabel.RANGE_BALANCED

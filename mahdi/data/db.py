@@ -264,6 +264,60 @@ def insert_feature_store(conn: ConnectionLike, timestamp: datetime, symbol: str,
     _upsert(conn, "feature_store", ("timestamp", "symbol", "features", "feature_version"), ("timestamp", "symbol"), row)
 
 
+def get_feature_history(conn: ConnectionLike, symbol: str, feature_version: str) -> list[tuple[datetime, dict]]:
+    """
+    입력: 심볼, 피처 버전 태그.
+    계산: feature_store에서 해당 심볼·버전의 전체 이력을 시간순으로 반환한다 — 오프라인
+         fit 배치(scripts/fit_regime_engine.py)가 RegimeEngine.fit() 입력 ndarray를 구성할 때 사용.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT timestamp, features FROM feature_store "
+            "WHERE symbol=%s AND feature_version=%s ORDER BY timestamp ASC",
+            (symbol, feature_version),
+        )
+        rows = cur.fetchall()
+    return [(ts, features if isinstance(features, dict) else json.loads(features)) for ts, features in rows]
+
+
+def latest_regime_before(conn: ConnectionLike, before: datetime) -> int | None:
+    """
+    입력: 기준 시각(보통 오늘 자정) — 이 시각 이전(전일까지)의 마지막 레짐을 찾는다.
+    계산: SELECT ... WHERE timestamp < before ORDER BY timestamp DESC LIMIT 1.
+    해석: 실거래 파이프라인의 워밍업 폴백(warmup_fallback)이 하드코딩된 prior_close_regime
+         대신 실제 전일 마감 레짐을 쓸 수 있게 한다.
+    실패 조건: 이전 기록이 없으면(첫 실행일) None — 호출측이 기본 레짐으로 폴백해야 함.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT regime FROM regime_state WHERE timestamp < %s ORDER BY timestamp DESC LIMIT 1",
+            (before,),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else None
+
+
+def daily_closes(conn: ConnectionLike, symbol: str, days: int) -> list[float]:
+    """
+    입력: 선물 심볼, 조회할 최근 거래일 수(넉넉히, 예: 30 — rv_ratio가 21개를 요구).
+    계산: market_raw_1m을 날짜별로 묶어 각 날짜의 마지막 체결가(종가)를 뽑는다.
+    해석: mahdi.features.regime_features.rv_ratio 입력 — 시간순(오래된 순)으로 반환한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (timestamp::date) timestamp::date AS d, close
+            FROM market_raw_1m
+            WHERE symbol=%s
+            ORDER BY d DESC, timestamp DESC
+            LIMIT %s
+            """,
+            (symbol, days),
+        )
+        rows = cur.fetchall()
+    return [float(close) for _, close in reversed(rows)]
+
+
 def insert_regime_state(
     conn: ConnectionLike,
     timestamp: datetime,

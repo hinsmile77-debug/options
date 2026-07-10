@@ -6,6 +6,7 @@ import pytest
 
 from mahdi.broker.ws_client import KISWebSocketClient
 from mahdi.data.subscription_manager import RollingSubscriptionManager
+from mahdi.engines.regime import RegimeLabel, RegimeState
 from mahdi.features.options_intel import OptionLeg, calculate_gex
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.main import (
@@ -22,6 +23,16 @@ from mahdi.main import (
 
 _NUM_FIELDS = 45  # _MIN_FIELDS in mahdi.main (index 0..44)
 _FUT_NUM_FIELDS = 40  # _FUT_MIN_FIELDS(38) in mahdi.main
+
+
+class _FakeRegimeStateMachine:
+    """run_observation_loop 테스트용 — 실제 RegimeStateMachine 대신 DB 접근 없이 고정값만 반환."""
+
+    def update_bar(self, bar) -> None:
+        pass
+
+    def step(self, conn, timestamp) -> RegimeState:
+        return RegimeState(regime=RegimeLabel.RANGE_BALANCED, prob_vector=(0.0,) * 8, stability_flag=False, is_warmup=True)
 
 
 def _make_h0ifcnt0(
@@ -214,7 +225,12 @@ def test_run_observation_loop_writes_bar_and_regime_on_minute_rollover(monkeypat
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol="101S03"))
+        _run(
+            run_observation_loop(
+                ws_client, [subscription_manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+            )
+        )
 
     assert rest_client.calls == 1
     assert subscription_manager.desired_strikes  # 초기 ATM 구독이 수행됨
@@ -223,7 +239,9 @@ def test_run_observation_loop_writes_bar_and_regime_on_minute_rollover(monkeypat
     assert bar["symbol"] == "201S03C325"
     assert bar["open"] == 350.0
     assert bar["close"] == 350.2
-    assert len(written_regimes) == 1
+    # 2026-07-10: 레짐은 선물봉 완성 시에만 갱신한다 — 이 테스트의 틱은 전부 옵션(futures_symbol과
+    # 다른 심볼)이라 옵션봉은 market_raw_1m에 적재되지만 regime_state는 갱신되지 않아야 한다.
+    assert len(written_regimes) == 0
 
 
 def test_run_observation_loop_keeps_different_symbols_in_separate_bars(monkeypatch):
@@ -255,7 +273,12 @@ def test_run_observation_loop_keeps_different_symbols_in_separate_bars(monkeypat
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol="101S03"))
+        _run(
+            run_observation_loop(
+                ws_client, [subscription_manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+            )
+        )
 
     assert len(written_bars) == 1  # 09:00분 봉은 콜만 flush됨(풋은 아직 진행 중인 분이라 미완성)
     call_bar = next(b for b in written_bars if b["symbol"] == "201S03C325")
@@ -751,7 +774,12 @@ def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol))
+        _run(
+            run_observation_loop(
+                ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol,
+                regime_state_machine=_FakeRegimeStateMachine(),
+            )
+        )
 
     futures_bars = [b for b in written_bars if b["symbol"] == futures_symbol]
     assert len(futures_bars) == 1
@@ -800,7 +828,12 @@ def test_run_observation_loop_computes_vpin_for_option_symbol_too(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
 
     with pytest.raises(ConnectionError):
-        _run(run_observation_loop(ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol))
+        _run(
+            run_observation_loop(
+                ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol,
+                regime_state_machine=_FakeRegimeStateMachine(),
+            )
+        )
 
     assert len(written_bars) == 1
     bar = written_bars[0]

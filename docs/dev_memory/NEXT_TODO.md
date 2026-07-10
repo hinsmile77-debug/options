@@ -4,6 +4,24 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ---
 
+## 레짐(Regime) 실데이터 파이프라인 — 2026-07-10 배선 완료, 재시작 및 후속 확인 필요
+
+- [ ] 관측 루프 재시작 필요 — 재시작 전까지는 옛 하드코딩 `warmup_fallback(RANGE_BALANCED, 0, 0)`
+      로직이 계속 돈다([[SESSION_LOG]]/[[DECISION_LOG]] 2026-07-10 항목 참고).
+- [ ] 재시작 후 큰 갭이 있는 날 `compute_gap_zscore` 기반 TREND_UP/DOWN·VOL_EXPANSION·CRISIS_DEFENSE
+      전환이 실제로 동작하는지 확인. 갭이 작은 평상시엔 전일 마감 레짐을 그대로 물려받는 게 정상 동작.
+- [ ] `feature_store`에 §7.3 6개 피처가 매분 실제로 쌓이는지 DB로 확인(`symbol="KOSPI200"`,
+      `feature_version="v1"`).
+- [ ] `feature_store`가 20영업일 이상(대략 8,000행) 쌓이면 `python scripts/fit_regime_engine.py` 실행 →
+      `data/models/regime_engine.pkl` 생성 → 다음 재시작부터 `RegimeStateMachine`이 자동으로 predict()
+      모드로 전환되는지 확인.
+- [ ] `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 현재 0.0 고정 스텁 — 데이터 소스 연동 필요(§7.3 완전
+      구현의 남은 부분).
+- [ ] `macro_score`는 현재 외국인 순매수 부호 근사치(`compute_macro_score_proxy`) — VIX 기간구조·
+      S&P선물 등을 포함한 완전한 매크로 나침반(§8)으로 교체 검토.
+- [ ] `rv_ratio`(RV5d/RV20d)는 선물 심볼이 분기 롤오버될 때마다 일별 종가 이력이 끊긴다(현재 심볼
+      기준으로만 `daily_closes` 조회) — 롤오버 연속성 처리 필요 여부 검토.
+
 ## 관측 인프라(Phase 1) 마무리
 
 - [x] `nearest_expiry_chain()`으로 얻은 심볼 목록을 순회하며 `rest_client.get_quote()` 반복 호출 →
