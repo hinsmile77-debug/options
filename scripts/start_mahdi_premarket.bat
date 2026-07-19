@@ -56,7 +56,13 @@ echo [%date% %time%] COCKPIT 대시보드 실행 (새 창) >> "%LOG_FILE%"
 start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && uv run streamlit run mahdi/dashboard/app.py >> logs\cockpit.log 2>&1"
 
 echo [%date% %time%] 관측 루프 실행 (새 창) >> "%LOG_FILE%"
-start "Mahdi Observation Loop" cmd /k "cd /d %PROJECT_DIR% && uv run python -m mahdi.main >> logs\observation_loop.log 2>&1"
+REM 2026-07-19(§5-5 로그 위생): stdout을 여기서 logs\observation_loop.log로 리다이렉트하면
+REM Python 로깅(mahdi.main._configure_logging()의 RotatingFileHandler)이 회전시키는 파일을
+REM 이 리다이렉트가 계속 원래 경로에 append해 덮어써 로테이션이 무의미해진다(105MB까지 무한
+REM 누적됐던 원인) — 이제 Python이 그 파일을 직접 소유하므로 stdout은 콘솔 창에만 보이게 두고,
+REM stderr(로깅 설정이 끝나기 전 극초반 크래시 등 로깅으로 못 잡는 것)만 별도의 회전 없는
+REM 크래시 전용 로그로 남긴다.
+start "Mahdi Observation Loop" cmd /k "cd /d %PROJECT_DIR% && uv run python -m mahdi.main 2>>logs\observation_loop_crash.log"
 
 echo [%date% %time%] ===== 기동 스크립트 종료 (창들은 계속 실행 중) ===== >> "%LOG_FILE%"
 

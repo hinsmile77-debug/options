@@ -2,6 +2,8 @@ import asyncio
 import logging
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import pytest
 
@@ -1656,3 +1658,74 @@ def test_poll_macro_snapshot_skips_write_when_all_futures_fail(monkeypatch):
 
     assert written == []
     assert rest_client.daily_calls == []  # 선물 3건이 전부 실패하면 US10Y 조회 자체를 시도하지 않음
+
+
+def test_configure_logging_uses_rotating_file_handler(monkeypatch, tmp_path):
+    # 2026-07-19(§5-5 "로그 위생"): logs/observation_loop.log가 로테이션 없이 105MB까지
+    # 누적됐던 문제 — Python 로깅이 파일당 LOG_MAX_BYTES로 회전시키는 RotatingFileHandler를
+    # 실제로 구성하는지 검증한다(실제 프로젝트 logs/ 디렉터리는 건드리지 않도록 tmp_path로 치환).
+    import mahdi.main as mahdi_main
+
+    fake_log_dir = tmp_path / "logs"
+    fake_log_file = fake_log_dir / "observation_loop.log"
+    monkeypatch.setattr(mahdi_main, "LOG_DIR", fake_log_dir)
+    monkeypatch.setattr(mahdi_main, "LOG_FILE", fake_log_file)
+
+    basic_config_calls = []
+    monkeypatch.setattr(mahdi_main.logging, "basicConfig", lambda **kwargs: basic_config_calls.append(kwargs))
+
+    mahdi_main._configure_logging()
+
+    assert fake_log_dir.exists()  # mkdir(parents=True, exist_ok=True) 확인
+    assert len(basic_config_calls) == 1
+    handlers = basic_config_calls[0]["handlers"]
+    assert len(handlers) == 2
+
+    file_handlers = [h for h in handlers if isinstance(h, RotatingFileHandler)]
+    assert len(file_handlers) == 1
+    file_handler = file_handlers[0]
+    assert file_handler.maxBytes == mahdi_main.LOG_MAX_BYTES
+    assert file_handler.backupCount == mahdi_main.LOG_BACKUP_COUNT
+    assert Path(file_handler.baseFilename) == fake_log_file.resolve()
+
+    stream_handlers = [h for h in handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)]
+    assert len(stream_handlers) == 1
+
+
+def test_poll_option_chain_throttles_repeated_leg_insert_failure_warnings(monkeypatch, caplog):
+    # 2026-07-19(§5-5): 얇은 옵션 종목의 NumericValueOutOfRange(§3-1)는 한 사이클 안에서
+    # 레그마다 반복 재발할 수 있다(실측 3,416회) — 60초 창 안에서는 최초 1건만 실제로 로깅돼야
+    # 로그 파일이 그 반복으로 다시 파묻히지 않는다.
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+    fake_conn = _FakeConnWithRollback()
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield fake_conn
+
+    call_count = {"n": 0}
+
+    def fake_insert(conn, row):
+        call_count["n"] += 1
+        raise ValueError("numeric field overflow")  # 이번 사이클의 두 레그(C/P) 모두 실패
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", fake_insert)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client, [(_FakeSubscriptionManagerWithStrikes(), "regular")], _FakeMaster(), interval_seconds=1
+                )
+            )
+
+    assert call_count["n"] == 2  # 콜/풋 둘 다 삽입 시도는 됨(실패 자체는 억제 대상 아님)
+    failure_records = [r for r in caplog.records if "옵션 체인 적재 실패" in r.getMessage()]
+    assert len(failure_records) == 1  # 같은 60초 창 안에서 두 번째(풋) 실패는 로깅 억제됨

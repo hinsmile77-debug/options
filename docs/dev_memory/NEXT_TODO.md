@@ -100,11 +100,30 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       `slack_alert_settings` 싱글턴 테이블(DB, `db/migrations/009_slack_alert_settings.sql`)로 공유—
       라이브 컨테이너에 이미 적용 완료(빈 테이블, 아직 아무도 안 건드려 SlackSettings 기본값 True로
       동작 중)([[SESSION_LOG]] 2026-07-19 항목 참고).
-  - [ ] **실제 Slack 메시지 발송 검증 안 됨** — 이번 세션에선 단위테스트(가짜 httpx.AsyncClient)로만
-        검증했고, 실제 봇 토큰으로 진짜 채널(C0BJ7R4MZ9B)에 메시지가 도착하는지는 확인 안 함. 관측
-        루프 재시작 후(또는 수동 스모크 테스트로) 첫 알림이 실제로 오는지 확인 필요.
+  - [x] (2026-07-19 검증 완료) **실제 Slack 메시지 발송 확인** — 실제 봇 토큰으로 채널
+        (C0BJ7R4MZ9B)에 테스트 메시지 발송 후 사용자가 정상 수신 확인. 첫 시도에서 콘솔에 한글이
+        깨져 보여 httpx json= 편의 파라미터가 charset을 안 붙이는 게 원인인 줄 알고
+        `mahdi/notify.py`를 명시적 UTF-8 바이트+`charset=utf-8` 헤더로 고쳤으나, Slack
+        `conversations.history`로 재확인해보니 **원래도 정상 전송되고 있었음**(깨져 보인 건 이
+        Windows 콘솔(cp949)의 표시 문제였을 뿐) — 그래도 더 견고한 방식이라 되돌리지 않고 유지.
   - [ ] COCKPIT 체크박스를 브라우저에서 실제로 토글해 DB(`slack_alert_settings.enabled`)에 반영되고,
         관측 루프가 재시작 없이 그 값을 바로 따르는지 실운영 확인 필요(단위테스트로는 로직만 검증됨).
+- [x] (2026-07-19 구현 완료) **로그 위생** — `logs/observation_loop.log`가 로테이션 없이 105MB까지
+      누적된 문제(운영점검보고서 §5-5). `mahdi/main.py`에 `_configure_logging()`(신규) 추가 —
+      `logging.handlers.RotatingFileHandler`(파일당 10MB, 최근 10개=최대 약 110MB)로 이 파일을
+      Python이 직접 소유하도록 바꿈. `scripts/start_mahdi_premarket.bat`도 함께 수정해 stdout
+      리다이렉트(`>> logs\observation_loop.log`)를 제거(안 걷어내면 Python이 회전시킨 파일을 이
+      리다이렉트가 계속 원래 경로에 append해 로테이션이 무의미해짐) — 콘솔 창엔 여전히 실시간으로
+      보이고, stderr만 별도 회전 없는 크래시 전용 로그(`logs\observation_loop_crash.log`)로 남김.
+      `mahdi/logutil.py`(신규) `WarningThrottle`로 §3-1 NumericValueOutOfRange(한 사이클 안에서
+      레그마다 반복 재발)와 WS 재연결 반복 실패 경고를 60초당 최초 1건만 로깅하도록 억제(억제된
+      건수는 다음 로깅 때 요약으로 붙음)([[SESSION_LOG]] 2026-07-19 항목 참고).
+  - [ ] **기존 104MB 로그 파일은 그대로 둠** — 다음 실제 관측 루프 실행 시 RotatingFileHandler가
+        열자마자 maxBytes 초과를 감지해 즉시 `.1`로 회전시키고 새 빈 파일로 시작한다(Python
+        표준 동작, 별도 조치 불필요) — 다만 그 첫 `.1` 백업 자체는 여전히 104MB이므로 디스크
+        공간이 급하면 수동으로 지워도 됨.
+  - [ ] 실제 관측 루프를 재시작해 콘솔 창에 로그가 여전히 실시간으로 보이는지, `logs/observation_loop.log`가
+        실제로 10MB 근방에서 회전되는지 실운영 확인 필요(단위테스트는 tmp_path로 격리해 검증함).
 - [ ] `_option_symbol` 그리드(고정 2.5 간격 ATM±N)와 실제 상장 행사가가 어긋나는 구간을
       실거래로 확인(현재는 `option_symbol()`이 None 반환 시 조용히 스킵만 함)
 - [ ] `poll_option_chain()` 범위를 `nearest_expiry_chain()`(체인 전체, ATM±3보다 훨씬 많은 종목)로 넓힐지 결정 —

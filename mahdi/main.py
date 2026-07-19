@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from datetime import date, datetime, time as dtime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import httpx
@@ -23,7 +25,7 @@ from mahdi.broker import tr_codes
 from mahdi.broker.rest_client import KISRestClient
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.broker.ws_client import ApprovalKeyIssuer, KISWebSocketClient, Subscription, WSConnection
-from mahdi.config.settings import get_db_settings, get_kis_settings, get_slack_settings
+from mahdi.config.settings import PROJECT_ROOT, get_db_settings, get_kis_settings, get_slack_settings
 from mahdi import notify
 from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
@@ -33,8 +35,25 @@ from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivati
 from mahdi.engines.regime_pipeline import RegimeStateMachine
 from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp
 from mahdi.features.orderflow import calculate_vpin
+from mahdi.logutil import WarningThrottle
 
 logger = logging.getLogger("mahdi.main")
+
+# 2026-07-19(§5-5 "로그 위생") — logs/observation_loop.log가 로테이션 없이 105MB까지 누적된 문제.
+# 배치파일(scripts/start_mahdi_premarket.bat)의 stdout 리다이렉트(`>> logs\observation_loop.log`)를
+# 걷어내고 Python 로깅이 이 파일을 직접 소유·회전시킨다 — 파일당 10MB, 최근 10개(최대 약 110MB)만
+# 유지하고 그 이전은 자동 삭제된다.
+LOG_DIR = PROJECT_ROOT / "logs"
+LOG_FILE = LOG_DIR / "observation_loop.log"
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 10
+
+# 같은 종류의 WARNING이 짧은 시간 안에 반복되면(예: 얇은 옵션 종목의 NumericValueOutOfRange가
+# 60초 사이클 안에서 레그마다 반복 — §3-1) 창(window)당 최초 1건만 로깅해 로그 파일이 그 반복으로
+# 파묻히지 않게 한다(mahdi/logutil.py 참고). 각 폴러 함수 안에서 지역 변수로 만든다(모듈
+# 전역으로 두면 실제 운영에선 어차피 함수당 1회만 호출돼 차이가 없지만, 테스트에서 서로 다른
+# 테스트 함수 호출이 같은 60초 실시간 윈도를 공유해 억제 상태가 새어나가는 문제가 생긴다).
+WARNING_THROTTLE_WINDOW_SECONDS = 60.0
 
 KOSPI200_OPTION_STRIKE_INTERVAL = 2.5
 # 2026-07-10: 위클리를 월/목 두 북으로 분리하며 3(먼슬리+위클리월+위클리목)으로 늘어난
@@ -265,7 +284,9 @@ async def run_observation_loop_forever(
          REST 폴러까지 전부 함께 죽었다. 2026-07-19(§5-4): "연결됨→끊김" 전환 시점에 한 번,
          "끊김→재연결 성공" 전환 시점에 한 번만 Slack 알림을 보낸다(재연결 재시도마다 매번
          보내면 네트워크 장애가 길어질 때 스팸이 된다) — currently_connected 플래그로 전환
-         시점만 골라낸다.
+         시점만 골라낸다. 이미 끊긴 상태에서 반복되는 재연결 시도 실패 로그는(§5-5 "로그 위생")
+         WarningThrottle로 60초당 최초 1건만 남긴다 — 장애가 길어지면 백오프 간격(5~60초)마다
+         계속 같은 경고가 찍혀 로그 파일이 그 반복으로 파묻히는 걸 막는다.
     실패 조건: DB 오류·ValueError(구독 슬롯 한도 등) 등 연결 문제가 아닌 예외는 재시도 없이 그대로
               전파한다 — 재시도로 해결되지 않는 코드/설정 문제이므로 사람이 봐야 한다. 정상적으로는
               run_observation_loop이 listen()의 무한 수신 루프라 정상 반환하지 않지만, 혹시라도
@@ -273,6 +294,7 @@ async def run_observation_loop_forever(
     """
     backoff = WS_RECONNECT_INITIAL_BACKOFF_SECONDS
     currently_connected = True
+    warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     try:
         await run_observation_loop(
             ws_client, subscription_managers, rest_client,
@@ -307,7 +329,11 @@ async def run_observation_loop_forever(
                 notify.notify("WS 연결 끊김 — 자동 재연결 시도 중. 장시간 지속되면 KIS/네트워크 상태 확인 필요.", "CRITICAL")
                 currently_connected = False
             else:
-                logger.warning("WS 재연결 시도 실패 — %.0f초 후 재시도", backoff, exc_info=True)
+                # 2026-07-19(§5-5): 장애가 길어지면 백오프 간격마다(5~60초) 계속 반복되는 경고 —
+                # 이미 위에서 "끊김" 알림은 한 번 나갔으므로 여기선 로그 위생만 신경 쓴다.
+                warning_throttle.warning(
+                    "ws_reconnect_attempt_failed", "WS 재연결 시도 실패 — %.0f초 후 재시도", backoff, exc_info=True,
+                )
             continue
 
 
@@ -550,10 +576,15 @@ async def poll_option_chain(
               OPTION_CHAIN_GAP_ALERT_SECONDS(5분)를 넘겨도 재시도까지 계속 실패하면 결손을
               Slack으로 한 번 알리고(gap_alerted), 다음에 rows가 다시 들어오면 복구를 한 번
               알린다 — 매 사이클(60초)마다 반복 경고하면 스팸이 되므로 상태 전환 시점에만 보낸다.
+    로그 위생(2026-07-19, §5-5): 얇은 옵션 종목의 NumericValueOutOfRange(§3-1)는 한 사이클 안에서
+              레그마다(최대 수십 건) 반복 재발할 수 있다 — WarningThrottle로 60초당 최초 1건만
+              실제로 로깅해 105MB까지 로테이션 없이 누적됐던 로그가 이 반복으로 다시 파묻히지
+              않게 한다.
     """
     next_tick: float | None = None
     last_success_time: datetime | None = None
     gap_alerted = False
+    warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
@@ -604,7 +635,10 @@ async def poll_option_chain(
                         # 2026-07-16: strike/type만으로는 "왜" 범위를 넘었는지(delta_val이 이상한지,
                         # hts_ints_vltl이 이상한지 등) 알 수 없었다 — KIS 원본 응답(output1)을 함께
                         # 남겨 다음 재발 시 바로 원인 필드를 특정할 수 있게 한다.
-                        logger.warning(
+                        # 2026-07-19: 같은 사이클 안에서 레그마다 반복될 수 있어(§3-1, 한 사이클에
+                        # 최대 수십 건) 60초당 최초 1건만 실제로 로깅한다(§5-5).
+                        warning_throttle.warning(
+                            "option_chain_leg_insert_failure",
                             "옵션 체인 적재 실패(값 이상 등): strike=%s type=%s raw_kis_output1=%s",
                             row.get("strike"), row.get("option_type"), row.get("_raw_kis_output1"),
                             exc_info=True,
@@ -1073,8 +1107,26 @@ async def poll_investor_flow(
         await asyncio.sleep(delay)
 
 
+def _configure_logging() -> None:
+    """
+    계산: 콘솔(stdout)과 로테이션 파일(logs/observation_loop.log) 양쪽에 동시에 로깅한다.
+         2026-07-19(§5-5) — 예전엔 scripts/start_mahdi_premarket.bat가 stdout을
+         `>> logs\\observation_loop.log 2>&1`로 그대로 리다이렉트해서 로테이션이 전혀 없었고
+         (105MB까지 무한 누적 확인), Python 로깅은 콘솔에만 나갔다. 이제 Python 로깅이 이 파일을
+         직접 소유해 파일당 LOG_MAX_BYTES(10MB), 최근 LOG_BACKUP_COUNT(10)개(최대 약 110MB)만
+         유지하고 그 이전은 자동 삭제한다 — 배치파일도 함께 고쳐 stdout 리다이렉트를 없애고
+         (콘솔 창엔 여전히 실시간으로 보임) stderr만 별도의 회전 없는 크래시 전용 로그로 남긴다
+         (로깅 설정 자체가 안 끝난 극초반 크래시까지 잡기 위함 — 흔치 않은 이벤트라 회전 불필요).
+    실패 조건: logs/ 디렉터리가 없으면 미리 만든다(최초 실행 시).
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+    console_handler = logging.StreamHandler(sys.stdout)
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+
+
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    _configure_logging()
     kis_settings = get_kis_settings()
     get_db_settings()  # 조기 검증(연결 문자열 구성 오류를 기동 시점에 노출)
 

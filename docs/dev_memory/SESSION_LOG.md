@@ -4,6 +4,54 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] 로그 위생(로테이션+반복 경고 압축) — 07-16 운영점검보고서 §5 고도화 아이디어 5번 구현
+
+**트리거:** 운영점검보고서 §5-5 — `logs/observation_loop.log`가 로테이션 없이 105MB까지 누적됐고
+(실측 확인, 커밋 시점 파일 크기 104MB), 그 상당 부분이 반복되는 WARNING(§3-1 NumericValueOutOfRange,
+한 사이클 안에서 얇은 옵션 종목 레그마다 재발)이라 진짜 새로운 문제가 파묻히기 쉬웠다.
+
+**원인 조사:** `scripts/start_mahdi_premarket.bat`가 `mahdi.main`의 stdout을
+`>> logs\observation_loop.log 2>&1`로 그대로 리다이렉트하고 있었다 — Python 로깅 쪽은
+`logging.basicConfig(level=logging.INFO)`만 호출해 파일 핸들러가 아예 없었고(콘솔에만 나감),
+실제 파일 적재는 순전히 cmd.exe의 리다이렉트가 담당하고 있어 Python 쪽에서 로테이션을 걸 방법이
+없었다(cmd.exe 리다이렉트 자체엔 회전 기능이 없음).
+
+**구현:**
+- `mahdi/main.py` `_configure_logging()`(신규, `main()` 맨 앞에서 호출) — 콘솔(`StreamHandler(sys.stdout)`)과
+  `logging.handlers.RotatingFileHandler`(`logs/observation_loop.log`, `maxBytes=10MB`,
+  `backupCount=10` → 최대 약 110MB) 둘 다에 로깅. `LOG_DIR`/`LOG_FILE`/`LOG_MAX_BYTES`/
+  `LOG_BACKUP_COUNT`를 모듈 상수로 노출(테스트에서 tmp_path로 치환 가능하게).
+- `scripts/start_mahdi_premarket.bat`: 관측 루프 실행 줄에서 stdout 리다이렉트 제거(Python이
+  이제 파일을 직접 소유하므로 cmd.exe 리다이렉트와 병행하면 서로 다른 파일 핸들이 같은 경로에
+  동시에 쓰면서 Python 쪽 회전이 무의미해짐 — cmd.exe 리다이렉트는 항상 원래 경로에만 append함).
+  stderr만 `2>>logs\observation_loop_crash.log`로 남겨 로깅 설정이 끝나기 전 극초반 크래시까지
+  잡는 안전망으로 유지(회전 불필요 — 크래시는 흔치 않은 이벤트라 커봐야 몇 KB).
+- `mahdi/logutil.py`(신규) `WarningThrottle` — 같은 category의 WARNING을 window_seconds(60초)당
+  최초 1건만 실제로 로깅하고, 억제된 나머지는 다음 로깅 때 "(최근 N초간 M건 추가 억제됨)"으로
+  요약해 붙인다(완전히 숨기지 않음 — "계속 실패 중"이라는 사실 자체는 남아야 함).
+  `mahdi/main.py`의 두 곳에 배선: ①`poll_option_chain()`의 레그 삽입 실패 경고(§3-1의 진원지,
+  실측 한 사이클에 최대 수십 건) ②`run_observation_loop_forever()`의 "이미 끊긴 상태에서 재연결
+  시도 실패"(장애가 길어지면 백오프 간격마다 반복). 두 곳 다 WarningThrottle 인스턴스를
+  함수 지역 변수로 만든다 — 모듈 전역 싱글턴으로 두면 실제 운영에선 어차피 함수당 프로세스 생애
+  1회 호출이라 차이가 없지만, 테스트에서는 서로 다른 테스트 함수 호출이 같은 60초 "실시간" 창을
+  공유해 억제 상태가 새어나가는 문제가 생기는 걸 미리 피함.
+
+**검증:** `tests/test_logutil.py`(신규 5개 — 최초 1건은 항상 로깅, window 내 반복 억제, window
+경과 후 억제 건수 요약과 함께 재로깅, 서로 다른 category 독립성, exc_info 전달), `tests/test_main.py`
+(+2 — `_configure_logging()`이 RotatingFileHandler를 올바른 크기/경로로 구성하는지 tmp_path로
+격리 검증, `poll_option_chain`의 반복 레그 실패 경고가 60초 창 안에서 실제로 억제되는지). 기존
+`test_poll_option_chain_skips_bad_leg_and_continues_after_db_error`(caplog로 실패 로그 1건 확인)는
+단일 발생 케이스라 스로틀 도입으로 동작 변화 없음을 재확인. `.venv`(Python 3.12) 기준 전체
+pytest 253개 통과.
+
+**다음 확인 필요(코드 변경 아님, 실운영 확인 대상 — [[NEXT_TODO]] 참고):** 기존 104MB
+`observation_loop.log`는 그대로 뒀다 — 다음 실제 실행에서 RotatingFileHandler가 열자마자 크기
+초과를 감지해 즉시 `.1`로 회전시키고 새 파일로 시작한다(Python 표준 동작). 실제 관측 루프를
+재시작해 콘솔에 로그가 여전히 보이는지, 파일이 실제로 10MB 근방에서 회전되는지는 아직 실운영
+확인 안 됨.
+
+---
+
 ## [2026-07-19] Slack 능동 알림 도입 — 07-16 운영점검보고서 §5 고도화 아이디어 4번 구현
 
 **트리거:** 운영점검보고서 §5-4 "능동 알림 도입"(원안은 텔레그램 예시) — 사용자가 대신 Slack으로
