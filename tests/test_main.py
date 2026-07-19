@@ -23,6 +23,7 @@ from mahdi.main import (
     poll_macro_snapshot,
     poll_option_chain,
     run_observation_loop,
+    run_observation_loop_forever,
 )
 
 _NUM_FIELDS = 45  # _MIN_FIELDS in mahdi.main (index 0..44)
@@ -288,6 +289,165 @@ def test_run_observation_loop_keeps_different_symbols_in_separate_bars(monkeypat
     call_bar = next(b for b in written_bars if b["symbol"] == "201S03C325")
     assert call_bar["open"] == 60.0
     assert call_bar["close"] == 62.0  # 40.0/41.0(풋) 값이 섞이면 안 됨
+
+
+class _SingleUseConnectionCM:
+    """websockets.connect()의 `async with` 반환값을 흉내낸다 — 한 번만 __aenter__되는 1회용."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeConnectCall:
+    """connect(url) 호출마다 순서대로 다음 항목을 반환(또는 예외면 즉시 발생)하는 팩토리 —
+    실제 소켓 없이 WS 재연결 시나리오(연속 실패·성공 후 재끊김 등)를 결정론적으로 재현한다."""
+
+    def __init__(self, items: list):
+        self._items = list(items)
+        self.call_count = 0
+
+    def __call__(self, url):
+        self.call_count += 1
+        item = self._items.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return _SingleUseConnectionCM(item)
+
+
+def _patch_run_observation_loop_db(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+
+
+def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconnect(monkeypatch):
+    # 2026-07-16 점검 §3-1B/§5-2: "WS 연결이 끊기면 재연결 로직이 아예 없어 그대로 죽는다"는
+    # 문제 — 재연결 후 새 연결에 구독(선물 + ATM 옵션 전 종목)이 처음부터 다시 나가는지 검증한다.
+    rest_client = FakeRestClient(spot=350.0)
+
+    first_conn = FakeConnection([])  # recv() 즉시 ConnectionError(끊김 시뮬레이션)
+    ws_client = KISWebSocketClient(approval_key="APV1", connection=first_conn)
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+
+    second_conn = FakeConnection([])  # 재연결 성공 직후에도 바로 다시 끊김(연속 끊김까지 검증)
+    fake_connect = _FakeConnectCall([second_conn, RuntimeError("세 번째 연결 시도는 테스트 범위 밖")])
+
+    _patch_run_observation_loop_db(monkeypatch)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="세 번째 연결 시도는 테스트 범위 밖"):
+        _run(
+            run_observation_loop_forever(
+                ws_client, [manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                approval_key="APV1", connect=fake_connect,
+            )
+        )
+
+    assert fake_connect.call_count == 2  # 재연결 성공 1회 + 그다음 재연결 시도(실패로 테스트 종료)
+    # 연결에 성공하면 backoff가 초기값으로 리셋된다 — 두 번의 끊김 모두 "첫 끊김"이라 둘 다 5초.
+    assert sleep_calls == [5.0, 5.0]
+
+    # 재연결된 새 연결(second_conn)에 futures 구독 + ATM 옵션 전 종목이 처음부터 다시 나가야 한다
+    # (연결이 끊겼다 다시 붙으면 서버 쪽 구독 상태는 사라지므로, 스팟이 그대로여도 재구독 필요 —
+    # RollingSubscriptionManager.rebind()가 없으면 diff 로직 때문에 아무것도 재전송되지 않는다).
+    assert any("101S03" in msg for msg in second_conn.sent)  # 선물 구독
+    assert manager.desired_strikes == frozenset({347.5, 350.0, 352.5})
+    subscribe_msgs = [m for m in second_conn.sent if '"tr_type": "1"' in m]
+    assert len(subscribe_msgs) == 7  # 3 strikes x (C,P) = 6 + 선물 1
+
+
+def test_run_observation_loop_forever_backoff_caps_and_resets_after_success(monkeypatch):
+    # connect() 자체가 반복 실패하면(네트워크 장애 등) 백오프가 계속 커지되 상한(60초)을 넘지
+    # 않고, 한 번이라도 연결에 성공하면 다음 끊김부터 다시 초기값(5초)으로 리셋되는지 확인한다.
+    rest_client = FakeRestClient(spot=350.0)
+    first_conn = FakeConnection([])
+    ws_client = KISWebSocketClient(approval_key="APV1", connection=first_conn)
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+
+    ok_conn = FakeConnection([])
+    fake_connect = _FakeConnectCall(
+        [
+            OSError("연결 거부"),
+            OSError("연결 거부"),
+            ok_conn,  # 3번째 시도에서 연결 성공(들어가자마자 다시 끊김) → backoff 리셋 확인용
+            RuntimeError("종료용"),
+        ]
+    )
+
+    _patch_run_observation_loop_db(monkeypatch)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="종료용"):
+        _run(
+            run_observation_loop_forever(
+                ws_client, [manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                approval_key="APV1", connect=fake_connect,
+            )
+        )
+
+    # 5(최초 끊김) → 10(1차 재연결 실패 후) → 20(2차 재연결 실패 후) → 연결 성공(리셋) → 5(성공 후 재끊김)
+    assert sleep_calls == [5.0, 10.0, 20.0, 5.0]
+
+
+def test_run_observation_loop_forever_propagates_non_connection_errors(monkeypatch):
+    # DB 오류/ValueError(설정 문제 등) 같은 "연결 문제가 아닌" 예외는 재시도 없이 그대로 전파해야
+    # 한다 — 재연결로 해결되지 않는 코드/설정 문제를 조용히 계속 삼키면 안 된다.
+    rest_client = FakeRestClient(spot=350.0)
+    conn = FakeConnection([])
+    ws_client = KISWebSocketClient(approval_key="APV1", connection=conn)
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    def raise_config_error(conn, underlying, symbol, updated_at):
+        raise ValueError("설정 오류")
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", raise_config_error)
+
+    async def fake_sleep(seconds):
+        raise AssertionError("연결 문제가 아닌 예외에 재시도(sleep)가 호출되면 안 됨")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    def unexpected_connect(url):
+        raise AssertionError("연결 문제가 아닌 예외에 재연결이 시도되면 안 됨")
+
+    with pytest.raises(ValueError, match="설정 오류"):
+        _run(
+            run_observation_loop_forever(
+                ws_client, [manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                approval_key="APV1", connect=unexpected_connect,
+            )
+        )
 
 
 # 2026-07-06 실제 KIS 모의투자 get_quote() 응답에서 그대로 가져온 값(그릭스 필드명 실측: gama/delta_val 등).

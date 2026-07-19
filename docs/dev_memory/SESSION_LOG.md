@@ -4,6 +4,47 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] WS 재연결 로직 — 07-16 운영점검보고서 §5 고도화 아이디어 2번 구현
+
+**트리거:** 2026-07-16 운영점검보고서(§4 약점, §5-2) — "WS 연결이 끊기면 재연결 로직이 아예 없어
+그대로 죽는다"는 지적. Phase1(관측)에서는 "관측 공백" 정도지만, Phase2가 실제 포지션을 잡기
+시작하면 "포지션을 인지 못 하는" 훨씬 심각한 리스크가 되므로 Phase2 착수 전에 먼저 처리하자는
+제안(§5 항목 2)을 실행.
+
+**구현:**
+- `mahdi/data/subscription_manager.py` `RollingSubscriptionManager.rebind(ws_client)`(신규): 새
+  WS 클라이언트로 교체 + `_desired_strikes`를 비운다. 이게 없으면(단순히 `_ws`만 새 클라이언트로
+  바꾸면) `roll_to_spot()`의 diff 로직(겹치는 행사가는 재전송 안 함, `test_roll_to_spot_is_idempotent_for_unchanged_range`가
+  이미 보여주던 동작)이 "서버 쪽엔 구독이 하나도 없는데 매니저는 이미 구독했다고 착각"하는
+  상태를 만들어 재연결 후 아무것도 재구독되지 않는 버그가 생긴다.
+- `mahdi/main.py` `run_observation_loop_forever()`(신규): `run_observation_loop()`을 감싸 WS 단절
+  (`OSError`/`websockets.WebSocketException` — `ConnectionError`는 `OSError`의 서브클래스라 포함됨)
+  시 죽지 않고 지수 백오프(`WS_RECONNECT_INITIAL_BACKOFF_SECONDS=5.0` → `WS_RECONNECT_MAX_BACKOFF_SECONDS=60.0`,
+  연결에 한 번이라도 성공하면 다음 끊김부터 다시 5초로 리셋)로 재연결한다. 재연결마다 새
+  `KISWebSocketClient`를 만들고 모든 `subscription_managers`를 `rebind()`한 뒤
+  `run_observation_loop()`을 다시 호출 — ATM±N 옵션 전 종목 + 선물 구독이 새 연결에 처음부터
+  다시 나간다. DB 오류·`ValueError`(구독 슬롯 한도 등) 같은 "연결 문제가 아닌" 예외는 재시도 없이
+  그대로 전파(재시도로 해결 안 되는 문제이므로 사람이 봐야 함).
+- `main()`의 `asyncio.gather` 태스크 목록에서 `run_observation_loop(...)` 호출을
+  `run_observation_loop_forever(..., approval_key=approval_key)`로 교체. approval_key는
+  재연결마다 재발급하지 않고 최초 발급분을 재사용(REST 접속키 엔드포인트에 불필요한 부하를 주지
+  않기 위한 판단 — 실운영 검증 필요, [[NEXT_TODO]] 참고). `poll_option_chain`/`poll_expiry_liquidity`
+  등 REST 폴러는 이 함수와 독립된 태스크라 WS 재연결 시도 중에도 계속 관측을 이어간다(이번 수정
+  전에는 WS 단절 하나가 `asyncio.run(main())`까지 예외를 전파시켜 REST 폴러까지 전부 함께 죽었다).
+
+**검증:** `tests/test_data_subscription_manager.py`에 `rebind()` 후 재구독 여부 테스트 1개,
+`tests/test_main.py`에 `run_observation_loop_forever` 테스트 3개(①재연결+전체 재구독 확인,
+②connect() 반복 실패 시 백오프가 상한까지 커지고 연결 성공 후 리셋되는지, ③연결 문제가 아닌
+예외는 재시도 없이 그대로 전파하는지) 추가. 가짜 `connect()` 팩토리(`_FakeConnectCall`/
+`_SingleUseConnectionCM`)로 실제 소켓 없이 연속 끊김·재연결 시나리오를 결정론적으로 재현.
+`.venv`(Python 3.12) 기준 전체 pytest 230개 통과.
+
+**다음 확인 필요(코드 변경 아님, 실운영 확인 대상 — [[NEXT_TODO]] 참고):** approval_key 재사용이
+실제 장시간 재연결 시나리오에서도 KIS에 거부되지 않는지, 실제 네트워크 단절로 재연결이 실전에서
+정상 발동하는지는 아직 로그로 확인된 적 없음(지금까지는 단위테스트로만 검증됨).
+
+---
+
 ## [2026-07-19] NumericValueOutOfRange 진단 로깅 — 07-16 운영점검보고서 §5 고도화 아이디어 1번 구현
 
 **트리거:** 2026-07-16 운영점검보고서(§3-1) — 옵션체인 특정 10개 행사가(1087.5~1097.5, 1160~1170

@@ -74,3 +74,16 @@ class RollingSubscriptionManager:
     @property
     def desired_strikes(self) -> frozenset[float]:
         return frozenset(self._desired_strikes)
+
+    def rebind(self, ws_client: KISWebSocketClient) -> None:
+        """
+        입력: 재연결로 새로 만들어진 WS 클라이언트(2026-07-19, WS 재연결 도입).
+        계산: 새 클라이언트로 교체하고 _desired_strikes를 비운다. 재연결은 KIS 서버 쪽 구독
+             상태를 전부 초기화하므로(새 세션), 다음 roll_to_spot() 호출이 "겹치는 행사가는
+             그대로 두고 diff만 보낸다"로 동작하면 이미 알고 있던 _desired_strikes와 새로 계산한
+             범위가 같을 때 아무것도 재구독하지 않는다 — 실제로는 새 연결에 구독이 하나도 없는데
+             매니저만 "이미 구독했다"고 착각하는 상태가 된다. 비워두면 다음 roll_to_spot()이
+             현재 범위 전체를 새 연결에 처음부터 다시 구독한다.
+        """
+        self._ws = ws_client
+        self._desired_strikes = set()

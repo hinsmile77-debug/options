@@ -59,7 +59,19 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       2026-07-06 실데이터로 검증 중 심볼 혼입 버그 + WS 헤더 파싱 버그 둘 다 발견·수정함([[SESSION_LOG]] 참고)
 - [ ] 심볼별 aggregator 분리 수정 이후, 정규장 중 각 종목(콜/풋 개별)의 봉이 실제로 합리적인 OHLC 범위를
       유지하는지(더 이상 다른 종목과 안 섞이는지) 추가 관찰 필요 — 오늘은 수정 직후라 확인 시간이 짧았음
-- [ ] WS 연결이 끊겼을 때 재연결 로직 없음 — 장시간 유휴/네트워크 단절 시 그대로 죽음
+- [x] (2026-07-19 해소) **WS 재연결 로직** — `run_observation_loop_forever()`(신규, `mahdi/main.py`)가
+      `run_observation_loop()`을 감싸 WS 단절(OSError/websockets.WebSocketException) 시 죽지 않고
+      지수 백오프(5초→최대 60초, 연결 성공 시 리셋)로 재연결한다. 재연결마다
+      `RollingSubscriptionManager.rebind()`(신규)로 새 클라이언트로 교체 + `desired_strikes`를
+      리셋해, 서버 쪽 구독이 재연결로 사라진 것과 무관하게 ATM±N 전체를 새 연결에 처음부터
+      다시 구독한다([[SESSION_LOG]] 2026-07-19 항목 참고).
+  - [ ] **실운영 확인 필요**: approval_key를 재연결마다 재발급하지 않고 재사용하도록 구현함(REST
+        접속키 발급 엔드포인트에 불필요한 부하를 주지 않기 위한 판단) — 실제 장시간 운영 중
+        재연결이 발생했을 때 KIS가 오래된 approval_key로도 재연결을 계속 승인하는지 확인 안 됨.
+        거부되면(예: 인증 오류로 즉시 재끊김 반복) `ApprovalKeyIssuer(kis_settings).issue()`를
+        재연결 경로에도 추가해야 함.
+  - [ ] 실제 네트워크 단절(예: Wi-Fi 재시작, KIS 서버 점검)로 재연결이 실전에서 발동하는지,
+        재연결 후 몇 분 내로 정상 관측이 재개되는지 로그로 확인 필요(지금까지는 단위테스트로만 검증됨).
 - [ ] `_option_symbol` 그리드(고정 2.5 간격 ATM±N)와 실제 상장 행사가가 어긋나는 구간을
       실거래로 확인(현재는 `option_symbol()`이 None 반환 시 조용히 스킵만 함)
 - [ ] `poll_option_chain()` 범위를 `nearest_expiry_chain()`(체인 전체, ATM±3보다 훨씬 많은 종목)로 넓힐지 결정 —

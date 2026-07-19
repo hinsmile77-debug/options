@@ -126,7 +126,9 @@ async def run_observation_loop(
          적재한다(2026-07-06: 처음엔 선물에만 적용했으나, 옵션도 원한다는 사용자 요청으로 종목
          구분 없이 통일 — 옵션은 거래량이 얇아 버킷이 느리게 완성되거나 VPIN이 0.5 근처에 자주
          머물 수 있음을 알고 진행).
-    실패 조건: DB 연결 실패·WS 단절 시 예외가 위로 전파된다 — 재시작은 프로세스 관리자(Ops) 책임.
+    실패 조건: DB 연결 실패·WS 단절 시 예외가 위로 전파된다. WS 단절(재연결)은
+              run_observation_loop_forever가 감싸서 처리하므로, 이 함수 자체는 여전히 "한 번의
+              연결이 끊기면 예외를 던지고 끝"으로 단순하게 남겨둔다(2026-07-19).
     """
     quote = rest_client.get_quote(futures_symbol, market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
     # output3 = KOSPI200 지수 자체, output1 = 조회한 선물 계약가(베이시스 존재) — 지수 우선, 없으면 선물가로 폴백
@@ -214,6 +216,80 @@ async def run_observation_loop(
                 )
 
     await ws_client.listen(handle_message)
+
+
+# WS 재연결(2026-07-19, 운영점검보고서 §5-2) — 재연결 시도 사이 대기시간. 반복적으로 계속
+# 끊기는 상황(네트워크 장애 등)에서 무한정 짧은 간격으로 재시도해 KIS 서버에 부하를 주지 않도록
+# 지수 백오프를 쓰되, 한 번이라도 연결에 성공하면 다음 끊김부터는 다시 초기값부터 시작한다
+# (연결이 오래 잘 유지되다 어쩌다 한 번 끊긴 경우까지 계속 escalate될 이유가 없음).
+WS_RECONNECT_INITIAL_BACKOFF_SECONDS = 5.0
+WS_RECONNECT_MAX_BACKOFF_SECONDS = 60.0
+
+# websockets 라이브러리 자체 예외(ConnectionClosed 등)는 WebSocketException 계열이고, 소켓 단의
+# 실패(연결 거부 등)는 OSError(ConnectionError는 OSError의 서브클래스) 계열이다 — 재연결 대상은
+# 이 둘뿐이다. DB 예외/ValueError(구독 슬롯 한도 등)는 재시도로 해결되지 않는 별개의 문제라
+# 여기서 잡지 않고 그대로 전파해 사람이 보게 한다.
+_WS_DISCONNECT_ERRORS = (OSError, websockets.WebSocketException)
+
+
+async def run_observation_loop_forever(
+    ws_client: KISWebSocketClient,
+    subscription_managers: list[RollingSubscriptionManager],
+    rest_client: KISRestClient,
+    futures_symbol: str,
+    regime_state_machine: RegimeStateMachine,
+    approval_key: str,
+    connect=websockets.connect,
+) -> None:
+    """
+    입력: run_observation_loop과 동일 + 이미 연결된 첫 WS 클라이언트(호출측이 최초 1회 연결해
+         넘긴다 — main()의 `async with websockets.connect(...)` 블록 안에서 만든 것), 재연결 시
+         새 WS 클라이언트를 만드는 데 쓸 approval_key, connect(테스트 주입용, 기본값 websockets.connect).
+    계산: run_observation_loop을 감싸 WS 단절(_WS_DISCONNECT_ERRORS) 시 프로세스를 죽이는 대신
+         backoff초 대기 후 재연결한다. 2026-07-16 점검(§3-1B/§4/§5-2)에서 "WS 연결이 끊기면
+         재연결 로직이 아예 없어 그대로 죽는다"고 지적된 항목 — Phase1(관측)에서는 "관측 공백"
+         정도지만 Phase2가 실제 포지션을 잡기 시작하면 "포지션을 인지 못 하는" 리스크가 되므로
+         Phase2 착수 전에 먼저 처리해야 한다는 게 그 이유. 재연결마다 새 KISWebSocketClient를
+         만들고 모든 subscription_managers를 rebind()한다 — rebind()가 각 매니저의
+         _desired_strikes를 비우므로, 다음 run_observation_loop() 안의 roll_to_spot() 호출이
+         diff가 아니라 현재 ATM±N 범위 전체를 새 연결에 처음부터 다시 구독한다(그렇지 않으면
+         서버 쪽 구독 상태는 재연결로 완전히 사라졌는데 매니저만 "이미 구독 중"이라고 착각해
+         아무것도 재구독하지 않는 버그가 생긴다). asyncio.gather로 함께 도는 REST 폴러
+         (poll_option_chain 등)는 이 함수와 독립된 태스크라 재연결 시도 중에도 계속 관측을
+         이어간다 — 이번 수정 전에는 WS 단절 하나가 asyncio.run(main())까지 예외를 전파시켜
+         REST 폴러까지 전부 함께 죽었다.
+    실패 조건: DB 오류·ValueError(구독 슬롯 한도 등) 등 연결 문제가 아닌 예외는 재시도 없이 그대로
+              전파한다 — 재시도로 해결되지 않는 코드/설정 문제이므로 사람이 봐야 한다. 정상적으로는
+              run_observation_loop이 listen()의 무한 수신 루프라 정상 반환하지 않지만, 혹시라도
+              반환하면(예: 테스트) 재연결 없이 그대로 종료한다.
+    """
+    backoff = WS_RECONNECT_INITIAL_BACKOFF_SECONDS
+    try:
+        await run_observation_loop(
+            ws_client, subscription_managers, rest_client,
+            futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
+        )
+        return
+    except _WS_DISCONNECT_ERRORS:
+        logger.warning("WS 연결 끊김 — %.0f초 후 재연결 시도", backoff, exc_info=True)
+
+    while True:
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, WS_RECONNECT_MAX_BACKOFF_SECONDS)
+        try:
+            async with connect(tr_codes.MARKET_DATA_WS_DOMAIN) as raw_ws:
+                new_client = KISWebSocketClient(approval_key=approval_key, connection=_WebsocketsAdapter(raw_ws))
+                for manager in subscription_managers:
+                    manager.rebind(new_client)
+                backoff = WS_RECONNECT_INITIAL_BACKOFF_SECONDS  # 연결 성공 — 다음 끊김은 다시 초기값부터
+                await run_observation_loop(
+                    new_client, subscription_managers, rest_client,
+                    futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
+                )
+                return
+        except _WS_DISCONNECT_ERRORS:
+            logger.warning("WS 재연결 후 다시 끊김(혹은 재연결 자체 실패) — %.0f초 후 재시도", backoff, exc_info=True)
+            continue
 
 
 # H0IOCNT0(지수옵션 실시간체결가) 응답 필드 인덱스 — "^" 구분, 0-based.
@@ -1011,12 +1087,13 @@ async def main() -> None:
             (weekly_thu_manager, "weekly_thu"),
         ]
         tasks = [
-            run_observation_loop(
+            run_observation_loop_forever(
                 ws_client,
                 [monthly_manager, weekly_mon_manager, weekly_thu_manager],
                 rest_client,
                 futures_symbol=futures_symbol,
                 regime_state_machine=regime_state_machine,
+                approval_key=approval_key,
             ),
             poll_option_chain(rest_client, books, master, regime_state_machine=regime_state_machine),
             poll_expiry_liquidity(

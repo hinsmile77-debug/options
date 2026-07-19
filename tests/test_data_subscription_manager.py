@@ -65,6 +65,26 @@ def test_roll_to_spot_is_idempotent_for_unchanged_range():
     assert len(ws.active_subscriptions) == sent_after_first
 
 
+def test_rebind_resets_desired_strikes_so_next_roll_resubscribes_everything():
+    # 2026-07-19 WS 재연결 도입: 재연결로 서버 쪽 구독 상태가 전부 사라졌는데 매니저의
+    # desired_strikes만 남아있으면, roll_to_spot()의 diff 로직(위 idempotent 테스트가 보여주듯
+    # 겹치는 범위는 아무것도 재전송 안 함)이 새 연결에 아무것도 재구독하지 않는 버그가 생긴다.
+    old_ws = KISWebSocketClient(approval_key="APV", connection=FakeConnection())
+    manager = RollingSubscriptionManager(old_ws, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+    _run(manager.roll_to_spot(350.0))
+    assert manager.desired_strikes == frozenset({347.5, 350.0, 352.5})
+
+    new_ws = KISWebSocketClient(approval_key="APV2", connection=FakeConnection())
+    manager.rebind(new_ws)
+    assert manager.desired_strikes == frozenset()  # rebind 직후엔 "아직 아무것도 구독 안 한 상태"
+
+    _run(manager.roll_to_spot(350.0))  # 같은 스팟이라도 새 연결엔 전부 새로 구독돼야 함
+
+    assert manager.desired_strikes == frozenset({347.5, 350.0, 352.5})
+    assert len(new_ws.active_subscriptions) == 6  # 3 strikes x (C,P) 전부 새 연결에 재전송됨
+    assert len(old_ws.active_subscriptions) == 6  # 옛 연결 쪽 기록은 그대로(더 이상 안 씀)
+
+
 def test_roll_to_spot_skips_strikes_with_no_symbol():
     # symbol_formatter가 None을 반환하면(실제 상장 행사가와 그리드가 어긋난 경우) 조용히 건너뛴다.
     ws = KISWebSocketClient(approval_key="APV", connection=FakeConnection())
