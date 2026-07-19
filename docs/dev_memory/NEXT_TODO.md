@@ -82,10 +82,11 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       DB 관련 `datetime.now()` 호출을 전부 `db.local_now()`로 교체(동작 변경 없음, 단일 소스화만).
       `db/migrations/008_timestamp_policy_docs.sql`(신규)이 관련 TIMESTAMPTZ 컬럼 15개에
       `COMMENT ON COLUMN`으로 같은 설명을 남김([[SESSION_LOG]] 2026-07-19 항목 참고).
-  - [ ] **마이그레이션 적용 필요(코드는 이미 반영, DB엔 아직 미적용)**: 기존 관례대로
-        `docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < db/migrations/008_timestamp_policy_docs.sql`
-        를 실행해야 실제 DB 컬럼에 코멘트가 반영된다. 순수 메타데이터 변경(락/데이터 영향 없음)이라
-        장중에 실행해도 안전.
+  - [x] (2026-07-19 적용 완료) 마이그레이션을 실행 중인 컨테이너에 직접 적용
+        (`docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < db/migrations/008_timestamp_policy_docs.sql`
+        — Docker Desktop이 꺼져있어 먼저 기동, `restart: unless-stopped`로 컨테이너 자동 기동 후
+        적용). `pg_catalog.pg_description` 조회로 15개 컬럼 전부 코멘트 반영 확인, 데이터/스키마
+        타입은 무변경.
   - [ ] "TIMESTAMP로 컬럼 타입 변경"·"tz-aware 전환+과거데이터 보정" 두 대안은 이번에 보류만
         됐을 뿐 기각된 게 아님 — Phase2 착수 전이나 해외선물 교차분석이 실제로 필요해지는 시점에
         다시 검토할 것(비용: 전자는 TimescaleDB 하이퍼테이블 7개의 파티션 컬럼 타입 ALTER, 후자는
