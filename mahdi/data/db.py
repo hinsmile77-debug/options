@@ -2,6 +2,10 @@
 
 실시간 수집과 백테스트 재처리가 같은 삽입 경로를 쓰도록, INSERT는 모두 PK 충돌 시
 갱신(ON CONFLICT DO UPDATE)해 재처리에도 멱등성을 보장한다.
+
+**타임스탬프 정책(2026-07-19 명문화, §5-3)**: DB에 쓰이는 모든 시각은 반드시 이 모듈의
+local_now()를 거쳐서 만들 것 — 자세한 내용은 그 함수의 docstring과
+db/migrations/008_timestamp_policy_docs.sql 참고.
 """
 
 from __future__ import annotations
@@ -14,6 +18,40 @@ from typing import Any, Iterator, Protocol
 import psycopg
 
 from mahdi.config.settings import DBSettings, get_db_settings
+
+
+def local_now() -> datetime:
+    """
+    이 프로젝트가 DB에 쓰는 모든 시각의 유일한 생성 지점 — 다른 곳에서 datetime.now()를
+    직접 호출하지 말고 반드시 이 함수를 쓸 것(2026-07-19, 운영점검보고서 §3-4/§5-3 "타임스탬프
+    정책 명문화"로 도입 — 동작은 datetime.now()와 완전히 동일하다, 정책 변경이 아니라 기존
+    동작을 한 곳에 모아 문서화한 것).
+
+    반환값은 naive(타임존 정보 없는) 서버 로컬 벽시계 시각(KST)이다. DB의 모든 timestamp
+    컬럼은 TIMESTAMPTZ로 선언돼 있지만, naive datetime을 그대로 psycopg에 넘기면 Postgres가
+    "세션 타임존"(이 프로젝트는 명시 설정이 없어 기본값 UTC — docker-compose.yml에 TZ 미설정)
+    기준으로 해석해 저장한다. 즉 실제로는 KST 벽시계 시각인데 "UTC"라고 라벨링된 값이 저장된다
+    — 2026-07-16 점검에서 14:20(KST)에 조회한 market_raw_1m.timestamp가
+    "2026-07-16 14:20:00+00"으로 나온 것으로 확인(진짜 UTC라면 05:20이어야 함).
+
+    애플리케이션 코드 전체가 이 규약을 일관되게 쓰는 한(비교·차집합 등 모든 시간 연산이 같은
+    "가짜 UTC" 좌표계 안에서만 일어나는 한) self-consistent하고, 09:00~15:45 장중 판단 로직도
+    전부 KST 벽시계 기준으로 정확히 동작한다 — 지금 당장 고장난 동작은 없다.
+
+    잠재 위험(그대로 유효, 해결된 게 아니라 "문서화"만 한 상태):
+    ① 해외선물(VIX/CNH/ZN, 미국·홍콩 거래시간 기준) 데이터와 시각을 교차분석하면 9시간 오차가
+       실제 시차처럼 섞여 혼란을 준다.
+    ② `CURRENT_DATE`/`NOW()` 같은 Postgres 서버 함수를 쓰는 쿼리는 진짜 UTC로 동작하므로, 이
+       함수가 반환한 값과 섞어 쓰면(특히 00:00~09:00 KST 구간 — 진짜 UTC로는 전날 15:00~24:00)
+       날짜 경계가 어긋난다.
+
+    이 규약 자체를 바꾸려면(진짜 tz-aware로 전환, 또는 컬럼 타입을 TIMESTAMP로 바꿔 스키마가
+    최소한 "거짓말"은 안 하게 하는 것) 이미 쌓인 과거 데이터의 보정이나 하이퍼테이블 파티션
+    컬럼 타입 변경이 필요한 별도 마이그레이션 작업이다 — 사용자 확인 후 2026-07-19에 "지금은
+    문서화만 하고 스키마/데이터는 건드리지 않는다"로 결정함([[SESSION_LOG]] 참고).
+    """
+    return datetime.now()
+
 
 _MARKET_RAW_1M_COLUMNS = (
     "timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap",

@@ -4,6 +4,18 @@ from datetime import date, datetime
 from mahdi.data import db
 
 
+def test_local_now_returns_naive_wall_clock_time():
+    # 2026-07-19 타임스탬프 정책 명문화(§5-3): DB에 쓰이는 시각은 전부 이 함수를 거쳐야 한다.
+    # naive(tzinfo 없음)인 것 자체가 "정책"이다 — tz-aware로 바뀌면 psycopg가 다른 방식으로
+    # 직렬화해 기존에 쌓인 "가짜 UTC" 라벨 데이터와 갑자기 섞이므로, 이 성질이 깨지면 안 된다.
+    before = datetime.now()
+    result = db.local_now()
+    after = datetime.now()
+
+    assert result.tzinfo is None
+    assert before <= result <= after
+
+
 class FakeCursor:
     def __init__(self, store: dict):
         self.store = store

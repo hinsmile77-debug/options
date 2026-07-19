@@ -4,6 +4,52 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] 타임스탬프 정책 명문화 — 07-16 운영점검보고서 §5 고도화 아이디어 3번 구현
+
+**트리거:** 2026-07-16 운영점검보고서(§3-4) — `mahdi/main.py`가 전 구간에서 `datetime.now()`
+(naive, 서버 로컬시각=KST)를 그대로 TIMESTAMPTZ 컬럼에 써서, 실제로는 KST 벽시계 시각인데
+"+00"(UTC)으로 잘못 라벨링된 값이 저장되고 있음을 발견(14:20 KST 조회 결과가
+"...14:20:00+00"으로 나옴 — 진짜 UTC라면 05:20이어야 함). §5-3이 제안한 "타임스탬프 정책
+명문화"를 실행하되, 앞의 두 항목(§5-1 로깅, §5-2 WS 재연결)과 달리 이건 라이브 프로덕션
+DB(TimescaleDB 하이퍼테이블, 매일 데이터 누적 중)의 스키마/과거 데이터를 건드릴 수도 있는
+선택이라 먼저 사용자에게 방향을 확인함.
+
+**결정(사용자 확인):** 세 가지 방향(①문서화만/②TIMESTAMP로 컬럼 타입 변경/③tz-aware 전환+
+과거데이터 마이그레이션) 중 **①문서화만**을 선택 — 스키마·기존 데이터 전부 무변경, 코드 동작도
+100% 동일(datetime.now() 그대로). ②/③은 TimescaleDB 하이퍼테이블 7개의 파티션 컬럼 타입
+ALTER나 누적 데이터 9시간 일괄 보정이 필요해 라이브 시스템에서 검증 없이 지금 실행하기엔
+리스크가 크다고 판단해 보류(기각 아님 — 다시 검토할 시점은 [[NEXT_TODO]] 참고).
+
+**구현:**
+- `mahdi/data/db.py`에 `local_now()`(신규) — 동작은 `datetime.now()`와 완전히 동일하고, 이
+  프로젝트의 naive-KST 타임스탬프 규약·왜 이렇게 됐는지·잠재 위험(해외선물 교차분석 시 9시간
+  오차, Postgres 서버 함수(NOW()/CURRENT_DATE)와 섞어 쓸 때 날짜 경계 어긋남)을 설명하는 긴
+  docstring을 붙임. 모듈 doc스트링에도 "DB에 쓰이는 모든 시각은 이 함수를 거칠 것"을 명시.
+- `mahdi/main.py`(5곳: `upsert_active_futures_symbol` 호출 1곳 + `poll_time` 대입 4곳),
+  `mahdi/engines/regime_pipeline.py`(2곳: `compute_gap_zscore`/`latest_prior_close_regime`),
+  `mahdi/dashboard/data_source.py`(1곳: DB `expiry`(DATE) 비교용 `today`)의 `datetime.now()`를
+  전부 `db.local_now()`로 교체 — 전부 이미 `from mahdi.data import db`를 쓰고 있어 추가 임포트
+  불필요. `data_source.py`의 `_synthetic_snapshot()`(DB에 안 쓰이는 순수 합성 더미 시각)는
+  의도적으로 제외하고 그 이유를 주석으로 남김.
+- `db/migrations/008_timestamp_policy_docs.sql`(신규): 영향받는 TIMESTAMPTZ 컬럼 15개
+  (`market_raw_1m`/`option_analysis_1m`/`regime_state`/`feature_store`/`prediction_logs`/
+  `signal_decisions`/`execution_logs`/`trade_history`(entry_time·exit_time)/`risk_snapshots`/
+  `underlying_spot_1m`/`investor_flow_1m`/`active_futures_symbol`/`expiry_liquidity_1m`/
+  `macro_snapshot_5m`)에 `COMMENT ON COLUMN`으로 같은 설명을 남김 — 컬럼 타입/데이터는 전혀
+  안 바꾸는 순수 메타데이터 변경이라 락 걱정 없이 장중에도 적용 가능.
+
+**검증:** `tests/test_data_db.py`에 `local_now()`가 naive datetime을 반환하는지 확인하는 테스트
+추가. 기존 호출부 교체는 전부 `datetime.now()`와 동일한 값을 반환하는 순수 치환이라(모킹하는
+테스트가 없었음을 grep으로 확인) 기존 테스트 동작 변화 없음. `.venv`(Python 3.12) 기준 전체
+pytest 231개 통과.
+
+**다음 확인 필요(코드 변경 아님, 사용자 액션 필요 — [[NEXT_TODO]] 참고):** 마이그레이션 파일은
+git에 커밋되지만 기존 관례(`docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < 파일`)대로
+실행 중인 컨테이너에 수동 적용해야 실제 DB 컬럼에 코멘트가 반영된다 — 이번 세션에서 직접
+실행하지는 않음(라이브 컨테이너 접근 여부 확인 없이 실행하는 걸 피함).
+
+---
+
 ## [2026-07-19] WS 재연결 로직 — 07-16 운영점검보고서 §5 고도화 아이디어 2번 구현
 
 **트리거:** 2026-07-16 운영점검보고서(§4 약점, §5-2) — "WS 연결이 끊기면 재연결 로직이 아예 없어

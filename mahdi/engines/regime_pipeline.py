@@ -88,7 +88,7 @@ def compute_gap_zscore(conn, underlying: str) -> float:
          변동폭(spot·iv·sqrt(1/365))을 근사한다.
     실패 조건: 전일 데이터가 없거나(첫 실행일) IV를 못 찾으면 0.0(갭 없음으로 간주 — 안전한 중립값).
     """
-    today = datetime.now().date()
+    today = db.local_now().date()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT timestamp, spot FROM underlying_spot_1m WHERE underlying=%s AND timestamp::date < %s "
@@ -151,7 +151,7 @@ def compute_macro_score_proxy(conn, underlying: str) -> float:
 
 def latest_prior_close_regime(conn) -> RegimeLabel:
     """전일 마감 레짐 조회 — 없으면(첫 실행일) RANGE_BALANCED로 폴백."""
-    today_midnight = datetime.combine(datetime.now().date(), dtime.min)
+    today_midnight = datetime.combine(db.local_now().date(), dtime.min)
     regime_int = db.latest_regime_before(conn, today_midnight)
     if regime_int is None:
         return RegimeLabel.RANGE_BALANCED

@@ -72,6 +72,24 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
         재연결 경로에도 추가해야 함.
   - [ ] 실제 네트워크 단절(예: Wi-Fi 재시작, KIS 서버 점검)로 재연결이 실전에서 발동하는지,
         재연결 후 몇 분 내로 정상 관측이 재개되는지 로그로 확인 필요(지금까지는 단위테스트로만 검증됨).
+- [x] (2026-07-19 문서화만 완료, 스키마/데이터는 그대로) **타임스탬프 정책 명문화** — 2026-07-16
+      점검(§3-4)에서 발견: `datetime.now()`(naive, 서버 로컬=KST)를 TIMESTAMPTZ 컬럼에 그대로 써서
+      실제로는 KST 벽시계 시각인데 "+00"(UTC)으로 잘못 라벨링된 값이 저장되고 있었음. 사용자에게
+      세 가지 방향(문서화만 / TIMESTAMP로 컬럼 타입 변경 / tz-aware 전환+과거데이터 마이그레이션)을
+      제시했고 **"문서화만" 선택**(하이퍼테이블 스키마·기존 데이터는 건드리지 않음, 2026-07-19).
+      `mahdi/data/db.py`에 `local_now()`(datetime.now()와 동일 동작) 신설 + 큰 docstring으로 이
+      규약을 설명, `mahdi/main.py`/`mahdi/engines/regime_pipeline.py`/`mahdi/dashboard/data_source.py`의
+      DB 관련 `datetime.now()` 호출을 전부 `db.local_now()`로 교체(동작 변경 없음, 단일 소스화만).
+      `db/migrations/008_timestamp_policy_docs.sql`(신규)이 관련 TIMESTAMPTZ 컬럼 15개에
+      `COMMENT ON COLUMN`으로 같은 설명을 남김([[SESSION_LOG]] 2026-07-19 항목 참고).
+  - [ ] **마이그레이션 적용 필요(코드는 이미 반영, DB엔 아직 미적용)**: 기존 관례대로
+        `docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < db/migrations/008_timestamp_policy_docs.sql`
+        를 실행해야 실제 DB 컬럼에 코멘트가 반영된다. 순수 메타데이터 변경(락/데이터 영향 없음)이라
+        장중에 실행해도 안전.
+  - [ ] "TIMESTAMP로 컬럼 타입 변경"·"tz-aware 전환+과거데이터 보정" 두 대안은 이번에 보류만
+        됐을 뿐 기각된 게 아님 — Phase2 착수 전이나 해외선물 교차분석이 실제로 필요해지는 시점에
+        다시 검토할 것(비용: 전자는 TimescaleDB 하이퍼테이블 7개의 파티션 컬럼 타입 ALTER, 후자는
+        과거 데이터 9시간 일괄 보정 + 전환 시점 불연속 처리).
 - [ ] `_option_symbol` 그리드(고정 2.5 간격 ATM±N)와 실제 상장 행사가가 어긋나는 구간을
       실거래로 확인(현재는 `option_symbol()`이 None 반환 시 조용히 스킵만 함)
 - [ ] `poll_option_chain()` 범위를 `nearest_expiry_chain()`(체인 전체, ATM±3보다 훨씬 많은 종목)로 넓힐지 결정 —

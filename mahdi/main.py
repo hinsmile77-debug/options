@@ -142,7 +142,7 @@ async def run_observation_loop(
     await ws_client.subscribe(Subscription(tr_codes.WS_TR_FUTURES_CONTRACT, futures_symbol))
 
     with db.get_connection() as conn:
-        db.upsert_active_futures_symbol(conn, UNDERLYING, futures_symbol, datetime.now())
+        db.upsert_active_futures_symbol(conn, UNDERLYING, futures_symbol, db.local_now())
 
     # ATM±N 구독은 최대 14개 옵션 종목(행사가×C/P) + 선물 1건을 동시에 켜두므로, 종목별로 별도
     # 집계기가 필요하다 — 하나를 공유하면 서로 다른 종목의 체결가가 한 봉에 뒤섞인다.
@@ -530,7 +530,7 @@ async def poll_option_chain(
     """
     next_tick: float | None = None
     while True:
-        poll_time = datetime.now().replace(second=0, microsecond=0)
+        poll_time = db.local_now().replace(second=0, microsecond=0)
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
             rest_client, books, master, underlying, poll_time
         )
@@ -680,7 +680,7 @@ async def poll_expiry_liquidity(
 
     next_tick: float | None = None
     while True:
-        poll_time = datetime.now().replace(second=0, microsecond=0)
+        poll_time = db.local_now().replace(second=0, microsecond=0)
         any_strikes = False
         rows: list[dict] = []
         for subscription_manager, series in books:
@@ -905,7 +905,7 @@ async def poll_macro_snapshot(
     """
     next_tick: float | None = None
     while True:
-        poll_time = datetime.now().replace(second=0, microsecond=0)
+        poll_time = db.local_now().replace(second=0, microsecond=0)
         row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time)
 
         if row is None:
@@ -1001,7 +1001,7 @@ async def poll_investor_flow(
                 logger.warning("투자자 수급 폴링 재시도도 실패 — 이번 사이클 포기")
 
         if got_any:
-            poll_time = datetime.now().replace(second=0, microsecond=0)
+            poll_time = db.local_now().replace(second=0, microsecond=0)
             with db.get_connection() as conn:
                 db.insert_investor_flow(
                     conn, poll_time, underlying,

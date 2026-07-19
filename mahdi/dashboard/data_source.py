@@ -163,7 +163,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     ts, regime_idx, prob_vector, higher_tf_idx, stability_flag = regime_row
     regime_prob = {RegimeLabel(i): float(p) for i, p in enumerate(prob_vector)}
 
-    today = datetime.now().date()
+    today = db.local_now().date()
     legs = [
         OptionLeg(
             strike=row["strike"],
@@ -233,7 +233,7 @@ def _synthetic_macro_snapshot(rng: np.random.Generator) -> dict:
 
 def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
     rng = np.random.default_rng(seed)
-    now = datetime.now()
+    now = datetime.now()  # DB에 안 쓰이는 순수 합성 더미 시각이라 db.local_now() 정책 대상 아님
     n = 60
     timestamps = [now - timedelta(minutes=n - i) for i in range(n)]
 
