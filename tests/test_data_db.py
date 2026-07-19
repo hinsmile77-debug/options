@@ -379,3 +379,22 @@ def test_latest_option_chain_maps_rows_to_dicts():
             "timestamp": datetime(2026, 7, 6, 9, 31),
         }
     ]
+
+
+def test_expiry_liquidity_fossil_series_returns_empty_when_none_found():
+    conn = FakeReadConnection([])
+    assert db.expiry_liquidity_fossil_series(conn, "KOSPI200") == []
+
+
+def test_expiry_liquidity_fossil_series_returns_values_outside_whitelist():
+    # 2026-07-19(§5-6 "오늘의 점검 요약"): 2026-07-10 위클리 분리 이전 병합 라벨 "weekly"처럼
+    # 화이트리스트 밖 series가 남아있으면 그 값들을 그대로 알려줘야 한다(latest_expiry_liquidity()는
+    # 이런 화석 데이터를 조용히 걸러내기만 하지, "있는지 없는지"는 별도로 확인해야 함).
+    conn = FakeReadConnection([("weekly",)])
+
+    result = db.expiry_liquidity_fossil_series(conn, "KOSPI200")
+
+    assert result == ["weekly"]
+    assert conn.store["params"][0] == "KOSPI200"
+    assert set(conn.store["params"][1]) == {"regular", "weekly_mon", "weekly_thu"}
+    assert "series != ALL(%s)" in conn.store["query"]

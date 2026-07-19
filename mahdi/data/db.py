@@ -370,6 +370,28 @@ def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]
     ]
 
 
+def expiry_liquidity_fossil_series(conn: ConnectionLike, underlying: str) -> list[str]:
+    """
+    입력: 기초자산 라벨.
+    계산: _VALID_EXPIRY_LIQUIDITY_SERIES 화이트리스트 밖의 series 값이 expiry_liquidity_1m에
+         남아있는지 확인한다 — 2026-07-10 위클리 분리 이전 구코드가 남긴 series='weekly' 화석
+         데이터(179건)가 COCKPIT에 영구 노출됐던 사고([[DECISION_LOG]])와 같은 패턴이 재발하는지
+         COCKPIT "오늘의 점검 요약" 패널(2026-07-19, §5-6)에서 사람이 매번 DB를 직접 조회하지
+         않고도 상시 확인할 수 있게 한다.
+    해석: latest_expiry_liquidity()는 이미 이 화이트리스트로 걸러서 반환하므로 COCKPIT 정상
+         패널에는 화석 데이터가 안 보인다 — 하지만 그건 "숨긴 것"이지 "없는 것"은 아니므로,
+         실제로 그런 화석 행이 쌓이고 있는지는 별도로 확인해야 한다.
+    실패 조건: 화석 series가 없으면 빈 리스트.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT series FROM expiry_liquidity_1m WHERE underlying=%s AND series != ALL(%s)",
+            (underlying, list(_VALID_EXPIRY_LIQUIDITY_SERIES)),
+        )
+        rows = cur.fetchall()
+    return [row[0] for row in rows]
+
+
 def insert_feature_store(conn: ConnectionLike, timestamp: datetime, symbol: str, features: dict, feature_version: str) -> None:
     """
     입력: 타임스탬프, 종목코드, 피처 사전 결과(dict), 피처 버전 태그.

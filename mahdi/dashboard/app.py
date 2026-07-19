@@ -10,7 +10,12 @@ import time
 
 import streamlit as st
 
-from mahdi.dashboard.data_source import get_slack_alerts_enabled, load_snapshot, set_slack_alerts_enabled
+from mahdi.dashboard.data_source import (
+    get_health_summary,
+    get_slack_alerts_enabled,
+    load_snapshot,
+    set_slack_alerts_enabled,
+)
 from mahdi.dashboard.panels.flow_radar_panel import (
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
@@ -48,6 +53,16 @@ def render() -> None:
         )
         if slack_toggle != current_slack_enabled:
             set_slack_alerts_enabled(slack_toggle)
+
+    # 2026-07-19(§5-6 "오늘의 점검 요약") — 운영점검보고서 §1-B 장중 체크리스트 중 SQL로
+    # 자동화 가능한 항목들(데이터 결손율·CBOT 상태·series 화이트리스트 위반·레짐 stability_flag
+    # 비율)을 매번 사람이 DB를 직접 조회하지 않고 상단 배지로 상시 노출한다.
+    st.subheader("오늘의 점검 요약")
+    health_checks = get_health_summary()
+    health_cols = st.columns(len(health_checks))
+    for col, check in zip(health_cols, health_checks):
+        badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
+        badge(f"**{check.label}**\n\n{check.detail}")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("현재 레짐", REGIME_LABEL_KO[snapshot.regime])

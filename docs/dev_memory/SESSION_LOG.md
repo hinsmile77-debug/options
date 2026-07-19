@@ -4,6 +4,60 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] COCKPIT "오늘의 점검 요약" 패널 — 07-16 운영점검보고서 §5 고도화 아이디어 6번 구현
+
+**트리거:** 운영점검보고서 §5-6 — §1-B 장전/장중/장후 체크리스트 중 "데이터 결손율, CBOT 상태,
+series 화이트리스트 위반, 레짐 stability_flag 비율 등"은 SQL 몇 줄로 자동화 가능한데, 매번 사람이
+DB를 직접 조회해야 했다. COCKPIT 상단에 헬스체크 배지로 상시 노출하면 이 보고서 작업의 상당
+부분이 매일 자동으로 된다는 제안.
+
+**범위 판단:** 1-B 체크리스트 전부가 아니라 "SQL로 자동화 가능한" 것만 골랐다 — 로그 파일 내용
+확인(`logs/premarket_startup.log` 4줄 등), COCKPIT 브라우저 메모리 사용량, WS 구독 슬롯 예산
+(구독 매니저의 인메모리 상태라 DB에 없음) 같은 항목은 SQL로 볼 수 없어 제외. `feature_store`
+20영업일 카운트다운은 보고서에서 **별도 항목(§5-7)**으로 이미 분리돼 있어 여기서 겹쳐 구현하지
+않음(다음에 §5-7이 요청되면 그때 추가).
+
+**구현:**
+- `mahdi/dashboard/data_source.py`: `HealthCheck`(label/status/detail) dataclass +
+  `get_health_summary()`(오케스트레이터) + 개별 체크 함수 5개:
+  - `_option_chain_freshness_check`/`_futures_freshness_check` — 각각 `option_analysis_1m`/
+    `market_raw_1m`(현재 선물 심볼)의 최신 timestamp 나이를 본다. **장중(평일 09:00~15:45)에만**
+    결손 여부를 판단하고(`_is_trading_hours`), 그 외 시간엔 데이터가 없어도 정상이므로 "정보"로만
+    표시 — 장외시간에 매번 빨간 경고가 뜨는 오탐을 막기 위함. 임계값은 §5-4 Slack 알림과 동일한
+    5분(`_STALE_DATA_THRESHOLD_SECONDS`)으로 통일. 선물 결손 체크는 "WS가 지금 살아있는가"를 직접
+    볼 방법이 COCKPIT(별도 프로세스)엔 없어서 쓰는 대리 지표(WS가 끊기면 선물 체결도 같이 끊김).
+  - `_cbot_status_check` — `db.latest_macro_snapshot()`의 zn_front NULL 여부.
+  - `_fossil_data_check` — `expiry_liquidity_1m`의 화이트리스트 밖 series(신규
+    `db.expiry_liquidity_fossil_series()`) + `market_raw_1m`의 화석 라벨(`_LEGACY_MIXED_SYMBOL`)
+    잔존 여부.
+  - `_regime_stability_check` — 오늘 `regime_state`의 stability_flag 비율. 낮아도 버그가 아니므로
+    (§3-3 — warmup_fallback()이 의도적으로 항상 False 반환) "정보"로만 표시, 판단(ok/warning) 없음.
+  - `get_health_summary()`는 커넥션 하나를 열어 5개 체크에 공유하되, 체크 함수마다 자체
+    try/except+rollback을 가진다 — 하나가 실패해도(쿼리 오류) 트랜잭션이 아보트된 상태로 남아
+    나머지 체크까지 연쇄 실패하는 걸 막는다. DB 연결 자체가 안 되면 단일 "조회 불가" 항목 하나로
+    폴백.
+- `mahdi/data/db.py`: `expiry_liquidity_fossil_series()`(신규) — `_VALID_EXPIRY_LIQUIDITY_SERIES`
+  화이트리스트 밖 series가 실제로 쌓이고 있는지 확인(`latest_expiry_liquidity()`는 이미 이걸로
+  걸러서 반환하므로 COCKPIT 정상 패널에는 "숨겨질" 뿐 "없는 것"은 아님 — 2026-07-10 `series='weekly'`
+  화석 179건 사고와 같은 패턴 재발을 사람이 매번 DB로 확인 안 해도 되게 함).
+- `mahdi/dashboard/app.py`: 제목 바로 아래(Slack 토글 다음) `st.subheader("오늘의 점검 요약")` +
+  `st.columns(5)`에 `st.success`/`st.warning`/`st.info`로 배지 5개 렌더링.
+
+**검증:** `tests/test_data_db.py`(+2, `expiry_liquidity_fossil_series`), `tests/test_dashboard_data_source.py`
+(+22 — 순수 로직 `_is_trading_hours`/`_freshness_check` 7개, 개별 체크 함수 5개 각각의 정상/예외
+분기 11개, `get_health_summary` 오케스트레이션 2개, 및 관련 fixture 클래스). 라이브 DB(현재 장외
+시간)에 직접 `get_health_summary()`를 호출해 실제 값 확인 — 옵션체인/선물 둘 다 "장중 아님", CBOT
+"미승인"(예상대로, §4-2 6일째 지속), 화석 데이터 "없음"(정상), 레짐 "오늘 데이터 없음"(정상) —
+전부 기대한 그대로 나옴. AppTest로 렌더링 시도 시 예외 0건 확인(app.py 자체의 rerun 루프로 인한
+사전 존재 타임아웃은 여전히 발생 — 이전 세션에서 이미 원본 코드로도 재현 확인한 것과 동일, 이번
+변경과 무관). `.venv`(Python 3.12) 기준 전체 pytest 275개 통과.
+
+**다음 확인 필요(코드 변경 아님, 실운영 확인 대상 — [[NEXT_TODO]] 참고):** 실제 정규장 시간에
+COCKPIT을 열어 배지가 "정상"으로 정확히 전환되는지, 결손을 실제로 유도했을 때 경고로 바뀌는지는
+장외시간 실측만으로는 확인 불가 — 다음 거래일에 재확인 필요.
+
+---
+
 ## [2026-07-19] 로그 위생(로테이션+반복 경고 압축) — 07-16 운영점검보고서 §5 고도화 아이디어 5번 구현
 
 **트리거:** 운영점검보고서 §5-5 — `logs/observation_loop.log`가 로테이션 없이 105MB까지 누적됐고

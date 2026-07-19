@@ -124,6 +124,20 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
         공간이 급하면 수동으로 지워도 됨.
   - [ ] 실제 관측 루프를 재시작해 콘솔 창에 로그가 여전히 실시간으로 보이는지, `logs/observation_loop.log`가
         실제로 10MB 근방에서 회전되는지 실운영 확인 필요(단위테스트는 tmp_path로 격리해 검증함).
+- [x] (2026-07-19 구현+라이브 DB로 검증 완료) **COCKPIT "오늘의 점검 요약" 패널** — 운영점검보고서
+      §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목(§5-6): 옵션체인/선물 데이터 결손(장중에만
+      판단, §5-4 Slack 알림과 동일한 5분 기준), CBOT(zn_front) 승인 상태, series/symbol 화이트리스트
+      위반(화석 데이터), 오늘 레짐 stability_flag 비율 — 5개를 COCKPIT 제목 바로 아래 배지로
+      상시 노출. `mahdi/dashboard/data_source.py`에 `HealthCheck`/`get_health_summary()`(+ 5개
+      개별 체크 함수) 신규, `mahdi/data/db.py`에 `expiry_liquidity_fossil_series()` 신규(화이트리스트
+      밖 series 존재 여부 — `latest_expiry_liquidity()`는 이미 걸러서 반환하므로 "숨긴 것"과
+      "없는 것"을 구분하려면 별도 조회 필요). 항목별로 독립적으로 DB에 접근해(하나 실패해도
+      rollback 후 나머지는 계속 보여줌) 라이브 DB로 직접 조회해 정상 동작 확인함(장중 아님/CBOT
+      미승인/화석 데이터 없음/오늘 레짐 데이터 없음 — 현재 시각 기준 전부 예상대로 표시)
+      ([[SESSION_LOG]] 2026-07-19 항목 참고).
+  - [ ] 실제 장중(평일 09:00~15:45)에 COCKPIT을 열어 옵션체인/선물 배지가 "정상"으로 정확히
+        전환되는지, 결손을 실제로 유도했을 때(예: 폴링 중단) "결손" 경고로 바뀌는지 실측 확인 필요
+        (지금까지는 장외시간 실측 + 단위테스트로만 검증됨).
 - [ ] `_option_symbol` 그리드(고정 2.5 간격 ATM±N)와 실제 상장 행사가가 어긋나는 구간을
       실거래로 확인(현재는 `option_symbol()`이 None 반환 시 조용히 스킵만 함)
 - [ ] `poll_option_chain()` 범위를 `nearest_expiry_chain()`(체인 전체, ATM±3보다 훨씬 많은 종목)로 넓힐지 결정 —

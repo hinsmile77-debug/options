@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 
 import numpy as np
 
@@ -100,6 +100,158 @@ def set_slack_alerts_enabled(enabled: bool) -> None:
             db.set_slack_alerts_enabled(conn, enabled)
     except Exception:
         logger.warning("슬랙 알림 설정 저장 실패", exc_info=True)
+
+
+@dataclass(frozen=True, slots=True)
+class HealthCheck:
+    label: str
+    status: str  # "ok" | "warning" | "info"
+    detail: str
+
+
+# 2026-07-19(§5-6 "오늘의 점검 요약") — 1-B 장중 체크리스트의 "결손 여부" 기준(§5-4 Slack 알림의
+# OPTION_CHAIN_GAP_ALERT_SECONDS와 동일한 5분)과 정규장 시간. 공휴일 캘린더는 없음(이 코드베이스
+# 어디에도 아직 없음 — 평일 09:00~15:45만 "장중"으로 본다).
+_TRADING_DAY_START = dtime(9, 0)
+_TRADING_DAY_END = dtime(15, 45)
+_STALE_DATA_THRESHOLD_SECONDS = 300.0
+
+
+def _is_trading_hours(now: datetime) -> bool:
+    return now.weekday() < 5 and _TRADING_DAY_START <= now.time() <= _TRADING_DAY_END
+
+
+def _freshness_check(label: str, latest_ts: datetime | None, now: datetime) -> HealthCheck:
+    """장중이 아니면(주말/장외시간) 데이터가 안 들어와도 정상이므로 판단하지 않는다 — 장중에만
+    §5-4와 동일한 5분 기준으로 결손 여부를 판단한다."""
+    if not _is_trading_hours(now):
+        return HealthCheck(label, "info", "장중 아님(평일 09:00~15:45 외)")
+    if latest_ts is None:
+        return HealthCheck(label, "warning", "장중인데 데이터가 아직 한 건도 없음")
+    age_seconds = max((now - latest_ts).total_seconds(), 0.0)
+    if age_seconds >= _STALE_DATA_THRESHOLD_SECONDS:
+        return HealthCheck(label, "warning", f"{age_seconds / 60:.0f}분째 결손")
+    return HealthCheck(label, "ok", f"{age_seconds:.0f}초 전 갱신")
+
+
+def _option_chain_freshness_check(conn, underlying: str, now: datetime) -> HealthCheck:
+    label = "옵션체인(option_analysis_1m)"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(timestamp) FROM option_analysis_1m WHERE underlying=%s", (underlying,))
+            row = cur.fetchone()
+        latest_ts = row[0] if row else None
+    except Exception:
+        conn.rollback()
+        logger.warning("옵션체인 결손 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    return _freshness_check(label, latest_ts, now)
+
+
+def _futures_freshness_check(conn, underlying: str, now: datetime) -> HealthCheck:
+    # WS가 살아있는지 직접 볼 방법은 COCKPIT(별도 프로세스)에 없으므로, 선물 1분봉이 계속
+    # 들어오고 있는지를 대리 지표로 쓴다 — WS가 끊기면(재연결 로직이 있어도 그 사이엔) 선물
+    # 체결도 같이 끊긴다.
+    label = "선물 시세(market_raw_1m, WS 생존 대리 지표)"
+    try:
+        futures_symbol = db.get_active_futures_symbol(conn, underlying)
+        if futures_symbol is None:
+            return HealthCheck(label, "info", "선물 심볼 미등록(관측 루프 미기동)")
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(timestamp) FROM market_raw_1m WHERE symbol=%s", (futures_symbol,))
+            row = cur.fetchone()
+        latest_ts = row[0] if row else None
+    except Exception:
+        conn.rollback()
+        logger.warning("선물 결손 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    return _freshness_check(label, latest_ts, now)
+
+
+def _cbot_status_check(conn) -> HealthCheck:
+    label = "CBOT(ZN/US10Y 선물) 계좌 승인"
+    try:
+        snapshot = db.latest_macro_snapshot(conn)
+    except Exception:
+        conn.rollback()
+        logger.warning("CBOT 상태 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    if snapshot is None:
+        return HealthCheck(label, "info", "아직 매크로 스냅샷 폴링 데이터 없음")
+    zn_front = snapshot.get("zn_front")
+    if zn_front is None:
+        return HealthCheck(label, "info", "미승인 — zn_front NULL(KIS 앱/HTS 신청 상태 확인 필요)")
+    return HealthCheck(label, "ok", f"승인됨 — zn_front={zn_front:.2f}")
+
+
+def _fossil_data_check(conn, underlying: str, now: datetime) -> HealthCheck:
+    label = "화석 데이터(series/symbol 화이트리스트 위반)"
+    try:
+        fossil_series = db.expiry_liquidity_fossil_series(conn, underlying)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM market_raw_1m WHERE symbol=%s AND timestamp::date=%s",
+                (_LEGACY_MIXED_SYMBOL, now.date()),
+            )
+            legacy_symbol_count = cur.fetchone()[0]
+    except Exception:
+        conn.rollback()
+        logger.warning("화석 데이터 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    problems = []
+    if fossil_series:
+        problems.append(f"expiry_liquidity_1m series={fossil_series}")
+    if legacy_symbol_count:
+        problems.append(f"market_raw_1m symbol='{_LEGACY_MIXED_SYMBOL}' {legacy_symbol_count}건(오늘)")
+    if problems:
+        return HealthCheck(label, "warning", "; ".join(problems))
+    return HealthCheck(label, "ok", "화이트리스트 밖 데이터 없음")
+
+
+def _regime_stability_check(conn, now: datetime) -> HealthCheck:
+    label = "레짐 stability_flag 비율(오늘)"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FILTER (WHERE stability_flag), count(*) FROM regime_state WHERE timestamp::date=%s",
+                (now.date(),),
+            )
+            stable_count, total_count = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        logger.warning("레짐 안정성 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    if not total_count:
+        return HealthCheck(label, "info", "오늘 레짐 데이터 없음")
+    pct = stable_count / total_count * 100
+    # 낮은 비율 자체는 버그가 아니다(§3-3) — warmup_fallback()이 의도적으로 항상 False를
+    # 반환하는 정상 동작일 수 있으므로 판단(ok/warning)이 아니라 정보로만 노출한다.
+    return HealthCheck(label, "info", f"{pct:.0f}% 안정 ({stable_count}/{total_count}행) — 낮아도 버그 아님(§3-3)")
+
+
+def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
+    """
+    입력: 기초자산 라벨.
+    계산: 운영점검보고서 §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목들(§5-6 "오늘의 점검
+         요약") — 옵션체인/선물 데이터 결손, CBOT 승인 상태, series/symbol 화석 데이터 잔존 여부,
+         오늘 레짐 stability_flag 비율 — 을 매번 사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서
+         바로 볼 수 있게 한다.
+    실패 조건: 항목별로 독립적으로 조회한다 — 하나가 실패해도(쿼리 오류 등) rollback 후 나머지
+              항목은 계속 보여준다. DB 연결 자체가 안 되면 단일 "조회 불가" 항목 하나만 반환한다.
+    """
+    try:
+        with db.get_connection() as conn:
+            now = db.local_now()
+            return [
+                _option_chain_freshness_check(conn, underlying, now),
+                _futures_freshness_check(conn, underlying, now),
+                _cbot_status_check(conn),
+                _fossil_data_check(conn, underlying, now),
+                _regime_stability_check(conn, now),
+            ]
+    except Exception:
+        logger.warning("점검 요약 조회 실패", exc_info=True)
+        return [HealthCheck("오늘의 점검 요약", "warning", "DB 연결 실패로 조회 불가")]
 
 
 def load_snapshot(underlying: str = "KOSPI200") -> DashboardSnapshot:

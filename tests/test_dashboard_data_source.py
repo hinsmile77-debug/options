@@ -4,7 +4,16 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from mahdi.dashboard.data_source import (
+    HealthCheck,
+    _cbot_status_check,
+    _fossil_data_check,
+    _freshness_check,
+    _futures_freshness_check,
+    _is_trading_hours,
+    _option_chain_freshness_check,
+    _regime_stability_check,
     _synthetic_snapshot,
+    get_health_summary,
     get_slack_alerts_enabled,
     load_snapshot,
     set_slack_alerts_enabled,
@@ -357,3 +366,260 @@ def test_set_slack_alerts_enabled_swallows_db_errors(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
 
     set_slack_alerts_enabled(True)  # 예외가 전파되면 이 줄에서 테스트가 실패한다
+
+
+class _FakeHealthCursor:
+    """쿼리 문자열의 특정 부분으로 어떤 조회인지 구분해 미리 준비한 값을 돌려준다 —
+    get_health_summary()가 여러 종류의 쿼리(직접 SQL + db.py 함수 경유)를 섞어 쓰기 때문에
+    범용으로 만들었다."""
+
+    def __init__(self, responses: dict, log: list):
+        self._responses = responses
+        self._log = log
+        self._kind = "one"
+        self._value = None
+
+    def execute(self, query: str, params=None) -> None:
+        self._log.append((query, params))
+        if "option_analysis_1m" in query and "MAX(timestamp)" in query:
+            self._kind, self._value = "one", self._responses.get("option_chain_latest")
+        elif "active_futures_symbol" in query:
+            self._kind, self._value = "one", self._responses.get("futures_symbol_row")
+        elif "market_raw_1m" in query and "MAX(timestamp)" in query:
+            self._kind, self._value = "one", self._responses.get("futures_latest")
+        elif "market_raw_1m" in query and "count(*)" in query:
+            self._kind, self._value = "one", self._responses.get("legacy_symbol_count_row", (0,))
+        elif "macro_snapshot_5m" in query and "us10y_yield IS NOT NULL" in query:
+            self._kind, self._value = "one", self._responses.get("macro_fallback_row")
+        elif "macro_snapshot_5m" in query:
+            self._kind, self._value = "one", self._responses.get("macro_row")
+        elif "expiry_liquidity_1m" in query:
+            self._kind, self._value = "all", self._responses.get("fossil_series_rows", [])
+        elif "regime_state" in query:
+            self._kind, self._value = "one", self._responses.get("regime_stability_row")
+        else:
+            self._kind, self._value = "one", None
+
+    def fetchone(self):
+        return self._value
+
+    def fetchall(self):
+        return self._value if self._value is not None else []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeHealthConnection:
+    def __init__(self, responses: dict):
+        self._responses = responses
+        self.log: list = []
+        self.rollback_calls = 0
+
+    def cursor(self) -> _FakeHealthCursor:
+        return _FakeHealthCursor(self._responses, self.log)
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+class _BrokenHealthCursor:
+    def execute(self, *args, **kwargs) -> None:
+        raise RuntimeError("DB 오류")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _BrokenHealthConnection:
+    def __init__(self):
+        self.rollback_calls = 0
+
+    def cursor(self) -> _BrokenHealthCursor:
+        return _BrokenHealthCursor()
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+# --- _is_trading_hours / _freshness_check (순수 로직, DB 불필요) ------------------------------
+
+def test_is_trading_hours_true_during_weekday_market_window():
+    assert _is_trading_hours(datetime(2026, 7, 20, 10, 0)) is True  # 월요일 10:00
+
+
+def test_is_trading_hours_false_on_weekend():
+    assert _is_trading_hours(datetime(2026, 7, 18, 10, 0)) is False  # 토요일
+
+
+def test_is_trading_hours_false_outside_market_window():
+    assert _is_trading_hours(datetime(2026, 7, 20, 8, 59)) is False
+    assert _is_trading_hours(datetime(2026, 7, 20, 15, 46)) is False
+
+
+def test_freshness_check_is_info_outside_trading_hours_even_without_data():
+    # 장중이 아니면 데이터가 안 들어와도 정상 — 결손으로 오판하면 안 된다.
+    check = _freshness_check("라벨", None, datetime(2026, 7, 18, 10, 0))
+    assert check.status == "info"
+
+
+def test_freshness_check_warning_when_no_data_during_trading_hours():
+    check = _freshness_check("라벨", None, datetime(2026, 7, 20, 10, 0))
+    assert check.status == "warning"
+
+
+def test_freshness_check_ok_when_recently_updated():
+    now = datetime(2026, 7, 20, 10, 5)
+    check = _freshness_check("라벨", now - timedelta(seconds=30), now)
+    assert check.status == "ok"
+
+
+def test_freshness_check_warning_when_stale_beyond_threshold():
+    # §5-4 Slack 알림과 동일한 5분 기준.
+    now = datetime(2026, 7, 20, 10, 10)
+    check = _freshness_check("라벨", now - timedelta(minutes=6), now)
+    assert check.status == "warning"
+    assert "6분째 결손" in check.detail
+
+
+# --- _option_chain_freshness_check ------------------------------------------------------------
+
+def test_option_chain_freshness_check_ok():
+    now = datetime(2026, 7, 20, 10, 0)
+    conn = _FakeHealthConnection({"option_chain_latest": (now - timedelta(seconds=20),)})
+    check = _option_chain_freshness_check(conn, "KOSPI200", now)
+    assert check.status == "ok"
+
+
+def test_option_chain_freshness_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _option_chain_freshness_check(conn, "KOSPI200", datetime(2026, 7, 20, 10, 0))
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
+# --- _futures_freshness_check -------------------------------------------------------------------
+
+def test_futures_freshness_check_info_when_no_futures_symbol_registered():
+    now = datetime(2026, 7, 20, 10, 0)
+    conn = _FakeHealthConnection({"futures_symbol_row": None})
+    check = _futures_freshness_check(conn, "KOSPI200", now)
+    assert check.status == "info"
+
+
+def test_futures_freshness_check_ok_when_recent():
+    now = datetime(2026, 7, 20, 10, 0)
+    conn = _FakeHealthConnection(
+        {"futures_symbol_row": ("101S03",), "futures_latest": (now - timedelta(seconds=15),)}
+    )
+    check = _futures_freshness_check(conn, "KOSPI200", now)
+    assert check.status == "ok"
+
+
+# --- _cbot_status_check --------------------------------------------------------------------------
+
+def test_cbot_status_check_info_when_no_macro_snapshot_yet():
+    conn = _FakeHealthConnection({"macro_row": None})
+    check = _cbot_status_check(conn)
+    assert check.status == "info"
+    assert "매크로 스냅샷" in check.detail
+
+
+def test_cbot_status_check_info_when_zn_front_still_null():
+    conn = _FakeHealthConnection(
+        {"macro_row": (datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, None)}
+    )
+    check = _cbot_status_check(conn)
+    assert check.status == "info"
+    assert "미승인" in check.detail
+
+
+def test_cbot_status_check_ok_when_zn_front_present():
+    conn = _FakeHealthConnection(
+        {"macro_row": (datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, 110.25)}
+    )
+    check = _cbot_status_check(conn)
+    assert check.status == "ok"
+    assert "110.25" in check.detail
+
+
+# --- _fossil_data_check --------------------------------------------------------------------------
+
+def test_fossil_data_check_ok_when_clean():
+    now = datetime(2026, 7, 20, 10, 0)
+    conn = _FakeHealthConnection({"fossil_series_rows": [], "legacy_symbol_count_row": (0,)})
+    check = _fossil_data_check(conn, "KOSPI200", now)
+    assert check.status == "ok"
+
+
+def test_fossil_data_check_warning_when_fossil_series_found():
+    now = datetime(2026, 7, 20, 10, 0)
+    conn = _FakeHealthConnection({"fossil_series_rows": [("weekly",)], "legacy_symbol_count_row": (0,)})
+    check = _fossil_data_check(conn, "KOSPI200", now)
+    assert check.status == "warning"
+    assert "weekly" in check.detail
+
+
+# --- _regime_stability_check -----------------------------------------------------------------------
+
+def test_regime_stability_check_info_when_no_data_today():
+    conn = _FakeHealthConnection({"regime_stability_row": (0, 0)})
+    check = _regime_stability_check(conn, datetime(2026, 7, 20, 10, 0))
+    assert check.status == "info"
+    assert "데이터 없음" in check.detail
+
+
+def test_regime_stability_check_reports_percentage():
+    conn = _FakeHealthConnection({"regime_stability_row": (0, 337)})
+    check = _regime_stability_check(conn, datetime(2026, 7, 20, 10, 0))
+    assert check.status == "info"
+    assert "0% 안정" in check.detail
+    assert "0/337" in check.detail
+
+
+# --- get_health_summary (오케스트레이션) ------------------------------------------------------------
+
+def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
+    calls: list[str] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    def make_check(name):
+        def _check(*args, **kwargs):
+            calls.append(name)
+            return HealthCheck(name, "ok", "테스트")
+        return _check
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_freshness_check", make_check("option_chain"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._futures_freshness_check", make_check("futures"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._cbot_status_check", make_check("cbot"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._fossil_data_check", make_check("fossil"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
+
+    result = get_health_summary()
+
+    assert calls == ["option_chain", "futures", "cbot", "fossil", "regime"]
+    assert [c.label for c in result] == calls
+
+
+def test_get_health_summary_falls_back_to_single_warning_when_db_unavailable(monkeypatch):
+    @contextmanager
+    def broken_connection(settings=None):
+        raise ConnectionError("DB 없음")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
+
+    result = get_health_summary()
+
+    assert len(result) == 1
+    assert result[0].status == "warning"
