@@ -4,6 +4,38 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] NumericValueOutOfRange 진단 로깅 — 07-16 운영점검보고서 §5 고도화 아이디어 1번 구현
+
+**트리거:** 2026-07-16 운영점검보고서(§3-1) — 옵션체인 특정 10개 행사가(1087.5~1097.5, 1160~1170
+두 클러스터)에서 `psycopg.errors.NumericValueOutOfRange`(IV 등 DECIMAL(8,6) 범위 초과)로 레그 삽입
+실패가 30만 줄 로그 구간에서 3,416회 재현 중. 2026-07-06에 "레그 단위 try/except+rollback"으로
+크래시는 막았지만(§4-1), **당시엔 strike/option_type만 로깅해 어떤 raw 값이 왜 범위를 넘었는지
+근본 원인은 조사된 적이 없었다**. 보고서 §5-1이 제안한 "매크로 폴러의 `_log_kis_call_failure()` 패턴
+(원본 응답을 그대로 로깅)을 옵션체인 폴러에도 이식"을 실행.
+
+**구현:**
+- `mahdi/main.py` `_parse_option_quote()`: 파싱 성공 시 row에 `_raw_kis_output1`(파싱 전 KIS
+  `output1` 원본 dict)을 함께 실어 반환하도록 변경. `_OPTION_ANALYSIS_1M_COLUMNS`에 없는 키라
+  `db._upsert()`가 `row.get(c) for c in columns`로 컬럼만 골라 쓰므로 INSERT 쿼리엔 안 섞임(스키마
+  변경 없음, `_log_kis_call_failure`처럼 별도 함수로 안 빼고 row에 얹는 방식 선택 — 삽입 실패 시점엔
+  이미 REST 호출이 끝난 뒤라 exc가 `httpx.HTTPStatusError`가 아니고 psycopg 예외이므로 그 함수를
+  그대로 재사용할 수는 없었음).
+- `poll_option_chain()`의 레그 삽입 실패 로그(기존 `strike=%s type=%s`만 있던 곳)에
+  `raw_kis_output1=%s`를 추가해 원본 KIS 필드(delta_val/gama/theta/vega/hts_ints_vltl/hist_vltl 등)가
+  그대로 남도록 함.
+
+**검증:** `tests/test_main.py`에 신규 테스트 2개 추가 — `_parse_option_quote`가 row에 원본 output1을
+그대로 담는지, DB 삽입 실패 시 caplog로 실제 로그 문자열에 raw 필드(`hts_ints_vltl` 등)가 찍히는지.
+`.venv`(Python 3.12) 기준 전체 pytest 226개 통과(3.7 아나콘다 env는 `typing.Protocol` 미지원으로
+이 프로젝트에 안 맞음 — 앞으로는 `.venv/Scripts/python.exe`로 실행할 것).
+
+**다음 확인 필요(코드 변경 아님, 실운영 확인 대상 — [[NEXT_TODO]] 참고):** 이 커밋만으론 근본 원인이
+바로 안 밝혀진다 — 다음 재발 시 로그에 찍힐 `raw_kis_output1`을 실제로 봐야 원인 필드(예: 음수/특수
+sentinel 등)를 특정할 수 있다. 두 클러스터(70pt 간격)가 정말 서로 다른 북(먼슬리/위클리월/위클리목)의
+ATM 근방인지도 그때 함께 확인.
+
+---
+
 ## [2026-07-10] Cross-asset stress(VIX 기간구조·USDCNH·US10Y) KIS 데이터 소스 조사·구현 — ZN(US10Y)만 CBOT 계좌 신청 대기로 미완
 
 **트리거:** 사용자가 "§7.3 Cross-asset stress 피처(USDKRW·USDCNH·US10Y 급변)를 KIS API로 구성할 수 있게

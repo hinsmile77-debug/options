@@ -355,6 +355,12 @@ def _parse_option_quote(
             "oi_change": int(float(output1["otst_stpl_qty_icdc"])),
             "volume": int(float(output1["acml_vol"])),
             "spread_state": None,
+            # DB 컬럼이 아닌 진단용 필드 — _upsert()는 _OPTION_ANALYSIS_1M_COLUMNS에 있는
+            # 키만 읽으므로 여기 얹어도 INSERT 쿼리에 섞이지 않는다. 2026-07-16 점검에서
+            # 특정 행사가의 IV 등이 DECIMAL(8,6) 범위를 넘어 삽입이 실패하는데 원인(실제 raw
+            # 값이 뭐였는지)을 알 길이 없었던 문제 — 실패 시점에 KIS 원본 응답을 그대로 로깅할
+            # 수 있게 파싱 이전 output1을 함께 들고 다닌다.
+            "_raw_kis_output1": output1,
         }
         return row, spot
     except (KeyError, ValueError, TypeError):
@@ -479,9 +485,13 @@ async def poll_option_chain(
                         # 큰 값을 돌려줘 DECIMAL(8,6) 컬럼 범위를 넘는 numeric field overflow가 발생함 —
                         # 레그 하나가 죽는다고 사이클 전체(선물 틱 수신까지)가 죽으면 안 되므로 스킵.
                         # rollback 필수: psycopg는 실패한 트랜잭션에서 커밋 없이 다음 execute를 허용 안 함.
+                        # 2026-07-16: strike/type만으로는 "왜" 범위를 넘었는지(delta_val이 이상한지,
+                        # hts_ints_vltl이 이상한지 등) 알 수 없었다 — KIS 원본 응답(output1)을 함께
+                        # 남겨 다음 재발 시 바로 원인 필드를 특정할 수 있게 한다.
                         logger.warning(
-                            "옵션 체인 적재 실패(값 이상 등): strike=%s type=%s",
-                            row.get("strike"), row.get("option_type"), exc_info=True,
+                            "옵션 체인 적재 실패(값 이상 등): strike=%s type=%s raw_kis_output1=%s",
+                            row.get("strike"), row.get("option_type"), row.get("_raw_kis_output1"),
+                            exc_info=True,
                         )
                         conn.rollback()
                         continue

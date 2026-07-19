@@ -40,6 +40,17 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ## 관측 인프라(Phase 1) 마무리
 
+- [x] (2026-07-19 로깅만 완료, 근본원인 확인은 남음) **NumericValueOutOfRange 진단 로깅** — 2026-07-16
+      점검에서 특정 10개 행사가(1087.5~1097.5, 1160~1170 두 클러스터)의 IV 등이 DECIMAL(8,6) 범위를
+      계속 넘어 레그 삽입이 실패(3,416회) 중임을 발견. `_parse_option_quote()`가 원본 `output1`을
+      row에 `_raw_kis_output1`로 함께 실어 나르고, 삽입 실패 로그에 그대로 찍히도록 수정함([[SESSION_LOG]]
+      2026-07-19 항목 참고).
+  - [ ] 다음 재발 시 로그의 `raw_kis_output1`을 실제로 보고 어떤 필드(delta_val/gama/theta/vega/
+        hts_ints_vltl/hist_vltl 등)가 어떤 비정상 값(음수/특수 sentinel/자릿수 오류 등)을 반환하는지
+        확인해 근본 수정.
+  - [ ] 두 클러스터(약 70pt 간격)가 정말 서로 다른 북(먼슬리/위클리월/위클리목)의 ATM 근방인지
+        DB(`option_analysis_1m`은 실패라 안 남으므로 subscription_manager 로그/각 북의 desired_strikes
+        스냅샷 등으로)로 교차 확인.
 - [x] `nearest_expiry_chain()`으로 얻은 심볼 목록을 순회하며 `rest_client.get_quote()` 반복 호출 →
       `option_analysis_1m`(IV/Greeks/OI/GEX 등) 적재 루프를 `main.py`에 연결 — 2026-07-06 `poll_option_chain()`으로
       구현 완료([[SESSION_LOG]] 참고). 단, 범위는 `nearest_expiry_chain()`(체인 전체)이 아니라 WS와 동일한

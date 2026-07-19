@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import contextmanager
 from datetime import date, datetime
 
@@ -339,6 +340,15 @@ def test_parse_option_quote_missing_field_returns_none():
     assert _parse_option_quote({}, strike=1340.0, option_type="C", poll_time=datetime(2026, 7, 6, 9, 31)) is None
 
 
+def test_parse_option_quote_carries_raw_kis_output1_for_diagnostics():
+    # 2026-07-16: DB 삽입 실패(NumericValueOutOfRange 등) 시 "무엇이" 이상값이었는지 되짚어볼
+    # 수 있게, 파싱 전 원본 output1을 row에 함께 실어 나른다 — DB 컬럼이 아니므로 _upsert()가
+    # 무시하고(insert_option_analysis_1m 쿼리에 안 섞임), 실패 로그에서만 쓰인다.
+    poll_time = datetime(2026, 7, 6, 9, 31)
+    row, _ = _parse_option_quote(_SAMPLE_OPTION_QUOTE, strike=1340.0, option_type="C", poll_time=poll_time)
+    assert row["_raw_kis_output1"] == _SAMPLE_OPTION_QUOTE["output1"]
+
+
 class _FakeMaster:
     def option_symbol(
         self, option_type: str, strike: float, underlying: str = "KOSPI200", series: str = "regular"
@@ -408,7 +418,7 @@ class _FakeConnWithRollback:
         self.rollback_calls += 1
 
 
-def test_poll_option_chain_skips_bad_leg_and_continues_after_db_error(monkeypatch):
+def test_poll_option_chain_skips_bad_leg_and_continues_after_db_error(monkeypatch, caplog):
     # 2026-07-06 실운영 중 실제로 발생: 위클리 도입 후 얇은 종목의 IV 등이 DECIMAL(8,6) 범위를
     # 넘겨 psycopg.errors.NumericValueOutOfRange가 나면서 관측 루프 전체(선물 틱 수신 포함)가
     # 죽었다 — 레그 하나의 DB 삽입 실패가 rollback 후 다음 레그로 계속 이어져야 한다.
@@ -437,16 +447,24 @@ def test_poll_option_chain_skips_bad_leg_and_continues_after_db_error(monkeypatc
 
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(
-            poll_option_chain(
-                rest_client, [(_FakeSubscriptionManagerWithStrikes(), "regular")], _FakeMaster(), interval_seconds=1
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client, [(_FakeSubscriptionManagerWithStrikes(), "regular")], _FakeMaster(), interval_seconds=1
+                )
             )
-        )
 
     assert call_count["n"] == 2  # 1개 행사가 x (C, P) 둘 다 시도됨
     assert len(written_rows) == 1  # 첫 레그만 실패, 둘째 레그는 정상 적재됨(루프가 안 죽음)
     assert fake_conn.rollback_calls == 1
+
+    # 2026-07-16: strike/type만으론 "어떤 값이" 범위를 넘었는지 알 수 없었다 — 실패 로그에
+    # KIS 원본 응답(hts_ints_vltl 등 raw 필드)이 그대로 남아야 다음 재발 시 원인을 바로 특정할 수 있다.
+    failure_records = [r for r in caplog.records if "옵션 체인 적재 실패" in r.getMessage()]
+    assert len(failure_records) == 1
+    assert "hts_ints_vltl" in failure_records[0].getMessage()
+    assert _SAMPLE_OPTION_QUOTE["output1"]["hts_ints_vltl"] in failure_records[0].getMessage()
 
 
 class _FakeRestClientChainFlaky:
