@@ -23,7 +23,8 @@ from mahdi.broker import tr_codes
 from mahdi.broker.rest_client import KISRestClient
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.broker.ws_client import ApprovalKeyIssuer, KISWebSocketClient, Subscription, WSConnection
-from mahdi.config.settings import get_db_settings, get_kis_settings
+from mahdi.config.settings import get_db_settings, get_kis_settings, get_slack_settings
+from mahdi import notify
 from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
 from mahdi.data.subscription_manager import RollingSubscriptionManager
@@ -56,6 +57,10 @@ OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
 # 사이클까지 기다리지 않고 짧게 대기 후 한 번 더 시도해 유실을 줄인다.
 CYCLE_RETRY_BACKOFF_SECONDS = 5.0
+
+# 2026-07-19(§5-4 "능동 알림") — 마지막 성공 사이클 이후 이만큼 지나면(재시도까지 실패한 사이클이
+# 누적돼) option_analysis_1m 결손을 Slack으로 알린다. 운영점검보고서가 예시로 든 기준(5분)을 그대로 씀.
+OPTION_CHAIN_GAP_ALERT_SECONDS = 300.0
 
 # VPIN 등거래량 버킷 크기 — 실거래 일평균거래량 관찰 전까지 쓰는 잠정치. 학계 관례는
 # "일평균거래량/50"이지만 이 모의투자 환경의 실제 거래량 분포를 아직 모른다(2026-07-06 결정).
@@ -257,13 +262,17 @@ async def run_observation_loop_forever(
          아무것도 재구독하지 않는 버그가 생긴다). asyncio.gather로 함께 도는 REST 폴러
          (poll_option_chain 등)는 이 함수와 독립된 태스크라 재연결 시도 중에도 계속 관측을
          이어간다 — 이번 수정 전에는 WS 단절 하나가 asyncio.run(main())까지 예외를 전파시켜
-         REST 폴러까지 전부 함께 죽었다.
+         REST 폴러까지 전부 함께 죽었다. 2026-07-19(§5-4): "연결됨→끊김" 전환 시점에 한 번,
+         "끊김→재연결 성공" 전환 시점에 한 번만 Slack 알림을 보낸다(재연결 재시도마다 매번
+         보내면 네트워크 장애가 길어질 때 스팸이 된다) — currently_connected 플래그로 전환
+         시점만 골라낸다.
     실패 조건: DB 오류·ValueError(구독 슬롯 한도 등) 등 연결 문제가 아닌 예외는 재시도 없이 그대로
               전파한다 — 재시도로 해결되지 않는 코드/설정 문제이므로 사람이 봐야 한다. 정상적으로는
               run_observation_loop이 listen()의 무한 수신 루프라 정상 반환하지 않지만, 혹시라도
               반환하면(예: 테스트) 재연결 없이 그대로 종료한다.
     """
     backoff = WS_RECONNECT_INITIAL_BACKOFF_SECONDS
+    currently_connected = True
     try:
         await run_observation_loop(
             ws_client, subscription_managers, rest_client,
@@ -272,6 +281,8 @@ async def run_observation_loop_forever(
         return
     except _WS_DISCONNECT_ERRORS:
         logger.warning("WS 연결 끊김 — %.0f초 후 재연결 시도", backoff, exc_info=True)
+        notify.notify("WS 연결 끊김 — 자동 재연결 시도 중. 장시간 지속되면 KIS/네트워크 상태 확인 필요.", "CRITICAL")
+        currently_connected = False
 
     while True:
         await asyncio.sleep(backoff)
@@ -282,13 +293,21 @@ async def run_observation_loop_forever(
                 for manager in subscription_managers:
                     manager.rebind(new_client)
                 backoff = WS_RECONNECT_INITIAL_BACKOFF_SECONDS  # 연결 성공 — 다음 끊김은 다시 초기값부터
+                if not currently_connected:
+                    notify.notify("WS 재연결 성공 — 관측 재개.", "INFO")
+                    currently_connected = True
                 await run_observation_loop(
                     new_client, subscription_managers, rest_client,
                     futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
                 )
                 return
         except _WS_DISCONNECT_ERRORS:
-            logger.warning("WS 재연결 후 다시 끊김(혹은 재연결 자체 실패) — %.0f초 후 재시도", backoff, exc_info=True)
+            if currently_connected:
+                logger.warning("WS 재연결 후 다시 끊김 — %.0f초 후 재시도", backoff, exc_info=True)
+                notify.notify("WS 연결 끊김 — 자동 재연결 시도 중. 장시간 지속되면 KIS/네트워크 상태 확인 필요.", "CRITICAL")
+                currently_connected = False
+            else:
+                logger.warning("WS 재연결 시도 실패 — %.0f초 후 재시도", backoff, exc_info=True)
             continue
 
 
@@ -527,8 +546,14 @@ async def poll_option_chain(
            poll_time(분 단위로 자른 시각)이 분 경계를 건너뛰어 그 분의 1분봉이 통째로 유실되는
            현상을 2026-07-09에 DB로 확인했다. 사이클이 interval_seconds보다 오래 걸려 다음 틱을
            이미 지나쳤으면(delay<0) 따라잡으려 하지 않고 그 시점으로 스케줄을 재기준한다.
+    알림(2026-07-19, §5-4): 마지막으로 rows를 받은 시각(last_success_time) 대비
+              OPTION_CHAIN_GAP_ALERT_SECONDS(5분)를 넘겨도 재시도까지 계속 실패하면 결손을
+              Slack으로 한 번 알리고(gap_alerted), 다음에 rows가 다시 들어오면 복구를 한 번
+              알린다 — 매 사이클(60초)마다 반복 경고하면 스팸이 되므로 상태 전환 시점에만 보낸다.
     """
     next_tick: float | None = None
+    last_success_time: datetime | None = None
+    gap_alerted = False
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
@@ -548,6 +573,21 @@ async def poll_option_chain(
             )
             if not rows:
                 logger.warning("옵션 체인 폴링 재시도도 실패 — 이번 사이클 포기")
+
+        if rows:
+            if gap_alerted:
+                notify.notify("옵션 체인(option_analysis_1m) 데이터 결손 복구됨 — 정상 수신 재개.", "INFO")
+                gap_alerted = False
+            last_success_time = poll_time
+        elif last_success_time is not None and not gap_alerted:
+            gap_seconds = (poll_time - last_success_time).total_seconds()
+            if gap_seconds >= OPTION_CHAIN_GAP_ALERT_SECONDS:
+                notify.notify(
+                    f"옵션 체인(option_analysis_1m) 데이터가 {gap_seconds / 60:.0f}분째 결손 중 — "
+                    f"REST 폴링이 계속 실패하고 있습니다.",
+                    "WARNING",
+                )
+                gap_alerted = True
 
         _update_atm_iv(regime_state_machine, rows, latest_spot)
 
@@ -902,8 +942,13 @@ async def poll_macro_snapshot(
     실패 조건: 이번 사이클 전체가 실패하면(_collect_macro_snapshot_cycle이 None) 적재를
               건너뛰고 다음 정규 사이클을 기다린다 — 재시도 백오프는 두지 않는다(사이클당
               REST 호출이 4건뿐이라 다른 폴러만큼 레이트리밋에 취약하지 않음).
+    알림(2026-07-19, §5-4): 적재에 성공한 첫 사이클에서 zn_front가 그때도 None이면(CBOT 계좌
+              신청 미승인 — §4-2 6일째 지속 확인된 이슈) Slack으로 한 번만 알린다. 5분마다
+              매번 알리면 승인 전까지 하루 종일(정규장 기준 최대 78회) 반복 경고가 되므로,
+              이 프로세스 실행당(=거래일당, 매일 재시작되므로) 최초 1회만 보낸다.
     """
     next_tick: float | None = None
+    cbot_alert_sent = False
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
         row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time)
@@ -917,6 +962,13 @@ async def poll_macro_snapshot(
                 except Exception:
                     logger.warning("매크로 스냅샷 적재 실패", exc_info=True)
                     conn.rollback()
+            if row["zn_front"] is None and not cbot_alert_sent:
+                cbot_alert_sent = True
+                notify.notify(
+                    "CBOT(ZN/US10Y 선물) 계좌 신청이 여전히 미승인 상태입니다 — zn_front가 계속 "
+                    "NULL. KIS 앱/HTS에서 신청 상태를 재확인해주세요.",
+                    "WARNING",
+                )
 
         loop_now = asyncio.get_running_loop().time()
         next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
@@ -1103,6 +1155,11 @@ async def main() -> None:
         ]
         if overseas_future_master is not None:
             tasks.append(poll_macro_snapshot(rest_client, overseas_future_master))
+        # 2026-07-19(§5-4) — .env에 토큰/채널이 설정된 경우에만 워커를 띄운다. notify.notify()가
+        # 이미 미설정 시 조용히 무시하지만, 워커까지 안 띄우면 알림 기능이 꺼진 상태에서 불필요한
+        # 태스크가 asyncio.gather에 남지 않는다.
+        if get_slack_settings().is_configured:
+            tasks.append(notify.run_slack_worker())
         await asyncio.gather(*tasks)
 
 

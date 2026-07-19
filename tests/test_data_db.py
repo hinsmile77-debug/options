@@ -16,6 +16,35 @@ def test_local_now_returns_naive_wall_clock_time():
     assert before <= result <= after
 
 
+def test_is_slack_alerts_enabled_reads_stored_value():
+    # 2026-07-19(§5-4): 저장된 값이 있으면(누군가 이미 토글했으면) 그 값을 그대로 반환.
+    assert db.is_slack_alerts_enabled(FakeReadConnection([(True,)])) is True
+    assert db.is_slack_alerts_enabled(FakeReadConnection([(False,)])) is False
+
+
+def test_is_slack_alerts_enabled_falls_back_to_settings_default_when_no_row(monkeypatch):
+    # 아무도 토글한 적 없어(최초 기동) 행이 없으면 SlackSettings.slack_alerts_enabled_default로 폴백.
+    from mahdi.config import settings as settings_module
+
+    class _FakeSlackSettings:
+        slack_alerts_enabled_default = False
+
+    monkeypatch.setattr(settings_module, "get_slack_settings", lambda: _FakeSlackSettings())
+
+    assert db.is_slack_alerts_enabled(FakeReadConnection([])) is False
+
+
+def test_set_slack_alerts_enabled_upserts_singleton_row():
+    conn = FakeConnection()
+    db.set_slack_alerts_enabled(conn, True)
+
+    assert conn.committed is True
+    assert "INSERT INTO slack_alert_settings" in conn.store["query"]
+    assert "ON CONFLICT (id) DO UPDATE" in conn.store["query"]
+    assert conn.store["params"][0] is True  # id
+    assert conn.store["params"][1] is True  # enabled
+
+
 class FakeCursor:
     def __init__(self, store: dict):
         self.store = store

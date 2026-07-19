@@ -91,6 +91,20 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
         됐을 뿐 기각된 게 아님 — Phase2 착수 전이나 해외선물 교차분석이 실제로 필요해지는 시점에
         다시 검토할 것(비용: 전자는 TimescaleDB 하이퍼테이블 7개의 파티션 컬럼 타입 ALTER, 후자는
         과거 데이터 9시간 일괄 보정 + 전환 시점 불연속 처리).
+- [x] (2026-07-19 구현+라이브 DB 적용 완료) **Slack 능동 알림** — WS 연결 끊김/재연결, option_analysis_1m
+      5분 이상 결손+복구, CBOT(zn_front) 미승인 3가지를 Slack으로 알린다(운영점검보고서 §5-4).
+      `C:\Users\82108\PycharmProjects\futures`(미륵이)의 utils/notify.py+slack_queue.py 큐+워커 패턴을
+      asyncio로 이식(`mahdi/notify.py`, 신규). COCKPIT에 🔔 체크박스(대시보드 상단) + `mahdi/config/settings.py`
+      `SlackSettings`(.env: SLACK_BOT_TOKEN/SLACK_CHANNEL_ID/SLACK_ALERTS_ENABLED_DEFAULT) 추가.
+      On/Off는 COCKPIT(Streamlit)과 mahdi.main(관측 루프)이 별도 프로세스라 메모리 공유가 안 돼
+      `slack_alert_settings` 싱글턴 테이블(DB, `db/migrations/009_slack_alert_settings.sql`)로 공유—
+      라이브 컨테이너에 이미 적용 완료(빈 테이블, 아직 아무도 안 건드려 SlackSettings 기본값 True로
+      동작 중)([[SESSION_LOG]] 2026-07-19 항목 참고).
+  - [ ] **실제 Slack 메시지 발송 검증 안 됨** — 이번 세션에선 단위테스트(가짜 httpx.AsyncClient)로만
+        검증했고, 실제 봇 토큰으로 진짜 채널(C0BJ7R4MZ9B)에 메시지가 도착하는지는 확인 안 함. 관측
+        루프 재시작 후(또는 수동 스모크 테스트로) 첫 알림이 실제로 오는지 확인 필요.
+  - [ ] COCKPIT 체크박스를 브라우저에서 실제로 토글해 DB(`slack_alert_settings.enabled`)에 반영되고,
+        관측 루프가 재시작 없이 그 값을 바로 따르는지 실운영 확인 필요(단위테스트로는 로직만 검증됨).
 - [ ] `_option_symbol` 그리드(고정 2.5 간격 ATM±N)와 실제 상장 행사가가 어긋나는 구간을
       실거래로 확인(현재는 `option_symbol()`이 None 반환 시 조용히 스킵만 함)
 - [ ] `poll_option_chain()` 범위를 `nearest_expiry_chain()`(체인 전체, ATM±3보다 훨씬 많은 종목)로 넓힐지 결정 —

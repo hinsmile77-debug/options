@@ -3,7 +3,12 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from mahdi.dashboard.data_source import _synthetic_snapshot, load_snapshot
+from mahdi.dashboard.data_source import (
+    _synthetic_snapshot,
+    get_slack_alerts_enabled,
+    load_snapshot,
+    set_slack_alerts_enabled,
+)
 from mahdi.engines.regime import RegimeLabel
 
 
@@ -273,3 +278,82 @@ def test_load_snapshot_defaults_investor_flow_to_zero_when_not_yet_polled(monkey
     assert snap.foreign_net == 0.0
     assert snap.institution_net == 0.0
     assert snap.individual_net == 0.0
+
+
+class _FakeSlackSettingsCursor:
+    def __init__(self, row):
+        self._row = row
+
+    def execute(self, query, params=None) -> None:
+        pass
+
+    def fetchone(self):
+        return self._row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeSlackSettingsConnection:
+    def __init__(self, row):
+        self._row = row
+        self.committed = False
+
+    def cursor(self):
+        return _FakeSlackSettingsCursor(self._row)
+
+    def commit(self) -> None:
+        self.committed = True
+
+
+def test_get_slack_alerts_enabled_reads_stored_value(monkeypatch):
+    # 2026-07-19(§5-4): COCKPIT과 mahdi.main은 서로 다른 프로세스라 DB가 단일 진실 공급원이다.
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeSlackSettingsConnection((False,))
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    assert get_slack_alerts_enabled() is False
+
+
+def test_get_slack_alerts_enabled_falls_back_to_true_when_db_unavailable(monkeypatch):
+    # DB 연결 실패 시 "꺼짐"으로 잘못 표시해 사용자를 안심시키는 것보다 "켜짐"으로 보수적으로
+    # 표시하는 게 안전한 방향이라 True로 폴백한다.
+    @contextmanager
+    def broken_connection(settings=None):
+        raise ConnectionError("DB 없음")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
+
+    assert get_slack_alerts_enabled() is True
+
+
+def test_set_slack_alerts_enabled_writes_and_commits(monkeypatch):
+    conn = _FakeSlackSettingsConnection((True,))
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield conn
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    set_slack_alerts_enabled(False)  # 예외 없이 조용히 저장돼야 함
+
+    assert conn.committed is True
+
+
+def test_set_slack_alerts_enabled_swallows_db_errors(monkeypatch):
+    # COCKPIT 렌더링 도중 저장이 실패해도 대시보드 자체가 죽으면 안 된다.
+    @contextmanager
+    def broken_connection(settings=None):
+        raise ConnectionError("DB 없음")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
+
+    set_slack_alerts_enabled(True)  # 예외가 전파되면 이 줄에서 테스트가 실패한다

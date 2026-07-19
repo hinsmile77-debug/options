@@ -238,6 +238,35 @@ def upsert_active_futures_symbol(conn: ConnectionLike, underlying: str, symbol: 
     _upsert(conn, "active_futures_symbol", ("underlying", "symbol", "updated_at"), ("underlying",), row)
 
 
+def is_slack_alerts_enabled(conn: ConnectionLike) -> bool:
+    """
+    입력: DB 커넥션.
+    계산: slack_alert_settings(싱글턴 테이블, 2026-07-19 §5-4)의 enabled 값을 반환한다. COCKPIT
+         (Streamlit)과 mahdi.main(관측 루프)은 서로 다른 프로세스라 메모리 전역변수로 On/Off를
+         공유할 수 없다 — 이 함수가 양쪽이 항상 같은 값을 보게 하는 단일 진실 공급원(SSOT)이다.
+    실패 조건: 아무도 토글한 적이 없어 행이 없으면(최초 기동)
+              mahdi.config.settings.get_slack_settings().slack_alerts_enabled_default로 폴백한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT enabled FROM slack_alert_settings LIMIT 1")
+        row = cur.fetchone()
+    if row is None:
+        from mahdi.config.settings import get_slack_settings
+
+        return get_slack_settings().slack_alerts_enabled_default
+    return bool(row[0])
+
+
+def set_slack_alerts_enabled(conn: ConnectionLike, enabled: bool) -> None:
+    """
+    입력: DB 커넥션, 새 On/Off 값(COCKPIT 체크박스 토글).
+    계산: 싱글턴 행(id=TRUE 고정) upsert — mahdi.main의 notify()가 다음 알림 시도부터 바로
+         반영해서 보므로 재시작이 필요 없다.
+    """
+    row = {"id": True, "enabled": enabled, "updated_at": local_now()}
+    _upsert(conn, "slack_alert_settings", ("id", "enabled", "updated_at"), ("id",), row)
+
+
 _EXPIRY_LIQUIDITY_1M_COLUMNS = (
     "timestamp", "underlying", "series", "expiry",
     "atm_spread_pct", "depth", "volume", "days_to_expiry",

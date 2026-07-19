@@ -4,6 +4,75 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] Slack 능동 알림 도입 — 07-16 운영점검보고서 §5 고도화 아이디어 4번 구현
+
+**트리거:** 운영점검보고서 §5-4 "능동 알림 도입"(원안은 텔레그램 예시) — 사용자가 대신 Slack으로
+지정하며 실제 채널 ID(C0BJ7R4MZ9B)와 Bot User OAuth Token을 제공, "미륵이"
+(`C:\Users\82108\PycharmProjects\futures`) 프로젝트의 Slack 알림 체계를 참조하라고 요청. 대시보드
+On/Off 버튼 + settings 설정 항목 추가도 함께 요청.
+
+**미륵이 체계 조사:** `utils/notify.py`(레벨별 아이콘+타임스탬프+PC라벨 붙여 `_send()`) +
+`utils/slack_queue.py`(threading.Queue+데몬 워커 스레드, `chat.postMessage` 호출, 실패 시 10분
+쿨다운 경고, 성공 시 1초 슬립으로 레이트리밋 준수) 조합. 대시보드 체크박스(PyQt `QCheckBox`)의
+`stateChanged`가 `notify.set_slack_enabled()`(프로세스 내 전역 플래그)를 직접 호출 — 미륵이는
+대시보드와 알림 발송이 **같은 프로세스**(PyQt 메인 루프)라 전역 변수 공유가 가능했다.
+
+**마흐디와의 구조적 차이(설계 변경 포인트):** 마흐디는 COCKPIT(Streamlit, 별도 프로세스)과
+관측 루프(mahdi.main, 별도 프로세스)가 완전히 분리돼 있어 미륵이처럼 전역 변수로 On/Off를 공유할
+수 없다 — 그래서 On/Off 진실 공급원을 DB(`slack_alert_settings` 싱글턴 테이블)로 옮겼다. 또
+마흐디는 threading이 아니라 asyncio(main()의 asyncio.gather) 기반이라 threading.Queue+워커
+스레드 대신 asyncio.Queue+워커 태스크로 이식했다.
+
+**구현:**
+- `mahdi/notify.py`(신규): `notify(message, level)` — .env 토큰/채널 미설정 또는 DB On/Off가
+  꺼져 있으면 조용히 무시, 그 외엔 큐에 적재만 하고 즉시 반환(호출자가 API 응답을 기다리지 않음).
+  `run_slack_worker()` — 큐를 순차 처리하는 백그라운드 태스크(1초 간격, Slack 레이트리밋 준수),
+  전송 실패해도 태스크 자체는 안 죽고 다음 메시지를 계속 처리.
+- `mahdi/config/settings.py`: `SlackSettings`(`SLACK_BOT_TOKEN`/`SLACK_CHANNEL_ID`/
+  `SLACK_ALERTS_ENABLED_DEFAULT`, `.env`) + `get_slack_settings()`. `.env`/`.env.example`에 항목 추가
+  (`.env`엔 사용자가 준 실제 토큰/채널 값을 넣음, `.env.example`엔 빈 플레이스홀더).
+- `db/migrations/009_slack_alert_settings.sql`(신규): `slack_alert_settings` 싱글턴 테이블
+  (`id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id)` 트릭으로 단일 행만 허용). 시드 데이터 없음 —
+  행이 없으면 `SlackSettings.slack_alerts_enabled_default`로 폴백(`mahdi/data/db.py`
+  `is_slack_alerts_enabled()`/`set_slack_alerts_enabled()` 신규).
+- `mahdi/main.py`: 세 지점에 알림 배선 — ①`run_observation_loop_forever()`(WS 재연결, §5-2)에
+  "연결됨→끊김"/"끊김→재연결 성공" 상태 전환 시점에만 알림(재시도마다 매번 X, `currently_connected`
+  플래그로 판단). ②`poll_option_chain()`에 `OPTION_CHAIN_GAP_ALERT_SECONDS=300`(5분) 이상
+  결손 시 경고 1회 + 복구 시 안내 1회(`last_success_time`/`gap_alerted`로 상태 추적). ③
+  `poll_macro_snapshot()`에 적재 성공한 첫 사이클에서 `zn_front is None`이면(CBOT 미승인)
+  경고 1회(`cbot_alert_sent` 플래그, 프로세스=거래일당 1회). `main()`의 `asyncio.gather`에
+  `.env` 설정된 경우만 `notify.run_slack_worker()` 태스크 추가.
+- `mahdi/dashboard/data_source.py`: `get_slack_alerts_enabled()`/`set_slack_alerts_enabled()` —
+  DB 연결 실패 시 "켜짐(True)"으로 보수적 폴백(꺼짐으로 잘못 표시해 사용자를 안심시키는 것보다
+  안전).
+- `mahdi/dashboard/app.py`: 제목 아래 🔔 체크박스 — DB 조회값과 위젯값이 다르면(사용자가 방금
+  클릭) 즉시 DB에 저장, 다음 리런(10초)부터 최신값 반영.
+
+**검증:** `tests/test_notify.py`(신규 6개 — 미설정/DB꺼짐/정상 경로 게이팅, DB 예외 삼킴, 워커의
+전송+레이트리밋+API오류 복원력), `tests/test_data_db.py`(+3, is/set_slack_alerts_enabled),
+`tests/test_dashboard_data_source.py`(+4, get/set + DB실패 폴백), `tests/test_main.py`(+2 신규
+— 옵션체인 5분 결손+복구 알림, CBOT 알림 1회성 / 기존 WS 재연결 테스트 1개 확장 — 상태전환마다
+알림이 정확히 1번씩만 나가는지). `_collect_option_chain_cycle`을 페이크로 바꿔 REST 세부사항과
+분리 검증하는 과정에서, 사이클 종료 지연(next_tick 스케줄링 값이 1,2,3...초로 누적)이 재시도
+백오프 상수(5.0)와 우연히 같아져 테스트 종료 조건이 오작동하는 걸 발견 → retry_backoff_seconds를
+테스트에서만 999.0 같은 확실히 다른 값으로 override해 해결(실제 코드 버그 아님, 테스트 설계 이슈).
+`.venv`(Python 3.12) 기준 전체 pytest 246개 통과. `py_compile`로 신규/수정 파일 전부 문법 검증.
+Streamlit `AppTest`로 app.py 렌더링을 시도했으나 스크립트 최하단의 `time.sleep+st.rerun()` 자체
+루프 때문에 타임아웃되는 것을 확인 — 이건 이 커밋 이전 원본 app.py에도 이미 있던 사전 조건(같은
+타임아웃을 원본 코드로도 재현 확인)이라 이번 변경과 무관함. 대신 타임아웃 직전 로그에서 새
+체크박스 관련 DB 예외가 설계대로 조용히 처리(로그만 남기고 True 폴백)됨은 확인함.
+
+**라이브 반영:** 사용자 요청으로 마이그레이션 009를 실행 중인 컨테이너에 직접 적용
+(`docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < db/migrations/009_slack_alert_settings.sql`,
+Docker Desktop이 이미 떠 있던 상태). `\d slack_alert_settings`로 스키마, `SELECT count(*)`로 빈
+테이블(0행) 확인 — 시드 없음 설계대로 SlackSettings 기본값(True)으로 동작 중.
+
+**다음 확인 필요(코드 아님, 실운영 확인 대상 — [[NEXT_TODO]] 참고):** 실제 Slack 메시지가 채널에
+도착하는지(단위테스트는 가짜 HTTP 클라이언트로만 검증), COCKPIT 체크박스를 브라우저에서 실제로
+토글했을 때 관측 루프가 재시작 없이 반영하는지.
+
+---
+
 ## [2026-07-19] 타임스탬프 정책 명문화 — 07-16 운영점검보고서 §5 고도화 아이디어 3번 구현
 
 **트리거:** 2026-07-16 운영점검보고서(§3-4) — `mahdi/main.py`가 전 구간에서 `datetime.now()`

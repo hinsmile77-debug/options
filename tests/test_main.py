@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -352,6 +352,9 @@ def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconne
 
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
     with pytest.raises(RuntimeError, match="세 번째 연결 시도는 테스트 범위 밖"):
         _run(
             run_observation_loop_forever(
@@ -372,6 +375,13 @@ def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconne
     assert manager.desired_strikes == frozenset({347.5, 350.0, 352.5})
     subscribe_msgs = [m for m in second_conn.sent if '"tr_type": "1"' in m]
     assert len(subscribe_msgs) == 7  # 3 strikes x (C,P) = 6 + 선물 1
+
+    # 2026-07-19(§5-4): "연결됨→끊김"(최초) → "끊김→재연결 성공" → "연결됨→끊김"(재재연결 전
+    # 두 번째 끊김) 세 번의 상태 전환마다 Slack 알림이 한 번씩만 나가야 한다(재시도마다 매번X).
+    assert [level for _, level in notify_calls] == ["CRITICAL", "INFO", "CRITICAL"]
+    assert "끊김" in notify_calls[0][0]
+    assert "재연결 성공" in notify_calls[1][0]
+    assert "끊김" in notify_calls[2][0]
 
 
 def test_run_observation_loop_forever_backoff_caps_and_resets_after_success(monkeypatch):
@@ -715,6 +725,84 @@ def test_poll_option_chain_gives_up_after_retry_still_fails(monkeypatch):
 
     assert len(rest_client.calls) == 4  # 1차 2건 + 재시도 2건, 전부 실패 시도
     assert written_rows == []  # 재시도까지 실패하면 이번 사이클은 조용히 포기(다음 사이클엔 정상 진행)
+
+
+def test_poll_option_chain_sends_gap_alert_after_5min_then_recovery_notice(monkeypatch):
+    # 2026-07-19(§5-4): "option_analysis_1m이 5분 이상 결손"되면 Slack 경고를 한 번만 보내고
+    # (매 60초 사이클마다 반복 경고하면 스팸), 데이터가 다시 들어오면 복구 알림을 한 번 보낸다.
+    # _collect_option_chain_cycle 자체를 페이크로 바꿔 REST/파싱 세부사항과 분리해서 검증한다.
+    base = datetime(2026, 7, 19, 9, 0)
+    poll_times = [
+        base,                          # iter0: 성공 → last_success_time 확정
+        base + timedelta(minutes=1),   # iter1: 실패 시작(아직 5분 미만)
+        base + timedelta(minutes=6),   # iter2: 마지막 성공 대비 6분 경과 → 경고 발송
+        base + timedelta(minutes=7),   # iter3: 여전히 실패 — 중복 경고 없어야 함
+        base + timedelta(minutes=8),   # iter4: 복구 → 복구 알림
+    ]
+    outcomes = [
+        (["row0"], 350.0, True),
+        ([], None, True),
+        ([], None, True),
+        ([], None, True),
+        (["row4"], 350.0, True),
+    ]
+    idx = {"i": -1}
+
+    def fake_local_now():
+        idx["i"] += 1
+        return poll_times[idx["i"]]
+
+    async def fake_collect(rest_client, books, master, underlying, poll_time):
+        return outcomes[idx["i"]]
+
+    monkeypatch.setattr("mahdi.main.db.local_now", fake_local_now)
+    monkeypatch.setattr("mahdi.main._collect_option_chain_cycle", fake_collect)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    # 재시도 백오프를 사이클 종료 지연(next_tick 스케줄링 — interval_seconds=1에선 대략 1,2,3...초로
+    # 매 사이클 늘어남)과 값으로 혼동되지 않을 만큼 확실히 다른 값으로 지정 — 그래야 아래 fake_sleep이
+    # "재시도 대기"와 "사이클 종료 후 다음 틱 대기"를 값만으로 안전하게 구분할 수 있다.
+    distinctive_retry_backoff = 999.0
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if seconds == distinctive_retry_backoff:
+            return  # 재시도 백오프 — 그냥 통과
+        if idx["i"] >= len(poll_times) - 1:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client=None,
+                books=[],
+                master=None,
+                interval_seconds=1,
+                retry_backoff_seconds=distinctive_retry_backoff,
+            )
+        )
+
+    assert idx["i"] == len(poll_times) - 1
+    assert len(notify_calls) == 2  # 경고 1건 + 복구 1건(iter1은 아직 5분 미만이라 경고 없음)
+    gap_message, gap_level = notify_calls[0]
+    assert gap_level == "WARNING"
+    assert "결손" in gap_message
+    recovery_message, recovery_level = notify_calls[1]
+    assert recovery_level == "INFO"
+    assert "복구" in recovery_message
 
 
 class _FakeLoop:
@@ -1388,6 +1476,50 @@ def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch)
     assert row["us10y_yield"] == pytest.approx(4.54)
     assert row["zn_front"] is None  # 마스터에 ZN 매핑이 없으면(CBOT 미신청 등) 조회 자체를 건너뜀
     assert row["quality_flag"] == 0
+
+
+def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monkeypatch):
+    # 2026-07-19(§5-4): CBOT(ZN/US10Y 선물) 계좌 신청이 거부된 상태(zn_front=None)가 적재 성공한
+    # 첫 사이클에 감지되면 Slack으로 한 번만 알린다 — 5분마다 반복 알리면 승인 전까지 하루 종일
+    # 스팸이 되므로, 이 프로세스 실행(거래일)당 최초 1회만 보내야 한다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:  # 두 번째 사이클까지 돌려 중복 알림이 없는지 확인
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 2  # 두 사이클 모두 적재는 성공(zn_front만 None)
+    assert len(notify_calls) == 1  # 두 번째 사이클에서 재알림 없이 딱 한 번만
+    message, level = notify_calls[0]
+    assert level == "WARNING"
+    assert "CBOT" in message
 
 
 def test_poll_macro_snapshot_includes_zn_front_when_cbot_enabled(monkeypatch):

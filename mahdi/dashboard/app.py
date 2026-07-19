@@ -10,7 +10,7 @@ import time
 
 import streamlit as st
 
-from mahdi.dashboard.data_source import load_snapshot
+from mahdi.dashboard.data_source import get_slack_alerts_enabled, load_snapshot, set_slack_alerts_enabled
 from mahdi.dashboard.panels.flow_radar_panel import (
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
@@ -33,6 +33,21 @@ def render() -> None:
     st.title("마흐디 COCKPIT — 관측 전용 (Phase 1)")
     if not snapshot.is_live:
         st.warning("DB에서 데이터를 찾지 못해 합성 리플레이 데이터로 표시 중입니다 (독립 실행 모드).")
+
+    # 2026-07-19(§5-4 "능동 알림 도입") — Slack On/Off. COCKPIT과 관측 루프(mahdi.main)는 서로
+    # 다른 프로세스라 DB(slack_alert_settings)를 통해 값을 주고받는다 — 여기서 저장하면 재시작
+    # 없이 mahdi.main의 다음 알림 시도부터 바로 반영된다.
+    slack_col, _ = st.columns([1, 5])
+    with slack_col:
+        current_slack_enabled = get_slack_alerts_enabled()
+        slack_toggle = st.checkbox(
+            "🔔 슬랙 알림",
+            value=current_slack_enabled,
+            key="slack_alert_toggle",
+            help="option_analysis_1m 결손·CBOT 계좌 미승인·WS 연결 끊김 등 이상 상황을 Slack으로 알립니다.",
+        )
+        if slack_toggle != current_slack_enabled:
+            set_slack_alerts_enabled(slack_toggle)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("현재 레짐", REGIME_LABEL_KO[snapshot.regime])

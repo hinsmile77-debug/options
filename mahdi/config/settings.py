@@ -28,6 +28,20 @@ class KISSettings(BaseSettings):
         return self.kis_env.lower() != "prod"
 
 
+class SlackSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=str(PROJECT_ROOT / ".env"), extra="ignore")
+
+    slack_bot_token: str = Field(default="", alias="SLACK_BOT_TOKEN")
+    slack_channel_id: str = Field(default="", alias="SLACK_CHANNEL_ID")
+    # DB(slack_alert_settings)에 아직 아무도 토글한 적 없을 때(최초 기동)의 기본값 —
+    # 2026-07-19 운영점검보고서 §5-4, mahdi/data/db.py의 is_slack_alerts_enabled() 참고.
+    slack_alerts_enabled_default: bool = Field(default=True, alias="SLACK_ALERTS_ENABLED_DEFAULT")
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.slack_bot_token and self.slack_channel_id)
+
+
 class DBSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(PROJECT_ROOT / ".env"), extra="ignore")
 
@@ -61,6 +75,11 @@ def get_kis_settings() -> KISSettings:
 @lru_cache
 def get_db_settings() -> DBSettings:
     return DBSettings()
+
+
+@lru_cache
+def get_slack_settings() -> SlackSettings:
+    return SlackSettings()
 
 
 @lru_cache

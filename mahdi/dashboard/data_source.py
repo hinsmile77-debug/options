@@ -75,6 +75,33 @@ class DashboardSnapshot:
     macro_snapshot: dict | None
 
 
+def get_slack_alerts_enabled() -> bool:
+    """
+    계산: slack_alert_settings(2026-07-19 §5-4)를 조회한다 — mahdi.main(관측 루프, COCKPIT과는
+         별도 프로세스)과 On/Off 값을 공유하는 단일 진실 공급원(SSOT)이 DB이기 때문에 여기서도
+         DB를 직접 조회한다(메모리 전역변수로는 프로세스 간 공유가 안 됨).
+    실패 조건: DB 연결 실패 시 True(알림 켜짐)로 보수적으로 폴백 — COCKPIT이 "알림이 꺼져있다"고
+              잘못 표시해 사용자가 안심하는 것보다는, 실제로는 켜져 있는데 꺼진 것처럼 보이는 게
+              더 안전한 방향(전자는 사용자가 알림이 온다고 착각하게 만듦)이라 이 방향으로 정함.
+    """
+    try:
+        with db.get_connection() as conn:
+            return db.is_slack_alerts_enabled(conn)
+    except Exception:
+        logger.warning("슬랙 알림 설정 조회 실패", exc_info=True)
+        return True
+
+
+def set_slack_alerts_enabled(enabled: bool) -> None:
+    """계산: COCKPIT 체크박스 토글 → DB 저장. 저장 즉시 mahdi.main의 다음 notify() 호출부터
+    반영된다(재시작 불필요) — 실패해도 COCKPIT 자체가 죽으면 안 되므로 예외를 삼키고 로그만 남긴다."""
+    try:
+        with db.get_connection() as conn:
+            db.set_slack_alerts_enabled(conn, enabled)
+    except Exception:
+        logger.warning("슬랙 알림 설정 저장 실패", exc_info=True)
+
+
 def load_snapshot(underlying: str = "KOSPI200") -> DashboardSnapshot:
     live = _load_from_db(underlying)
     return live if live is not None else _synthetic_snapshot()
