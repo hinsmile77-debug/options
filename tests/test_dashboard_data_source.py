@@ -11,6 +11,7 @@ from mahdi.dashboard.data_source import (
     _futures_freshness_check,
     _is_trading_hours,
     _option_chain_freshness_check,
+    _regime_fit_progress_check,
     _regime_stability_check,
     _synthetic_snapshot,
     get_health_summary,
@@ -397,6 +398,8 @@ class _FakeHealthCursor:
             self._kind, self._value = "all", self._responses.get("fossil_series_rows", [])
         elif "regime_state" in query:
             self._kind, self._value = "one", self._responses.get("regime_stability_row")
+        elif "feature_store" in query:
+            self._kind, self._value = "one", self._responses.get("regime_fit_progress_row")
         else:
             self._kind, self._value = "one", None
 
@@ -583,6 +586,40 @@ def test_regime_stability_check_reports_percentage():
     assert "0/337" in check.detail
 
 
+# --- _regime_fit_progress_check (§5-7 "20영업일 도달 카운트다운") -----------------------------------
+
+def test_regime_fit_progress_check_info_when_no_data_yet():
+    conn = _FakeHealthConnection({"regime_fit_progress_row": (0, 0)})
+    check = _regime_fit_progress_check(conn, "KOSPI200")
+    assert check.status == "info"
+    assert "아직" in check.detail
+
+
+def test_regime_fit_progress_check_reports_progress_and_eta():
+    # 2026-07-19(§5-7): 8,000행 목표 중 4,000행이 10영업일 만에 쌓였다면 하루 평균 400행 —
+    # 남은 4,000행은 약 10영업일 더 걸릴 것으로 추정돼야 한다.
+    conn = _FakeHealthConnection({"regime_fit_progress_row": (4000, 10)})
+    check = _regime_fit_progress_check(conn, "KOSPI200")
+    assert check.status == "info"
+    assert "4,000/8,000행" in check.detail
+    assert "10/20영업일" in check.detail
+    assert "10영업일 남음" in check.detail
+
+
+def test_regime_fit_progress_check_ok_when_target_reached():
+    conn = _FakeHealthConnection({"regime_fit_progress_row": (8500, 21)})
+    check = _regime_fit_progress_check(conn, "KOSPI200")
+    assert check.status == "ok"
+    assert "fit_regime_engine.py 실행 가능" in check.detail
+
+
+def test_regime_fit_progress_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _regime_fit_progress_check(conn, "KOSPI200")
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
 # --- get_health_summary (오케스트레이션) ------------------------------------------------------------
 
 def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
@@ -604,10 +641,11 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._cbot_status_check", make_check("cbot"))
     monkeypatch.setattr("mahdi.dashboard.data_source._fossil_data_check", make_check("fossil"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
 
     result = get_health_summary()
 
-    assert calls == ["option_chain", "futures", "cbot", "fossil", "regime"]
+    assert calls == ["option_chain", "futures", "cbot", "fossil", "regime", "regime_fit_progress"]
     assert [c.label for c in result] == calls
 
 

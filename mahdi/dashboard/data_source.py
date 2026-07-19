@@ -14,6 +14,7 @@ import numpy as np
 
 from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel
+from mahdi.engines.regime_pipeline import FEATURE_VERSION
 from mahdi.features.options_intel import OptionLeg, find_gamma_flip, gamma_walls as compute_gamma_walls
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
@@ -229,13 +230,66 @@ def _regime_stability_check(conn, now: datetime) -> HealthCheck:
     return HealthCheck(label, "info", f"{pct:.0f}% 안정 ({stable_count}/{total_count}행) — 낮아도 버그 아님(§3-3)")
 
 
+# 2026-07-19(§5-7 "20영업일 도달 카운트다운") — RegimeEngine.fit()을 실제로 게이팅하는 기준은
+# scripts/fit_regime_engine.py의 DEFAULT_MIN_SAMPLES(행수)다. scripts/는 sys.path를 직접
+# 조작하는 독립 실행 스크립트라 패키지처럼 안전하게 import하기 부적절해 값만 그대로 복제한다 —
+# scripts/fit_regime_engine.py의 DEFAULT_MIN_SAMPLES를 바꾸면 이 값도 함께 맞출 것.
+_REGIME_FIT_TARGET_ROWS = 8000
+# v6 스펙/보고서가 쓰는 "20영업일"이라는 더 직관적인 단위 — 20세션 × 405분/세션 ≈ 8,100행이
+# 근사 기준이라 위 행수 목표와 함께 보여준다.
+_REGIME_FIT_TARGET_BUSINESS_DAYS = 20
+
+
+def _regime_fit_progress_check(conn, underlying: str) -> HealthCheck:
+    """
+    계산: feature_store에 실제로 데이터가 쌓인 날짜 수(DISTINCT timestamp::date)와 총 행수를
+         세어 scripts/fit_regime_engine.py 실행 시점까지 얼마나 남았는지 추정한다. 론치일부터
+         달력으로 계산하지 않고 "실제로 데이터가 쌓인 날짜 수"를 직접 세는 이유: 스케줄러가
+         쉬거나 실패한 날이 있어도(주말·공휴일 포함) 자동으로 정확하다 — 하드코딩된 론치일 +
+         영업일 계산보다 항상 실제 축적 상태를 정확히 반영한다.
+    """
+    label = "레짐 엔진 학습 데이터(feature_store, 20영업일 목표)"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*), count(DISTINCT timestamp::date) FROM feature_store "
+                "WHERE symbol=%s AND feature_version=%s",
+                (underlying, FEATURE_VERSION),
+            )
+            total_rows, distinct_days = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        logger.warning("레짐 학습 데이터 진행률 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+
+    if not total_rows:
+        return HealthCheck(label, "info", "아직 feature_store 데이터 없음")
+
+    if total_rows >= _REGIME_FIT_TARGET_ROWS:
+        return HealthCheck(
+            label, "ok",
+            f"{total_rows:,}행 / {distinct_days}영업일 — 목표 도달, scripts/fit_regime_engine.py 실행 가능",
+        )
+
+    remaining_rows = _REGIME_FIT_TARGET_ROWS - total_rows
+    avg_rows_per_day = total_rows / distinct_days if distinct_days else 0.0
+    if avg_rows_per_day > 0:
+        eta_detail = f"약 {remaining_rows / avg_rows_per_day:.0f}영업일 남음(하루 평균 {avg_rows_per_day:.0f}행 기준 추정)"
+    else:
+        eta_detail = "누적 속도 계산 불가"
+    return HealthCheck(
+        label, "info",
+        f"{total_rows:,}/{_REGIME_FIT_TARGET_ROWS:,}행 ({distinct_days}/{_REGIME_FIT_TARGET_BUSINESS_DAYS}영업일) — {eta_detail}",
+    )
+
+
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     """
     입력: 기초자산 라벨.
     계산: 운영점검보고서 §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목들(§5-6 "오늘의 점검
          요약") — 옵션체인/선물 데이터 결손, CBOT 승인 상태, series/symbol 화석 데이터 잔존 여부,
-         오늘 레짐 stability_flag 비율 — 을 매번 사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서
-         바로 볼 수 있게 한다.
+         오늘 레짐 stability_flag 비율, feature_store 20영업일 목표 진행률(§5-7) — 을 매번
+         사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서 바로 볼 수 있게 한다.
     실패 조건: 항목별로 독립적으로 조회한다 — 하나가 실패해도(쿼리 오류 등) rollback 후 나머지
               항목은 계속 보여준다. DB 연결 자체가 안 되면 단일 "조회 불가" 항목 하나만 반환한다.
     """
@@ -248,6 +302,7 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _cbot_status_check(conn),
                 _fossil_data_check(conn, underlying, now),
                 _regime_stability_check(conn, now),
+                _regime_fit_progress_check(conn, underlying),
             ]
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)

@@ -4,6 +4,44 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-19] 20영업일 도달 카운트다운 — 07-16 운영점검보고서 §5 고도화 아이디어 7번 구현
+
+**트리거:** 운영점검보고서 §5-7 — `feature_store` 행수/영업일 카운트를 COCKPIT에 표시해
+`scripts/fit_regime_engine.py`(HMM 재학습 배치) 실행 시점을 사람이 달력으로 계산 안 해도 되게.
+바로 전 세션(§5-6)에서 만든 "오늘의 점검 요약" 배지 행에 자연스럽게 6번째 항목으로 추가.
+
+**설계 결정 — 론치일 기준 달력 계산 대신 실측 카운트:** 보고서 원문은 "론치일(07-05) 기준으로
+주말·공휴일 제외 20영업일이면 대략 8월 초"라고 예시를 들었지만, 이 방식(하드코딩된 론치일 +
+공휴일 캘린더로 역산)은 스케줄러가 실패했거나(07-07 Docker 꺼진 채 기동 실패 사례처럼) 쉬는 날이
+있으면 어긋난다. 대신 `feature_store`에서 `count(DISTINCT timestamp::date)`로 "실제로 데이터가
+쌓인 날짜 수"를 직접 세는 방식을 택함 — 실제로 라이브 DB로 확인해보니 5영업일로 나왔는데, 이는
+론치일(07-05)이 아니라 `RegimeStateMachine`이 실배선된 날(2026-07-10)부터 feature_store에
+실제 데이터가 쌓이기 시작했기 때문(그 전엔 레짐 배선 버그로 warmup_fallback만 하드코딩 인자로
+호출되고 있었음, 07-10 커밋 참고) — 달력 계산이었다면 이 차이를 놓쳤을 것이다.
+
+**구현:**
+- `mahdi/dashboard/data_source.py` `_regime_fit_progress_check()`(신규, `get_health_summary()`의
+  6번째 체크로 배선) — `feature_store WHERE symbol=underlying AND feature_version=FEATURE_VERSION`에서
+  `count(*)`(총 행수)와 `count(DISTINCT timestamp::date)`(실제 데이터 쌓인 날짜 수)를 한 쿼리로
+  가져와, 목표(`_REGIME_FIT_TARGET_ROWS=8000`, `scripts/fit_regime_engine.py`의
+  `DEFAULT_MIN_SAMPLES`와 맞춤 — scripts/는 sys.path를 직접 조작하는 독립 스크립트라 안전하게
+  import하기 부적절해 값만 복제하고 주석으로 동기화 필요성을 남김) 대비 진행률과, 하루 평균
+  누적 속도(총 행수/누적 일수) 기반 잔여 영업일 추정치를 함께 보여준다. 목표 도달 시
+  "ok" 배지로 전환되며 `scripts/fit_regime_engine.py` 실행 가능 안내를 덧붙인다.
+- `FEATURE_VERSION`은 `mahdi.engines.regime_pipeline`에서 그대로 import(순환참조 없음 확인).
+
+**검증:** `tests/test_dashboard_data_source.py`(+5 — 데이터 없음/진행 중(ETA 계산 검증)/목표
+도달/쿼리 오류 각각의 분기, 기존 `get_health_summary` 오케스트레이션 테스트도 6번째 체크
+포함하도록 업데이트). 라이브 DB로 직접 확인: 현재 1,764/8,000행(5/20영업일), 하루 평균 353행
+기준 약 18영업일 남음으로 정상 표시됨. `.venv`(Python 3.12) 기준 전체 pytest 279개 통과.
+
+**다음 확인 필요(코드 변경 아님, 실운영 확인 대상 — [[NEXT_TODO]] 참고):** 실제 목표(8,000행)
+도달 시(대략 8월 초 예상) "ok" 배지로 정확히 전환되는지, 그 시점에 `scripts/fit_regime_engine.py`를
+실제로 실행해 모델이 정상 생성되고 `RegimeStateMachine`이 predict() 모드로 전환되는지까지는
+아직 확인 안 됨(시간이 더 지나야 가능).
+
+---
+
 ## [2026-07-19] COCKPIT "오늘의 점검 요약" 패널 — 07-16 운영점검보고서 §5 고도화 아이디어 6번 구현
 
 **트리거:** 운영점검보고서 §5-6 — §1-B 장전/장중/장후 체크리스트 중 "데이터 결손율, CBOT 상태,
