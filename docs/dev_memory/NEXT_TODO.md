@@ -224,8 +224,9 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       정상 표시 확인. **단, 이 확인 과정에서 별도의 심각한 버그(`_freshness_check`의
       naive/aware datetime TypeError로 헬스체크 전체가 다운돼 있었음)를 발견·수정함
       ([[SESSION_LOG]] 2026-07-20 3차 항목, [[DECISION_LOG]] 참고).**
-  - [ ] 브라우저에서 실제 COCKPIT 화면을 열어 배지가 육안으로도 정상 렌더링되는지는 아직
-        미확인(CLI 호출로만 검증됨) — 다음에 COCKPIT을 열 때 확인할 것.
+  - [x] (2026-07-20 완료) 버그 수정 후 COCKPIT(Streamlit)만 별도 재시작(관측 루프는 무중단
+        유지) → 사용자가 브라우저 스크린샷으로 7개 배지 정상 렌더링 확인(옵션체인/선물 "95초
+        전 갱신", 콜/풋 균형 "콜 45건/풋 90건", CBOT "미승인" 등 기대한 그대로).
 - [ ] `scripts/start_mahdi_premarket.bat`의 cockpit.log 회전(10MB 임계값, 기동 시점 1회 체크)이
       실제로 트리거되는 날이 오면(현재 3.7MB대) `.1` 파일이 정상 생성되는지 확인.
 - [ ] `mahdi/main.py`의 `_log_startup_gap_since_last_run()`(직전 정상 기동 경과 로그)과
