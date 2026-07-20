@@ -147,6 +147,16 @@ def insert_macro_snapshot_5m(conn: ConnectionLike, row: dict) -> None:
     _upsert(conn, "macro_snapshot_5m", _MACRO_SNAPSHOT_5M_COLUMNS, ("timestamp",), row)
 
 
+def macro_snapshot_columns() -> tuple[str, ...]:
+    """
+    해석: insert_macro_snapshot_5m()이 실제로 쓰는 컬럼 목록을 그대로 노출한다 — COCKPIT 스키마
+         정합성 헬스체크(2026-07-21)가 이 목록을 information_schema.columns와 대조해 라이브 DB에
+         db/migrations/*.sql이 전부 적용됐는지 판단한다. 목록을 따로 하드코딩하면 두 곳이 어긋날
+         수 있어 단일 소스(_MACRO_SNAPSHOT_5M_COLUMNS)를 그대로 반환한다.
+    """
+    return _MACRO_SNAPSHOT_5M_COLUMNS
+
+
 def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
     """
     계산: us10y_yield/usdkrw는 하루 대부분 NULL이라(위 insert_macro_snapshot_5m 설명 참고), 최신

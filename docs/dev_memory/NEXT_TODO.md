@@ -77,6 +77,44 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       레이트리밋 경합으로 유실되는 사이클이 있는지 DB로 확인(다른 세 폴러는 2026-07-09에 이미 이 문제를
       겪고 고정틱 스케줄링으로 고쳤음 — `poll_macro_snapshot`도 같은 패턴을 이미 쓰고 있지만 실운영
       검증은 아직 안 함).
+- [x] (2026-07-21 장전 점검·수정 완료) **마이그레이션 010/011 라이브 DB 미적용으로 매크로 스냅샷
+      적재 전면 중단 + COCKPIT 종일 합성 폴백** — `db/migrations/010_macro_snapshot_zn_fallback_source.sql`
+      (`zn_front_source`)·`011_macro_snapshot_es_move_usdkrw.sql`(`usdkrw`/`es_front`/`es_front_source`/
+      `move_index`/`move_index_source`) 둘 다 파일만 커밋됐을 뿐 `docker exec psql < file.sql`로 라이브
+      컨테이너에 적용된 적이 없었음(`docker-entrypoint-initdb.d`는 볼륨 최초 생성 시 1회만 실행되고
+      기존 볼륨엔 재적용 안 됨 — 008/009와 달리 이번엔 적용을 깜빡함). 오늘 07:30 장전 기동 직후부터
+      `poll_macro_snapshot`의 INSERT가 매 사이클 `UndefinedColumn: usdkrw`로 전부 실패
+      (`macro_snapshot_5m` 신규 행 0건, 전날 15:42에 멈춰있었음). 더 심각한 건
+      [mahdi/dashboard/data_source.py](mahdi/dashboard/data_source.py) `_load_from_db`의 매크로 조회
+      `except` 블록에 `conn.rollback()`이 빠져있던 기존 버그(2026-07-10 커밋부터 잠복, 오늘 처음 발동)—
+      같은 커넥션의 후속 쿼리(`get_active_futures_symbol`)가 `InFailedSqlTransaction`으로 연쇄 실패해
+      `_load_from_db` 전체가 예외로 빠지고 **COCKPIT이 07:30~07:53 사이 125회 "합성 리플레이"로 폴백**
+      (실시간 데이터가 아니라 가짜 데이터를 보여주고 있었음). 조치: (1) 마이그레이션 010/011을
+      `docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < ...`로 라이브 적용, 14개 컬럼 전부
+      존재 확인. (2) `data_source.py`의 누락된 `conn.rollback()` 추가(같은 파일 다른 체크 함수들과
+      패턴 통일). 전체 테스트 335개 통과. COCKPIT 프로세스만 재시작(관측 루프는 무중단 유지, Streamlit이
+      임포트 모듈 변경을 자동 반영 안 하는 기존에 확인된 특성 때문 — 2026-07-06/07-20 항목 참고) 후
+      `load_snapshot()` 직접 호출로 `is_live=True` 정상 복구 확인.
+  - [x] (2026-07-21 같은 세션에서 4개 고도화 항목 전부 구현·검증 완료) **재발 방지 구조 개선**:
+        (1) `scripts/start_mahdi_premarket.bat`에 `docker compose up -d` 직후 `db/migrations/*.sql`을
+        파일명 오름차순(`dir /b /on`)으로 매 기동마다 전부 재적용하는 단계 신설(`:apply_migration`
+        서브루틴, `psql -v ON_ERROR_STOP=1`, 개별 파일 실패는 경고만 남기고 기동은 계속 진행) —
+        001~011 전 파일이 `CREATE TABLE IF NOT EXISTS`/`ADD COLUMN IF NOT EXISTS`/
+        `create_hypertable(if_not_exists=>TRUE)`/`COMMENT ON COLUMN`으로만 작성돼 매일 재실행해도
+        안전함을 전수 확인 후 적용. cmd.exe 로직(for/call/goto, 괄호 블록 없음)은 영어 주석
+        버전으로 별도 격리 실행해 검증(한글 REM 주석이 이 세션 도구 셸에서 깨지는 현상은
+        2026-07-20 항목에 이미 문서화된 기존 현상 — 실제 Windows 작업 스케줄러 실행엔 영향 없음).
+        (2) `mahdi/dashboard/data_source.py`에 `_schema_integrity_check()` 신규 — `db.macro_snapshot_columns()`
+        (신규 공개 함수, `_MACRO_SNAPSHOT_5M_COLUMNS`를 그대로 노출해 INSERT/헬스체크가 같은
+        목록을 공유)와 `information_schema.columns`를 대조해 "오늘의 점검 요약"에 8번째 배지로
+        노출, 라이브 재검증(`get_health_summary()` 직접 호출)으로 "ok" 확인. (3) `data_source.py`
+        전체 재점검 결과 이 케이스 외 다른 rollback 누락은 없음을 확인(슬랙 설정 조회/저장 두
+        함수는 커넥션을 재사용하지 않아 애초에 문제 없음). (4) `mahdi/main.py`
+        `poll_macro_snapshot`에 `MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK`(=2, 10분) 연속
+        INSERT 실패 시 Slack 경고 + 복구 시 별도 알림(gap_alerted와 동일 패턴) 신규 배선. 신규
+        테스트 9개 추가(연속실패 알림/복구 알림/스키마체크 ok·warning·조회실패/컬럼목록 단일소스
+        고정) — 전체 341개 통과. COCKPIT 재시작 후 브라우저 미확인(다음 실제 접속 시 8개 배지
+        정상 렌더링 확인 필요).
 
 ## 관측 인프라(Phase 1) 마무리
 

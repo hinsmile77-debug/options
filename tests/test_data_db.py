@@ -175,6 +175,13 @@ def test_insert_macro_snapshot_5m_upserts_on_timestamp():
     assert len(conn.store["params"]) == len(db._MACRO_SNAPSHOT_5M_COLUMNS)
 
 
+def test_macro_snapshot_columns_matches_insert_columns():
+    # 2026-07-21: COCKPIT 스키마 정합성 헬스체크(_schema_integrity_check)가 이 목록을
+    # information_schema.columns와 대조한다 — insert_macro_snapshot_5m()이 실제로 쓰는
+    # 컬럼과 어긋나면 헬스체크가 무의미해지므로 단일 소스임을 고정한다.
+    assert db.macro_snapshot_columns() == db._MACRO_SNAPSHOT_5M_COLUMNS
+
+
 class _FakeSequentialCursor:
     def __init__(self, results: list):
         self._results = results

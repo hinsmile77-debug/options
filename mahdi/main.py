@@ -90,6 +90,12 @@ CYCLE_RETRY_BACKOFF_SECONDS = 5.0
 # 누적돼) option_analysis_1m 결손을 Slack으로 알린다. 운영점검보고서가 예시로 든 기준(5분)을 그대로 씀.
 OPTION_CHAIN_GAP_ALERT_SECONDS = 300.0
 
+# 2026-07-21(장전 점검 후속) — macro_snapshot_5m INSERT가 연속 실패하면(2026-07-21 실측:
+# db/migrations 010/011 라이브 미적용으로 UndefinedColumn이 종일 반복됨) Slack으로 알린다.
+# 사이클 자체가 이미 5분 주기라 1회 실패는 일시적 DB 지연 등일 수 있어 즉시 알리지 않고, 2회
+# 연속(=10분)부터 스키마 불일치 같은 지속성 문제로 보고 알린다.
+MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK = 2
+
 # VPIN 등거래량 버킷 크기 — 실거래 일평균거래량 관찰 전까지 쓰는 잠정치. 학계 관례는
 # "일평균거래량/50"이지만 이 모의투자 환경의 실제 거래량 분포를 아직 모른다(2026-07-06 결정).
 # 옵션은 선물보다 훨씬 얇아 버킷이 완성되기까지 오래 걸리거나 VPIN이 0.5(중립) 근처에 자주
@@ -1093,9 +1099,16 @@ async def poll_macro_snapshot(
               yfinance_fallback.py 참고) Slack으로 한 번만 알린다. 5분마다 매번 알리면 하루 종일
               (정규장 기준 최대 78회) 반복 경고가 되므로, 이 프로세스 실행당(=거래일당, 매일
               재시작되므로) 최초 1회만 보낸다.
+    알림(2026-07-21 추가): INSERT 자체가 MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK회 연속
+              실패하면(2026-07-21 실측: 마이그레이션 라이브 미적용으로 UndefinedColumn이 종일
+              반복됐는데 로그에만 WARNING으로 남고 아무도 알아채지 못함) Slack으로 알린다. 이후
+              한 번이라도 성공하면 복구 알림을 보내고 스트릭/알림 상태를 리셋 — gap_alerted
+              (poll_option_chain)와 동일한 "지속되면 알리고, 회복되면 알린다" 패턴.
     """
     next_tick: float | None = None
     cbot_alert_sent = False
+    insert_failure_streak = 0
+    insert_failure_alerted = False
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
         row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time)
@@ -1103,12 +1116,28 @@ async def poll_macro_snapshot(
         if row is None:
             logger.warning("매크로 스냅샷 폴링 전체 실패 — 이번 사이클 건너뜀")
         else:
+            insert_ok = True
             with db.get_connection() as conn:
                 try:
                     db.insert_macro_snapshot_5m(conn, row)
                 except Exception:
                     logger.warning("매크로 스냅샷 적재 실패", exc_info=True)
                     conn.rollback()
+                    insert_ok = False
+            if insert_ok:
+                if insert_failure_alerted:
+                    notify.notify("매크로 스냅샷(macro_snapshot_5m) 적재 복구됨 — 정상 적재 재개.", "INFO")
+                    insert_failure_alerted = False
+                insert_failure_streak = 0
+            else:
+                insert_failure_streak += 1
+                if insert_failure_streak >= MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK and not insert_failure_alerted:
+                    insert_failure_alerted = True
+                    notify.notify(
+                        f"매크로 스냅샷(macro_snapshot_5m) 적재가 {insert_failure_streak}회 연속 실패했습니다 "
+                        "— db/migrations 라이브 미적용(스키마 불일치) 등 DB 문제일 수 있습니다. 로그 확인 필요.",
+                        "WARNING",
+                    )
             if row["zn_front"] is None and not cbot_alert_sent:
                 cbot_alert_sent = True
                 notify.notify(

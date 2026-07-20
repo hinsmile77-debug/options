@@ -52,6 +52,30 @@ echo [%date% %time%] Docker 데몬 준비 완료 >> "%LOG_FILE%"
 echo [%date% %time%] docker compose up -d >> "%LOG_FILE%"
 docker compose up -d >> "%LOG_FILE%" 2>&1
 
+REM 2026-07-21 이상점 대응: db/migrations/*.sql이 파일로만 커밋되고 라이브 컨테이너엔 반영 안
+REM 된 채로 남는 사고가 두 번(010/011) 있었다 — docker-entrypoint-initdb.d는 볼륨 최초 생성
+REM 시 1회만 실행되고, 그 뒤로는 사람이 기억해서 docker exec psql로 수동 적용해야 하는 구조라
+REM 재발이 예정돼 있었음(dev_memory/NEXT_TODO.md 2026-07-21 항목 참고). 모든 마이그레이션이
+REM CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS / create_hypertable(if_not_exists=>
+REM TRUE) / COMMENT ON COLUMN으로만 작성돼 있어(2026-07-21 전수 확인) 매일 재실행해도 안전 —
+REM 기동 시점마다 파일명 오름차순(001, 002, ...)으로 전부 재적용해 "적용을 깜빡함" 자체를
+REM 구조적으로 없앤다. 개별 파일이 실패해도(예: DB가 막 떠서 아직 준비 안 됨) 경고만 남기고
+REM 다음 파일로 넘어간다 — 한 파일 실패로 기동 전체가 멈추면 안 된다.
+echo [%date% %time%] DB 마이그레이션 적용(db/migrations, 전체 재실행) >> "%LOG_FILE%"
+for /f "delims=" %%f in ('dir /b /on "%PROJECT_DIR%\db\migrations\*.sql"') do call :apply_migration "%PROJECT_DIR%\db\migrations\%%f"
+goto :migrations_done
+
+:apply_migration
+docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi -v ON_ERROR_STOP=1 < "%~1" >> "%LOG_FILE%" 2>&1
+if errorlevel 1 goto :migration_failed
+echo [%date% %time%] 마이그레이션 적용 완료 - %~nx1 >> "%LOG_FILE%"
+goto :eof
+:migration_failed
+echo [%date% %time%] 경고: 마이그레이션 적용 실패 - %~nx1 (계속 진행) >> "%LOG_FILE%"
+goto :eof
+
+:migrations_done
+
 REM 2026-07-20 로그 위생: cockpit.log는 observation_loop.log와 달리(2026-07-19, Python
 REM RotatingFileHandler로 직접 소유하도록 교체됨) 여전히 cmd.exe append 리다이렉트로만 쌓여
 REM 로테이션이 없다. 같은 무한 누적 문제가 재발할 수 있어 기동 시점(하루 1회)마다 크기를

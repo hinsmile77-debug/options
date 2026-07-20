@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from mahdi.data import db
 from mahdi.dashboard.data_source import (
     HealthCheck,
     _cbot_status_check,
@@ -14,6 +15,7 @@ from mahdi.dashboard.data_source import (
     _option_chain_leg_balance_check,
     _regime_fit_progress_check,
     _regime_stability_check,
+    _schema_integrity_check,
     _synthetic_snapshot,
     get_health_summary,
     get_slack_alerts_enabled,
@@ -399,6 +401,8 @@ class _FakeHealthCursor:
             self._kind, self._value = "one", self._responses.get("usdkrw_fallback_row")
         elif "macro_snapshot_5m" in query:
             self._kind, self._value = "one", self._responses.get("macro_row")
+        elif "information_schema.columns" in query:
+            self._kind, self._value = "all", self._responses.get("schema_columns_rows", [])
         elif "expiry_liquidity_1m" in query:
             self._kind, self._value = "all", self._responses.get("fossil_series_rows", [])
         elif "regime_state" in query:
@@ -655,6 +659,41 @@ def test_cbot_status_check_info_when_zn_front_from_yfinance_fallback():
     assert "108.50" in check.detail
 
 
+# --- _schema_integrity_check ----------------------------------------------------------------------
+
+def test_schema_integrity_check_ok_when_all_columns_present():
+    # 2026-07-21: db.macro_snapshot_columns()(코드가 실제로 쓰는 컬럼 목록)와 라이브 DB의
+    # information_schema.columns를 대조 — 전부 있으면 ok.
+    rows = [(c,) for c in db.macro_snapshot_columns()]
+    conn = _FakeHealthConnection({"schema_columns_rows": rows})
+    check = _schema_integrity_check(conn)
+    assert check.status == "ok"
+
+
+def test_schema_integrity_check_warns_when_migration_not_applied_live():
+    # 2026-07-21 실측 그대로 재현: 마이그레이션 010/011이 라이브 DB에 미적용돼
+    # zn_front_source/usdkrw/es_front/es_front_source/move_index/move_index_source 6개
+    # 컬럼이 빠진 상태.
+    present = {
+        "timestamp", "vix_front", "vix_next", "vix_term_structure", "usdcnh", "us10y_yield",
+        "quality_flag", "zn_front",
+    }
+    rows = [(c,) for c in present]
+    conn = _FakeHealthConnection({"schema_columns_rows": rows})
+    check = _schema_integrity_check(conn)
+    assert check.status == "warning"
+    assert "usdkrw" in check.detail
+    assert "es_front" in check.detail
+    assert "zn_front_source" in check.detail
+
+
+def test_schema_integrity_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _schema_integrity_check(conn)
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
 # --- _fossil_data_check --------------------------------------------------------------------------
 
 def test_fossil_data_check_ok_when_clean():
@@ -743,13 +782,14 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._futures_freshness_check", make_check("futures"))
     monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_leg_balance_check", make_check("leg_balance"))
     monkeypatch.setattr("mahdi.dashboard.data_source._cbot_status_check", make_check("cbot"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._schema_integrity_check", make_check("schema"))
     monkeypatch.setattr("mahdi.dashboard.data_source._fossil_data_check", make_check("fossil"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
 
     result = get_health_summary()
 
-    assert calls == ["option_chain", "futures", "leg_balance", "cbot", "fossil", "regime", "regime_fit_progress"]
+    assert calls == ["option_chain", "futures", "leg_balance", "cbot", "schema", "fossil", "regime", "regime_fit_progress"]
     assert [c.label for c in result] == calls
 
 

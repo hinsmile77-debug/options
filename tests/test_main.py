@@ -1698,6 +1698,124 @@ def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monk
     assert "ZN" in message
 
 
+def test_poll_macro_snapshot_sends_insert_failure_alert_after_streak(monkeypatch):
+    # 2026-07-21: macro_snapshot_5m INSERT가 연속 실패하면(예: 마이그레이션 라이브 미적용으로
+    # UndefinedColumn) 로그에만 남기지 않고 MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK회
+    # 연속 실패한 시점에 한 번 Slack으로 알린다 — 1회만 실패했을 때는 아직 알리지 않는다(일시적
+    # DB 지연과 구분).
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+
+    class _FakeConn:
+        def __init__(self):
+            self.rollback_calls = 0
+
+        def rollback(self):
+            self.rollback_calls += 1
+
+    conns: list[_FakeConn] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        conn = _FakeConn()
+        conns.append(conn)
+        yield conn
+
+    def fake_insert(conn, row):
+        raise RuntimeError('column "usdkrw" does not exist')
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", fake_insert)
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:  # 3번째 사이클까지 돌려 3회 연속 실패 확인
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(conns) == 3
+    assert all(c.rollback_calls == 1 for c in conns)  # 매 실패 사이클마다 rollback 필수(트랜잭션 중단 방지)
+
+    insert_failure_notifications = [(m, lvl) for m, lvl in notify_calls if "적재" in m and "실패" in m]
+    assert len(insert_failure_notifications) == 1  # 2회차에 딱 한 번만, 3회차엔 재알림 없음
+    message, level = insert_failure_notifications[0]
+    assert level == "WARNING"
+    assert "2회" in message
+
+
+def test_poll_macro_snapshot_sends_recovery_alert_after_insert_failure(monkeypatch):
+    # 2026-07-21: 연속 실패로 알림이 나간 뒤 다음 사이클에서 적재가 다시 성공하면 복구 알림을
+    # 보내고 스트릭/알림 상태를 리셋한다 — gap_alerted(poll_option_chain)와 동일한 "지속되면
+    # 알리고, 회복되면 알린다" 패턴.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+
+    class _FakeConn:
+        def rollback(self):
+            pass
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConn()
+
+    written: list[dict] = []
+    insert_attempt = {"n": 0}
+
+    def fake_insert(conn, row):
+        insert_attempt["n"] += 1
+        if insert_attempt["n"] <= 2:
+            raise RuntimeError('column "usdkrw" does not exist')
+        written.append(row)
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", fake_insert)
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:  # 실패 2회 + 성공 1회
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1  # 3번째 사이클에서만 적재 성공
+    messages = [m for m, _ in notify_calls]
+    assert any("적재" in m and "실패" in m for m in messages)
+    assert any("복구" in m for m in messages)
+
+
 def test_poll_macro_snapshot_includes_zn_front_when_cbot_enabled(monkeypatch):
     # 2026-07-10 사용자가 계좌에 CBOT 거래소 신청을 완료한 뒤의 경로 — ZN 근월물이 마스터에
     # 매핑되면 5분마다 zn_front도 함께 조회·적재돼야 한다. KIS 조회가 성공하면 yfinance 폴백은

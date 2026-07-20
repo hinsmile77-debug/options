@@ -279,6 +279,36 @@ def _fossil_data_check(conn, underlying: str, now: datetime) -> HealthCheck:
     return HealthCheck(label, "ok", "화이트리스트 밖 데이터 없음")
 
 
+def _schema_integrity_check(conn) -> HealthCheck:
+    """
+    해석: 2026-07-21 장전 점검에서 실측된 사고(마이그레이션 010/011이 파일로만 커밋되고
+         라이브 컨테이너엔 반영 안 돼 macro_snapshot_5m 적재가 종일 실패 + COCKPIT이 그 여파로
+         합성 폴백에 빠짐 — NEXT_TODO.md 참고) 재발을 대시보드에서 즉시 알아챌 수 있게 한다.
+         db.macro_snapshot_columns()(코드가 실제로 쓰는 컬럼 목록, INSERT/SELECT와 단일 소스
+         공유)를 information_schema.columns와 대조한다 — 두 쪽이 어긋나면 그 컬럼을 추가하는
+         db/migrations/*.sql이 아직 라이브 DB에 적용 안 된 것.
+    """
+    label = "스키마 정합성(마이그레이션 적용 여부)"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
+                ("macro_snapshot_5m",),
+            )
+            existing = {row[0] for row in cur.fetchall()}
+    except Exception:
+        conn.rollback()
+        logger.warning("스키마 정합성 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    missing = [c for c in db.macro_snapshot_columns() if c not in existing]
+    if missing:
+        return HealthCheck(
+            label, "warning",
+            f"macro_snapshot_5m에 없는 컬럼: {', '.join(missing)} — db/migrations 라이브 적용 필요",
+        )
+    return HealthCheck(label, "ok", "macro_snapshot_5m 컬럼 전부 정상")
+
+
 def _regime_stability_check(conn, now: datetime) -> HealthCheck:
     label = "레짐 stability_flag 비율(오늘)"
     try:
@@ -358,9 +388,9 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     입력: 기초자산 라벨.
     계산: 운영점검보고서 §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목들(§5-6 "오늘의 점검
          요약") — 옵션체인/선물 데이터 결손, 옵션체인 콜/풋 균형(2026-07-20 추가), CBOT 승인
-         상태, series/symbol 화석 데이터 잔존 여부, 오늘 레짐 stability_flag 비율, feature_store
-         20영업일 목표 진행률(§5-7) — 을 매번 사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서
-         바로 볼 수 있게 한다.
+         상태, 스키마 정합성/마이그레이션 적용 여부(2026-07-21 추가), series/symbol 화석 데이터
+         잔존 여부, 오늘 레짐 stability_flag 비율, feature_store 20영업일 목표 진행률(§5-7) — 을
+         매번 사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서 바로 볼 수 있게 한다.
     실패 조건: 항목별로 독립적으로 조회한다 — 하나가 실패해도(쿼리 오류 등) rollback 후 나머지
               항목은 계속 보여준다. DB 연결 자체가 안 되면 단일 "조회 불가" 항목 하나만 반환한다.
     """
@@ -372,6 +402,7 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _futures_freshness_check(conn, underlying, now),
                 _option_chain_leg_balance_check(conn, underlying, now),
                 _cbot_status_check(conn),
+                _schema_integrity_check(conn),
                 _fossil_data_check(conn, underlying, now),
                 _regime_stability_check(conn, now),
                 _regime_fit_progress_check(conn, underlying),
@@ -415,6 +446,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
             try:
                 macro_snapshot = db.latest_macro_snapshot(conn)
             except Exception:
+                conn.rollback()
                 logger.warning("매크로 스냅샷 조회 실패", exc_info=True)
                 macro_snapshot = None
 
