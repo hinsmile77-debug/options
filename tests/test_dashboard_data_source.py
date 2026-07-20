@@ -395,6 +395,8 @@ class _FakeHealthCursor:
             self._kind, self._value = "one", self._responses.get("legacy_symbol_count_row", (0,))
         elif "macro_snapshot_5m" in query and "us10y_yield IS NOT NULL" in query:
             self._kind, self._value = "one", self._responses.get("macro_fallback_row")
+        elif "macro_snapshot_5m" in query and "usdkrw IS NOT NULL" in query:
+            self._kind, self._value = "one", self._responses.get("usdkrw_fallback_row")
         elif "macro_snapshot_5m" in query:
             self._kind, self._value = "one", self._responses.get("macro_row")
         elif "expiry_liquidity_1m" in query:
@@ -610,20 +612,47 @@ def test_cbot_status_check_info_when_no_macro_snapshot_yet():
 
 def test_cbot_status_check_info_when_zn_front_still_null():
     conn = _FakeHealthConnection(
-        {"macro_row": (datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, None)}
+        {
+            "macro_row": (
+                datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, 1352.0,
+                None, None, None, None, None, None,
+            )
+        }
     )
     check = _cbot_status_check(conn)
     assert check.status == "info"
     assert "미승인" in check.detail
 
 
-def test_cbot_status_check_ok_when_zn_front_present():
+def test_cbot_status_check_ok_when_zn_front_from_kis():
     conn = _FakeHealthConnection(
-        {"macro_row": (datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, 110.25)}
+        {
+            "macro_row": (
+                datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, 1352.0,
+                110.25, "kis", None, None, None, None,
+            )
+        }
     )
     check = _cbot_status_check(conn)
     assert check.status == "ok"
     assert "110.25" in check.detail
+
+
+def test_cbot_status_check_info_when_zn_front_from_yfinance_fallback():
+    # 2026-07-20: CME|CBOT가 KIS 유료 항목(월 228.8불)이라 미구독 상태 — zn_front가
+    # yfinance 폴백값이면 실제 CBOT 승인처럼 "ok"로 보이면 안 되고, 폴백 사용 중임을 알려야 한다.
+    conn = _FakeHealthConnection(
+        {
+            "macro_row": (
+                datetime(2026, 7, 20, 9, 5), 17.5, 17.8, 0.017, 6.78, 4.5, 1352.0,
+                108.50, "yfinance_fallback", None, None, None, None,
+            )
+        }
+    )
+    check = _cbot_status_check(conn)
+    assert check.status == "info"
+    assert "폴백" in check.detail
+    assert "108.50" in check.detail
 
 
 # --- _fossil_data_check --------------------------------------------------------------------------

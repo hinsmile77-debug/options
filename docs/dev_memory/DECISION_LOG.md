@@ -4,6 +4,40 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-20] 실거래 전환 시 데이터 소스 재검토 필요 항목 정리 — 모의투자 단계는 실험적 가용 데이터(yfinance 등)로 대체
+
+**결정:** 아래 매크로/크로스에셋 데이터 항목들은 모의투자(개발) 단계에서 **정식 유료/공식 구독이
+아니라, 그 시점에 무료로 구할 수 있었던 실험적 데이터(yfinance 비공식 스크래핑 등)로 대체**해
+수집 파이프라인을 완성했다. 실제 자금이 걸리는 실거래 전환 시점에는 항목별로 아래 조치가 필요하다.
+
+| 항목 | 모의투자(현재) 소스 | 실거래 전환 시 필요 조치 | 비고 |
+|---|---|---|---|
+| ZN(10Y 국채선물, `zn_front`) | yfinance(`ZN=F`, 비공식) — `zn_front_source="yfinance_fallback"` | KIS `CME\|CBOT` 유료 구독(HTS [7936] 확인: 월 228.8불) 또는 Databento/IBKR 등 공식 라이선스 데이터로 전환 | KIS 구독만 켜면 코드 변경 없이 자동으로 KIS가 우선 사용됨(폴백 구조, `main.py._collect_macro_snapshot_cycle`) |
+| ES(S&P500 E-mini 선물, `es_front`) | yfinance(`ES=F`, 비공식) — `es_front_source="yfinance_fallback"` | KIS `CME\|CME` 유료 구독(ZN과 별개 구독, 월 228.8불) 또는 Databento 등 | 위와 동일한 폴백 구조 |
+| MOVE Index(`move_index`) | yfinance(`^MOVE`, 비공식) — `move_index_source`는 항상 `"yfinance_fallback"` | **KIS에 경로 자체가 없음**(`ffcode.mst`/`frgn_code.mst` 실측 확인 — 장외 파생 인덱스라 거래소 상장 상품이 아님) — 실거래로 전환해도 그대로 비공식 소스에 의존하게 된다. 정확도가 중요하면 ICE 공식 라이선스 데이터 별도 계약 검토 | 이 표에서 유일하게 "KIS 구독"만으로는 해결이 안 되는 항목 |
+| USDKRW(`usdkrw`) | KIS 정식 무료 API(환율구분 `X`, `FX@KRW`) | **조치 불필요** — 이미 계좌 게이트 없는 정식 KIS 데이터. 다만 일봉이라 장중 실시간 급변 감지엔 한계 — 필요시 실시간 환율 소스로 업그레이드 검토 | 실거래 전환 여부와 무관하게 이미 "진짜" 데이터 |
+| US10Y_yield(`us10y_yield`) | KIS 정식 무료 API(국채구분 `I`) | 조치 불필요(위와 동일) — 일봉 한계도 동일 | 〃 |
+| VIX 선물(`vix_front`/`vix_next`) | KIS 정식 무료(CBOE, 계좌 무관 즉시 성공) | 조치 불필요 | 〃 |
+| USDCNH 선물(`usdcnh`) | KIS 정식 무료(HKEx, 계좌 무관 즉시 성공) | 조치 불필요 | 〃 |
+
+**Why:** 모의투자 개발 단계에서 CME 계열 유료 구독(ZN·ES 각 월 228.8불)에 비용을 지불하는 것은
+시기상조라는 사용자 판단에 따라, "데이터가 아예 없는 것"보다 "출처가 불명확한(비공식) 근사치라도
+있는 것"을 택했다 — 다만 그 판단이 나중에 실거래 신뢰도 착오로 이어지지 않도록, 반드시
+`*_source` 컬럼(`zn_front_source`/`es_front_source`/`move_index_source`)으로 실제 출처를
+구분해 COCKPIT([macro_panel](mahdi/dashboard/panels/macro_panel.py)·
+[_cbot_status_check](mahdi/dashboard/data_source.py))에 "(폴백)"으로 표시하고, 어떤 값이
+실거래 판단에 그대로 신뢰할 수 없는 근사치인지 코드/화면에서 항상 구분되게 했다.
+
+**How to apply:** 실거래(진짜 자금) 전환을 계획하는 시점에는 반드시 이 표를 먼저 확인할 것 —
+특히 ZN/ES는 KIS 유료 구독만 켜면 코드 변경 없이 자동 전환되지만, **MOVE는 근본적으로 KIS로
+해결되지 않는 항목**이라는 점을 놓치면 안 된다. yfinance 자체가 비공식 스크래핑이라 레이트리밋·
+스키마 변경·데이터 누락 리스크가 있으므로(2026-07-20 조사 — yfinance futures 데이터 누락 이슈
+다수 보고됨), 실거래 자본이 걸리기 전에는 이 표의 "조치 필요" 항목이 전부 공식 데이터 소스로
+교체 완료돼야 한다. [[NEXT_TODO]]의 "yfinance 폴백은 비공식 스크래핑이라 운영 신뢰도가 낮다"
+항목과 교차 참고.
+
+---
+
 ## [2026-07-20] 배치파일 자기점검(직전 정상 실행 경과)은 Python으로 구현 — cmd.exe엔 날짜 연산/문자열 로직을 추가하지 않는다
 
 **결정:** "직전 정상 실행 이후 경과 시간"을 로그에 남기는 기능을, `scripts/start_mahdi_premarket.bat`/

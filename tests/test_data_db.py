@@ -157,7 +157,13 @@ def test_insert_macro_snapshot_5m_upserts_on_timestamp():
         "vix_term_structure": 0.017143,
         "usdcnh": 6.7803,
         "us10y_yield": 4.54,
+        "usdkrw": 1352.30,
         "zn_front": 110.25,
+        "zn_front_source": "kis",
+        "es_front": 5123.25,
+        "es_front_source": "kis",
+        "move_index": 95.30,
+        "move_index_source": "yfinance_fallback",
         "quality_flag": 0,
     }
 
@@ -204,7 +210,9 @@ def test_latest_macro_snapshot_returns_none_when_no_rows():
 
 def test_latest_macro_snapshot_returns_row_when_us10y_present():
     ts = datetime(2026, 7, 10, 8, 5)
-    conn = _FakeSequentialConnection((ts, 17.50, 17.80, 0.017143, 6.7803, 4.54, 110.25))
+    conn = _FakeSequentialConnection(
+        (ts, 17.50, 17.80, 0.017143, 6.7803, 4.54, 1352.30, 110.25, "kis", 5123.25, "kis", 95.30, "yfinance_fallback")
+    )
 
     result = db.latest_macro_snapshot(conn)
 
@@ -215,25 +223,49 @@ def test_latest_macro_snapshot_returns_row_when_us10y_present():
         "vix_term_structure": 0.017143,
         "usdcnh": 6.7803,
         "us10y_yield": 4.54,
+        "usdkrw": 1352.30,
         "zn_front": 110.25,
+        "zn_front_source": "kis",
+        "es_front": 5123.25,
+        "es_front_source": "kis",
+        "move_index": 95.30,
+        "move_index_source": "yfinance_fallback",
     }
 
 
 def test_latest_macro_snapshot_forward_fills_us10y_when_null():
     # 최신 5분 행은 US10Y(일봉 레벨)가 아직 안 갱신돼 NULL이지만, 그 전에 일봉으로 한 번 채워진
-    # 값이 있으면 그 값을 LOCF로 들고 와야 한다. zn_front는 CBOT 신청 후 5분마다 갱신되므로
-    # 별도 폴백 없이 그대로 반환돼야 한다.
+    # 값이 있으면 그 값을 LOCF로 들고 와야 한다. zn_front는 CBOT 신청 후(또는 yfinance 폴백으로)
+    # 5분마다 갱신되므로 별도 폴백 없이 그대로 반환돼야 한다. usdkrw는 이 테스트에서 값이 있어
+    # 별도 LOCF 쿼리가 안 나가는 케이스로 둔다(usdkrw 자체의 LOCF는 아래 별도 테스트에서 검증).
     ts = datetime(2026, 7, 10, 8, 10)
     conn = _FakeSequentialConnection(
-        (ts, 17.55, 17.85, 0.017094, 6.7810, None, 110.30),  # 최신 행: us10y_yield NULL, zn_front는 값 있음
-        (4.54,),  # 폴백 쿼리 결과
+        # 최신 행: us10y_yield NULL, zn_front는 yfinance 폴백으로 채워진 값
+        (ts, 17.55, 17.85, 0.017094, 6.7810, None, 1352.35, 110.30, "yfinance_fallback", 5100.00, "kis", None, None),
+        (4.54,),  # us10y_yield 폴백 쿼리 결과
     )
 
     result = db.latest_macro_snapshot(conn)
 
     assert result["us10y_yield"] == 4.54
     assert result["vix_front"] == 17.55
+    assert result["usdkrw"] == 1352.35
     assert result["zn_front"] == 110.30
+    assert result["zn_front_source"] == "yfinance_fallback"
+
+
+def test_latest_macro_snapshot_forward_fills_usdkrw_when_null():
+    # USDKRW도 US10Y와 동일하게 일봉이라 하루 중 대부분 NULL — 값이 채워진 마지막 행으로 LOCF.
+    ts = datetime(2026, 7, 10, 8, 15)
+    conn = _FakeSequentialConnection(
+        (ts, 17.60, 17.90, 0.017045, 6.7820, 4.54, None, 110.40, "kis", None, None, None, None),
+        (1352.30,),  # usdkrw 폴백 쿼리 결과
+    )
+
+    result = db.latest_macro_snapshot(conn)
+
+    assert result["usdkrw"] == 1352.30
+    assert result["us10y_yield"] == 4.54
 
 
 def test_insert_underlying_spot_upserts_on_timestamp_underlying():
@@ -286,6 +318,37 @@ def test_latest_underlying_spot_returns_value():
 def test_latest_underlying_spot_returns_none_when_no_rows():
     conn = FakeReadConnection([])
     assert db.latest_underlying_spot(conn, "KOSPI200") is None
+
+
+def test_recent_usdkrw_daily_series_returns_oldest_first():
+    # DB는 (날짜, 값) 튜플을 DESC로 반환하지만 함수는 rv_ratio/cross_asset_stress가 기대하는
+    # 시간순(오래된 순) 값 리스트로 뒤집어 돌려줘야 한다(daily_closes와 동일 패턴).
+    conn = FakeReadConnection(
+        [(date(2026, 7, 10), 1352.30), (date(2026, 7, 9), 1351.00), (date(2026, 7, 8), 1350.00)]
+    )
+    assert db.recent_usdkrw_daily_series(conn, days=10) == [1350.00, 1351.00, 1352.30]
+
+
+def test_recent_usdkrw_daily_series_empty_when_no_rows():
+    conn = FakeReadConnection([])
+    assert db.recent_usdkrw_daily_series(conn, days=10) == []
+
+
+def test_recent_us10y_daily_series_returns_oldest_first():
+    conn = FakeReadConnection(
+        [(date(2026, 7, 10), 4.54), (date(2026, 7, 9), 4.52), (date(2026, 7, 8), 4.50)]
+    )
+    assert db.recent_us10y_daily_series(conn, days=10) == [4.50, 4.52, 4.54]
+
+
+def test_recent_usdcnh_series_returns_oldest_first():
+    conn = FakeReadConnection([(6.900,), (6.780,), (6.781,)])
+    assert db.recent_usdcnh_series(conn, limit=24) == [6.781, 6.780, 6.900]
+
+
+def test_recent_es_front_series_returns_oldest_first():
+    conn = FakeReadConnection([(5100.00,), (5050.00,), (5000.00,)])
+    assert db.recent_es_front_series(conn, limit=12) == [5000.00, 5050.00, 5100.00]
 
 
 def test_insert_investor_flow_upserts_on_timestamp_underlying():

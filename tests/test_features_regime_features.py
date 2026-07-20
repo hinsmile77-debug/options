@@ -94,5 +94,30 @@ def test_book_thinning_spike_is_positive():
     assert book_thinning(spreads) > 2.0
 
 
-def test_cross_asset_stress_is_neutral_stub():
+def test_cross_asset_stress_neutral_when_no_data():
     assert cross_asset_stress() == 0.0
+    assert cross_asset_stress([], [], []) == 0.0
+
+
+def test_cross_asset_stress_neutral_when_all_series_flat():
+    flat = [1.0, 1.0, 1.0, 1.0]
+    assert cross_asset_stress(flat, flat, flat) == pytest.approx(0.0)
+
+
+def test_cross_asset_stress_reacts_to_usdcnh_spike():
+    usdcnh_spike = [6.78, 6.781, 6.779, 6.780, 6.900]
+    assert cross_asset_stress([], usdcnh_spike, []) > 2.0
+
+
+def test_cross_asset_stress_reacts_to_usdkrw_daily_spike():
+    # USDKRW는 거래일 단위 값만 있으므로 day-over-day 급변이 실질적인 "급변" 단위다.
+    usdkrw_spike = [1340.0, 1342.0, 1341.0, 1343.0, 1400.0]
+    assert cross_asset_stress(usdkrw_spike, [], []) > 2.0
+
+
+def test_cross_asset_stress_averages_across_available_series():
+    # 세 시퀀스 중 하나만 데이터가 있으면 나머지는 중립(0.0)으로 취급해 평균을 낸다.
+    usdcnh_spike = [6.78, 6.781, 6.779, 6.780, 6.900]
+    only_usdcnh = cross_asset_stress([], usdcnh_spike, [])
+    all_three_same_spike = cross_asset_stress(usdcnh_spike, usdcnh_spike, usdcnh_spike)
+    assert only_usdcnh == pytest.approx(all_three_same_spike / 3)

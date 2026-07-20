@@ -232,7 +232,13 @@ def _option_chain_leg_balance_check(conn, underlying: str, now: datetime) -> Hea
 
 
 def _cbot_status_check(conn) -> HealthCheck:
-    label = "CBOT(ZN/US10Y 선물) 계좌 승인"
+    """
+    해석: CME|CBOT 해외선물옵션 실시간시세는 KIS 유료 항목(2026-07-20 HTS [7936] 확인: 월
+         228.8불)이라 모의투자 개발 단계에서는 미구독 상태다 — zn_front가 채워져 있어도 그
+         출처(zn_front_source)가 "kis"가 아니라 "yfinance_fallback"이면 실제 CBOT 승인이
+         아니라 mahdi/data/yfinance_fallback.py의 비공식 근사치이므로 "ok"로 표시하면 안 된다.
+    """
+    label = "CBOT(ZN/US10Y 선물) 데이터"
     try:
         snapshot = db.latest_macro_snapshot(conn)
     except Exception:
@@ -244,6 +250,8 @@ def _cbot_status_check(conn) -> HealthCheck:
     zn_front = snapshot.get("zn_front")
     if zn_front is None:
         return HealthCheck(label, "info", "미승인 — zn_front NULL(KIS 앱/HTS 신청 상태 확인 필요)")
+    if snapshot.get("zn_front_source") == "yfinance_fallback":
+        return HealthCheck(label, "info", f"CBOT 미구독, yfinance 폴백 사용 중 — zn_front={zn_front:.2f}")
     return HealthCheck(label, "ok", f"승인됨 — zn_front={zn_front:.2f}")
 
 

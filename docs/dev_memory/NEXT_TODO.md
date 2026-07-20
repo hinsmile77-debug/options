@@ -14,25 +14,65 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 - [ ] `feature_store`가 20영업일 이상(대략 8,000행) 쌓이면 `python scripts/fit_regime_engine.py` 실행 →
       `data/models/regime_engine.pkl` 생성 → 다음 재시작부터 `RegimeStateMachine`이 자동으로 predict()
       모드로 전환되는지 확인.
-- [ ] `cross_asset_stress`(USDKRW·USDCNH·US10Y)는 여전히 0.0 고정 스텁 — **원시 데이터는 2026-07-10
-      `macro_snapshot_5m`으로 수집되기 시작함**(아래 새 절 참고). 남은 일은 `regime_features.py`의
-      `cross_asset_stress()`를 `db.latest_macro_snapshot()` 기반 실계산으로 교체하는 배선뿐([[DECISION_LOG]]
-      2026-07-10 "Cross-asset stress는 스팟/지수가 아니라..." 항목이 "How to apply"에 이 부분 언급).
-      USDKRW는 아직 아무 경로로도 안 채워짐 — `market_raw_1m.usdkrw` 컬럼도 계속 비어있는 채로 남음,
-      별도 확인 필요.
-- [ ] `macro_score`는 현재 외국인 순매수 부호 근사치(`compute_macro_score_proxy`) — 이제 `macro_snapshot_5m`에
-      VIX 기간구조가 있으니 이걸 포함한 완전한 매크로 나침반(§8)으로 교체 검토.
+- [x] **`cross_asset_stress` 실계산 배선 완료(2026-07-20)** — 더 이상 0.0 고정 스텁이 아니다.
+      `mahdi/features/regime_features.py`의 `cross_asset_stress(usdkrw_daily_series,
+      usdcnh_recent_series, us10y_daily_series)`가 세 시퀀스 각각에 `book_thinning`과 동일한
+      z-score(`_series_zscore`로 추출·공유)를 구해 절대값 평균을 낸다. `RegimeStateMachine.step`이
+      `db.recent_usdkrw_daily_series`(일봉, 최근 10거래일)·`db.recent_usdcnh_series`(5분 스냅샷,
+      최근 24개=2시간)·`db.recent_us10y_daily_series`(일봉, 최근 10거래일)를 매 선물봉마다 조회해
+      넘긴다. USDKRW/US10Y는 거래일당 값이 하나뿐이라 "급변"이 거래일 단위 day-over-day 변화로
+      측정되고, USDCNH는 5분 주기라 인트라데이 변동을 그대로 반영 — 이 refresh 주기 차이를 그대로
+      살린 설계다. `feature_store`에 실제로 유의미한 값이 쌓이는지는 정규장 운영 후 확인 필요.
+- [x] **`macro_score`(`compute_macro_score_proxy`) 복합 신호로 확장 완료(2026-07-20)** — 함수
+      이름·시그니처는 [[DECISION_LOG]] 2026-07-10 결정("시그니처는 유지하고 내부만 교체")대로
+      유지, 내부 계산만 교체함. 기존 외국인 순매수 부호(K-market 수급)에 4개 신호 추가:
+      VIX 기간구조 부호(백워데이션=위험회피/콘탱고=위험선호), USDKRW/USDCNH 추세(상승=자국통화
+      약세=위험회피로 부호 반전), ES(S&P500 선물) 추세(상승=위험선호). 각 신호는 -1/0/+1로
+      정규화해 "존재하는 신호만" 평균(데이터 없는 신호는 분모에서도 제외). US10Y·MOVE는 방향이
+      위험선호/회피로 명확히 매핑되지 않아(수익률·변동성 급등이 맥락에 따라 다름) 제외 —
+      그 "급변 크기"는 이미 `cross_asset_stress()`가 별도로 포착 중. `db.recent_es_front_series`
+      신규 추가(`recent_usdcnh_series`와 동일 패턴). `mahdi/engines/regime_pipeline.py`에
+      `_directional_sign`/`_trend_sign` 헬퍼 추가.
 - [ ] `rv_ratio`(RV5d/RV20d)는 선물 심볼이 분기 롤오버될 때마다 일별 종가 이력이 끊긴다(현재 심볼
       기준으로만 `daily_closes` 조회) — 롤오버 연속성 처리 필요 여부 검토.
 
-## Cross-asset stress 매크로 스냅샷 — 2026-07-10 구현, ZN(US10Y)만 CBOT 계좌 승인 대기
+## Cross-asset stress 매크로 스냅샷 — 2026-07-10 구현, ZN은 2026-07-20 yfinance 폴백으로 전환
 
-- [ ] **CBOT 신청 처리 여부 재확인** — 사용자가 신청 완료했다고 확인했지만 재시작 후 세 사이클 연속
-      `EGW00552: CBOT SUB거래소 신청 상태가 아닙니다`로 계속 거부됨([[SESSION_LOG]]/[[DECISION_LOG]]
-      2026-07-10 항목 참고). KIS 앱/HTS에서 신청 상태가 실제로 "승인 완료"인지, 모의투자 계좌 쪽에도
-      반영되는 신청인지 확인 필요. 열리면 `macro_snapshot_5m.zn_front`가 재시작 없이 다음 5분
-      사이클부터 자동으로 채워진다(코드 변경 불필요).
-- [ ] `regime_features.cross_asset_stress()` 배선(위 레짐 절 항목과 동일 — 여기서도 교차 참조).
+- [x] **CBOT EGW00552 원인 확정** — 2026-07-20 HTS [7936](해외선물옵션 거래소 실시간시세신청/조회)
+      실측 확인: CME|CBOT는 **API(무료) 탭에 아예 없고 API(유료) 탭에만 있음** — 기간이용료
+      **월 228.8불**. "2026-07-10 신청 완료"로 믿었던 것은 무료 탭 기준이었을 가능성이 높고, 실제로는
+      유료 구독이 성립한 적이 없었던 것으로 보임(그래서 6일 넘게 EGW00552가 계속 남).
+- [x] **당분간 KIS CBOT 유료 구독 안 함 — yfinance 폴백으로 대체(2026-07-20)** — 모의투자 개발
+      단계에서 월 228.8불을 지불하는 건 시기상조라는 사용자 결정. `mahdi/data/yfinance_fallback.py`
+      신규(`ZN=F` yfinance), `main.py._collect_macro_snapshot_cycle`이 KIS 조회 실패 시에만 호출.
+      `macro_snapshot_5m.zn_front_source`("kis"|"yfinance_fallback"|NULL, migration 010)로 출처
+      구분 — COCKPIT [_cbot_status_check](mahdi/dashboard/data_source.py)·
+      [macro_panel](mahdi/dashboard/panels/macro_panel.py)에 "(폴백)" 표시로 실제 CBOT 체결가와
+      혼동되지 않게 함. **정식 운영 전환 시(또는 안정화 후 유료 구독 결정 시) 재검토 필요** — KIS가
+      나중에 성공하기 시작하면 코드 변경 없이 자동으로 KIS 우선 사용된다.
+- [x] **v6 "글로벌 확인 신호" 나머지 항목(S&P500 선물·MOVE·USDKRW) 점검 및 수집 배선(2026-07-20)** —
+      마스터파일 실측으로 셋 다 KIS 수집 가능 여부를 확정함:
+      - **USDKRW**: KIS `frgn_code.mst` 실측 확인 — 환율구분 `FID_COND_MRKT_DIV_CODE="X"`,
+        심볼 `FID_INPUT_ISCD="FX@KRW"`로 US10Y와 **완전히 동일한 무료 엔드포인트**
+        (`inquire-daily-chartprice`)에서 계좌 게이트 없이 바로 얻어짐 → KIS로 즉시 구현
+        (`macro_snapshot_5m.usdkrw`, us10y_yield와 동일하게 일봉 LOCF).
+      - **ES(S&P500 E-mini 선물)**: KIS `ffcode.mst` 실측 확인 — 상품코드 `ES`/거래소코드 `CME`
+        (ZN의 CBOT와 다른 서브거래소지만 HTS [7936]상 "CME|CME"도 동일하게 유료 월 228.8불) →
+        ZN과 동일한 yfinance 폴백 패턴(`ES=F`) 적용(`macro_snapshot_5m.es_front`/`es_front_source`).
+      - **MOVE(ICE BofA MOVE Index)**: 마스터파일 어디에도 없음(장외 파생 인덱스라 거래소 상장
+        상품 자체가 아님) → KIS 경로 없음, yfinance(`^MOVE`) 전용 폴백만 가능
+        (`macro_snapshot_5m.move_index`/`move_index_source`, 항상 "yfinance_fallback").
+      `zn_fallback.py`는 3개 심볼(ZN/ES/MOVE)을 공용으로 다루는 `mahdi/data/yfinance_fallback.py`
+      (`fetch_last_close(symbol)`)로 일반화함, migration 011.
+      **참고**: `cross_asset_stress()` 실계산 배선과 `macro_score`(`compute_macro_score_proxy`)에
+      ES 추세 반영까지 같은 날 바로 이어서 완료함(위 레짐 절 항목 참고). MOVE는 방향성이
+      위험선호/회피로 명확히 매핑되지 않아 `macro_score`에는 의도적으로 넣지 않음(설계 결정,
+      TODO 아님) — `cross_asset_stress()`의 급변 크기 계산에만 반영.
+- [ ] yfinance 폴백은 비공식 스크래핑이라 운영 신뢰도가 낮다(레이트리밋/스키마 변경 가능) — 정식
+      운영 전 재점검 필요. **실거래 전환 시 항목별 필요 조치는 [[DECISION_LOG]] 2026-07-20
+      "실거래 전환 시 데이터 소스 재검토 필요 항목 정리" 표 참고**(ZN/ES는 KIS CME 계열 유료
+      구독 월 228.8불 또는 Databento GLBX.MDP3 월 $179로 대체 가능, MOVE는 KIS로 근본적으로
+      해결 안 됨).
 - [ ] `poll_macro_snapshot`이 정규장 하루 운영 후 실제로 5분 간격을 안정적으로 지키는지, 다른 폴러들과의
       레이트리밋 경합으로 유실되는 사이클이 있는지 DB로 확인(다른 세 폴러는 2026-07-09에 이미 이 문제를
       겪고 고정틱 스케줄링으로 고쳤음 — `poll_macro_snapshot`도 같은 패턴을 이미 쓰고 있지만 실운영

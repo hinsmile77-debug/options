@@ -8,7 +8,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from mahdi.broker import tr_codes
 from mahdi.broker.ws_client import KISWebSocketClient
+from mahdi.data import yfinance_fallback
 from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.engines.regime import RegimeLabel, RegimeState
 from mahdi.features.options_intel import OptionLeg, calculate_gex
@@ -18,9 +20,9 @@ from mahdi.main import (
     _parse_asking_price_leg,
     _parse_futures_tick,
     _parse_option_quote,
+    _parse_overseas_daily_last_price,
     _parse_overseas_future_last_price,
     _parse_tick,
-    _parse_us10y_yield,
     poll_expiry_liquidity,
     poll_investor_flow,
     poll_macro_snapshot,
@@ -1538,12 +1540,13 @@ def test_parse_overseas_future_last_price_missing_field_returns_none():
     assert _parse_overseas_future_last_price({"output1": {"last_price": "N/A"}}) is None
 
 
-def test_parse_us10y_yield_valid_response():
-    assert _parse_us10y_yield({"output1": {"ovrs_nmix_prpr": "4.5400"}}) == pytest.approx(4.54)
+def test_parse_overseas_daily_last_price_valid_response():
+    # 국채구분(I)·환율구분(X) 등 공통 스키마 — US10Y/USDKRW 둘 다 같은 파서를 쓴다.
+    assert _parse_overseas_daily_last_price({"output1": {"ovrs_nmix_prpr": "4.5400"}}) == pytest.approx(4.54)
 
 
-def test_parse_us10y_yield_missing_field_returns_none():
-    assert _parse_us10y_yield({}) is None
+def test_parse_overseas_daily_last_price_missing_field_returns_none():
+    assert _parse_overseas_daily_last_price({}) is None
 
 
 class _FakeOverseasFutureMaster:
@@ -1555,9 +1558,16 @@ class _FakeOverseasFutureMaster:
 
 
 class _FakeOverseasRestClient:
-    def __init__(self, future_prices: dict[str, dict], daily_chart: dict | None = None, failing: set[str] = frozenset()):
+    def __init__(
+        self,
+        future_prices: dict[str, dict],
+        daily_chart: dict | None = None,
+        usdkrw_daily_chart: dict | None = None,
+        failing: set[str] = frozenset(),
+    ):
         self._future_prices = future_prices
         self._daily_chart = daily_chart
+        self._usdkrw_daily_chart = usdkrw_daily_chart
         self._failing = failing
         self.future_calls: list[str] = []
         self.daily_calls: list[tuple[str, str]] = []
@@ -1570,6 +1580,10 @@ class _FakeOverseasRestClient:
 
     def get_overseas_daily_chartprice(self, market_div_code, symbol, date_from, date_to, period_div_code="D") -> dict:
         self.daily_calls.append((market_div_code, symbol))
+        if market_div_code == tr_codes.FID_MRKT_DIV_OVERSEAS_FX:
+            if "USDKRW" in self._failing:
+                raise RuntimeError("KIS 500")
+            return self._usdkrw_daily_chart
         if "US10Y" in self._failing:
             raise RuntimeError("KIS 500")
         return self._daily_chart
@@ -1581,6 +1595,21 @@ def _future_price_response(last_price: float) -> dict:
 
 def _daily_chart_response(prpr: float) -> dict:
     return {"output1": {"ovrs_nmix_prpr": str(prpr)}, "rt_cd": "0"}
+
+
+def _fallback_stub(zn=None, es=None, move=None):
+    """mahdi.main.yfinance_fallback.fetch_last_close 대체용 — 심볼별로 다른 값/실패를 지정한다.
+    지정하지 않은 심볼은 전부 None(폴백도 실패)을 반환한다."""
+    responses = {
+        yfinance_fallback.ZN_FALLBACK_SYMBOL: zn,
+        yfinance_fallback.ES_FALLBACK_SYMBOL: es,
+        yfinance_fallback.MOVE_FALLBACK_SYMBOL: move,
+    }
+
+    def _fetch(symbol: str) -> float | None:
+        return responses.get(symbol)
+
+    return _fetch
 
 
 def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch):
@@ -1601,6 +1630,7 @@ def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch)
 
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
 
     async def fake_sleep(seconds):
         raise RuntimeError("stop-loop")
@@ -1618,14 +1648,15 @@ def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch)
     assert row["vix_term_structure"] == pytest.approx(17.80 / 17.50 - 1)
     assert row["usdcnh"] == 6.7803
     assert row["us10y_yield"] == pytest.approx(4.54)
-    assert row["zn_front"] is None  # 마스터에 ZN 매핑이 없으면(CBOT 미신청 등) 조회 자체를 건너뜀
+    assert row["zn_front"] is None  # 마스터에 ZN 매핑이 없고(CBOT 미구독) yfinance 폴백도 실패
+    assert row["zn_front_source"] is None
     assert row["quality_flag"] == 0
 
 
 def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monkeypatch):
-    # 2026-07-19(§5-4): CBOT(ZN/US10Y 선물) 계좌 신청이 거부된 상태(zn_front=None)가 적재 성공한
-    # 첫 사이클에 감지되면 Slack으로 한 번만 알린다 — 5분마다 반복 알리면 승인 전까지 하루 종일
-    # 스팸이 되므로, 이 프로세스 실행(거래일)당 최초 1회만 보내야 한다.
+    # 2026-07-19(§5-4): KIS·yfinance 폴백 둘 다 실패해 zn_front=None인 상태가 적재 성공한 첫
+    # 사이클에 감지되면 Slack으로 한 번만 알린다 — 5분마다 반복 알리면 하루 종일 스팸이 되므로,
+    # 이 프로세스 실행(거래일)당 최초 1회만 보내야 한다.
     master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
     rest_client = _FakeOverseasRestClient(
         future_prices={
@@ -1643,6 +1674,7 @@ def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monk
 
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
 
     notify_calls: list[tuple[str, str]] = []
     monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
@@ -1663,12 +1695,13 @@ def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monk
     assert len(notify_calls) == 1  # 두 번째 사이클에서 재알림 없이 딱 한 번만
     message, level = notify_calls[0]
     assert level == "WARNING"
-    assert "CBOT" in message
+    assert "ZN" in message
 
 
 def test_poll_macro_snapshot_includes_zn_front_when_cbot_enabled(monkeypatch):
     # 2026-07-10 사용자가 계좌에 CBOT 거래소 신청을 완료한 뒤의 경로 — ZN 근월물이 마스터에
-    # 매핑되면 5분마다 zn_front도 함께 조회·적재돼야 한다.
+    # 매핑되면 5분마다 zn_front도 함께 조회·적재돼야 한다. KIS 조회가 성공하면 yfinance 폴백은
+    # 아예 호출되지 않아야 한다(2026-07-20 폴백 추가 — 불필요한 외부 호출 방지).
     master = _FakeOverseasFutureMaster(
         {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ZN": ("ZNU26", "ZNZ26")}
     )
@@ -1687,8 +1720,15 @@ def test_poll_macro_snapshot_includes_zn_front_when_cbot_enabled(monkeypatch):
     def fake_get_connection(settings=None):
         yield object()
 
+    fallback_calls: list[str] = []
+
+    def _record_fallback_call(symbol: str) -> float | None:
+        fallback_calls.append(symbol)
+        return None  # ES/MOVE는 이 테스트에서 KIS 경로가 없으니 폴백이 호출돼도 됨 — ZN만 안 되면 됨
+
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _record_fallback_call)
 
     async def fake_sleep(seconds):
         raise RuntimeError("stop-loop")
@@ -1702,10 +1742,14 @@ def test_poll_macro_snapshot_includes_zn_front_when_cbot_enabled(monkeypatch):
     assert "ZNZ26" not in rest_client.future_calls  # 차근월물은 조회하지 않음(VIX와 달리 급변 감지엔 근월물 하나면 충분)
     assert len(written) == 1
     assert written[0]["zn_front"] == 110.25
+    assert written[0]["zn_front_source"] == "kis"
+    # KIS 조회가 성공했으면 ZN에 대해서는 yfinance 폴백을 호출하면 안 된다(불필요한 외부 호출 방지).
+    assert yfinance_fallback.ZN_FALLBACK_SYMBOL not in fallback_calls
 
 
 def test_poll_macro_snapshot_continues_when_zn_fails_but_others_succeed(monkeypatch):
     # CBOT 신청 직후 일시적 오류 등으로 ZN만 실패해도 나머지 필드는 그대로 적재돼야 한다.
+    # yfinance 폴백도 함께 실패하는 경우를 가정(폴백 성공 케이스는 별도 테스트에서 검증).
     master = _FakeOverseasFutureMaster(
         {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ZN": ("ZNU26", "ZNZ26")}
     )
@@ -1726,6 +1770,7 @@ def test_poll_macro_snapshot_continues_when_zn_fails_but_others_succeed(monkeypa
 
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
 
     async def fake_sleep(seconds):
         raise RuntimeError("stop-loop")
@@ -1737,7 +1782,47 @@ def test_poll_macro_snapshot_continues_when_zn_fails_but_others_succeed(monkeypa
 
     assert len(written) == 1
     assert written[0]["zn_front"] is None
+    assert written[0]["zn_front_source"] is None
     assert written[0]["vix_front"] == 17.50  # ZN 실패가 다른 필드를 막지 않음
+
+
+def test_poll_macro_snapshot_uses_yfinance_fallback_when_kis_zn_fails(monkeypatch):
+    # 2026-07-20: CME|CBOT가 KIS 유료 항목(월 228.8불)이라 모의투자 개발 단계에서는 미구독 —
+    # KIS ZN 조회가 실패하면 yfinance 폴백값으로 zn_front를 채우고, 출처를 zn_front_source에
+    # 남겨 실제 CBOT 체결가와 구분할 수 있어야 한다.
+    master = _FakeOverseasFutureMaster(
+        {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ZN": ("ZNU26", "ZNZ26")}
+    )
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+        failing={"ZNU26"},
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub(zn=108.50))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["zn_front"] == 108.50
+    assert written[0]["zn_front_source"] == "yfinance_fallback"
 
 
 def test_poll_macro_snapshot_continues_when_us10y_fails(monkeypatch):
@@ -1760,6 +1845,7 @@ def test_poll_macro_snapshot_continues_when_us10y_fails(monkeypatch):
 
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
 
     async def fake_sleep(seconds):
         raise RuntimeError("stop-loop")
@@ -1799,7 +1885,193 @@ def test_poll_macro_snapshot_skips_write_when_all_futures_fail(monkeypatch):
         _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
 
     assert written == []
-    assert rest_client.daily_calls == []  # 선물 3건이 전부 실패하면 US10Y 조회 자체를 시도하지 않음
+    assert rest_client.daily_calls == []  # 선물 3건이 전부 실패하면 US10Y/USDKRW 조회 자체를 시도하지 않음
+
+
+def test_poll_macro_snapshot_collects_usdkrw_daily_level(monkeypatch):
+    # 2026-07-20: USDKRW는 해외주식 도메인(환율구분 X, FX@KRW)이라 CBOT 같은 계좌 게이트가 없다 —
+    # US10Y와 동일하게 계좌 제약 없이 무료로 얻어야 한다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+        usdkrw_daily_chart=_daily_chart_response(1352.30),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert (tr_codes.FID_MRKT_DIV_OVERSEAS_FX, tr_codes.FID_INPUT_ISCD_USDKRW) in rest_client.daily_calls
+    assert len(written) == 1
+    assert written[0]["usdkrw"] == pytest.approx(1352.30)
+
+
+def test_poll_macro_snapshot_continues_when_usdkrw_fails(monkeypatch):
+    # USDKRW 조회만 실패해도(레이트리밋 등) 나머지 필드는 그대로 적재돼야 한다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+        failing={"USDKRW"},
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["usdkrw"] is None
+    assert written[0]["us10y_yield"] == pytest.approx(4.54)  # USDKRW 실패가 US10Y를 막지 않음
+
+
+def test_poll_macro_snapshot_includes_es_front_when_kis_succeeds(monkeypatch):
+    # 2026-07-20: ES(CME E-mini S&P500)도 마스터에 매핑되면 ZN과 동일하게 KIS를 우선 사용해야 한다.
+    master = _FakeOverseasFutureMaster(
+        {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ES": ("ESU26", "ESZ26")}
+    )
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+            "ESU26": _future_price_response(5123.25),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    fallback_calls: list[str] = []
+
+    def _record_fallback_call(symbol: str) -> float | None:
+        fallback_calls.append(symbol)
+        return None
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _record_fallback_call)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert "ESU26" in rest_client.future_calls
+    assert "ESZ26" not in rest_client.future_calls  # 근월물만 조회
+    assert len(written) == 1
+    assert written[0]["es_front"] == 5123.25
+    assert written[0]["es_front_source"] == "kis"
+    assert yfinance_fallback.ES_FALLBACK_SYMBOL not in fallback_calls
+
+
+def test_poll_macro_snapshot_uses_yfinance_fallback_when_kis_es_fails(monkeypatch):
+    # ES(CME|CME)도 ZN(CME|CBOT)과 동일하게 KIS 유료 항목 — 미구독 상태에서는 yfinance 폴백을 쓴다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub(es=5100.00))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["es_front"] == 5100.00
+    assert written[0]["es_front_source"] == "yfinance_fallback"
+
+
+def test_poll_macro_snapshot_collects_move_index_via_yfinance_only(monkeypatch):
+    # MOVE(ICE BofA MOVE Index)는 장외 파생 인덱스라 KIS 해외선물옵션 마스터파일에 상품 자체가
+    # 없다 — KIS 시도 없이 처음부터 yfinance 폴백만으로 채워져야 한다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub(move=95.30))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["move_index"] == pytest.approx(95.30)
+    assert written[0]["move_index_source"] == "yfinance_fallback"
 
 
 def test_configure_logging_uses_rotating_file_handler(monkeypatch, tmp_path):

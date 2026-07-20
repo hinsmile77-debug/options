@@ -84,12 +84,22 @@ TR_OVERSEAS_FUTUREOPTION_PRICE = "HHDFC55010000"
 
 OVERSEAS_FUTURE_PRODUCT_VIX = "VX"    # CBOE VIX 선물 — VIX 기간구조(근월-차근월 스프레드)
 OVERSEAS_FUTURE_PRODUCT_CNH = "CNH"   # HKEx USD/CNH 선물 — USDCNH 대용
-OVERSEAS_FUTURE_PRODUCT_ZN = "ZN"     # CME/CBOT 10년 국채선물 — US10Y 급변 감지용(2026-07-10 CBOT 거래소 신청 완료 후 사용)
+OVERSEAS_FUTURE_PRODUCT_ZN = "ZN"     # CME/CBOT 10년 국채선물 — US10Y 급변 감지용. 2026-07-20 HTS
+                                       # [7936] 실측: CME|CBOT는 KIS 유료 항목(월 228.8불)이라
+                                       # 모의투자 개발 단계에서는 미구독 — mahdi/data/yfinance_fallback.py로 대체.
+OVERSEAS_FUTURE_PRODUCT_ES = "ES"     # CME E-mini S&P500 선물 — 2026-07-20 ffcode.mst 실측: 상품코드
+                                       # ES/거래소코드 CME 확인(ZN의 CBOT와 별개 서브거래소지만 HTS
+                                       # [7936]상 "CME|CME"도 동일하게 유료(월 228.8불) — 미구독,
+                                       # yfinance_fallback.py로 대체.
 
-# 해외주식 종목_지수_환율기간별시세(일_주_월_년, v1_해외주식-012) — US10Y는 CBOT 신청이 안 된
-# 계좌에서도 이 경로(국채구분 I)로 "일봉"만 얻을 수 있다(2026-07-10 실측: 같은 API의 분봉
-# 엔드포인트는 I구분에서 "ERROR INVALID FID_COND_MRKT_DIV_CODE"로 거부되어 분봉은 미지원 확정).
+# 해외주식 종목_지수_환율기간별시세(일_주_월_년, v1_해외주식-012) — US10Y는 CBOT 미구독 계좌에서도
+# 이 경로(국채구분 I)로 "일봉"만 얻을 수 있다(2026-07-10 실측: 같은 API의 분봉 엔드포인트는
+# I구분에서 "ERROR INVALID FID_COND_MRKT_DIV_CODE"로 거부되어 분봉은 미지원 확정). 2026-07-20
+# frgn_code.mst 실측으로 환율구분(X)도 같은 엔드포인트로 무료 조회됨을 확인 — USDKRW는 CBOT 같은
+# 계좌 게이트 자체가 없다(해외선물옵션 도메인이 아니라 해외주식 도메인이라 SUB거래소 신청 무관).
 PATH_OVERSEAS_INDEX_DAILY_CHARTPRICE = "/uapi/overseas-price/v1/quotations/inquire-daily-chartprice"
 TR_OVERSEAS_INDEX_DAILY_CHARTPRICE = "FHKST03030100"
 FID_MRKT_DIV_OVERSEAS_TREASURY = "I"  # 국채(수익률) 구분 — frgn_code.mst 'B'구분 심볼(예: Y0202=US10Y)과 짝
 FID_INPUT_ISCD_US10Y = "Y0202"        # frgn_code.mst 실측: "US T-Note 10 Years(Y)"
+FID_MRKT_DIV_OVERSEAS_FX = "X"        # 환율 구분 — frgn_code.mst 'X'구분 심볼(예: FX@KRW=USDKRW)과 짝
+FID_INPUT_ISCD_USDKRW = "FX@KRW"      # frgn_code.mst 실측: "대한민국 원/달러(KMB)"

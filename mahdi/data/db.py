@@ -60,7 +60,9 @@ _MARKET_RAW_1M_COLUMNS = (
 )
 
 _MACRO_SNAPSHOT_5M_COLUMNS = (
-    "timestamp", "vix_front", "vix_next", "vix_term_structure", "usdcnh", "us10y_yield", "zn_front", "quality_flag",
+    "timestamp", "vix_front", "vix_next", "vix_term_structure", "usdcnh", "us10y_yield", "usdkrw",
+    "zn_front", "zn_front_source", "es_front", "es_front_source", "move_index", "move_index_source",
+    "quality_flag",
 )
 
 _OPTION_ANALYSIS_1M_COLUMNS = (
@@ -128,12 +130,18 @@ def insert_option_analysis_1m(conn: ConnectionLike, row: dict) -> None:
 
 def insert_macro_snapshot_5m(conn: ConnectionLike, row: dict) -> None:
     """
-    입력: macro_snapshot_5m 컬럼과 동일한 키를 가진 dict(Cross-asset stress 원시값, v6 §7.3) —
+    입력: macro_snapshot_5m 컬럼과 동일한 키를 가진 dict(Cross-asset stress 원시값, v6 §7.3/§8) —
          vix_front/vix_next(CBOE VX 선물 근월·차근월 현재가), vix_term_structure(vix_next/
-         vix_front - 1, 양수면 콘탱고), usdcnh(HKEx CNH 선물 현재가), us10y_yield(해외주식
-         국채구분 일봉 API — 실제 수익률(%) 레벨, 대부분의 5분 행에서 None일 수 있음),
-         zn_front(2026-07-10 CBOT 거래소 신청 완료 후 추가 — CME 10년 국채선물 근월물 현재가,
-         5분마다 갱신되는 "급변" 감지용. 가격은 수익률과 역상관이므로 us10y_yield와 단위가 다름).
+         vix_front - 1, 양수면 콘탱고), usdcnh(HKEx CNH 선물 현재가), us10y_yield/usdkrw(해외주식
+         종목_지수_환율기간별시세 일봉 API — 국채구분 I / 환율구분 X, 둘 다 대부분의 5분 행에서
+         None일 수 있음, 계좌 게이트 없이 무료), zn_front/es_front(CME 10년 국채선물·E-mini
+         S&P500 선물 근월물 현재가, 5분마다 갱신되는 "급변" 감지용 — 가격은 수익률과 역상관이므로
+         us10y_yield와 단위가 다름), zn_front_source/es_front_source/move_index_source(2026-07-20
+         추가 — 각각 "kis"|"yfinance_fallback"|None. CME 계열 실시간시세가 KIS 유료 항목(월
+         228.8불)이라 모의투자 개발 단계에서는 미구독 상태이고, 값이 mahdi/data/
+         yfinance_fallback.py의 폴백값일 수 있다 — 이 필드로 실제 출처를 구분한다),
+         move_index(ICE BofA MOVE Index — 장외 파생 인덱스라 KIS 경로 자체가 없어 항상
+         yfinance_fallback에서만 옴).
     계산: INSERT ... ON CONFLICT (timestamp) DO UPDATE — 재처리에도 멱등.
     """
     _upsert(conn, "macro_snapshot_5m", _MACRO_SNAPSHOT_5M_COLUMNS, ("timestamp",), row)
@@ -141,21 +149,27 @@ def insert_macro_snapshot_5m(conn: ConnectionLike, row: dict) -> None:
 
 def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
     """
-    계산: us10y_yield는 하루 대부분 NULL이라(위 insert_macro_snapshot_5m 설명 참고), 최신 행에
-         값이 없으면 값이 채워진 마지막 행에서 하나 더 가져와 LOCF(forward-fill)한다. zn_front는
-         CBOT 신청 완료 후 5분마다 갱신되므로 별도 폴백이 필요 없다.
+    계산: us10y_yield/usdkrw는 하루 대부분 NULL이라(위 insert_macro_snapshot_5m 설명 참고), 최신
+         행에 값이 없으면 값이 채워진 마지막 행에서 하나 더 가져와 각각 LOCF(forward-fill)한다.
+         zn_front/es_front/move_index는 5분마다(또는 폴백으로) 갱신되므로 별도 LOCF가 필요 없다.
     해석: 대시보드/레짐 피처가 "지금 시점의 매크로 상태"를 한 번에 조회할 수 있게 한다.
+         *_source 필드도 함께 반환해 COCKPIT이 "kis"(실제 체결가)와 "yfinance_fallback"(근사치,
+         mahdi/data/yfinance_fallback.py 참고)를 구분해 보여줄 수 있게 한다.
     실패 조건: 폴링이 한 번도 안 돌았으면 None.
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, zn_front "
+            "SELECT timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, usdkrw, "
+            "zn_front, zn_front_source, es_front, es_front_source, move_index, move_index_source "
             "FROM macro_snapshot_5m ORDER BY timestamp DESC LIMIT 1"
         )
         row = cur.fetchone()
     if row is None:
         return None
-    timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, zn_front = row
+    (
+        timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, usdkrw,
+        zn_front, zn_front_source, es_front, es_front_source, move_index, move_index_source,
+    ) = row
     if us10y_yield is None:
         with conn.cursor() as cur:
             cur.execute(
@@ -164,6 +178,14 @@ def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
             )
             fallback = cur.fetchone()
         us10y_yield = fallback[0] if fallback else None
+    if usdkrw is None:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT usdkrw FROM macro_snapshot_5m "
+                "WHERE usdkrw IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+            )
+            fallback = cur.fetchone()
+        usdkrw = fallback[0] if fallback else None
     return {
         "timestamp": timestamp,
         "vix_front": float(vix_front) if vix_front is not None else None,
@@ -171,8 +193,89 @@ def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
         "vix_term_structure": float(vix_term_structure) if vix_term_structure is not None else None,
         "usdcnh": float(usdcnh) if usdcnh is not None else None,
         "us10y_yield": float(us10y_yield) if us10y_yield is not None else None,
+        "usdkrw": float(usdkrw) if usdkrw is not None else None,
         "zn_front": float(zn_front) if zn_front is not None else None,
+        "zn_front_source": zn_front_source,
+        "es_front": float(es_front) if es_front is not None else None,
+        "es_front_source": es_front_source,
+        "move_index": float(move_index) if move_index is not None else None,
+        "move_index_source": move_index_source,
     }
+
+
+def recent_usdkrw_daily_series(conn: ConnectionLike, days: int) -> list[float]:
+    """
+    입력: 조회할 최근 거래일 수(예: 10).
+    계산: macro_snapshot_5m을 날짜별로 묶어 각 날짜의 마지막 usdkrw 값을 뽑는다(daily_closes와
+         동일 패턴) — USDKRW는 KIS 해외주식 일봉 API로만 얻어 거래일당 값이 하나뿐이므로, 5분
+         스냅샷이 아니라 거래일 단위 이력이 "급변"을 측정하는 실질적인 단위다.
+    해석: mahdi.features.regime_features.cross_asset_stress의 usdkrw_daily_series 입력 —
+         시간순(오래된 순)으로 반환한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (timestamp::date) timestamp::date AS d, usdkrw
+            FROM macro_snapshot_5m
+            WHERE usdkrw IS NOT NULL
+            ORDER BY d DESC, timestamp DESC
+            LIMIT %s
+            """,
+            (days,),
+        )
+        rows = cur.fetchall()
+    return [float(usdkrw) for _, usdkrw in reversed(rows)]
+
+
+def recent_us10y_daily_series(conn: ConnectionLike, days: int) -> list[float]:
+    """US10Y_yield 버전 — recent_usdkrw_daily_series와 동일 패턴(US10Y도 일봉 전용)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (timestamp::date) timestamp::date AS d, us10y_yield
+            FROM macro_snapshot_5m
+            WHERE us10y_yield IS NOT NULL
+            ORDER BY d DESC, timestamp DESC
+            LIMIT %s
+            """,
+            (days,),
+        )
+        rows = cur.fetchall()
+    return [float(us10y_yield) for _, us10y_yield in reversed(rows)]
+
+
+def recent_usdcnh_series(conn: ConnectionLike, limit: int) -> list[float]:
+    """
+    입력: 조회할 최근 5분 스냅샷 행 수(예: 24 — 2시간).
+    계산: macro_snapshot_5m에서 usdcnh가 non-null인 최근 limit개 행을 시간순(오래된 순)으로
+         반환한다 — usdcnh는 5분마다 실제로 갱신되는 선물가라(계좌 게이트 없음) us10y_yield/
+         usdkrw와 달리 장중 인트라데이 변동을 그대로 반영한다.
+    해석: mahdi.features.regime_features.cross_asset_stress의 usdcnh_recent_series 입력.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT usdcnh FROM macro_snapshot_5m WHERE usdcnh IS NOT NULL ORDER BY timestamp DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [float(usdcnh) for (usdcnh,) in reversed(rows)]
+
+
+def recent_es_front_series(conn: ConnectionLike, limit: int) -> list[float]:
+    """
+    입력: 조회할 최근 5분 스냅샷 행 수.
+    계산: macro_snapshot_5m에서 es_front가 non-null인 최근 limit개 행을 시간순(오래된 순)으로
+         반환한다 — recent_usdcnh_series와 동일 패턴. es_front는 KIS(구독 시)든 yfinance
+         폴백이든 5분마다 갱신되므로 출처와 무관하게 같은 방식으로 추세를 볼 수 있다.
+    해석: mahdi.engines.regime_pipeline.compute_macro_score_proxy의 S&P500 선물 추세 신호 입력.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT es_front FROM macro_snapshot_5m WHERE es_front IS NOT NULL ORDER BY timestamp DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [float(es_front) for (es_front,) in reversed(rows)]
 
 
 def insert_underlying_spot(conn: ConnectionLike, timestamp: datetime, underlying: str, spot: float) -> None:

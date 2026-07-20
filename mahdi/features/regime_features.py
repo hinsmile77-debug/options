@@ -15,8 +15,6 @@ _NEUTRAL_HURST = 0.5
 _NEUTRAL_ADX = 20.0
 _NEUTRAL_RV_RATIO = 1.0
 _NEUTRAL_IV_CHG = 0.0
-_NEUTRAL_BOOK_THINNING = 0.0
-_NEUTRAL_CROSS_ASSET_STRESS = 0.0
 
 
 def hurst_exponent(closes: Sequence[float]) -> float:
@@ -209,6 +207,22 @@ def iv_change_rate(iv_series: Sequence[float]) -> float:
     return (iv_series[-1] - iv_series[0]) / iv_series[0]
 
 
+def _series_zscore(series: Sequence[float]) -> float:
+    """
+    계산: 시퀀스 마지막 값이 그 앞(직전 구간) 평균 대비 몇 표준편차 위/아래인지(부호 있는 z-score).
+    실패 조건: 데이터 3개 미만이거나 표준편차가 0(값 불변)이면 중립값 0.0 — book_thinning·
+              cross_asset_stress가 공유하는 핵심 계산.
+    """
+    if len(series) < 3:
+        return 0.0
+    baseline = series[:-1]
+    mean = sum(baseline) / len(baseline)
+    std = _stdev(baseline)
+    if std <= 0:
+        return 0.0
+    return (series[-1] - mean) / std
+
+
 def book_thinning(spread_series: Sequence[float]) -> float:
     """
     호가 잔량 급감 대리 지표 — 최우선 매도/매수 스프레드 확대 z-score.
@@ -216,26 +230,38 @@ def book_thinning(spread_series: Sequence[float]) -> float:
     입력: 시간순 정렬된 bid_ask_spread 시퀀스(market_raw_1m에 이미 적재됨). 원 스펙(§7.3)은
          호가 잔량 절대치 급감이지만, 잔량 절대치는 현재 스키마에 없다 — 스프레드가 급격히
          벌어지는 것은 유동성 공급자가 호가를 거둬들이는 것과 사실상 동일한 신호라 대리로 쓴다.
-    계산: 최신 스프레드가 직전 구간 평균 대비 몇 표준편차 위에 있는지(z-score).
+    계산: 최신 스프레드가 직전 구간 평균 대비 몇 표준편차 위에 있는지(z-score, _series_zscore).
     해석: 값이 클수록(예: 2 이상) 호가 유동성이 급격히 얇아짐 → LIQUIDITY_THIN 신호.
     실패 조건: 데이터 3개 미만이거나 표준편차가 0(스프레드 불변)이면 중립값 0.0.
     """
-    if len(spread_series) < 3:
-        return _NEUTRAL_BOOK_THINNING
-    baseline = spread_series[:-1]
-    mean = sum(baseline) / len(baseline)
-    std = _stdev(baseline)
-    if std <= 0:
-        return _NEUTRAL_BOOK_THINNING
-    return (spread_series[-1] - mean) / std
+    return _series_zscore(spread_series)
 
 
-def cross_asset_stress() -> float:
+def cross_asset_stress(
+    usdkrw_daily_series: Sequence[float] = (),
+    usdcnh_recent_series: Sequence[float] = (),
+    us10y_daily_series: Sequence[float] = (),
+) -> float:
     """
     Cross-asset stress(USDKRW·USDCNH·US10Y 급변) — §7.3.
 
-    TODO(2026-07-10): 이 코드베이스는 아직 USDKRW/USDCNH/US10Y를 수집하지 않는다(KIS API 범위
-    밖 — 별도 데이터 소스 연동 필요). 그 연동이 붙기 전까지는 항상 중립값 0.0을 반환해 HMM 피처
-    차원은 유지하되 허위 신호를 만들지 않는다.
+    입력(2026-07-20 실데이터 배선 — mahdi.engines.regime_pipeline.RegimeStateMachine.step이
+    호출측에서 DB로부터 채워 넘긴다):
+      - usdkrw_daily_series/us10y_daily_series: `db.recent_usdkrw_daily_series`/
+        `db.recent_us10y_daily_series` — 둘 다 KIS 해외주식 일봉 API로만 얻어 거래일당 값이
+        하나뿐이다(계좌 게이트 없음, macro_snapshot_5m.usdkrw/us10y_yield). "급변"의 실질 단위가
+        분/시간이 아니라 거래일이라 5분 스냅샷이 아닌 거래일별 값 이력을 쓴다.
+      - usdcnh_recent_series: `db.recent_usdcnh_series` — usdcnh는 5분마다 실제로 갱신되는
+        선물가라 장중 인트라데이 변동을 그대로 반영한다.
+    계산: 세 시퀀스 각각에 book_thinning과 동일한 z-score(_series_zscore)를 구해 절대값 평균을
+         낸다(방향은 무시하고 급변 "크기"만 본다).
+    해석: 값이 클수록 최근 급변 폭이 큼 — VOL_EXPANSION/CRISIS_DEFENSE 레짐 전환의 보조 신호.
+    실패 조건: 인자를 안 넘기거나(과거 스텁 호출 호환) 세 시퀀스 모두 데이터 부족(3개 미만)이면
+              평균 자체가 0.0(중립)이 된다 — 데이터가 일부만 있어도 그 부분만으로 평균을 낸다.
     """
-    return _NEUTRAL_CROSS_ASSET_STRESS
+    stresses = [
+        abs(_series_zscore(usdkrw_daily_series)),
+        abs(_series_zscore(usdcnh_recent_series)),
+        abs(_series_zscore(us10y_daily_series)),
+    ]
+    return sum(stresses) / len(stresses)

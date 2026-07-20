@@ -32,6 +32,7 @@ from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregat
 from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.data.overseas_future_master import OverseasFutureMaster, load_overseas_future_master
 from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivatives_master
+from mahdi.data import yfinance_fallback
 from mahdi.engines.regime_pipeline import RegimeStateMachine
 from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp
 from mahdi.features.orderflow import calculate_vpin
@@ -882,9 +883,10 @@ def _parse_overseas_future_last_price(resp: dict) -> float | None:
         return None
 
 
-def _parse_us10y_yield(resp: dict) -> float | None:
-    """입력: get_overseas_daily_chartprice() 응답(국채구분 I, Y0202). 계산: output1.ovrs_nmix_prpr
-    (최신 종가=수익률%)를 float로. 실패 조건: 필드 없음/변환 불가면 None."""
+def _parse_overseas_daily_last_price(resp: dict) -> float | None:
+    """입력: get_overseas_daily_chartprice() 응답(국채구분 I/환율구분 X 등 공통 스키마). 계산:
+    output1.ovrs_nmix_prpr(최신 종가 — I구분이면 수익률%, X구분이면 환율)를 float로. 실패 조건:
+    필드 없음/변환 불가면 None."""
     try:
         return float(resp["output1"]["ovrs_nmix_prpr"])
     except (KeyError, ValueError, TypeError):
@@ -927,19 +929,29 @@ async def _collect_macro_snapshot_cycle(
     """
     입력: REST 클라이언트, 해외선물 종목코드 마스터, 폴링 시각(분 단위로 자름).
     계산: VIX 선물(CBOE VX) 근월·차근월, USDCNH 선물(HKEx CNH) 근월 현재가를 조회해 콘탱고/
-         백워데이션(vix_term_structure = vix_next/vix_front - 1)을 계산하고, US10Y는 일봉
-         API(국채구분 I)로 최신 종가(us10y_yield, 실제 수익률 %)를, ZN 선물(CME/CBOT 10년
-         국채선물) 근월물 현재가(zn_front)로 5분 주기 급변 감지용 값을 함께 담는다(2026-07-10
-         사용자가 계좌에 CBOT 거래소 신청을 완료해 추가 — 신청 전에는 EGW00552로 항상 실패해
-         zn_front가 계속 None이었다). 종목코드를 마스터에서 못 찾거나 개별 조회가 실패해도
-         나머지 필드는 계속 채운다(부분 실패 허용).
+         백워데이션(vix_term_structure = vix_next/vix_front - 1)을 계산하고, US10Y·USDKRW는 일봉
+         API(해외주식 종목_지수_환율기간별시세, 국채구분 I / 환율구분 X)로 최신 종가를, ZN·ES
+         선물(둘 다 CME 상장) 근월물 현재가로 5분 주기 급변 감지용 값을, MOVE(ICE BofA MOVE
+         Index)는 yfinance 전용으로 함께 담는다.
+         - ZN·ES: CME 계열 실시간시세는 KIS 유료 항목(2026-07-20 HTS [7936] 확인: 월 228.8불,
+           ZN은 CME|CBOT·ES는 CME|CME 서브거래소로 별개 구독)이라 모의투자 개발 단계에서는
+           미구독 상태다 — KIS 조회가 안 되면(마스터 미매핑·EGW00552 등)
+           mahdi/data/yfinance_fallback.py로 대신 채우고, *_source 필드("kis"|"yfinance_fallback"|
+           None)로 실제 출처를 구분한다.
+         - USDKRW: 해외선물옵션이 아니라 해외주식 도메인(inquire-daily-chartprice)이라 애초에
+           CBOT 같은 SUB거래소 신청 게이트가 없다 — US10Y와 동일하게 계좌 제약 없이 무료로 얻는다.
+         - MOVE: 장외 파생 인덱스라 KIS 해외선물옵션 마스터파일에 상품 자체가 없음 — KIS 경로가
+           없으므로 처음부터 yfinance_fallback만 시도한다.
+         종목코드를 마스터에서 못 찾거나 개별 조회가 실패해도 나머지 필드는 계속 채운다(부분 실패
+         허용).
     실패 조건: vix_front/vix_next/usdcnh 셋 다 실패하면(레이트리밋 버스트 등) None을 반환해
-              호출측이 이번 사이클 적재를 건너뛰게 한다 — us10y_yield/zn_front만 성공한 상태로
-              5분 행을 남기는 건 의미가 없다.
+              호출측이 이번 사이클 적재를 건너뛰게 한다 — 나머지 필드만 성공한 상태로 5분 행을
+              남기는 건 의미가 없다.
     """
     vix_front_code, vix_next_code = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_VIX)
     cnh_front_code, _ = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_CNH)
     zn_front_code, _ = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_ZN)
+    es_front_code, _ = overseas_master.front_two_codes(tr_codes.OVERSEAS_FUTURE_PRODUCT_ES)
 
     vix_front = vix_next = usdcnh = None
     if vix_front_code is not None:
@@ -967,11 +979,12 @@ async def _collect_macro_snapshot_cycle(
     if vix_front is None and vix_next is None and usdcnh is None:
         return None
 
+    date_to = poll_time.strftime("%Y%m%d")
+    date_from = (poll_time - timedelta(days=US10Y_LOOKBACK_DAYS)).strftime("%Y%m%d")
+
     us10y_yield = None
     try:
-        date_to = poll_time.strftime("%Y%m%d")
-        date_from = (poll_time - timedelta(days=US10Y_LOOKBACK_DAYS)).strftime("%Y%m%d")
-        us10y_yield = _parse_us10y_yield(
+        us10y_yield = _parse_overseas_daily_last_price(
             await asyncio.to_thread(
                 rest_client.get_overseas_daily_chartprice,
                 tr_codes.FID_MRKT_DIV_OVERSEAS_TREASURY,
@@ -983,14 +996,63 @@ async def _collect_macro_snapshot_cycle(
     except Exception as exc:
         _log_kis_call_failure("US10Y 일봉 조회 실패", exc)
 
+    usdkrw = None
+    try:
+        usdkrw = _parse_overseas_daily_last_price(
+            await asyncio.to_thread(
+                rest_client.get_overseas_daily_chartprice,
+                tr_codes.FID_MRKT_DIV_OVERSEAS_FX,
+                tr_codes.FID_INPUT_ISCD_USDKRW,
+                date_from,
+                date_to,
+            )
+        )
+    except Exception as exc:
+        _log_kis_call_failure("USDKRW 일봉 조회 실패", exc)
+
     zn_front = None
+    zn_front_source = None
     if zn_front_code is not None:
         try:
             zn_front = _parse_overseas_future_last_price(
                 await asyncio.to_thread(rest_client.get_overseas_future_price, zn_front_code)
             )
+            if zn_front is not None:
+                zn_front_source = "kis"
         except Exception as exc:
             _log_kis_call_failure(f"ZN(10년 국채선물) 근월물 조회 실패: {zn_front_code}", exc)
+
+    if zn_front is None:
+        # CME|CBOT 실시간시세는 KIS 유료 항목(HTS [7936] 확인: 월 228.8불)이라 모의투자 개발
+        # 단계에서는 미구독 상태다 — KIS 조회가 안 됐을 때만(마스터 미매핑이든 호출 실패든) 여기서
+        # yfinance 폴백을 시도한다. 폴백도 실패하면 zn_front_source는 None으로 남는다.
+        zn_front = await asyncio.to_thread(yfinance_fallback.fetch_last_close, yfinance_fallback.ZN_FALLBACK_SYMBOL)
+        if zn_front is not None:
+            zn_front_source = "yfinance_fallback"
+
+    es_front = None
+    es_front_source = None
+    if es_front_code is not None:
+        try:
+            es_front = _parse_overseas_future_last_price(
+                await asyncio.to_thread(rest_client.get_overseas_future_price, es_front_code)
+            )
+            if es_front is not None:
+                es_front_source = "kis"
+        except Exception as exc:
+            _log_kis_call_failure(f"ES(E-mini S&P500) 근월물 조회 실패: {es_front_code}", exc)
+
+    if es_front is None:
+        # CME|CME(ES) 실시간시세도 ZN(CME|CBOT)과 마찬가지로 KIS 유료 항목 — 미구독 상태에서는
+        # yfinance 폴백으로 대신 채운다.
+        es_front = await asyncio.to_thread(yfinance_fallback.fetch_last_close, yfinance_fallback.ES_FALLBACK_SYMBOL)
+        if es_front is not None:
+            es_front_source = "yfinance_fallback"
+
+    # MOVE(ICE BofA MOVE Index)는 장외 파생 인덱스라 KIS 해외선물옵션 마스터파일에 상품 자체가
+    # 없다 — KIS 시도 없이 처음부터 yfinance 폴백만 쓴다.
+    move_index = await asyncio.to_thread(yfinance_fallback.fetch_last_close, yfinance_fallback.MOVE_FALLBACK_SYMBOL)
+    move_index_source = "yfinance_fallback" if move_index is not None else None
 
     vix_term_structure = (vix_next / vix_front - 1) if (vix_front and vix_next) else None
 
@@ -1001,7 +1063,13 @@ async def _collect_macro_snapshot_cycle(
         "vix_term_structure": vix_term_structure,
         "usdcnh": usdcnh,
         "us10y_yield": us10y_yield,
+        "usdkrw": usdkrw,
         "zn_front": zn_front,
+        "zn_front_source": zn_front_source,
+        "es_front": es_front,
+        "es_front_source": es_front_source,
+        "move_index": move_index,
+        "move_index_source": move_index_source,
         "quality_flag": 0 if (vix_front is not None and vix_next is not None and usdcnh is not None) else 1,
     }
 
@@ -1020,10 +1088,11 @@ async def poll_macro_snapshot(
     실패 조건: 이번 사이클 전체가 실패하면(_collect_macro_snapshot_cycle이 None) 적재를
               건너뛰고 다음 정규 사이클을 기다린다 — 재시도 백오프는 두지 않는다(사이클당
               REST 호출이 4건뿐이라 다른 폴러만큼 레이트리밋에 취약하지 않음).
-    알림(2026-07-19, §5-4): 적재에 성공한 첫 사이클에서 zn_front가 그때도 None이면(CBOT 계좌
-              신청 미승인 — §4-2 6일째 지속 확인된 이슈) Slack으로 한 번만 알린다. 5분마다
-              매번 알리면 승인 전까지 하루 종일(정규장 기준 최대 78회) 반복 경고가 되므로,
-              이 프로세스 실행당(=거래일당, 매일 재시작되므로) 최초 1회만 보낸다.
+    알림(2026-07-19, §5-4; 2026-07-20 문구 갱신): 적재에 성공한 첫 사이클에서 zn_front가 그때도
+              None이면(KIS 미구독 + yfinance 폴백까지 실패 — 둘 다 안 되는 경우만 해당,
+              yfinance_fallback.py 참고) Slack으로 한 번만 알린다. 5분마다 매번 알리면 하루 종일
+              (정규장 기준 최대 78회) 반복 경고가 되므로, 이 프로세스 실행당(=거래일당, 매일
+              재시작되므로) 최초 1회만 보낸다.
     """
     next_tick: float | None = None
     cbot_alert_sent = False
@@ -1043,8 +1112,8 @@ async def poll_macro_snapshot(
             if row["zn_front"] is None and not cbot_alert_sent:
                 cbot_alert_sent = True
                 notify.notify(
-                    "CBOT(ZN/US10Y 선물) 계좌 신청이 여전히 미승인 상태입니다 — zn_front가 계속 "
-                    "NULL. KIS 앱/HTS에서 신청 상태를 재확인해주세요.",
+                    "ZN(10년 국채선물) 데이터를 KIS·yfinance 폴백 양쪽 모두에서 가져오지 못했습니다 "
+                    "— zn_front가 계속 NULL. 네트워크 상태 또는 yfinance 응답을 확인해주세요.",
                     "WARNING",
                 )
 
