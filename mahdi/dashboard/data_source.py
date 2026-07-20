@@ -124,11 +124,22 @@ def _is_trading_hours(now: datetime) -> bool:
 
 def _freshness_check(label: str, latest_ts: datetime | None, now: datetime) -> HealthCheck:
     """장중이 아니면(주말/장외시간) 데이터가 안 들어와도 정상이므로 판단하지 않는다 — 장중에만
-    §5-4와 동일한 5분 기준으로 결손 여부를 판단한다."""
+    §5-4와 동일한 5분 기준으로 결손 여부를 판단한다.
+
+    2026-07-20(버그 수정): latest_ts는 TIMESTAMPTZ 컬럼(MAX(timestamp))에서 psycopg가 읽어온
+    값이라 tzinfo가 붙어 있는데, now(db.local_now())는 naive다 — 장외시간에는 이 함수가 그 값을
+    한 번도 안 써서(위 `_is_trading_hours` 조기 반환) 안 드러나다가, 오늘(2026-07-20) 정규장
+    시간에 처음 실제로 `now - latest_ts`가 실행되며 TypeError로 전체 헬스체크가 죽는 것을
+    실측했다. db.local_now()의 "naive-KST가 세션 타임존(UTC) 라벨로 저장된다"는 정책(그 함수
+    docstring 참고) 때문에 tzinfo만 떼면 벽시계 숫자는 이미 같은 좌표계 — 실제 시간대 변환은
+    필요 없다.
+    """
     if not _is_trading_hours(now):
         return HealthCheck(label, "info", "장중 아님(평일 09:00~15:45 외)")
     if latest_ts is None:
         return HealthCheck(label, "warning", "장중인데 데이터가 아직 한 건도 없음")
+    if latest_ts.tzinfo is not None:
+        latest_ts = latest_ts.replace(tzinfo=None)
     age_seconds = max((now - latest_ts).total_seconds(), 0.0)
     if age_seconds >= _STALE_DATA_THRESHOLD_SECONDS:
         return HealthCheck(label, "warning", f"{age_seconds / 60:.0f}분째 결손")

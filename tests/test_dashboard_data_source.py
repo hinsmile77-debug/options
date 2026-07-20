@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -494,11 +494,29 @@ def test_freshness_check_warning_when_stale_beyond_threshold():
     assert "6분째 결손" in check.detail
 
 
+def test_freshness_check_handles_timezone_aware_latest_ts_from_db(monkeypatch):
+    # 2026-07-20 실측 버그: latest_ts는 TIMESTAMPTZ 컬럼(MAX(timestamp))에서 psycopg가 읽어와
+    # tzinfo가 붙어 있는데, now(db.local_now())는 naive라 "now - latest_ts"가
+    # "can't subtract offset-naive and offset-aware datetimes" TypeError로 죽었다 — 장외시간
+    # 실측만으로는 이 경로(_is_trading_hours 통과 후 실제로 뺄셈)가 한 번도 실행 안 돼 숨어있다가,
+    # 정규장 시간에 처음 실제로 터진 것을 실측 확인했다. now가 naive-KST일 때 latest_ts가
+    # tzinfo=UTC로 붙어와도(db.local_now() 정책상 벽시계 숫자는 이미 같은 좌표계) 죽지 않고
+    # 정상 계산돼야 한다.
+    now = datetime(2026, 7, 20, 10, 5)
+    aware_latest_ts = datetime(2026, 7, 20, 10, 4, 30, tzinfo=timezone.utc)  # 30초 전, tzinfo 있음
+    check = _freshness_check("라벨", aware_latest_ts, now)
+    assert check.status == "ok"
+    assert "30초 전 갱신" in check.detail
+
+
 # --- _option_chain_freshness_check ------------------------------------------------------------
 
 def test_option_chain_freshness_check_ok():
     now = datetime(2026, 7, 20, 10, 0)
-    conn = _FakeHealthConnection({"option_chain_latest": (now - timedelta(seconds=20),)})
+    # TIMESTAMPTZ 컬럼에서 psycopg가 실제로 돌려주는 형태(tzinfo 있음)를 그대로 재현 —
+    # naive로만 테스트하면 2026-07-20에 실측한 tzinfo 불일치 버그를 못 잡는다.
+    aware_latest = (now - timedelta(seconds=20)).replace(tzinfo=timezone.utc)
+    conn = _FakeHealthConnection({"option_chain_latest": (aware_latest,)})
     check = _option_chain_freshness_check(conn, "KOSPI200", now)
     assert check.status == "ok"
 
@@ -521,8 +539,9 @@ def test_futures_freshness_check_info_when_no_futures_symbol_registered():
 
 def test_futures_freshness_check_ok_when_recent():
     now = datetime(2026, 7, 20, 10, 0)
+    aware_latest = (now - timedelta(seconds=15)).replace(tzinfo=timezone.utc)
     conn = _FakeHealthConnection(
-        {"futures_symbol_row": ("101S03",), "futures_latest": (now - timedelta(seconds=15),)}
+        {"futures_symbol_row": ("101S03",), "futures_latest": (aware_latest,)}
     )
     check = _futures_freshness_check(conn, "KOSPI200", now)
     assert check.status == "ok"

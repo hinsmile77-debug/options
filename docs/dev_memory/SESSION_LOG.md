@@ -4,6 +4,50 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-20] 3차 — 정규장 첫 실측으로 COCKPIT 헬스체크 전체 다운 발견·수정 (tz-aware/naive TypeError)
+
+**트리거:** 사용자가 실전 선물옵션계좌(44833081) 온라인 개설 완료 스크린샷을 공유하며 "데이터 수집
+관련 점검 진행해" 요청.
+
+**발견:** 데이터 수집 상태를 확인하려고 `get_health_summary()`를 실전 DB에 직접 호출했다가
+`TypeError: can't subtract offset-naive and offset-aware datetimes`로 전체가 죽는 것을 실측—
+`_freshness_check`(`data_source.py`)가 `now - latest_ts`를 계산하는데, `now`(`db.local_now()`)는
+naive KST인 반면 `latest_ts`(`MAX(timestamp)`, TIMESTAMPTZ 컬럼)는 psycopg가 tzinfo를 붙여
+돌려준다. 이 뺄셈은 `_is_trading_hours(now)`가 True일 때만 실행되는데, 2026-07-19 헬스체크
+기능 도입 이후 오늘(2026-07-20 11시대)이 이 코드가 **처음으로 실제 정규장 시간에 실행된 순간**이라
+지금까지 아무도(장외시간 실측+단위테스트만으로는) 못 잡았던 버그였다 — 어제 NEXT_TODO에 정확히
+"다음 거래일에 재확인 필요"로 남겨뒀던 항목이 바로 이거였다. `get_health_summary()`의 바깥
+try/except가 이 예외를 통째로 삼켜 7개 배지 전부가 "DB 연결 실패로 조회 불가"라는 오해의 소지가
+있는 메시지로 뭉개지고 있었다(진짜 DB 연결 문제가 아니었음).
+
+**원인:** `db.local_now()` docstring에 이미 문서화된 정책(naive-KST 벽시계 시각이 세션
+타임존(UTC) 라벨로 저장됨, [[DECISION_LOG]] 2026-07-19 타임스탬프 정책 참고) 때문에, DB에서
+읽어온 값의 tzinfo만 떼면 벽시계 숫자는 이미 `now`와 같은 좌표계다 — 실제 시간대 변환은 필요
+없고 naive/aware 불일치만 없애면 된다. 테스트가 이 버그를 못 잡은 이유는 `_FakeHealthCursor`
+픽스처가 naive datetime을 돌려주도록 만들어져 있어 실제 psycopg의 TIMESTAMPTZ 반환 형태(tzinfo
+있음)를 재현하지 못했기 때문 — 이번에 관련 픽스처를 aware datetime으로 교체했다.
+
+**구현:** `_freshness_check`에 `latest_ts.tzinfo is not None`이면 `.replace(tzinfo=None)`으로
+정규화하는 한 줄 추가(공유 헬퍼라 `_option_chain_freshness_check`/`_futures_freshness_check`
+둘 다 한 번에 고쳐짐). 다른 헬스체크 함수(`_cbot_status_check`/`_fossil_data_check`/
+`_regime_stability_check`/`_regime_fit_progress_check`/`_option_chain_leg_balance_check`)는
+전부 쿼리 파라미터로만 시각을 넘기거나(서버사이드 비교, Python 뺄셈 없음) `now.date()`만 써서
+같은 버그가 없음을 코드 전수조사로 확인.
+
+**검증:** 신규 회귀 테스트 1개(`_freshness_check`에 tzinfo 있는 값을 직접 넣어 검증) + 기존
+`test_option_chain_freshness_check_ok`/`test_futures_freshness_check_ok_when_recent`의 픽스처를
+aware datetime으로 교체, 전체 pytest 통과. 실전 DB에 `get_health_summary()`를 직접 호출해 7개
+배지 전부 정상 표시 확인(정규장 중 첫 실측 — 옵션체인/선물 "ok", 콜/풋 균형 "콜 40건/풋 80건
+ok"로 오늘 오전과 방향이 바뀌어 있음도 확인, CBOT은 여전히 "미승인").
+
+**계좌 관련(코드 변경 아님, 확인 필요):** 스크린샷의 신규 계좌(44833081, 실전 선물옵션계좌)는
+현재 `.env`에 설정된 KIS 모의투자 계좌(60045705, `KIS_ENV=vps`)와 계좌번호 체계 자체가 다르다 —
+모의투자 계좌는 보통 실전 계좌와 별개로 발급되므로 이 신규 계좌가 자동으로 연결되는 것은 아니다.
+CBOT 미승인 상태가 이 신규 계좌 개설로 해소됐는지는 이 세션에서 확인 불가(사용자에게 확인 필요,
+[[NEXT_TODO]] 참고) — `.env`를 임의로 바꾸지 않았다.
+
+---
+
 ## [2026-07-20] 2차 — 고도화 방안 구현: REST 실패 로깅 표준화, 적응형 레이트리미터, 배치파일 자기점검
 
 **트리거:** 같은 날 1차 세션(바로 아래 항목)의 보고서 마지막 "고도화 방안(실행 점검 결과 기반)"
