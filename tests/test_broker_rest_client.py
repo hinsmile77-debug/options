@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from mahdi.broker import tr_codes
-from mahdi.broker.rest_client import KISRestClient
+from mahdi.broker.rest_client import KISRestClient, _is_kis_rate_limit_error, _RateLimiter
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.config.settings import KISSettings
 
@@ -287,3 +287,128 @@ def test_rate_limiter_serializes_concurrent_threads():
     # 아니라 첫 호출~마지막 호출 총 스팬으로 검증해 그 지터에 흔들리지 않게 한다.
     total_span = call_times[-1] - call_times[0]
     assert total_span >= 0.15 * 3 * 0.8
+
+
+# --- _is_kis_rate_limit_error (2026-07-20 고도화: 적응형 레이트리미터) -----------------------------
+
+def _http_error_with_body(status_code: int, json_body: dict | None = None, content: bytes | None = None):
+    request = httpx.Request("GET", "https://example.com")
+    if json_body is not None:
+        response = httpx.Response(status_code, json=json_body, request=request)
+    else:
+        response = httpx.Response(status_code, content=content, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError("raise_for_status()가 예외를 던지지 않음")
+
+
+def test_is_kis_rate_limit_error_true_for_egw00201():
+    exc = _http_error_with_body(500, {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"})
+    assert _is_kis_rate_limit_error(exc) is True
+
+
+def test_is_kis_rate_limit_error_false_for_other_500():
+    # 계좌 미승인(CBOT 등) 같은 페이싱과 무관한 500까지 백오프 대상으로 삼으면 안 된다.
+    exc = _http_error_with_body(500, {"rt_cd": "1", "msg_cd": "EGW00552", "msg1": "CBOT SUB거래소 신청 계좌가 아닙니다."})
+    assert _is_kis_rate_limit_error(exc) is False
+
+
+def test_is_kis_rate_limit_error_false_for_non_json_body():
+    exc = _http_error_with_body(500, content=b"not json")
+    assert _is_kis_rate_limit_error(exc) is False
+
+
+# --- _RateLimiter 적응형 백오프 -------------------------------------------------------------------
+
+def test_rate_limiter_widens_interval_on_rate_limit_hit():
+    limiter = _RateLimiter(min_interval=1.0)
+    assert limiter._current_interval == pytest.approx(1.0)
+    limiter.record_rate_limit_hit()
+    assert limiter._current_interval == pytest.approx(1.5)
+    limiter.record_rate_limit_hit()
+    assert limiter._current_interval == pytest.approx(2.25)
+
+
+def test_rate_limiter_caps_interval_at_max_multiplier():
+    limiter = _RateLimiter(min_interval=1.0)
+    for _ in range(20):  # 반복 적중해도 상한(min_interval의 4배)을 넘지 않아야 함
+        limiter.record_rate_limit_hit()
+    assert limiter._current_interval == pytest.approx(4.0)
+
+
+def test_rate_limiter_recovers_toward_min_after_sustained_success():
+    limiter = _RateLimiter(min_interval=1.0)
+    limiter.record_rate_limit_hit()  # 1.0 -> 1.5로 넓어짐
+    for _ in range(19):
+        limiter.record_success()
+    assert limiter._current_interval == pytest.approx(1.5)  # 임계값(20건) 미달 — 아직 그대로
+    limiter.record_success()  # 20번째 연속 성공 — 이제 한 단계 되돌림
+    assert limiter._current_interval == pytest.approx(1.5 * 0.9)
+
+
+def test_rate_limiter_never_recovers_below_min_interval():
+    limiter = _RateLimiter(min_interval=1.0)
+    limiter._current_interval = 1.05  # 되돌림 한 스텝이면 min 밑으로 내려갈 수 있는 경계 상황
+    for _ in range(20):
+        limiter.record_success()
+    assert limiter._current_interval == pytest.approx(1.0)  # min 밑으로는 절대 안 내려감
+
+
+def test_rate_limiter_record_success_is_noop_when_not_widened():
+    limiter = _RateLimiter(min_interval=1.0)
+    for _ in range(100):
+        limiter.record_success()
+    assert limiter._current_interval == pytest.approx(1.0)  # 넓어진 적이 없으면 아무 효과 없음
+
+
+def test_rate_limiter_disabled_when_min_interval_is_zero():
+    limiter = _RateLimiter(min_interval=0.0)
+    limiter.record_rate_limit_hit()  # 레이트리밋 자체가 꺼져 있으므로(테스트에서 흔히 씀) 무효과
+    assert limiter._current_interval == 0.0
+
+
+def test_get_widens_rate_limiter_on_egw00201_then_holds_after_one_success():
+    # KISRestClient._get()을 통한 통합 검증 — 500+EGW00201을 실제로 받으면 다음 호출부터
+    # 페이싱 간격이 넓어지고, 그 뒤 성공 1건만으로는(임계값 20건 미달) 아직 되돌아가지 않는다.
+    responses = iter(
+        [
+            httpx.Response(500, json={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"}),
+            httpx.Response(200, json={"output": {}}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=1.0,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.get_balance()
+    assert client._rate_limiter._current_interval == pytest.approx(1.5)
+
+    client.get_balance()
+    assert client._rate_limiter._current_interval == pytest.approx(1.5)  # 아직 임계값 미달
+
+
+def test_get_does_not_widen_rate_limiter_on_unrelated_500():
+    # CBOT 미승인처럼 페이싱과 무관한 500은 백오프를 키우면 안 된다(전체 호출이 불필요하게 느려짐).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"rt_cd": "1", "msg_cd": "EGW00552", "msg1": "CBOT SUB거래소 신청 계좌가 아닙니다."})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=1.0,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.get_balance()
+    assert client._rate_limiter._current_interval == pytest.approx(1.0)

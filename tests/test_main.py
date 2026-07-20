@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import httpx
 import pytest
 
 from mahdi.broker.ws_client import KISWebSocketClient
@@ -754,7 +755,7 @@ def test_poll_option_chain_sends_gap_alert_after_5min_then_recovery_notice(monke
         idx["i"] += 1
         return poll_times[idx["i"]]
 
-    async def fake_collect(rest_client, books, master, underlying, poll_time):
+    async def fake_collect(rest_client, books, master, underlying, poll_time, warning_throttle):
         return outcomes[idx["i"]]
 
     monkeypatch.setattr("mahdi.main.db.local_now", fake_local_now)
@@ -862,15 +863,16 @@ def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeyp
 class _FakeInvestorFlowRestClient:
     """섹터(F001/OC01/OP01)별로 다른 응답을 돌려주고, 지정한 섹터는 예외를 던진다."""
 
-    def __init__(self, responses: dict, failing_sectors: set[str] = frozenset()):
+    def __init__(self, responses: dict, failing_sectors: set[str] = frozenset(), exc: Exception | None = None):
         self._responses = responses
         self._failing_sectors = failing_sectors
+        self._exc = exc if exc is not None else RuntimeError("KIS 500")
         self.calls: list[tuple[str, str]] = []
 
     def get_investor_flow(self, market_code: str, sector_code: str) -> dict:
         self.calls.append((market_code, sector_code))
         if sector_code in self._failing_sectors:
-            raise RuntimeError("KIS 500")
+            raise self._exc
         return self._responses[sector_code]
 
 
@@ -955,6 +957,47 @@ def test_poll_investor_flow_continues_when_one_segment_fails(monkeypatch):
     assert len(rest_client.calls) == 3  # 실패한 OC01도 시도는 함
     assert len(written) == 1
     assert written[0]["foreign_net"] == pytest.approx(-120.0)  # F001 + OP01만 합산(OC01 실패분 제외)
+
+
+def test_poll_investor_flow_segment_failure_logs_kis_response_body_and_is_throttled(monkeypatch, caplog):
+    # 2026-07-20 고도화: poll_option_chain에 이미 적용한 "응답 바디 로깅 + 스로틀"을
+    # poll_investor_flow에도 표준화 — 이전엔 그냥 "KIS 500"만 남고 레이트리밋인지 다른 원인인지
+    # 알 수 없었다.
+    exc = _http_status_error(500, {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"})
+    rest_client = _FakeInvestorFlowRestClient(
+        {"F001": _investor_flow_response(-100.0, 200.0, -50.0)},
+        failing_sectors={"OC01", "OP01"},
+        exc=exc,
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    def fake_insert_investor_flow(conn, timestamp, underlying, foreign_net, institution_net, individual_net):
+        written.append({"foreign_net": foreign_net})
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_investor_flow", fake_insert_investor_flow)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_investor_flow(rest_client, interval_seconds=1))
+
+    assert len(rest_client.calls) == 3  # 실패한 OC01/OP01도 둘 다 시도됨
+    assert len(written) == 1  # F001만 성공해도 적재는 됨
+
+    failure_records = [r for r in caplog.records if "투자자 수급 폴링 실패" in r.getMessage()]
+    assert len(failure_records) == 1  # 같은 60초 창 안에서 두 번째(OP01) 실패는 억제됨
+    logged_message = failure_records[0].getMessage()
+    assert "EGW00201" in logged_message
+    assert "초당 거래건수를 초과하였습니다" in logged_message
 
 
 class _FakeInvestorFlowRestClientFlaky:
@@ -1321,6 +1364,105 @@ def test_poll_expiry_liquidity_skips_bad_book_and_continues_after_db_error(monke
     assert call_count["n"] == 2  # 북 2개 각각 1행씩 시도됨
     assert len(written_rows) == 1  # 첫 북만 실패, 둘째 북은 정상 적재됨(루프가 안 죽음)
     assert fake_conn.rollback_calls == 1
+
+
+class _FakeRestClientForLiquidityAlwaysFailsAskingPrice:
+    """get_quote(앵커)는 정상 응답, get_asking_price(레그)는 항상 지정된 예외를 던진다."""
+
+    def __init__(self, quote_resp: dict, exc: Exception):
+        self._quote_resp = quote_resp
+        self._exc = exc
+        self.asking_calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        return self._quote_resp
+
+    def get_asking_price(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.asking_calls.append(symbol)
+        raise self._exc
+
+
+def test_poll_expiry_liquidity_leg_fetch_failure_logs_kis_response_body_and_is_throttled(monkeypatch, caplog):
+    # 2026-07-20 고도화: poll_option_chain과 동일하게 응답 바디 로깅 + 스로틀을 표준화.
+    exc = _http_status_error(500, {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"})
+    rest_client = _FakeRestClientForLiquidityAlwaysFailsAskingPrice(_SAMPLE_OPTION_QUOTE, exc)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: None)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0})  # ATM±2, 5개 행사가
+    books = [(_FakeSubscriptionManagerForLiquidity(strikes), "regular")]
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+
+    assert len(rest_client.asking_calls) == 5 * 2  # ATM±2(5) x (C,P) 전부 시도됨
+
+    failure_records = [r for r in caplog.records if "만기 유동성 폴링 실패" in r.getMessage()]
+    assert len(failure_records) == 1  # 같은 60초 창 안에서 나머지 9건은 억제됨
+    logged_message = failure_records[0].getMessage()
+    assert "EGW00201" in logged_message
+    assert "초당 거래건수를 초과하였습니다" in logged_message
+
+
+class _FakeRestClientForLiquidityAlwaysFailsQuote:
+    """get_quote(앵커/만기확인)는 항상 지정된 예외, get_asking_price(레그)는 정상 응답."""
+
+    def __init__(self, exc: Exception, asking_resp: dict):
+        self._exc = exc
+        self._asking_resp = asking_resp
+        self.quote_calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.quote_calls.append(symbol)
+        raise self._exc
+
+    def get_asking_price(self, symbol: str, market_div_code: str | None = None) -> dict:
+        return self._asking_resp
+
+
+def test_poll_expiry_liquidity_anchor_fetch_failure_is_logged_with_response_body(monkeypatch, caplog):
+    # 2026-07-20 고도화: 이전엔 앵커(만기확인용 get_quote) 실패가 완전히 조용히 삼켜져
+    # (parsed_anchor=None) 로그에 아무 흔적도 안 남았다 — 원인 추적이 불가능한 사각지대였다.
+    exc = _http_status_error(500, {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"})
+    rest_client = _FakeRestClientForLiquidityAlwaysFailsQuote(exc, _SAMPLE_ASKING_PRICE)
+    written_rows: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: written_rows.append(row))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0})
+    books = [(_FakeSubscriptionManagerForLiquidity(strikes), "regular")]
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+
+    assert len(rest_client.quote_calls) == 1  # 앵커 1건 시도됨
+    assert written_rows == []  # 만기를 못 구해 그 북은 건너뜀(적재 없음)
+
+    failure_records = [r for r in caplog.records if "만기 유동성 만기확인 조회 실패" in r.getMessage()]
+    assert len(failure_records) == 1
+    assert "EGW00201" in failure_records[0].getMessage()
 
 
 def test_poll_expiry_liquidity_waits_startup_offset_before_first_cycle(monkeypatch):
@@ -1692,6 +1834,72 @@ def test_configure_logging_uses_rotating_file_handler(monkeypatch, tmp_path):
     assert len(stream_handlers) == 1
 
 
+def test_log_startup_gap_writes_marker_when_none_exists(monkeypatch, tmp_path, caplog):
+    # 2026-07-20 고도화: 마커 파일이 아직 없으면(최초 실행) 비교 없이 정보만 남기고, 이번 기동
+    # 시각으로 마커를 새로 만든다.
+    import mahdi.main as mahdi_main
+
+    fake_log_dir = tmp_path / "logs"
+    fake_marker = fake_log_dir / ".last_successful_start.txt"
+    monkeypatch.setattr(mahdi_main, "LOG_DIR", fake_log_dir)
+    monkeypatch.setattr(mahdi_main, "LAST_START_MARKER_FILE", fake_marker)
+
+    now = datetime(2026, 7, 20, 7, 30, 0)
+    monkeypatch.setattr(mahdi_main.db, "local_now", lambda: now)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        mahdi_main._log_startup_gap_since_last_run()
+
+    assert "직전 정상 기동 기록 없음" in caplog.text
+    assert fake_marker.exists()
+    assert fake_marker.read_text(encoding="utf-8") == now.isoformat()
+
+
+def test_log_startup_gap_reports_elapsed_hours_and_updates_marker(monkeypatch, tmp_path, caplog):
+    # 07-17(금) 15:45 장마감 자동 종료가 스케줄대로 실행되지 못했던 사례처럼, 예약 실행이
+    # 하루 이상 건너뛰면 다음 정상 기동 시점에 경과 시간이 로그에 그대로 남아야 한다.
+    import mahdi.main as mahdi_main
+
+    fake_log_dir = tmp_path / "logs"
+    fake_log_dir.mkdir()
+    fake_marker = fake_log_dir / ".last_successful_start.txt"
+    last = datetime(2026, 7, 17, 7, 30, 0)
+    fake_marker.write_text(last.isoformat(), encoding="utf-8")
+    monkeypatch.setattr(mahdi_main, "LOG_DIR", fake_log_dir)
+    monkeypatch.setattr(mahdi_main, "LAST_START_MARKER_FILE", fake_marker)
+
+    now = datetime(2026, 7, 20, 7, 30, 0)  # 정확히 3일(72시간) 뒤
+    monkeypatch.setattr(mahdi_main.db, "local_now", lambda: now)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        mahdi_main._log_startup_gap_since_last_run()
+
+    assert "직전 정상 기동: 2026-07-17 07:30:00 (72.0시간 전)" in caplog.text
+    assert fake_marker.read_text(encoding="utf-8") == now.isoformat()  # 마커가 이번 기동 시각으로 갱신됨
+
+
+def test_log_startup_gap_handles_corrupted_marker_and_recovers(monkeypatch, tmp_path, caplog):
+    # 마커 파일 내용이 파싱 불가해도(수동 편집 실수 등) 관측 루프 기동 자체는 죽으면 안 되고,
+    # 다음 기동을 위해 마커는 정상값으로 복구돼야 한다.
+    import mahdi.main as mahdi_main
+
+    fake_log_dir = tmp_path / "logs"
+    fake_log_dir.mkdir()
+    fake_marker = fake_log_dir / ".last_successful_start.txt"
+    fake_marker.write_text("이건 타임스탬프가 아님", encoding="utf-8")
+    monkeypatch.setattr(mahdi_main, "LOG_DIR", fake_log_dir)
+    monkeypatch.setattr(mahdi_main, "LAST_START_MARKER_FILE", fake_marker)
+
+    now = datetime(2026, 7, 20, 7, 30, 0)
+    monkeypatch.setattr(mahdi_main.db, "local_now", lambda: now)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        mahdi_main._log_startup_gap_since_last_run()
+
+    assert "직전 기동 기록 확인 실패" in caplog.text
+    assert fake_marker.read_text(encoding="utf-8") == now.isoformat()  # 손상된 마커도 이번 기록으로 복구됨
+
+
 def test_poll_option_chain_throttles_repeated_leg_insert_failure_warnings(monkeypatch, caplog):
     # 2026-07-19(§5-5): 얇은 옵션 종목의 NumericValueOutOfRange(§3-1)는 한 사이클 안에서
     # 레그마다 반복 재발할 수 있다(실측 3,416회) — 60초 창 안에서는 최초 1건만 실제로 로깅돼야
@@ -1729,3 +1937,65 @@ def test_poll_option_chain_throttles_repeated_leg_insert_failure_warnings(monkey
     assert call_count["n"] == 2  # 콜/풋 둘 다 삽입 시도는 됨(실패 자체는 억제 대상 아님)
     failure_records = [r for r in caplog.records if "옵션 체인 적재 실패" in r.getMessage()]
     assert len(failure_records) == 1  # 같은 60초 창 안에서 두 번째(풋) 실패는 로깅 억제됨
+
+
+def _http_status_error(status_code: int, json_body: dict) -> httpx.HTTPStatusError:
+    """실제 KIS 500 응답처럼 msg_cd/msg1이 담긴 응답 바디를 가진 httpx.HTTPStatusError를 만든다."""
+    request = httpx.Request("GET", "https://example.com")
+    response = httpx.Response(status_code, json=json_body, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError("raise_for_status()가 예외를 던지지 않음")
+
+
+class _FakeRestClientChainAlwaysFails:
+    """get_quote() 호출마다 항상 지정된 예외를 던진다 — 레그별 조회 실패 로깅 검증용."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        raise self._exc
+
+
+def test_poll_option_chain_leg_fetch_failure_logs_kis_response_body_and_is_throttled(monkeypatch, caplog):
+    # 2026-07-20: get_quote() 500을 그냥 재로깅하면 "Server error 500"만 남고 레이트리밋(EGW00201)인지
+    # 다른 원인인지 로그만으로 구분할 수 없었다 — httpx 응답 바디(msg_cd/msg1)를 함께 남겨야 한다.
+    # 또한 이 실패는 사이클 전체 실패(§3-1과 별개)로 재시도까지 이어지면 레그당 최대 4번(1차 2건 +
+    # 재시도 2건) 반복될 수 있어, §5-5와 동일하게 60초당 최초 1건만 실제로 로깅돼야 한다.
+    exc = _http_status_error(500, {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"})
+    rest_client = _FakeRestClientChainAlwaysFails(exc)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    async def fake_sleep(seconds):
+        if seconds != 5.0:  # retry_backoff_seconds(기본값)면 통과시켜 재시도가 실제로 일어나게 함
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client, [(_FakeSubscriptionManagerWithStrikes(), "regular")], _FakeMaster(), interval_seconds=1
+                )
+            )
+
+    assert len(rest_client.calls) == 4  # 1차 시도(콜/풋) + 재시도(콜/풋) 전부 시도됨
+
+    fetch_failure_records = [r for r in caplog.records if "옵션 체인 폴링 실패" in r.getMessage()]
+    assert len(fetch_failure_records) == 1  # 같은 60초 창 안에서 나머지 3건은 억제됨
+    logged_message = fetch_failure_records[0].getMessage()
+    assert "EGW00201" in logged_message  # 응답 바디(KIS 원인 코드)가 로그에 남음
+    assert "초당 거래건수를 초과하였습니다" in logged_message

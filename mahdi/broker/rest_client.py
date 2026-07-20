@@ -17,23 +17,44 @@ from mahdi.config.settings import KISSettings
 # 2026-07-08 실측: main.py의 옵션체인/수급/유동성 폴링 루프 3개가 동시에(asyncio.gather) 60초
 # 주기로 REST를 호출하는데, 각 루프 내부는 순차 호출이라도 서로 다른 asyncio.to_thread 스레드가
 # 겹치는 순간 KIS 앱키의 초당 호출 한도를 넘겨 500 Internal Server Error가 대량 발생함(정규장
-# 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인). 문서화된 모의투자 TPS 한도가
-# 없어 보수적으로 2건/초로 제한 — 사이클당 필요한 최대 호출(옵션체인 ~28 + 수급 3 = 31)도
-# 15.5초면 끝나 60초 주기 안에 여유 있게 들어간다.
-DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 0.5
+# 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인). 당시 문서화된 모의투자 TPS
+# 한도가 없어 보수적으로 2건/초(0.5초 간격)로 제한.
+#
+# 2026-07-20 재실측: 2건/초로도 부족함을 확인 — _collect_option_chain_cycle이 행사가마다
+# 콜→풋 순서로 호출하는데, DB로 확인한 결과 콜은 거의 항상 성공(행사가당 18~19건/8분)하고
+# 풋만 계속 500(행사가당 3건/8분)이 되는 정확한 교대 패턴이 5개 행사가 전부에서 동일하게
+# 나타났다. 매 쌍의 두 번째 호출(0.5초 뒤)만 계속 걸리는 이 패턴은 KIS 모의투자의 실제 한도가
+# 2건/초가 아니라 1건/초에 더 가깝다는 강한 정황이다 — 1건/초(1.0초 간격)로 상향한다.
+# 사이클당 필요한 최대 호출(옵션체인 ~30 + 수급 3 = 33)도 33초면 끝나 60초 주기 안에 들어간다.
+DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 
 
 class _RateLimiter:
     """여러 스레드(asyncio.to_thread)가 공유하는 최소 호출 간격 페이서.
 
+    2026-07-20(고도화): 고정 간격 대신 적응형으로 개선했다 — KIS 모의투자의 실제 초당 호출
+    한도는 문서화돼 있지 않고, 이미 2026-07-08(2건/초로 추정) → 2026-07-20(실측 결과 1건/초에
+    더 가까움)로 한 번 틀렸던 적이 있다. 앞으로도 계좌/시간대별로 실제 한도가 달라질 가능성을
+    고려해, 레이트리밋(500 + KIS 에러코드 EGW00201)이 감지되면 다음 호출부터 간격을 즉시
+    넓히고(record_rate_limit_hit), 그 넓어진 간격에서 성공이 충분히 이어지면 서서히 기준
+    간격(min_interval)까지만 되돌린다(record_success) — 기준 간격 밑으로는 절대 안 내려가고,
+    무한정 넓어지지도 않도록 상한(_MAX_INTERVAL_MULTIPLIER배)을 둔다.
+
     락은 "다음 호출 가능 시각" 예약에만 쓰고 실제 대기(time.sleep)는 락 밖에서 하므로,
     대기 중인 스레드가 다른 스레드의 예약을 막지 않는다.
     """
 
+    _BACKOFF_MULTIPLIER = 1.5  # 레이트리밋 감지될 때마다 현재 간격에 곱하는 값
+    _MAX_INTERVAL_MULTIPLIER = 4.0  # 기준 간격(min_interval) 대비 최대 몇 배까지 늘어날 수 있는지
+    _RECOVERY_SUCCESS_THRESHOLD = 20  # 이만큼 연속 성공하면 간격을 한 단계 되돌림
+    _RECOVERY_FACTOR = 0.9  # 되돌릴 때 곱하는 축소 비율(급하게 되돌리지 않고 서서히)
+
     def __init__(self, min_interval: float) -> None:
         self._min_interval = min_interval
+        self._current_interval = min_interval
         self._lock = threading.Lock()
         self._next_allowed = 0.0
+        self._consecutive_successes = 0
 
     def wait(self) -> None:
         if self._min_interval <= 0:
@@ -41,10 +62,47 @@ class _RateLimiter:
         with self._lock:
             now = time.monotonic()
             start = max(now, self._next_allowed)
-            self._next_allowed = start + self._min_interval
+            self._next_allowed = start + self._current_interval
         delay = start - now
         if delay > 0:
             time.sleep(delay)
+
+    def record_rate_limit_hit(self) -> None:
+        """레이트리밋 실패가 감지되면 호출 — 다음 wait()부터 넓어진 간격이 바로 적용된다."""
+        if self._min_interval <= 0:
+            return
+        with self._lock:
+            self._consecutive_successes = 0
+            max_interval = self._min_interval * self._MAX_INTERVAL_MULTIPLIER
+            self._current_interval = min(
+                max(self._current_interval, self._min_interval) * self._BACKOFF_MULTIPLIER, max_interval
+            )
+
+    def record_success(self) -> None:
+        """호출 성공마다 호출 — 넓어진 간격이 있을 때만 연속 성공을 세어 서서히 되돌린다."""
+        if self._current_interval <= self._min_interval:
+            return
+        with self._lock:
+            if self._current_interval <= self._min_interval:
+                return
+            self._consecutive_successes += 1
+            if self._consecutive_successes >= self._RECOVERY_SUCCESS_THRESHOLD:
+                self._consecutive_successes = 0
+                self._current_interval = max(self._current_interval * self._RECOVERY_FACTOR, self._min_interval)
+
+
+def _is_kis_rate_limit_error(exc: httpx.HTTPStatusError) -> bool:
+    """
+    계산: KIS가 초당 거래건수 초과 시 돌려주는 특정 에러코드(EGW00201)인지 확인한다(2026-07-20
+         US10Y 조회 500 응답 바디에서 {"msg_cd":"EGW00201","msg1":"초당 거래건수를 초과하였습니다"}
+         실측). 이 코드일 때만 백오프를 키운다 — 그 외 500(계좌 미승인, 존재하지 않는 종목 등)은
+         페이싱과 무관한 원인이라 무분별하게 전체 호출을 느리게 만들면 안 된다.
+    실패 조건: 응답 바디가 JSON이 아니거나 msg_cd가 없으면 False(레이트리밋 아님으로 취급).
+    """
+    try:
+        return exc.response.json().get("msg_cd") == "EGW00201"
+    except Exception:
+        return False
 
 
 class KISRestClient:
@@ -78,17 +136,30 @@ class KISRestClient:
         }
 
     def _get(self, url: str, **kwargs) -> dict:
-        """모든 REST GET 호출의 단일 진입점 — 실제 전송 직전에 _rate_limiter로 페이싱한다."""
+        """모든 REST GET 호출의 단일 진입점 — 실제 전송 직전에 _rate_limiter로 페이싱하고,
+        결과에 따라 적응형 백오프 상태를 갱신한다(2026-07-20, _RateLimiter 참고)."""
         self._rate_limiter.wait()
         response = self._client.get(url, **kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if _is_kis_rate_limit_error(exc):
+                self._rate_limiter.record_rate_limit_hit()
+            raise
+        self._rate_limiter.record_success()
         return response.json()
 
     def _post(self, url: str, **kwargs) -> dict:
         """모든 REST POST 호출의 단일 진입점 — GET과 동일한 공유 레이트리미터를 통과시킨다."""
         self._rate_limiter.wait()
         response = self._client.post(url, **kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if _is_kis_rate_limit_error(exc):
+                self._rate_limiter.record_rate_limit_hit()
+            raise
+        self._rate_limiter.record_success()
         return response.json()
 
     def get_quote(self, symbol: str, market_div_code: str = tr_codes.FID_MRKT_DIV_INDEX_OPTION) -> dict:

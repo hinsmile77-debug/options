@@ -13,6 +13,9 @@ echo [%date% %time%] ===== Mahdi 장마감 자동 종료 시작 ===== >> "%LOG_F
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi COCKPIT*" >> "%LOG_FILE%" 2>&1
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi Observation Loop*" >> "%LOG_FILE%" 2>&1
 
+cd /d "%PROJECT_DIR%"
+uv run python scripts\log_marketclose_stop.py
+
 echo [%date% %time%] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"
 
 endlocal

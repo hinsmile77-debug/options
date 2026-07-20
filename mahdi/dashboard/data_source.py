@@ -169,6 +169,57 @@ def _futures_freshness_check(conn, underlying: str, now: datetime) -> HealthChec
     return _freshness_check(label, latest_ts, now)
 
 
+# 2026-07-20 — 옵션체인 콜/풋 조회 성공률 비대칭 발견(NEXT_TODO/DECISION_LOG 참고). 공유
+# _RateLimiter(rest_client.py)가 행사가마다 콜→풋 순서로 호출하는데 KIS 모의투자의 실제 한도가
+# 설정값보다 빡빡해, 매 쌍의 두 번째 호출(풋)만 계속 500이 되는 패턴이 실측(콜 18~19건 vs 풋
+# 3건, 행사가 5개 전부 동일 경향)됐다 — 사이클 전체가 실패하는 경우(§3-1, gap 알림으로 이미
+# 커버됨)와 달리 한쪽만 계속 죽는 이 결손은 지금까지 계측된 적이 없었다.
+_OPTION_LEG_BALANCE_LOOKBACK_MINUTES = 10
+_OPTION_LEG_BALANCE_MIN_RATIO = 0.5  # 적은 쪽/많은 쪽 비율이 이 밑으로 떨어지면 경고
+
+
+def _option_chain_leg_balance_check(conn, underlying: str, now: datetime) -> HealthCheck:
+    """
+    계산: 최근 _OPTION_LEG_BALANCE_LOOKBACK_MINUTES분간 option_analysis_1m의 콜/풋 적재 건수를
+         비교한다. 콜/풋 중 적은 쪽이 많은 쪽의 절반에도 못 미치면 위 발견 패턴의 재발로 보고
+         경고한다.
+    실패 조건: 다른 헬스체크와 달리 장중 여부로 게이팅하지 않는다 — 이 문제가 실제로 발견된
+              시각도 07:30 장전이었다(옵션체인 REST 폴링은 장중 여부와 무관하게 구독이 롤링되는
+              즉시 시작된다). 최근 구간에 콜/풋 데이터가 둘 다 없으면(폴링 미기동 등) 판단하지
+              않고 정보로만 표시한다.
+    """
+    label = "옵션체인 콜/풋 균형(option_analysis_1m)"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT option_type, count(*) FROM option_analysis_1m "
+                "WHERE underlying=%s AND timestamp >= %s GROUP BY option_type",
+                (underlying, now - timedelta(minutes=_OPTION_LEG_BALANCE_LOOKBACK_MINUTES)),
+            )
+            counts = dict(cur.fetchall())
+    except Exception:
+        conn.rollback()
+        logger.warning("옵션체인 콜/풋 균형 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+
+    call_count = counts.get("C", 0)
+    put_count = counts.get("P", 0)
+    if not call_count and not put_count:
+        return HealthCheck(label, "info", f"최근 {_OPTION_LEG_BALANCE_LOOKBACK_MINUTES}분간 데이터 없음")
+
+    larger, smaller = max(call_count, put_count), min(call_count, put_count)
+    if smaller / larger < _OPTION_LEG_BALANCE_MIN_RATIO:
+        skewed_side = "풋" if put_count < call_count else "콜"
+        return HealthCheck(
+            label, "warning",
+            f"콜 {call_count}건 / 풋 {put_count}건(최근 {_OPTION_LEG_BALANCE_LOOKBACK_MINUTES}분) — "
+            f"{skewed_side} 조회만 계속 실패 중일 수 있음(레이트리밋 의심, NEXT_TODO 참고)",
+        )
+    return HealthCheck(
+        label, "ok", f"콜 {call_count}건 / 풋 {put_count}건(최근 {_OPTION_LEG_BALANCE_LOOKBACK_MINUTES}분)"
+    )
+
+
 def _cbot_status_check(conn) -> HealthCheck:
     label = "CBOT(ZN/US10Y 선물) 계좌 승인"
     try:
@@ -287,9 +338,10 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     """
     입력: 기초자산 라벨.
     계산: 운영점검보고서 §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목들(§5-6 "오늘의 점검
-         요약") — 옵션체인/선물 데이터 결손, CBOT 승인 상태, series/symbol 화석 데이터 잔존 여부,
-         오늘 레짐 stability_flag 비율, feature_store 20영업일 목표 진행률(§5-7) — 을 매번
-         사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서 바로 볼 수 있게 한다.
+         요약") — 옵션체인/선물 데이터 결손, 옵션체인 콜/풋 균형(2026-07-20 추가), CBOT 승인
+         상태, series/symbol 화석 데이터 잔존 여부, 오늘 레짐 stability_flag 비율, feature_store
+         20영업일 목표 진행률(§5-7) — 을 매번 사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서
+         바로 볼 수 있게 한다.
     실패 조건: 항목별로 독립적으로 조회한다 — 하나가 실패해도(쿼리 오류 등) rollback 후 나머지
               항목은 계속 보여준다. DB 연결 자체가 안 되면 단일 "조회 불가" 항목 하나만 반환한다.
     """
@@ -299,6 +351,7 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
             return [
                 _option_chain_freshness_check(conn, underlying, now),
                 _futures_freshness_check(conn, underlying, now),
+                _option_chain_leg_balance_check(conn, underlying, now),
                 _cbot_status_check(conn),
                 _fossil_data_check(conn, underlying, now),
                 _regime_stability_check(conn, now),

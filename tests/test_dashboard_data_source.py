@@ -11,6 +11,7 @@ from mahdi.dashboard.data_source import (
     _futures_freshness_check,
     _is_trading_hours,
     _option_chain_freshness_check,
+    _option_chain_leg_balance_check,
     _regime_fit_progress_check,
     _regime_stability_check,
     _synthetic_snapshot,
@@ -384,6 +385,8 @@ class _FakeHealthCursor:
         self._log.append((query, params))
         if "option_analysis_1m" in query and "MAX(timestamp)" in query:
             self._kind, self._value = "one", self._responses.get("option_chain_latest")
+        elif "option_analysis_1m" in query and "GROUP BY option_type" in query:
+            self._kind, self._value = "all", self._responses.get("leg_balance_rows", [])
         elif "active_futures_symbol" in query:
             self._kind, self._value = "one", self._responses.get("futures_symbol_row")
         elif "market_raw_1m" in query and "MAX(timestamp)" in query:
@@ -525,6 +528,58 @@ def test_futures_freshness_check_ok_when_recent():
     assert check.status == "ok"
 
 
+# --- _option_chain_leg_balance_check (2026-07-20, 콜/풋 조회 성공률 비대칭 발견) -----------------
+
+def test_leg_balance_check_info_when_no_data_in_lookback_window():
+    now = datetime(2026, 7, 20, 7, 30)
+    conn = _FakeHealthConnection({"leg_balance_rows": []})
+    check = _option_chain_leg_balance_check(conn, "KOSPI200", now)
+    assert check.status == "info"
+    assert "데이터 없음" in check.detail
+
+
+def test_leg_balance_check_ok_when_call_and_put_roughly_balanced():
+    now = datetime(2026, 7, 20, 7, 30)
+    conn = _FakeHealthConnection({"leg_balance_rows": [("C", 18), ("P", 15)]})
+    check = _option_chain_leg_balance_check(conn, "KOSPI200", now)
+    assert check.status == "ok"
+    assert "콜 18건 / 풋 15건" in check.detail
+
+
+def test_leg_balance_check_warns_when_put_side_mostly_failing():
+    # 2026-07-20 실측 그대로: 콜 18~19건 vs 풋 3건.
+    now = datetime(2026, 7, 20, 7, 30)
+    conn = _FakeHealthConnection({"leg_balance_rows": [("C", 18), ("P", 3)]})
+    check = _option_chain_leg_balance_check(conn, "KOSPI200", now)
+    assert check.status == "warning"
+    assert "풋 조회만" in check.detail
+
+
+def test_leg_balance_check_warns_when_call_side_mostly_failing():
+    # 대칭 방향(콜만 실패)도 똑같이 잡아야 한다.
+    now = datetime(2026, 7, 20, 7, 30)
+    conn = _FakeHealthConnection({"leg_balance_rows": [("C", 2), ("P", 17)]})
+    check = _option_chain_leg_balance_check(conn, "KOSPI200", now)
+    assert check.status == "warning"
+    assert "콜 조회만" in check.detail
+
+
+def test_leg_balance_check_not_gated_by_trading_hours():
+    # 다른 헬스체크(_freshness_check)와 달리 장중 여부로 게이팅하지 않는다 — 이 문제가 실제로
+    # 발견된 시각도 07:30 장전이었다.
+    weekend = datetime(2026, 7, 18, 10, 0)  # 토요일
+    conn = _FakeHealthConnection({"leg_balance_rows": [("C", 18), ("P", 3)]})
+    check = _option_chain_leg_balance_check(conn, "KOSPI200", weekend)
+    assert check.status == "warning"
+
+
+def test_leg_balance_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _option_chain_leg_balance_check(conn, "KOSPI200", datetime(2026, 7, 20, 7, 30))
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
 # --- _cbot_status_check --------------------------------------------------------------------------
 
 def test_cbot_status_check_info_when_no_macro_snapshot_yet():
@@ -638,6 +693,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_freshness_check", make_check("option_chain"))
     monkeypatch.setattr("mahdi.dashboard.data_source._futures_freshness_check", make_check("futures"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_leg_balance_check", make_check("leg_balance"))
     monkeypatch.setattr("mahdi.dashboard.data_source._cbot_status_check", make_check("cbot"))
     monkeypatch.setattr("mahdi.dashboard.data_source._fossil_data_check", make_check("fossil"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
@@ -645,7 +701,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
 
     result = get_health_summary()
 
-    assert calls == ["option_chain", "futures", "cbot", "fossil", "regime", "regime_fit_progress"]
+    assert calls == ["option_chain", "futures", "leg_balance", "cbot", "fossil", "regime", "regime_fit_progress"]
     assert [c.label for c in result] == calls
 
 

@@ -52,6 +52,24 @@ echo [%date% %time%] Docker 데몬 준비 완료 >> "%LOG_FILE%"
 echo [%date% %time%] docker compose up -d >> "%LOG_FILE%"
 docker compose up -d >> "%LOG_FILE%" 2>&1
 
+REM 2026-07-20 로그 위생: cockpit.log는 observation_loop.log와 달리(2026-07-19, Python
+REM RotatingFileHandler로 직접 소유하도록 교체됨) 여전히 cmd.exe append 리다이렉트로만 쌓여
+REM 로테이션이 없다. 같은 무한 누적 문제가 재발할 수 있어 기동 시점(하루 1회)마다 크기를
+REM 확인해 임계값(10MB)을 넘으면 .1로 회전 후 새로 시작한다.
+REM 주의: 이 REM 블록은 꺾쇠 기호(리다이렉트/파이프 기호)를 절대 쓰지 않는다 — 2026-07-20
+REM 최초 버전이 설명문에 그 기호를 그대로 적었다가 cmd.exe가 그걸 실제 연산자로 해석해
+REM 파싱 오류를 낸 적이 있다(REM은 이런 기호 앞에서 완전한 주석이 아니다).
+REM 아래 로직도 괄호 블록 대신 goto/라벨을 쓴다 — 위 Docker 대기 루프와 같은 이유
+REM (2026-07-07 괄호 파싱 버그 참고).
+set "COCKPIT_LOG=%PROJECT_DIR%\logs\cockpit.log"
+if not exist "%COCKPIT_LOG%" goto :cockpit_log_rotate_skip
+for %%F in ("%COCKPIT_LOG%") do set "COCKPIT_LOG_SIZE=%%~zF"
+if %COCKPIT_LOG_SIZE% LSS 10485760 goto :cockpit_log_rotate_skip
+echo [%date% %time%] cockpit.log가 10MB를 넘어 회전(.1로 이동) >> "%LOG_FILE%"
+move /y "%COCKPIT_LOG%" "%COCKPIT_LOG%.1" >nul
+
+:cockpit_log_rotate_skip
+
 echo [%date% %time%] COCKPIT 대시보드 실행 (새 창) >> "%LOG_FILE%"
 start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && uv run streamlit run mahdi/dashboard/app.py >> logs\cockpit.log 2>&1"
 

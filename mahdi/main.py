@@ -48,6 +48,14 @@ LOG_FILE = LOG_DIR / "observation_loop.log"
 LOG_MAX_BYTES = 10 * 1024 * 1024
 LOG_BACKUP_COUNT = 10
 
+# 2026-07-20(고도화) — 07-17(금) 15:45 장마감 자동 종료가 스케줄대로 실행되지 못하고 다음날
+# 지연 실행됐던 사례처럼, 예약 실행이 하루 이상 건너뛰어도 사람이 매번 로그 타임스탬프를 손으로
+# 비교하지 않아도 알아챌 수 있게 한다. 날짜 연산은 배치파일(cmd.exe)이 아니라 여기서 한다 —
+# cmd.exe 쪽 날짜 연산/문자열 처리는 로케일·인코딩에 따라 예측 못한 방식으로 깨지기 쉽다는 걸
+# 이번 작업 중 실제로 겪었다(격리 테스트 중 재현 및 회복이 어려운 방식으로 멈춘 사례 있음 —
+# 라이브 스케줄 스크립트에는 반영하지 않기로 결정).
+LAST_START_MARKER_FILE = LOG_DIR / ".last_successful_start.txt"
+
 # 같은 종류의 WARNING이 짧은 시간 안에 반복되면(예: 얇은 옵션 종목의 NumericValueOutOfRange가
 # 60초 사이클 안에서 레그마다 반복 — §3-1) 창(window)당 최초 1건만 로깅해 로그 파일이 그 반복으로
 # 파묻히지 않게 한다(mahdi/logutil.py 참고). 각 폴러 함수 안에서 지역 변수로 만든다(모듈
@@ -494,13 +502,20 @@ async def _collect_option_chain_cycle(
     master: IndexDerivativesMaster,
     underlying: str,
     poll_time: datetime,
+    warning_throttle: WarningThrottle,
 ) -> tuple[list[dict], float | None, bool]:
     """
     입력/계산: poll_option_chain 한 사이클분 — 북마다 행사가×콜/풋 각각에 get_quote()를 호출해
          파싱 성공한 행(option_analysis_1m용)과 마지막으로 확인된 기초자산 스팟을 모은다.
+         warning_throttle은 poll_option_chain이 사이클 전체에서 공유하는 인스턴스를 그대로
+         전달받는다(레그별 실패 로그를 §5-5와 동일하게 60초당 최초 1건으로 억제하기 위함,
+         2026-07-20).
     실패 조건: 개별 종목 조회/파싱 실패는 건너뛰고 다음 종목을 계속 처리한다(rows에서 빠질 뿐).
               반환하는 any_strikes=False는 "아직 구독 자체가 없다"(기동 초입)를 뜻하고, rows가
               빈 리스트인 것과는 구분된다 — 호출측이 재시도 여부를 판단하는 데 쓴다.
+    로그(2026-07-20): 조회 실패는 `_log_kis_call_failure`로 응답 바디(레이트리밋 등 KIS 원인
+              코드)를 함께 남기고, `warning_throttle`로 반복을 억제한다 — 이전에는 매 건 풀
+              트레이스백이 그대로 찍혀 로그가 파묻혔고, 원인(레이트리밋 vs 그 외)도 알 수 없었다.
     """
     latest_spot: float | None = None
     rows: list[dict] = []
@@ -517,8 +532,11 @@ async def _collect_option_chain_cycle(
                     continue
                 try:
                     resp = await asyncio.to_thread(rest_client.get_quote, symbol)
-                except Exception:
-                    logger.warning("옵션 체인 폴링 실패: %s", symbol, exc_info=True)
+                except Exception as exc:
+                    _log_kis_call_failure(
+                        f"옵션 체인 폴링 실패: {symbol}", exc,
+                        throttle=warning_throttle, category="option_chain_leg_fetch_failure",
+                    )
                     continue
                 parsed = _parse_option_quote(resp, strike, option_type, poll_time)
                 if parsed is None:
@@ -588,7 +606,7 @@ async def poll_option_chain(
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
-            rest_client, books, master, underlying, poll_time
+            rest_client, books, master, underlying, poll_time, warning_throttle
         )
 
         if not any_strikes:
@@ -600,7 +618,7 @@ async def poll_option_chain(
             logger.warning("옵션 체인 폴링 전체 실패 — %.0f초 후 재시도", retry_backoff_seconds)
             await asyncio.sleep(retry_backoff_seconds)
             rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
-                rest_client, books, master, underlying, poll_time
+                rest_client, books, master, underlying, poll_time, warning_throttle
             )
             if not rows:
                 logger.warning("옵션 체인 폴링 재시도도 실패 — 이번 사이클 포기")
@@ -748,11 +766,15 @@ async def poll_expiry_liquidity(
     실패 조건: 개별 레그 조회/파싱 실패는 건너뛰고 나머지로 계속 집계한다. 유효한 레그가 하나도
               없거나 만기를 확인하지 못하면 그 북은 이번 사이클을 건너뛴다. 모든 북에 구독 행사가가
               없으면(기동 초입) 2초 뒤 재확인.
+    로그(2026-07-20): REST 조회 실패는 poll_option_chain과 동일하게 `_log_kis_call_failure`로
+              응답 바디를 남기고 `warning_throttle`로 반복을 억제한다 — 만기확인용 get_quote()
+              실패는 이전엔 아예 로그도 안 남기고 조용히 삼켰다(원인 추적 불가능한 사각지대였음).
     """
     if startup_offset_seconds > 0:
         await asyncio.sleep(startup_offset_seconds)
 
     next_tick: float | None = None
+    warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
         any_strikes = False
@@ -770,7 +792,11 @@ async def poll_expiry_liquidity(
                 try:
                     anchor_resp = await asyncio.to_thread(rest_client.get_quote, anchor_symbol)
                     parsed_anchor = _parse_option_quote(anchor_resp, atm_strike, "C", poll_time)
-                except Exception:
+                except Exception as exc:
+                    _log_kis_call_failure(
+                        f"만기 유동성 만기확인 조회 실패: {anchor_symbol}", exc,
+                        throttle=warning_throttle, category="expiry_liquidity_anchor_fetch_failure",
+                    )
                     parsed_anchor = None
                 if parsed_anchor is not None:
                     expiry = parsed_anchor[0]["expiry"]
@@ -787,8 +813,11 @@ async def poll_expiry_liquidity(
                         continue
                     try:
                         resp = await asyncio.to_thread(rest_client.get_asking_price, symbol)
-                    except Exception:
-                        logger.warning("만기 유동성 폴링 실패: %s", symbol, exc_info=True)
+                    except Exception as exc:
+                        _log_kis_call_failure(
+                            f"만기 유동성 폴링 실패: {symbol}", exc,
+                            throttle=warning_throttle, category="expiry_liquidity_leg_fetch_failure",
+                        )
                         continue
                     parsed_leg = _parse_asking_price_leg(resp)
                     if parsed_leg is None:
@@ -862,19 +891,34 @@ def _parse_us10y_yield(resp: dict) -> float | None:
         return None
 
 
-def _log_kis_call_failure(message: str, exc: Exception) -> None:
+def _log_kis_call_failure(
+    message: str,
+    exc: Exception,
+    *,
+    throttle: WarningThrottle | None = None,
+    category: str | None = None,
+) -> None:
     """
-    입력: 로그 메시지, 발생한 예외.
+    입력: 로그 메시지, 발생한 예외, (선택) 반복 경고 억제용 WarningThrottle과 그 category.
     계산: httpx.HTTPStatusError는 KIS의 실제 에러 코드/메시지(rt_cd/msg_cd/msg1)가 응답 바디에
          있는데, raise_for_status()가 만드는 예외 메시지 자체엔 그게 안 실려 그냥 재로깅하면
          "Server error 500"만 남고 원인(레이트리밋/계좌 미신청/일시 장애 등)을 구분할 수 없다
          (2026-07-10 CBOT 신청 후에도 ZN 조회가 500을 반복해 원인 확인 중 필요해짐) — 바디
          텍스트를 함께 남긴다.
+         2026-07-20: `_collect_option_chain_cycle`의 레그별 조회 실패처럼 한 사이클 안에서 레그마다
+         (최대 수십 건) 반복 재발할 수 있는 호출측은 throttle/category를 함께 넘기면 §5-5와 동일한
+         패턴(WarningThrottle)으로 억제된다. 매크로 스냅샷처럼 사이클당 호출이 1건뿐이라 반복
+         스팸 우려가 없는 호출측은 throttle을 안 넘기면 기존처럼 즉시 로깅된다.
+    실패 조건: 없음 — 로깅 자체는 항상 성공한다고 가정.
     """
     if isinstance(exc, httpx.HTTPStatusError):
-        logger.warning("%s — %s", message, exc.response.text, exc_info=True)
+        fmt, args = "%s — %s", (message, exc.response.text)
     else:
-        logger.warning(message, exc_info=True)
+        fmt, args = "%s", (message,)
+    if throttle is not None and category is not None:
+        throttle.warning(category, fmt, *args, exc_info=True)
+    else:
+        logger.warning(fmt, *args, exc_info=True)
 
 
 async def _collect_macro_snapshot_cycle(
@@ -1024,11 +1068,17 @@ _INVESTOR_FLOW_SECTORS = (
 )
 
 
-async def _collect_investor_flow_cycle(rest_client: KISRestClient) -> tuple[float, float, float, bool]:
+async def _collect_investor_flow_cycle(
+    rest_client: KISRestClient, warning_throttle: WarningThrottle
+) -> tuple[float, float, float, bool]:
     """
     입력/계산: poll_investor_flow 한 사이클분 — 선물/콜/풋 세 세그먼트를 조회해 합산한다.
+         warning_throttle은 poll_investor_flow가 사이클 전체에서 공유하는 인스턴스를 그대로
+         전달받는다(§5-5와 동일 패턴, 2026-07-20).
     실패 조건: 세그먼트 하나 실패는 건너뛰고 나머지로 합산 계속. got_any=False는 셋 다 실패했음을
               뜻한다 — 호출측이 재시도 여부를 판단하는 데 쓴다.
+    로그(2026-07-20): 조회 실패는 `_log_kis_call_failure`로 응답 바디(레이트리밋 등 KIS 원인
+              코드)를 함께 남기고, `warning_throttle`로 반복을 억제한다(poll_option_chain과 동일).
     """
     foreign_total = 0.0
     institution_total = 0.0
@@ -1044,8 +1094,11 @@ async def _collect_investor_flow_cycle(rest_client: KISRestClient) -> tuple[floa
             institution_total += float(row["orgn_ntby_tr_pbmn"])
             individual_total += float(row["prsn_ntby_tr_pbmn"])
             got_any = True
-        except Exception:
-            logger.warning("투자자 수급 폴링 실패: %s", sector, exc_info=True)
+        except Exception as exc:
+            _log_kis_call_failure(
+                f"투자자 수급 폴링 실패: {sector}", exc,
+                throttle=warning_throttle, category="investor_flow_segment_fetch_failure",
+            )
             continue
 
     return foreign_total, institution_total, individual_total, got_any
@@ -1072,16 +1125,17 @@ async def poll_investor_flow(
            (2026-07-09 — "작업 후 sleep" 누적 드리프트로 poll_time이 분 경계를 건너뛰는 것을 방지).
     """
     next_tick: float | None = None
+    warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
         foreign_total, institution_total, individual_total, got_any = await _collect_investor_flow_cycle(
-            rest_client
+            rest_client, warning_throttle
         )
 
         if not got_any:
             logger.warning("투자자 수급 폴링 전체 실패 — %.0f초 후 재시도", retry_backoff_seconds)
             await asyncio.sleep(retry_backoff_seconds)
             foreign_total, institution_total, individual_total, got_any = await _collect_investor_flow_cycle(
-                rest_client
+                rest_client, warning_throttle
             )
             if not got_any:
                 logger.warning("투자자 수급 폴링 재시도도 실패 — 이번 사이클 포기")
@@ -1125,8 +1179,38 @@ def _configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
 
 
+def _log_startup_gap_since_last_run() -> None:
+    """
+    계산: LAST_START_MARKER_FILE에 남아있는 직전 정상 기동 시각과 현재 시각의 차이를 INFO로
+         남긴 뒤, 이번 기동 시각으로 마커를 갱신한다(2026-07-20 고도화 항목). 예약된 장전 기동이
+         하루 이상 건너뛰거나(Docker 미기동으로 조용히 실패하는 경우 등), 반대로 예상보다 훨씬
+         일찍(수동 재시작 등) 다시 떴는지를 observation_loop.log 한 줄로 바로 알아챌 수 있다.
+    실패 조건: 마커 파일이 없으면(최초 실행) 또는 파싱 실패하면 비교 없이 건너뛰고, 그래도 마커
+              갱신은 시도한다. 마커 읽기/쓰기 자체가 실패해도(권한 등) 예외를 삼키고 로그만
+              남긴다 — 이 기능 하나 때문에 관측 루프 기동 전체가 죽으면 안 된다.
+    """
+    try:
+        if LAST_START_MARKER_FILE.exists():
+            last = datetime.fromisoformat(LAST_START_MARKER_FILE.read_text(encoding="utf-8").strip())
+            gap_hours = (db.local_now() - last).total_seconds() / 3600
+            logger.info(
+                "직전 정상 기동: %s (%.1f시간 전)", last.strftime("%Y-%m-%d %H:%M:%S"), gap_hours,
+            )
+        else:
+            logger.info("직전 정상 기동 기록 없음(최초 실행 또는 마커 파일 삭제됨)")
+    except Exception:
+        logger.warning("직전 기동 기록 확인 실패", exc_info=True)
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_START_MARKER_FILE.write_text(db.local_now().isoformat(), encoding="utf-8")
+    except Exception:
+        logger.warning("직전 기동 기록 저장 실패", exc_info=True)
+
+
 async def main() -> None:
     _configure_logging()
+    _log_startup_gap_since_last_run()
     kis_settings = get_kis_settings()
     get_db_settings()  # 조기 검증(연결 문자열 구성 오류를 기동 시점에 노출)
 
