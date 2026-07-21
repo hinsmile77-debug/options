@@ -139,6 +139,97 @@ def test_run_slack_worker_posts_message_and_rate_limits(monkeypatch):
     assert sleep_calls == [1.0]  # Slack 레이트리밋 간격
 
 
+class _FakeSyncResponse:
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeSyncClient:
+    def __init__(self, response: dict):
+        self._response = response
+        self.posted: list[tuple] = []
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def post(self, url, headers=None, content=None):
+        self.posted.append((url, headers, content))
+        return _FakeSyncResponse(self._response)
+
+
+def test_notify_sync_noop_when_slack_not_configured(monkeypatch):
+    monkeypatch.setattr(notify, "get_slack_settings", lambda: _FakeSlackSettings(token="", channel=""))
+    fake_client = _FakeSyncClient({"ok": True})
+    monkeypatch.setattr(notify.httpx, "Client", fake_client)
+
+    notify.notify_sync("메시지")
+
+    assert fake_client.posted == []  # 설정이 없으면 DB 조회도, 전송도 하지 않는다
+
+
+def test_notify_sync_noop_when_db_toggle_disabled(monkeypatch):
+    monkeypatch.setattr(notify, "get_slack_settings", lambda: _FakeSlackSettings())
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr(notify.db, "get_connection", fake_get_connection)
+    monkeypatch.setattr(notify.db, "is_slack_alerts_enabled", lambda conn: False)
+    fake_client = _FakeSyncClient({"ok": True})
+    monkeypatch.setattr(notify.httpx, "Client", fake_client)
+
+    notify.notify_sync("메시지")
+
+    assert fake_client.posted == []
+
+
+def test_notify_sync_posts_immediately_without_event_loop(monkeypatch):
+    # scripts/log_marketclose_stop.py처럼 실행 중인 asyncio 이벤트 루프가 없는 일회성 스크립트에서도
+    # 큐에 쌓아두기만 하고 끝나버리지 않고(아무도 안 비움) 그 자리에서 바로 전송돼야 한다.
+    monkeypatch.setattr(notify, "get_slack_settings", lambda: _FakeSlackSettings())
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr(notify.db, "get_connection", fake_get_connection)
+    monkeypatch.setattr(notify.db, "is_slack_alerts_enabled", lambda conn: True)
+    fake_client = _FakeSyncClient({"ok": True})
+    monkeypatch.setattr(notify.httpx, "Client", fake_client)
+
+    notify.notify_sync("장마감 종료 후에도 프로세스가 남아있습니다", "WARNING")
+
+    assert len(fake_client.posted) == 1
+    url, headers, body = fake_client.posted[0]
+    assert url == notify._SLACK_POST_MESSAGE_URL
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["channel"] == "C123"
+    assert "장마감 종료 후에도 프로세스가 남아있습니다" in payload["text"]
+    assert "⚠️" in payload["text"]
+
+
+def test_notify_sync_swallows_errors_without_raising(monkeypatch):
+    monkeypatch.setattr(notify, "get_slack_settings", lambda: _FakeSlackSettings())
+
+    def broken_get_connection(settings=None):
+        raise ConnectionError("DB 다운")
+
+    monkeypatch.setattr(notify.db, "get_connection", broken_get_connection)
+
+    notify.notify_sync("메시지")  # 예외가 전파되면 이 줄에서 테스트가 실패한다
+
+
 def test_run_slack_worker_continues_after_api_error(monkeypatch):
     # Slack API가 error를 반환해도(예: 채널 미초대) 워커 태스크 자체는 죽지 않고 다음 메시지를
     # 계속 처리해야 한다 — 이 태스크가 죽으면 이후 모든 알림이 영구히 멈춘다.

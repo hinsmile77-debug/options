@@ -14,17 +14,30 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from mahdi import notify
 from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 
 LOG_FILE = PROJECT_ROOT / "logs" / "premarket_startup.log"
 LAST_STOP_MARKER_FILE = PROJECT_ROOT / "logs" / ".last_marketclose_stop.txt"
+
+# 2026-07-21 이상점 대응(운영점검보고서 §3-1): stop_mahdi_marketclose.bat의 taskkill(창 제목
+# 기반)이 사고 대응 중 수동 재시작된 프로세스를 못 찾고 "No tasks running"만 남긴 채 실제로는
+# COCKPIT/관측 루프가 계속 살아있던 사례가 있었다. 같은 배치파일에 추가한 PowerShell 커맨드라인
+# fallback kill 이후에도 남아있는지 여기서 다시 한번 커맨드라인 기준으로 확인한다.
+_REMAINING_PROCESS_CHECK_COMMAND = [
+    "powershell", "-NoProfile", "-Command",
+    "(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and "
+    "($_.CommandLine -like '*mahdi.main*' -or $_.CommandLine -like '*mahdi/dashboard/app.py*') }"
+    ").Count",
+]
 
 
 def log_gap_and_update_marker() -> None:
@@ -55,8 +68,54 @@ def log_gap_and_update_marker() -> None:
     LAST_STOP_MARKER_FILE.write_text(now.isoformat(), encoding="utf-8")
 
 
+def _count_remaining_mahdi_processes() -> int:
+    """
+    계산: stop_mahdi_marketclose.bat의 taskkill + PowerShell fallback kill 이후에도
+         COCKPIT/관측 루프가 실제로 종료됐는지 커맨드라인 기준으로 재확인한다.
+    실패 조건: PowerShell 호출 자체가 실패하면(타임아웃 등) 예외를 그대로 올린다 — 호출측이
+              "확인 실패"와 "정말 0개 남음"을 구분해야 하므로 여기서 0으로 뭉개면 안 된다.
+    """
+    result = subprocess.run(
+        _REMAINING_PROCESS_CHECK_COMMAND, capture_output=True, text=True, timeout=20, check=True,
+    )
+    return int(result.stdout.strip() or "0")
+
+
+def check_remaining_processes_and_alert() -> None:
+    """
+    계산: 종료 시도 후에도 마흐디 프로세스가 남아있으면 premarket_startup.log에 경고를 남기고
+         Slack으로도 알린다(2026-07-21, 운영점검보고서 §4 "종료 결과 검증 알림") — 지금까지는
+         taskkill이 아무것도 못 찾아도 아무도 알아채지 못한 채 조용히 넘어갔다.
+    실패 조건: 확인 자체가 실패해도(PowerShell 없음 등) 조용히 넘어간다 — 이 점검 기능 하나
+              때문에 장마감 종료 스크립트의 나머지 흐름(마커 갱신 등)이 막히면 안 된다.
+    """
+    now = db.local_now()
+    try:
+        remaining = _count_remaining_mahdi_processes()
+    except Exception:
+        return
+    if remaining <= 0:
+        return
+
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(
+            f"[{now:%Y-%m-%d %H:%M:%S}] 경고: 장마감 종료 시도 후에도 마흐디 프로세스 "
+            f"{remaining}개가 남아있음(창 제목/커맨드라인 fallback 모두 실패했을 가능성 — "
+            "수동 확인 필요)\n"
+        )
+    notify.notify_sync(
+        f"장마감 자동 종료 후에도 프로세스 {remaining}개가 남아있습니다 — 수동 확인 필요",
+        level="WARNING",
+    )
+
+
 if __name__ == "__main__":
     try:
         log_gap_and_update_marker()
+    except Exception:
+        pass
+    try:
+        check_remaining_processes_and_alert()
     except Exception:
         pass

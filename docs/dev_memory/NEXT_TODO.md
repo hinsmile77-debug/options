@@ -92,9 +92,25 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
       (실시간 데이터가 아니라 가짜 데이터를 보여주고 있었음). 조치: (1) 마이그레이션 010/011을
       `docker exec -i mahdi_timescaledb psql -U mahdi -d mahdi < ...`로 라이브 적용, 14개 컬럼 전부
       존재 확인. (2) `data_source.py`의 누락된 `conn.rollback()` 추가(같은 파일 다른 체크 함수들과
-      패턴 통일). 전체 테스트 335개 통과. COCKPIT 프로세스만 재시작(관측 루프는 무중단 유지, Streamlit이
-      임포트 모듈 변경을 자동 반영 안 하는 기존에 확인된 특성 때문 — 2026-07-06/07-20 항목 참고) 후
+      패턴 통일). 전체 테스트 335개 통과. COCKPIT 프로세스를 재시작(Streamlit이 임포트 모듈
+      변경을 자동 반영 안 하는 기존에 확인된 특성 때문 — 2026-07-06/07-20 항목 참고) 후
       `load_snapshot()` 직접 호출로 `is_live=True` 정상 복구 확인.
+  - [x] (2026-07-21 같은 날 정정) **"관측 루프는 무중단 유지" 서술 정정** — 위 항목을 처음 적을
+        때 관측 루프(`mahdi.main`)는 재시작하지 않았다고 기록했으나, 오늘자 운영점검보고서
+        (§1-2) 작성 중 실측으로 **이 서술이 틀렸음**을 확인했다. 근거 셋: ① 현재 살아있는
+        `mahdi.main` 프로세스의 OS 생성 시각(`Get-CimInstance Win32_Process`)이 08:40:09로,
+        배치스크립트가 07:30:32에 새 창을 띄운 시각과 70분 차이난다. ② `observation_loop.log`
+        자체에 `_log_startup_gap_since_last_run()`이 남긴 "직전 정상 기동" 줄이 오늘 **두 번**
+        있다 — 07:30:56(정상 예약 기동)과, 그로부터 1.2시간 후(≈08:43~08:45)의 두 번째 기동.
+        ③ `observation_loop_crash.log`는 오늘 갱신되지 않아(마지막 07-19) 비정상 크래시가
+        아니라 창을 닫고 수동으로 재시작한 것으로 보인다. 즉 이 사고를 복구하며 COCKPIT뿐 아니라
+        관측 루프도 재시작됐다 — 다만 그 재시작이 `start_mahdi_premarket.bat`의 명명 규약
+        (`start "Mahdi COCKPIT" ...` / `start "Mahdi Observation Loop" ...`)을 거치지 않아
+        창 제목이 달라졌고, 이게 §3-1(15:45 자동 종료 taskkill이 "No tasks running"만 남기고
+        실패)의 원인으로 이어졌다. 재발 방지로 `stop_mahdi_marketclose.bat`에 창 제목 대신
+        실행 커맨드라인(`mahdi.main`/`mahdi/dashboard/app.py` 포함 여부) 기준 PowerShell
+        fallback kill을 추가하고, `scripts/log_marketclose_stop.py`에 종료 후 잔존 프로세스를
+        재확인해 Slack 경고하는 로직을 배선함(같은 날 후속 커밋).
   - [x] (2026-07-21 같은 세션에서 4개 고도화 항목 전부 구현·검증 완료) **재발 방지 구조 개선**:
         (1) `scripts/start_mahdi_premarket.bat`에 `docker compose up -d` 직후 `db/migrations/*.sql`을
         파일명 오름차순(`dir /b /on`)으로 매 기동마다 전부 재적용하는 단계 신설(`:apply_migration`
@@ -118,14 +134,22 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ## 관측 인프라(Phase 1) 마무리
 
-- [x] (2026-07-19 로깅만 완료, 근본원인 확인은 남음) **NumericValueOutOfRange 진단 로깅** — 2026-07-16
-      점검에서 특정 10개 행사가(1087.5~1097.5, 1160~1170 두 클러스터)의 IV 등이 DECIMAL(8,6) 범위를
-      계속 넘어 레그 삽입이 실패(3,416회) 중임을 발견. `_parse_option_quote()`가 원본 `output1`을
-      row에 `_raw_kis_output1`로 함께 실어 나르고, 삽입 실패 로그에 그대로 찍히도록 수정함([[SESSION_LOG]]
-      2026-07-19 항목 참고).
-  - [ ] 다음 재발 시 로그의 `raw_kis_output1`을 실제로 보고 어떤 필드(delta_val/gama/theta/vega/
-        hts_ints_vltl/hist_vltl 등)가 어떤 비정상 값(음수/특수 sentinel/자릿수 오류 등)을 반환하는지
-        확인해 근본 수정.
+- [x] (2026-07-19 로깅 추가, 2026-07-21 근본원인 확정·수정 완료) **NumericValueOutOfRange 진단 로깅
+      및 수정** — 2026-07-16 점검에서 특정 10개 행사가(1087.5~1097.5, 1160~1170 두 클러스터)의
+      IV 등이 DECIMAL(8,6) 범위를 계속 넘어 레그 삽입이 실패(3,416회) 중임을 발견.
+      `_parse_option_quote()`가 원본 `output1`을 row에 `_raw_kis_output1`로 함께 실어 나르고,
+      삽입 실패 로그에 그대로 찍히도록 수정함([[SESSION_LOG]] 2026-07-19 항목 참고).
+  - [x] (2026-07-21 확정) 로그의 `raw_kis_output1`을 실제로 확인 — **범인은 `theta` 단독**.
+        KIS `theta` 필드는 원화 단위 하루 시간가치 감소분이라 얇은/근접만기 옵션일수록
+        절댓값이 수백~수천대(실측 최대 |9625.4268|)까지 커지는데, `theta` 컬럼이
+        `DECIMAL(8,6)`(절댓값 99.999999까지만 허용)이라 상시 오버플로우했다. 같은 로그로
+        `delta_val`(최대 |0.886|)·`gama`(최대 |0.0571|)·`vega`(최대 61.3252)는 전부 기존
+        범위 안임을 확인(전수 재검토 완료). 위클리 옵션이 만기에 가까울수록 theta 절댓값이
+        커지므로, 이 버그는 만기 임박일수록 유실이 심해지다가 만기 전날엔 근접 만기 데이터가
+        사실상 전량 빠지는 형태로 나타났다(DB 실측: 15:45 시점 근접 두 만기 데이터가 통째로
+        사라지고 월물만 남음 — 운영점검보고서 2026-07-21 §2-1). `db/migrations/012_option_analysis_theta_scale.sql`로
+        `theta`를 `NUMERIC(14,4)`로 확장, 라이브 DB에도 즉시 적용·검증 완료. 두 클러스터가
+        서로 다른 북인지는 여전히 미확인(우선순위 낮음, 근본원인 해결로 실익 감소).
   - [ ] 두 클러스터(약 70pt 간격)가 정말 서로 다른 북(먼슬리/위클리월/위클리목)의 ATM 근방인지
         DB(`option_analysis_1m`은 실패라 안 남으므로 subscription_manager 로그/각 북의 desired_strikes
         스냅샷 등으로)로 교차 확인.

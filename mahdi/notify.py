@@ -68,6 +68,53 @@ def notify(message: str, level: str = "INFO") -> None:
         logger.warning("Slack 알림 큐가 가득 참 — 메시지 버림: %s", full_message)
 
 
+def notify_sync(message: str, level: str = "INFO") -> None:
+    """
+    입력: 메시지 본문, 레벨("INFO"|"WARNING"|"CRITICAL").
+    계산: notify()와 같은 설정/On-off 확인을 거쳐 즉시(블로킹) Slack으로 전송한다.
+         scripts/log_marketclose_stop.py처럼 asyncio 이벤트 루프 없이 한 번 실행되고 끝나는
+         일회성 스크립트용 — notify()의 큐+run_slack_worker() 패턴은 워커 태스크가 이벤트
+         루프 안에서 계속 돌고 있어야 큐가 실제로 비워지는데, 일회성 스크립트는 그 워커를
+         띄울 이유가 없다(2026-07-21, 운영점검보고서 §4 "종료 결과 검증 알림").
+    실패 조건: notify()와 동일하게 이 함수는 절대 예외를 던지지 않는다 — 알림 실패가
+              호출측(장마감 스크립트)의 나머지 로직을 막으면 안 된다.
+    """
+    settings = get_slack_settings()
+    if not settings.is_configured:
+        return
+    try:
+        with db.get_connection() as conn:
+            enabled = db.is_slack_alerts_enabled(conn)
+    except Exception:
+        logger.warning("Slack On/Off 설정 조회 실패 — 이번 알림 스킵", exc_info=True)
+        return
+    if not enabled:
+        return
+
+    icon = _LEVEL_ICON.get(level, "")
+    ts = datetime.now().strftime("%H:%M:%S")
+    full_message = f"{icon} [{ts}] [마흐디] {message}"
+    logger.info("Slack 알림(동기): %s", full_message)
+    try:
+        body = json.dumps(
+            {"channel": settings.slack_channel_id, "text": full_message}, ensure_ascii=False
+        ).encode("utf-8")
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.post(
+                _SLACK_POST_MESSAGE_URL,
+                headers={
+                    "Authorization": f"Bearer {settings.slack_bot_token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                content=body,
+            )
+        result = resp.json()
+        if not result.get("ok"):
+            logger.warning("Slack API 오류: %s", result.get("error", result))
+    except Exception:
+        logger.warning("Slack 전송 실패(동기)", exc_info=True)
+
+
 async def run_slack_worker() -> None:
     """
     계산: 큐를 순차 처리하는 백그라운드 태스크 — main()의 asyncio.gather에 다른 폴러들과

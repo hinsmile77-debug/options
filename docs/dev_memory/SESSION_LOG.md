@@ -4,6 +4,58 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-21] 2차 — 일일 운영점검 보고서 작성 + fix 4건 구현 (theta 오버플로우 근본수정, 종료 스크립트 견고화)
+
+**트리거:** 사용자의 일일 반복 요청(`docs/persnal-docs/daily_prompt.txt`) — 오늘 로그를 장전/장중/장후로
+나눠 조사해 이상점 정리·보고 후, 별도 요청으로 fix 우선순위 구현까지 진행.
+
+**보고서:** `docs/동작점검/2026-07-21_마흐디_운영점검보고서.md` 신규 작성. 로그(`observation_loop.log[.1]`,
+`cockpit.log`, `premarket_startup.log`), 실시간 DB, 그리고 **현재 실행 중인 프로세스(`Get-CimInstance
+Win32_Process`)를 직접 조회**해 다음을 확인:
+- 오늘 아침 마이그레이션 010/011 라이브 미반영 사고(1차 세션, 커밋 `fe75414`, 08:41)로 COCKPIT이
+  07:30~07:53 125회 합성 데이터 폴백 — 이미 그 세션에서 수정 완료됨을 재확인.
+- **신규 발견 1**: 그 사고를 수동 복구하는 과정에서 COCKPIT뿐 아니라 관측 루프(`mahdi.main`)도
+  08:40경 재시작된 정황을 OS 프로세스 생성시각 + 로그 자체의 "직전 정상 기동" 이중 기록으로
+  확인 — dev_memory의 "관측 루프는 무중단 유지" 서술과 모순됨을 발견해 [[NEXT_TODO]]에 정정 남김.
+- **신규 발견 2(최우선 근본원인 확정)**: 2026-07-16부터 미해결이던 `NumericValueOutOfRange`의
+  범인이 `theta` 컬럼(`DECIMAL(8,6)`) 오버플로우임을 원시 로그값(실측 최대 |theta|=9625.4268)으로
+  확정. 위클리 옵션이 만기에 가까울수록 유실이 커져 장마감 무렵엔 근접 두 만기 데이터가 거의
+  전량 빠지는 것을 DB 분당 집계로 실증(30행/분 → 10행/분, 정확히 15:45부터 근접 만기 소멸).
+- **신규 발견 3**: 15:45 자동 종료(`stop_mahdi_marketclose.bat`)의 `taskkill`이 COCKPIT·관측 루프
+  둘 다 "No tasks running"만 남기고 실제로는 못 죽임(위 신규 발견 1의 수동 재시작이 창 제목
+  규약을 깨뜨렸기 때문으로 추정) — 15:55 재확인해도 두 프로세스 모두 생존 확인.
+- **정정**: 최초 작성 시 "500 Internal Server Error·EGW00201이 지속 이슈"라고 적었으나,
+  이는 `observation_loop.log.1`이 크기 기준 회전이라 07-20 이전 로그까지 섞인 착시였음을
+  같은 날 재확인(오늘 재시작 이후 순수 로그엔 둘 다 0건) — 보고서에서 해당 fix 항목 제거.
+
+**구현한 fix (우선순위 순, 전체 350개 테스트 통과):**
+1. `db/migrations/012_option_analysis_theta_scale.sql` — `theta`를 `NUMERIC(8,6)`→`NUMERIC(14,4)`로
+   확장. 같은 로그로 delta/gamma/vega는 기존 범위 안임을 전수 확인해 손대지 않음. **라이브 DB에
+   즉시 적용·검증 완료**.
+2. `scripts/stop_mahdi_marketclose.bat` — 기존 창 제목(`WINDOWTITLE`) 기반 `taskkill` 뒤에
+   PowerShell 커맨드라인 매칭(`CommandLine -like '*mahdi.main*'`/`'*mahdi/dashboard/app.py*'`)
+   기반 fallback kill 추가. 창 제목과 무관하게 실제로 무슨 코드를 실행 중인지로 찾으므로 수동
+   재시작에도 안전 — `cmd.exe /c` 경유로 실제 배치파일 실행 경로와 동일한 조건에서 read-only
+   드라이런으로 매칭 정확성 검증(오탐/누락 없이 실제 9개 프로세스 전부 매칭, 자기 자신은
+   `$PID` 제외로 안전하게 배제).
+3. `mahdi/notify.py`에 `notify_sync()` 신규 — `notify()`의 큐+워커 패턴은 이벤트 루프가 계속
+   돌고 있어야 큐가 비워지는데, `log_marketclose_stop.py`처럼 실행되고 바로 끝나는 일회성
+   스크립트엔 안 맞아 즉시(블로킹) 전송 버전을 추가.
+4. `scripts/log_marketclose_stop.py`에 `check_remaining_processes_and_alert()` 신규 — 종료
+   시도 후에도 커맨드라인 기준으로 마흐디 프로세스가 남아있으면 로그 경고 + Slack 알림(신규
+   함수 `notify_sync` 재사용). 확인 자체가 실패해도 예외를 삼켜 종료 스크립트 나머지 흐름을
+   막지 않음.
+
+**dev_memory 정정:** [[NEXT_TODO]]의 "관측 루프는 무중단 유지" 서술 및 "NumericValueOutOfRange
+근본원인 미확인" 항목을 위 발견 내용대로 정정·완료 처리(이 항목 참고).
+
+**검증:** 신규 테스트 9개(`notify_sync` 4개, `check_remaining_processes_and_alert`/
+`_count_remaining_mahdi_processes` 5개) 포함 전체 350개 통과. `stop_mahdi_marketclose.bat`
+자체는 지금 장중(15:55) 살아있는 실제 프로세스를 죽이게 되므로 이 세션에서 실행하지 않음 —
+내일 15:45 실제 장마감 때가 첫 실전 검증 기회.
+
+---
+
 ## [2026-07-20] 3차 — 정규장 첫 실측으로 COCKPIT 헬스체크 전체 다운 발견·수정 (tz-aware/naive TypeError)
 
 **트리거:** 사용자가 실전 선물옵션계좌(44833081) 온라인 개설 완료 스크린샷을 공유하며 "데이터 수집
