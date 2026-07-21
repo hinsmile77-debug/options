@@ -383,14 +383,42 @@ def _regime_fit_progress_check(conn, underlying: str) -> HealthCheck:
     )
 
 
+def _shutdown_reliability_check(conn) -> HealthCheck:
+    """
+    해석: 2026-07-21 §3-1에서 실측된 사고(15:45 자동 종료의 taskkill이 창 제목 매칭 실패로
+         "No tasks running"만 남기고 실제로는 COCKPIT/관측 루프가 계속 살아있었는데 아무도
+         알아채지 못함) 재발을 COCKPIT에서 바로 알아챌 수 있게 한다.
+         scripts/log_marketclose_stop.py가 매 장마감 종료 시도마다 커맨드라인 기준으로 남은
+         프로세스 수를 shutdown_check_log(싱글턴 테이블)에 기록한다 — 여기서는 그 최신 기록만
+         읽는다(운영점검보고서 §5-3 "종료 신뢰성 배지").
+    """
+    label = "종료 신뢰성(직전 장마감)"
+    try:
+        result = db.latest_shutdown_check(conn)
+    except Exception:
+        conn.rollback()
+        logger.warning("종료 신뢰성 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    if result is None:
+        return HealthCheck(label, "info", "기록 없음(마이그레이션 013 적용 전이거나 아직 장마감 종료 이력 없음)")
+    checked_at, remaining = result
+    if remaining <= 0:
+        return HealthCheck(label, "ok", f"{checked_at:%Y-%m-%d %H:%M} 기준 정상 종료(잔존 프로세스 없음)")
+    return HealthCheck(
+        label, "warning",
+        f"{checked_at:%Y-%m-%d %H:%M} 기준 프로세스 {remaining}개 잔존 — 수동 확인 필요",
+    )
+
+
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     """
     입력: 기초자산 라벨.
     계산: 운영점검보고서 §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목들(§5-6 "오늘의 점검
          요약") — 옵션체인/선물 데이터 결손, 옵션체인 콜/풋 균형(2026-07-20 추가), CBOT 승인
          상태, 스키마 정합성/마이그레이션 적용 여부(2026-07-21 추가), series/symbol 화석 데이터
-         잔존 여부, 오늘 레짐 stability_flag 비율, feature_store 20영업일 목표 진행률(§5-7) — 을
-         매번 사람이 DB를 직접 조회하지 않고 COCKPIT 상단에서 바로 볼 수 있게 한다.
+         잔존 여부, 오늘 레짐 stability_flag 비율, feature_store 20영업일 목표 진행률(§5-7),
+         직전 장마감 종료 신뢰성(2026-07-21 §5-3 추가) — 을 매번 사람이 DB를 직접 조회하지
+         않고 COCKPIT 상단에서 바로 볼 수 있게 한다.
     실패 조건: 항목별로 독립적으로 조회한다 — 하나가 실패해도(쿼리 오류 등) rollback 후 나머지
               항목은 계속 보여준다. DB 연결 자체가 안 되면 단일 "조회 불가" 항목 하나만 반환한다.
     """
@@ -406,6 +434,7 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _fossil_data_check(conn, underlying, now),
                 _regime_stability_check(conn, now),
                 _regime_fit_progress_check(conn, underlying),
+                _shutdown_reliability_check(conn),
             ]
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)

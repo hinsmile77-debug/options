@@ -380,6 +380,32 @@ def set_slack_alerts_enabled(conn: ConnectionLike, enabled: bool) -> None:
     _upsert(conn, "slack_alert_settings", ("id", "enabled", "updated_at"), ("id",), row)
 
 
+def record_shutdown_check(conn: ConnectionLike, checked_at: datetime, remaining_process_count: int) -> None:
+    """
+    입력: DB 커넥션, 확인 시각, taskkill/PowerShell fallback kill 이후에도 커맨드라인 기준으로
+         남아있는 마흐디 프로세스 수(0이면 정상 종료).
+    계산: 싱글턴 행(id=TRUE 고정) upsert — scripts/log_marketclose_stop.py가 장마감 종료
+         시도마다(성공/실패 무관하게 항상) 호출해 COCKPIT이 "직전 장마감이 실제로 깨끗했는지"를
+         재시작 없이 바로 볼 수 있게 한다(2026-07-21, 운영점검보고서 §5-3).
+    """
+    row = {"id": True, "checked_at": checked_at, "remaining_process_count": remaining_process_count}
+    _upsert(conn, "shutdown_check_log", ("id", "checked_at", "remaining_process_count"), ("id",), row)
+
+
+def latest_shutdown_check(conn: ConnectionLike) -> tuple[datetime, int] | None:
+    """
+    계산: 가장 최근 record_shutdown_check() 기록을 반환한다.
+    실패 조건: 아직 아무도 기록한 적이 없으면(최초 기동, 이 마이그레이션 적용 전 등) None —
+              호출측(COCKPIT 헬스체크)이 "정보 없음"으로 구분해서 보여줘야 한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT checked_at, remaining_process_count FROM shutdown_check_log LIMIT 1")
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return row[0], row[1]
+
+
 _EXPIRY_LIQUIDITY_1M_COLUMNS = (
     "timestamp", "underlying", "series", "expiry",
     "atm_spread_pct", "depth", "volume", "days_to_expiry",

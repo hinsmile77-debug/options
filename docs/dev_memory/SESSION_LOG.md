@@ -56,6 +56,37 @@ Win32_Process`)를 직접 조회**해 다음을 확인:
 
 ---
 
+## [2026-07-21] 3차 — 고도화 방안 5항목 구현 (종료 신뢰성 배지, KIS 필드 범위 참고표, Forced Flat 사전조건)
+
+**트리거:** 사용자가 2차 세션의 운영점검 보고서 §5(고도화 방안) 5항목을 우선순위 없이 전부
+구현 요청.
+
+**구현 계획 및 결과:**
+1. **위클리 데이터 신뢰도(습관화 부분)** — `docs/dev_memory/KIS_RAW_FIELD_RANGES.md` 신규.
+   `_parse_option_quote()`가 읽는 필드별 관측 범위·DB 컬럼·비고 표 + 신규 필드 추가 체크리스트.
+   `mahdi/main.py` `_parse_option_quote()` 독스트링에서 연결.
+2. **PID 파일 전환** — 2차 세션 Fix #2(커맨드라인 매칭)로 이미 더 나은 방식으로 대체 구현됨을
+   확인, 중복 작업 안 함.
+3. **종료 신뢰성 배지** — `db/migrations/013_shutdown_check_log.sql`(싱글턴 테이블, `slack_alert_settings`와
+   동일 패턴) 신규. `mahdi/data/db.py`에 `record_shutdown_check()`/`latest_shutdown_check()` 추가.
+   `scripts/log_marketclose_stop.py`의 `check_remaining_processes_and_alert()`가 남은 프로세스
+   수를 **성공/실패 무관하게 항상** DB에 기록하도록 수정(기존엔 경고 알림 목적으로만 조건부
+   기록). `mahdi/dashboard/data_source.py`에 `_shutdown_reliability_check()` 신규, "오늘의
+   점검 요약" 9번째 배지로 `get_health_summary()`에 연결. 라이브 DB에 마이그레이션 즉시 적용.
+4. **마이그레이션 자동 재적용 검증** — 코드 변경 없음(시간이 지나야 확인 가능한 항목), 보고서에
+   후속 확인 필요로 남김.
+5. **Forced Flat 사전조건 명문화** — `docs/dev_memory/DECISION_LOG.md`에 신규 결정 항목 작성.
+   오늘 사고(§3-1 종료 실패)를 근거로 "종료 시퀀스 자기검증 없이는 배포 금지" + 4개 완료 조건
+   체크리스트(상태머신 DB 기록/잔존 포지션 확인 단계/CRITICAL 알림/체크리스트 미충족 시 미완성
+   처리) 명문화, `shutdown_check_log` 패턴을 재사용하도록 연결.
+
+**검증:** 신규 테스트 9개(`_shutdown_reliability_check` 4개, `check_remaining_processes_and_alert`의
+DB 기록 관련 보강 3개(기존 3개 테스트에 DB 기록 검증 추가 + 실패 스왈로우 신규 1개),
+`get_health_summary` 순서 테스트 갱신) 포함 전체 355개 통과. `db/migrations/013_shutdown_check_log.sql`
+라이브 DB 적용·스키마 확인 완료.
+
+---
+
 ## [2026-07-20] 3차 — 정규장 첫 실측으로 COCKPIT 헬스체크 전체 다운 발견·수정 (tz-aware/naive TypeError)
 
 **트리거:** 사용자가 실전 선물옵션계좌(44833081) 온라인 개설 완료 스크린샷을 공유하며 "데이터 수집

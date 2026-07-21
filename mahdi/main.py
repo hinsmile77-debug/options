@@ -458,6 +458,9 @@ def _parse_option_quote(
          (콜+/풋- 부호 규약은 calculate_gex 내부에서 처리). rv_5d는 KIS hist_vltl(과거변동성)을
          근사치로 사용 — 정확한 5일 realized vol 재계산은 Phase1 범위 밖(추후 개선 대상).
     실패 조건: 필수 필드가 없거나 숫자 변환 실패 시 None(해당 레그 스킵 — 폴링 루프가 계속 돌게 함).
+    참고: 여기서 새 KIS 필드를 DB 컬럼에 매핑하기 전에 `docs/dev_memory/KIS_RAW_FIELD_RANGES.md`부터
+         확인할 것 — theta가 정규화 안 된 원화 절대값이라 DECIMAL(8,6)에서 상시 오버플로우하던
+         버그(2026-07-16 발견, 2026-07-21 근본원인 확정)를 반복하지 않기 위한 참고표다.
     """
     output1 = resp.get("output1") or {}
     output3 = resp.get("output3") or {}

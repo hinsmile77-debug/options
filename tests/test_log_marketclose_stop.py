@@ -1,7 +1,28 @@
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime
 
 from scripts import log_marketclose_stop
+
+
+def _fake_get_connection(monkeypatch):
+    """log_marketclose_stop.check_remaining_processes_and_alert()이 db.record_shutdown_check()를
+    통해 실제 DB에 쓰지 않도록(테스트가 라이브 shutdown_check_log를 오염시키면 COCKPIT에 가짜
+    경고가 뜬다) 커넥션 자체를 가짜로 바꾼다. 호출 기록만 남기는 더미 객체를 반환한다."""
+    conn = object()
+    recorded = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield conn
+
+    def fake_record(c, checked_at, remaining):
+        assert c is conn
+        recorded.append((checked_at, remaining))
+
+    monkeypatch.setattr(log_marketclose_stop.db, "get_connection", fake_get_connection)
+    monkeypatch.setattr(log_marketclose_stop.db, "record_shutdown_check", fake_record)
+    return recorded
 
 
 def test_log_gap_writes_marker_and_no_gap_line_when_none_exists(monkeypatch, tmp_path):
@@ -109,6 +130,7 @@ def test_check_remaining_processes_noop_when_none_remain(monkeypatch, tmp_path):
     fake_log_file = tmp_path / "logs" / "premarket_startup.log"
     monkeypatch.setattr(log_marketclose_stop, "LOG_FILE", fake_log_file)
     monkeypatch.setattr(log_marketclose_stop, "_count_remaining_mahdi_processes", lambda: 0)
+    recorded = _fake_get_connection(monkeypatch)
 
     alerted = []
     monkeypatch.setattr(log_marketclose_stop.notify, "notify_sync", lambda *a, **k: alerted.append((a, k)))
@@ -117,6 +139,8 @@ def test_check_remaining_processes_noop_when_none_remain(monkeypatch, tmp_path):
 
     assert not fake_log_file.exists()
     assert alerted == []
+    assert len(recorded) == 1
+    assert recorded[0][1] == 0  # 남은 프로세스가 0개여도 DB엔 항상 기록한다(§5-3)
 
 
 def test_check_remaining_processes_logs_and_alerts_when_processes_remain(monkeypatch, tmp_path):
@@ -128,6 +152,7 @@ def test_check_remaining_processes_logs_and_alerts_when_processes_remain(monkeyp
 
     now = datetime(2026, 7, 21, 15, 45, 5)
     monkeypatch.setattr(log_marketclose_stop.db, "local_now", lambda: now)
+    recorded = _fake_get_connection(monkeypatch)
 
     alerted = []
     monkeypatch.setattr(log_marketclose_stop.notify, "notify_sync", lambda *a, **k: alerted.append((a, k)))
@@ -141,6 +166,7 @@ def test_check_remaining_processes_logs_and_alerts_when_processes_remain(monkeyp
     args, kwargs = alerted[0]
     assert "2개" in args[0]
     assert kwargs.get("level") == "WARNING"
+    assert recorded == [(now, 2)]
 
 
 def test_check_remaining_processes_swallows_check_failure(monkeypatch, tmp_path):
@@ -151,10 +177,34 @@ def test_check_remaining_processes_swallows_check_failure(monkeypatch, tmp_path)
         raise subprocess.TimeoutExpired(cmd="powershell", timeout=20)
 
     monkeypatch.setattr(log_marketclose_stop, "_count_remaining_mahdi_processes", broken_count)
+    recorded = _fake_get_connection(monkeypatch)
     alerted = []
     monkeypatch.setattr(log_marketclose_stop.notify, "notify_sync", lambda *a, **k: alerted.append((a, k)))
 
     log_marketclose_stop.check_remaining_processes_and_alert()  # 예외가 전파되면 이 줄에서 실패
 
     assert not fake_log_file.exists()
-    assert alerted == []
+    assert recorded == []  # 확인 자체가 실패하면 기록할 값이 없으므로 DB에도 안 쓴다
+
+
+def test_check_remaining_processes_swallows_db_record_failure(monkeypatch, tmp_path):
+    # COCKPIT 배지 갱신(DB 기록)이 실패해도 로그 경고/Slack 알림은 정상적으로 나가야 한다.
+    fake_log_dir = tmp_path / "logs"
+    fake_log_dir.mkdir()
+    fake_log_file = fake_log_dir / "premarket_startup.log"
+    monkeypatch.setattr(log_marketclose_stop, "LOG_FILE", fake_log_file)
+    monkeypatch.setattr(log_marketclose_stop, "_count_remaining_mahdi_processes", lambda: 1)
+
+    @contextmanager
+    def broken_connection(settings=None):
+        raise ConnectionError("DB 다운")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(log_marketclose_stop.db, "get_connection", broken_connection)
+    alerted = []
+    monkeypatch.setattr(log_marketclose_stop.notify, "notify_sync", lambda *a, **k: alerted.append((a, k)))
+
+    log_marketclose_stop.check_remaining_processes_and_alert()  # 예외가 전파되면 이 줄에서 실패
+
+    assert "경고" in fake_log_file.read_text(encoding="utf-8")
+    assert len(alerted) == 1

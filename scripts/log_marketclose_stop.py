@@ -83,17 +83,28 @@ def _count_remaining_mahdi_processes() -> int:
 
 def check_remaining_processes_and_alert() -> None:
     """
-    계산: 종료 시도 후에도 마흐디 프로세스가 남아있으면 premarket_startup.log에 경고를 남기고
-         Slack으로도 알린다(2026-07-21, 운영점검보고서 §4 "종료 결과 검증 알림") — 지금까지는
-         taskkill이 아무것도 못 찾아도 아무도 알아채지 못한 채 조용히 넘어갔다.
-    실패 조건: 확인 자체가 실패해도(PowerShell 없음 등) 조용히 넘어간다 — 이 점검 기능 하나
-              때문에 장마감 종료 스크립트의 나머지 흐름(마커 갱신 등)이 막히면 안 된다.
+    계산: 종료 시도 후 마흐디 프로세스가 남아있는지 확인해 (1) DB(shutdown_check_log)에 항상
+         기록해 COCKPIT "오늘의 점검 요약"이 재시작 없이 "직전 장마감이 실제로 깨끗했는지"를
+         보여줄 수 있게 하고(2026-07-21, 운영점검보고서 §5-3 "종료 신뢰성 배지"), (2) 남아있는
+         경우에만 premarket_startup.log에 경고를 남기고 Slack으로도 알린다(§4 "종료 결과 검증
+         알림") — 지금까지는 taskkill이 아무것도 못 찾아도 아무도 알아채지 못한 채 조용히
+         넘어갔다.
+    실패 조건: 확인 자체가 실패해도(PowerShell 없음 등) 조용히 넘어간다. DB 기록 실패도
+              마찬가지로 삼킨다 — 이 점검/배지 기능 하나 때문에 장마감 종료 스크립트의 나머지
+              흐름(마커 갱신 등)이 막히면 안 된다.
     """
     now = db.local_now()
     try:
         remaining = _count_remaining_mahdi_processes()
     except Exception:
         return
+
+    try:
+        with db.get_connection() as conn:
+            db.record_shutdown_check(conn, now, remaining)
+    except Exception:
+        pass
+
     if remaining <= 0:
         return
 

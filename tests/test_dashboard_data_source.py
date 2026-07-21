@@ -16,6 +16,7 @@ from mahdi.dashboard.data_source import (
     _regime_fit_progress_check,
     _regime_stability_check,
     _schema_integrity_check,
+    _shutdown_reliability_check,
     _synthetic_snapshot,
     get_health_summary,
     get_slack_alerts_enabled,
@@ -409,6 +410,8 @@ class _FakeHealthCursor:
             self._kind, self._value = "one", self._responses.get("regime_stability_row")
         elif "feature_store" in query:
             self._kind, self._value = "one", self._responses.get("regime_fit_progress_row")
+        elif "shutdown_check_log" in query:
+            self._kind, self._value = "one", self._responses.get("shutdown_check_row")
         else:
             self._kind, self._value = "one", None
 
@@ -762,6 +765,40 @@ def test_regime_fit_progress_check_handles_query_error():
     assert conn.rollback_calls == 1
 
 
+# --- _shutdown_reliability_check (§5-3 "종료 신뢰성 배지") -----------------------------------------
+
+def test_shutdown_reliability_check_info_when_no_record_yet():
+    # 마이그레이션 013 적용 전이거나, log_marketclose_stop.py가 아직 한 번도 기록한 적 없는 상태.
+    conn = _FakeHealthConnection({"shutdown_check_row": None})
+    check = _shutdown_reliability_check(conn)
+    assert check.status == "info"
+    assert "기록 없음" in check.detail
+
+
+def test_shutdown_reliability_check_ok_when_no_processes_remained():
+    checked_at = datetime(2026, 7, 21, 15, 45, 5)
+    conn = _FakeHealthConnection({"shutdown_check_row": (checked_at, 0)})
+    check = _shutdown_reliability_check(conn)
+    assert check.status == "ok"
+    assert "정상 종료" in check.detail
+
+
+def test_shutdown_reliability_check_warns_when_processes_remained():
+    # 2026-07-21 §3-1 실측 재현: taskkill이 "No tasks running"만 남기고도 프로세스가 살아있었음.
+    checked_at = datetime(2026, 7, 21, 15, 45, 5)
+    conn = _FakeHealthConnection({"shutdown_check_row": (checked_at, 2)})
+    check = _shutdown_reliability_check(conn)
+    assert check.status == "warning"
+    assert "2개 잔존" in check.detail
+
+
+def test_shutdown_reliability_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _shutdown_reliability_check(conn)
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
 # --- get_health_summary (오케스트레이션) ------------------------------------------------------------
 
 def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
@@ -786,10 +823,14 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._fossil_data_check", make_check("fossil"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._shutdown_reliability_check", make_check("shutdown"))
 
     result = get_health_summary()
 
-    assert calls == ["option_chain", "futures", "leg_balance", "cbot", "schema", "fossil", "regime", "regime_fit_progress"]
+    assert calls == [
+        "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
+        "regime", "regime_fit_progress", "shutdown",
+    ]
     assert [c.label for c in result] == calls
 
 
