@@ -12,12 +12,19 @@ from datetime import datetime, time as dtime, timedelta
 
 import numpy as np
 
+from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel
 from mahdi.engines.regime_pipeline import FEATURE_VERSION
 from mahdi.features.options_intel import OptionLeg, find_gamma_flip, gamma_walls as compute_gamma_walls
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
+
+# 2026-07-22(운영점검보고서 §1-1) — 관측 루프(mahdi.main.LAST_START_MARKER_FILE)와 대칭인
+# COCKPIT 전용 마커. 07-21 08:15에 뜬 COCKPIT이 그날 15:45 종료 실패 이후에도 밤새 좀비로
+# 남아 07-22 07:30까지 이어졌는데, 이 사실을 알아채려면 cockpit.log의 Uvicorn 배너 유무를
+# 근거로 역추적해야 했다 — 이 프로세스가 "언제 새로 떴는지"를 자체 기록해두면 그럴 필요가 없다.
+COCKPIT_START_MARKER_FILE = PROJECT_ROOT / "logs" / ".last_cockpit_start.txt"
 
 # 심볼 혼입 버그(2026-07-06) 시기에 쓰던 옛 고정 라벨 — 더 이상 아무도 안 쓰지만 남아있는
 # 화석 데이터라 Flow Radar "가장 활발한 종목" 선정에서 제외한다.
@@ -680,3 +687,34 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         ],
         macro_snapshot=_synthetic_macro_snapshot(rng),
     )
+
+
+def record_cockpit_startup() -> str:
+    """
+    계산: COCKPIT_START_MARKER_FILE에 남아있는 직전 COCKPIT 기동 시각과 현재 시각의 차이를
+         메시지 문자열로 만들어 반환한 뒤, 이번 기동 시각으로 마커를 갱신한다 — 관측 루프의
+         mahdi.main._log_startup_gap_since_last_run()과 동일한 패턴(2026-07-22 도입).
+    해석: 문자열을 반환만 하고 로깅은 호출측(app.py)이 print()로 한다 — 이 프로세스(Streamlit)는
+         logging 핸들러가 설정돼 있지 않아 logger.info를 써도 cockpit.log에 실제로는 안 남는다
+         (Streamlit 자체 stdout/traceback만 배치스크립트의 리다이렉트로 남는 상태).
+    실패 조건: 마커 파일이 없으면(최초 실행) 또는 파싱 실패하면 비교 없이 안내 메시지만 반환하고,
+              그래도 마커 갱신은 시도한다. 마커 읽기/쓰기 자체가 실패해도(권한 등) 예외를 삼킨다
+              — 이 기능 하나 때문에 COCKPIT 기동 전체가 죽으면 안 된다.
+    """
+    try:
+        if COCKPIT_START_MARKER_FILE.exists():
+            last = datetime.fromisoformat(COCKPIT_START_MARKER_FILE.read_text(encoding="utf-8").strip())
+            gap_hours = (db.local_now() - last).total_seconds() / 3600
+            message = f"직전 COCKPIT 기동: {last:%Y-%m-%d %H:%M:%S} ({gap_hours:.1f}시간 전)"
+        else:
+            message = "직전 COCKPIT 기동 기록 없음(최초 실행 또는 마커 파일 삭제됨)"
+    except Exception:
+        message = "직전 COCKPIT 기동 기록 확인 실패"
+
+    try:
+        COCKPIT_START_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        COCKPIT_START_MARKER_FILE.write_text(db.local_now().isoformat(), encoding="utf-8")
+    except Exception:
+        pass
+
+    return message

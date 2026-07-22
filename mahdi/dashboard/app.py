@@ -14,6 +14,7 @@ from mahdi.dashboard.data_source import (
     get_health_summary,
     get_slack_alerts_enabled,
     load_snapshot,
+    record_cockpit_startup,
     set_slack_alerts_enabled,
 )
 from mahdi.dashboard.panels.flow_radar_panel import (
@@ -30,6 +31,17 @@ from mahdi.dashboard.panels.regime_panel import REGIME_LABEL_KO, build_regime_pr
 st.set_page_config(page_title="마흐디 COCKPIT v1", layout="wide")
 
 REFRESH_INTERVAL_SECONDS = 10  # 1분봉 적재 주기보다 짧게 잡아 새 봉을 빠르게 반영
+
+
+@st.cache_resource
+def _log_cockpit_startup_once() -> None:
+    # 2026-07-22(운영점검보고서 §1-1) — 이 스크립트는 REFRESH_INTERVAL_SECONDS마다 st.rerun()으로
+    # 처음부터 다시 실행되지만, st.cache_resource로 감싸면 실제 프로세스당 딱 1회만 호출된다.
+    # 좀비 프로세스(전날 떠서 안 죽고 남아있는 것)를 로그만으로 즉시 구분할 수 있게 한다.
+    print(record_cockpit_startup(), flush=True)
+
+
+_log_cockpit_startup_once()
 
 
 def render() -> None:

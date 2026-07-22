@@ -19,6 +19,18 @@ echo [%date% %time%] ===== Mahdi 장전 기동 시작 ===== >> "%LOG_FILE%"
 
 cd /d "%PROJECT_DIR%"
 
+REM 2026-07-22 이상점 대응(운영점검보고서 2026-07-22 §1-1): 어제(07-21) 08:15에 수동으로 뜬
+REM COCKPIT/관측 루프가 그날 15:45 자동 종료 실패 이후에도 밤새 좀비로 남아, 오늘 아침까지
+REM 그 사이 커밋된 새 코드(종료 신뢰성 배지 등)를 하나도 못 읽은 채 에러를 반복했다.
+REM stop_mahdi_marketclose.bat에 있는 것과 동일한 이중 안전망(창 제목 taskkill + 커맨드라인
+REM 매칭 PowerShell fallback)을 기동 스크립트에도 대칭으로 추가한다 — 지금까지 "종료"만
+REM 견고화됐고 "기동 전" 잔존 프로세스 점검은 전혀 없었다. 잔존 프로세스가 없는 게 정상
+REM 상황(매일 아침 대부분 이 경우)이므로 taskkill이 아무것도 못 찾아도 실패로 취급하지 않는다.
+echo [%date% %time%] 기동 전 잔존 프로세스 정리 >> "%LOG_FILE%"
+taskkill /F /T /FI "WINDOWTITLE eq Mahdi COCKPIT*" >> "%LOG_FILE%" 2>&1
+taskkill /F /T /FI "WINDOWTITLE eq Mahdi Observation Loop*" >> "%LOG_FILE%" 2>&1
+powershell -NoProfile -Command "$procs = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.CommandLine -like '*mahdi.main*' -or $_.CommandLine -like '*mahdi/dashboard/app.py*') }; foreach ($p in $procs) { Write-Output ('기동 전 커맨드라인 매칭 fallback 종료: PID {0} - {1}' -f $p.ProcessId, $p.CommandLine); Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; if (-not $procs) { Write-Output '기동 전 커맨드라인 매칭 fallback: 잔존 프로세스 없음' }" >> "%LOG_FILE%" 2>&1
+
 REM Docker 데몬이 이미 응답하면 Desktop 재실행 생략
 docker info >nul 2>&1
 if not errorlevel 1 goto :docker_ready

@@ -341,10 +341,10 @@ def test_rate_limiter_caps_interval_at_max_multiplier():
 def test_rate_limiter_recovers_toward_min_after_sustained_success():
     limiter = _RateLimiter(min_interval=1.0)
     limiter.record_rate_limit_hit()  # 1.0 -> 1.5로 넓어짐
-    for _ in range(19):
+    for _ in range(7):
         limiter.record_success()
-    assert limiter._current_interval == pytest.approx(1.5)  # 임계값(20건) 미달 — 아직 그대로
-    limiter.record_success()  # 20번째 연속 성공 — 이제 한 단계 되돌림
+    assert limiter._current_interval == pytest.approx(1.5)  # 임계값(8건) 미달 — 아직 그대로
+    limiter.record_success()  # 8번째 연속 성공 — 이제 한 단계 되돌림
     assert limiter._current_interval == pytest.approx(1.5 * 0.9)
 
 
@@ -371,7 +371,7 @@ def test_rate_limiter_disabled_when_min_interval_is_zero():
 
 def test_get_widens_rate_limiter_on_egw00201_then_holds_after_one_success():
     # KISRestClient._get()을 통한 통합 검증 — 500+EGW00201을 실제로 받으면 다음 호출부터
-    # 페이싱 간격이 넓어지고, 그 뒤 성공 1건만으로는(임계값 20건 미달) 아직 되돌아가지 않는다.
+    # 페이싱 간격이 넓어지고, 그 뒤 성공 1건만으로는(임계값 8건 미달) 아직 되돌아가지 않는다.
     responses = iter(
         [
             httpx.Response(500, json={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"}),

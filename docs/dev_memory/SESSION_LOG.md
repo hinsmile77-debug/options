@@ -4,6 +4,41 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-22] 2차 — 일일 운영점검 보고서 fix 3건 구현 (기동 전 좀비 프로세스 정리, 레이트리미터 재조정, COCKPIT 기동 마커)
+
+**트리거:** 1차 세션에서 작성한 `docs/동작점검/2026-07-22_마흐디_운영점검보고서.md`의 fix 우선순위대로
+구현 진행(사용자 요청, 일일 반복 워크플로).
+
+**보고서 핵심 발견 재확인(1차 세션):** 07-21 08:15/08:40에 뜬 COCKPIT·관측 루프가 그날 15:45 종료
+실패 이후에도 밤새 좀비로 남아, 어제 저녁 커밋(`e45f08a`)된 종료 신뢰성 배지 함수를 780회 가까이
+"함수 없음" 에러로 실패시켰다 — 오늘 아침 07:30에 정상 프로세스로 교체된 것은 기동 스크립트 로직이
+아니라 원인 불명의 수동/우연 개입으로 추정(`start_mahdi_premarket.bat`엔 잔존 프로세스 kill 로직이
+전혀 없었음). 별도로 어제 "오탐, 조치 불필요"로 정정했던 EGW00201 레이트리밋도 오늘 83건(0.56%,
+오후 집중) 재발.
+
+**구현한 fix (우선순위 순, 전체 360개 테스트 통과):**
+1. **`scripts/start_mahdi_premarket.bat`** — `stop_mahdi_marketclose.bat`와 대칭으로 기동 전
+   잔존 프로세스 정리 추가(창 제목 taskkill + 커맨드라인 매칭 PowerShell fallback, 동일 패턴
+   재사용). "종료"만 견고화되고 "기동"엔 방어가 없던 비대칭 갭을 해소. CRLF 정규화(`sed`) 적용,
+   PowerShell 프래그먼트·taskkill 두 줄 모두 `cmd /c` 경유로 격리 드라이런 검증(현재 잔존
+   프로세스 없어 정상적으로 "잔존 프로세스 없음" 출력 확인).
+2. **`mahdi/broker/rest_client.py`** — `_RateLimiter._RECOVERY_SUCCESS_THRESHOLD`를 20→8로 축소.
+   임계값 20일 때 4배(상한)에서 1배로 완전 회복하려면 성공 약 260건이 필요해 오후 내내 백오프가
+   높은 채로 눌러앉는 패턴을 오늘 실측(83건/14,852건, 오전보다 오후 집중 + "스케줄 밀림" 경고
+   57건) — 8로 낮춰 회복 소요를 약 2.5배(약 104건) 단축. `tests/test_broker_rest_client.py` 2개
+   테스트를 새 임계값에 맞게 갱신.
+3. **`mahdi/dashboard/data_source.py`/`app.py`** — 관측 루프의 `_log_startup_gap_since_last_run()`과
+   대칭인 `record_cockpit_startup()` 신규(마커 파일 `logs/.last_cockpit_start.txt`). COCKPIT은
+   로깅 핸들러가 설정돼 있지 않아 `logger.info`는 실제로 cockpit.log에 안 남는다는 걸 이번 조사로
+   확인했으므로 `print()`로 직접 출력. `app.py`에서 `st.cache_resource`로 감싸 10초 rerun마다
+   재실행되지 않고 프로세스당 1회만 실행되게 함. 테스트 3개 신규.
+
+**보류(Fix #4, DB 직접 검증):** Docker Desktop이 이번 세션 내내 꺼져있어 `shutdown_check_log`·
+`option_analysis_1m.theta` 실제 컬럼 타입을 라이브로 대조하지 못함 — [[NEXT_TODO]]에 다음 세션
+확인 항목으로 이관.
+
+---
+
 ## [2026-07-21] 2차 — 일일 운영점검 보고서 작성 + fix 4건 구현 (theta 오버플로우 근본수정, 종료 스크립트 견고화)
 
 **트리거:** 사용자의 일일 반복 요청(`docs/persnal-docs/daily_prompt.txt`) — 오늘 로그를 장전/장중/장후로

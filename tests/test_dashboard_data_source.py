@@ -21,6 +21,7 @@ from mahdi.dashboard.data_source import (
     get_health_summary,
     get_slack_alerts_enabled,
     load_snapshot,
+    record_cockpit_startup,
     set_slack_alerts_enabled,
 )
 from mahdi.engines.regime import RegimeLabel
@@ -846,3 +847,59 @@ def test_get_health_summary_falls_back_to_single_warning_when_db_unavailable(mon
 
     assert len(result) == 1
     assert result[0].status == "warning"
+
+
+# --- record_cockpit_startup (2026-07-22 운영점검보고서 §1-1 "좀비 프로세스" 재발 방지) -------------
+
+def test_record_cockpit_startup_writes_marker_when_none_exists(monkeypatch, tmp_path):
+    import mahdi.dashboard.data_source as data_source
+
+    fake_marker = tmp_path / "logs" / ".last_cockpit_start.txt"
+    monkeypatch.setattr(data_source, "COCKPIT_START_MARKER_FILE", fake_marker)
+    now = datetime(2026, 7, 22, 7, 30, 0)
+    monkeypatch.setattr(data_source.db, "local_now", lambda: now)
+
+    message = record_cockpit_startup()
+
+    assert "직전 COCKPIT 기동 기록 없음" in message
+    assert fake_marker.exists()
+    assert fake_marker.read_text(encoding="utf-8") == now.isoformat()
+
+
+def test_record_cockpit_startup_reports_elapsed_hours_and_updates_marker(monkeypatch, tmp_path):
+    # 07-21 08:15에 뜬 좀비 COCKPIT이 07-22 07:30까지(약 23.25시간) 안 죽고 남아있던 사례처럼,
+    # 다음 정상 기동 시점에 경과 시간이 메시지에 그대로 드러나야 한다.
+    import mahdi.dashboard.data_source as data_source
+
+    fake_log_dir = tmp_path / "logs"
+    fake_log_dir.mkdir()
+    fake_marker = fake_log_dir / ".last_cockpit_start.txt"
+    last = datetime(2026, 7, 21, 8, 15, 29)
+    fake_marker.write_text(last.isoformat(), encoding="utf-8")
+    monkeypatch.setattr(data_source, "COCKPIT_START_MARKER_FILE", fake_marker)
+
+    now = datetime(2026, 7, 22, 7, 30, 41)
+    monkeypatch.setattr(data_source.db, "local_now", lambda: now)
+
+    message = record_cockpit_startup()
+
+    assert "직전 COCKPIT 기동: 2026-07-21 08:15:29 (23.3시간 전)" in message
+    assert fake_marker.read_text(encoding="utf-8") == now.isoformat()
+
+
+def test_record_cockpit_startup_handles_corrupted_marker_and_recovers(monkeypatch, tmp_path):
+    import mahdi.dashboard.data_source as data_source
+
+    fake_log_dir = tmp_path / "logs"
+    fake_log_dir.mkdir()
+    fake_marker = fake_log_dir / ".last_cockpit_start.txt"
+    fake_marker.write_text("이건 타임스탬프가 아님", encoding="utf-8")
+    monkeypatch.setattr(data_source, "COCKPIT_START_MARKER_FILE", fake_marker)
+
+    now = datetime(2026, 7, 22, 7, 30, 0)
+    monkeypatch.setattr(data_source.db, "local_now", lambda: now)
+
+    message = record_cockpit_startup()
+
+    assert "직전 COCKPIT 기동 기록 확인 실패" in message
+    assert fake_marker.read_text(encoding="utf-8") == now.isoformat()  # 손상된 마커도 이번 기록으로 복구됨
