@@ -1,18 +1,23 @@
 from pathlib import Path
 
-from mahdi.data.symbol_master import IndexDerivativesMaster, parse_master_file
+from mahdi.data.symbol_master import PRODUCT_TYPE_MINI_FUTURES, IndexDerivativesMaster, parse_master_file
 
 # 필드 순서: 상품종류|단축코드|표준코드|한글종목명|월물구분코드|행사가|ATM구분|기초자산단축코드|기초자산명
 # (실제 마스터파일 실측 순서 — symbol_master.py의 _COLUMNS 주석 참고)
+# 선물 행은 2026-07-22 정정 실측대로 월물구분코드(5번째)를 공란으로, 실제 월물랭크는
+# ATM구분(7번째)에 둔다 — symbol_master.py 모듈 docstring 정정 항목 참고.
 _SAMPLE_ROWS = [
-    "1|A01609|STD001|F 202609|1|0.0| |2001|KOSPI200",
-    "1|A01612|STD002|F 202612|2|0.0| |2001|KOSPI200",
+    "1|A01609|STD001|F 202609| |0.0|1|2001|KOSPI200",
+    "1|A01612|STD002|F 202612| |0.0|2|2001|KOSPI200",
     "5|B0160350|STD010|C 202607|1|350.0| |2001|KOSPI200",
     "5|B0160352|STD011|C 202607|1|352.5| |2001|KOSPI200",
     "5|B0160355|STD012|C 202608|2|355.0| |2001|KOSPI200",
     "6|C0160350|STD020|P 202607|1|350.0| |2001|KOSPI200",
     "6|C0160352|STD021|P 202607|1|352.5| |2001|KOSPI200",
-    "1|Z09609|STD030|F 202609|1|0.0| |3003|KSQ150",
+    "1|Z09609|STD030|F 202609| |0.0|1|3003|KSQ150",
+    # 미니선물(상품종류 B) — 2026-07-22 실측 추가
+    "B|A05608|STD040|미니F 202608| |0.0|1|2001|KOSPI200",
+    "B|A05609|STD041|미니F 202609| |0.0|2|2001|KOSPI200",
     # 위클리(월)(상품종류 N/O) — 한글종목명이 "위클리M C 2607W1 1,300.0" 형식(2026-07-06 실측)
     "N|BAFBLWA41|STDW01|위클리M C 2607W1 1,100.0|2|1100.0| |2001|KOSPI200",
     "N|BAFBLWA73|STDW02|위클리M C 2607W1 1,180.0|2|1180.0| |2001|KOSPI200",
@@ -62,6 +67,20 @@ def test_front_month_future_code_filters_by_underlying(tmp_path):
     master = _master(tmp_path)
     assert master.front_month_future_code("KSQ150") == "Z09609"
     assert master.front_month_future_code("NONEXISTENT") is None
+
+
+def test_front_month_future_code_mini_futures_uses_atm구분_for_rank(tmp_path):
+    master = _master(tmp_path)
+    # 미니선물(상품종류 B)도 정규선물과 동일하게 ATM구분(7번째 필드)이 실제 월물랭크다 —
+    # 월물구분코드(5번째 필드)는 선물 행에서 항상 공란이라 이 랭킹에 쓰이지 않는다.
+    assert master.front_month_future_code("KOSPI200", product_type=PRODUCT_TYPE_MINI_FUTURES) == "A05608"
+
+
+def test_futures_regular_still_ranks_by_atm구분_not_월물구분코드(tmp_path):
+    master = _master(tmp_path)
+    # 월물구분코드가 전부 공란인 샘플에서도 ATM구분(1/2)만으로 근월이 올바르게 정렬돼야 한다.
+    rows = master.futures("KOSPI200")
+    assert list(rows["단축코드"]) == ["A01609", "A01612"]
 
 
 def test_options_filters_call_put_and_underlying(tmp_path):

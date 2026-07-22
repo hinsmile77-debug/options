@@ -8,6 +8,17 @@ KISRestClient.get_quote()를 반복 호출해 실시간 값을 채운다.
 출처(다운로드 URL·컬럼 스키마 모두 실제 스크립트로 확인):
 https://github.com/koreainvestment/open-trading-api/blob/main/stocks_info/domestic_index_future_code.py
 상품종류 코드값은 2026-07-03자 실제 마스터파일을 내려받아 KOSPI200 행을 직접 확인해 확정했다.
+
+정정(2026-07-22, 후속 프로젝트 messiah의 실계좌 실측 세션에서 발견 — fuoption/src/messiah/broker/kis/
+symbol_master.py 이식 과정 참고): 이 파일은 두 가지를 몰랐다.
+1. 상품종류 코드에 미니선물이 없었다 — 정규선물("1")만 알고 있었다. 미니선물은 상품종류="B"
+   (한글종목명 "미니F 202608" 형식)다.
+2. 선물 행의 실제 월물랭크(1=근월, 2=차근월, ...)는 "월물구분코드"라 이름 붙인 자리(5번째 필드)가
+   아니라 그 다음 자리(6번째 필드, 아래에서 "ATM구분"이라 이름 붙인 옵션 전용 컬럼)에 들어있다 —
+   선물 행에서 5번째 필드는 항상 공란이다(2026-07-22 실측: KOSPI200 정규선물 7종목·미니선물
+   6종목 전부 확인). 이 파일의 기존 `front_month_future_code()`가 결과적으로 맞는 값을 반환해온
+   것은, 마스터파일이 우연히 근월 순으로 정렬되어 있어(전부 공란인 컬럼으로 정렬 → 원래 순서
+   유지) 우연히 맞아떨어졌을 뿐이다 — 필드 자체의 의미를 신뢰해서가 아니었다.
 """
 
 from __future__ import annotations
@@ -40,6 +51,10 @@ MASTER_FILE_NAME = "fo_idx_code_mts.mst"
 # 였다(동일 만기 여러 행사가에서 5번째 필드가 '2'로 고정, 6번째 필드가 행사가별로 변함,
 # 7번째 필드는 대부분 공백). 참고 스크립트가 구버전 포맷 기준이거나 오기로 보인다 — 이 파일은
 # 실측값을 신뢰한다.
+# 주의(선물 행 한정, 2026-07-22 정정 — 모듈 docstring 참고): 위 "5번째=월물구분코드,
+# 7번째=대부분 공백"은 옵션 행(여러 행사가) 기준 관찰이다. 선물 행은 반대다 — 5번째 필드가
+# 항상 공백이고, 실제 월물랭크(1=근월, 2=차근월, ...)는 7번째 필드("ATM구분")에 들어있다.
+# futures()/front_month_future_code()는 이를 반영해 "ATM구분"으로 정렬한다.
 _COLUMNS = [
     "상품종류",
     "단축코드",
@@ -52,7 +67,8 @@ _COLUMNS = [
     "기초자산명",
 ]
 
-# 상품종류 코드 (기초자산명="KOSPI200" 행 기준 실측)
+# 상품종류 코드 (기초자산명="KOSPI200" 행 기준 실측 — 2026-07-06/07-10 실측 + 2026-07-22
+# messiah 이식 세션 실측(미니선물 "B" 추가) 종합)
 # 정정(2026-07-10): 2026-07-06 당시엔 "L/M이 단 한 행도 없다"고 결론 냈으나, 그건 그 주(週)
 # 우연히 N/O 풀만 살아있었을 뿐이었다. 2026-07-10 재실측(먼슬리 만기 다음날, 두 위클리 만기가
 # 동시에 상장된 시점) 결과 L/M 행이 실제로 존재하며(위클리C/P, 예: "위클리C 2607W3"), N/O
@@ -65,6 +81,7 @@ _COLUMNS = [
 # 의미불명이었으나 지금 보면 "월"의 약자로 보인다). 요일 대응은 이 실측 하나로 확정한 것이라
 # 만기 개편 등으로 어긋날 수 있음 — 의심되면 `get_quote()`의 `futs_last_tr_date` 요일로 재확인.
 PRODUCT_TYPE_FUTURES = "1"  # 지수선물 (정규)
+PRODUCT_TYPE_MINI_FUTURES = "B"  # 지수 미니선물 — 2026-07-22 messiah 실측으로 확인
 PRODUCT_TYPE_OPTION_CALL = "5"  # 지수옵션 콜 (정규, 월물)
 PRODUCT_TYPE_OPTION_PUT = "6"  # 지수옵션 풋 (정규, 월물)
 PRODUCT_TYPE_MINI_OPTION_CALL = "D"  # 미니옵션 콜
@@ -110,7 +127,9 @@ def parse_master_file(mst_path: Path) -> pd.DataFrame:
     """
     입력: 압축 해제된 .mst 파일 경로.
     계산: pipe(|) 구분·cp949 인코딩으로 읽어 9개 컬럼 DataFrame으로 변환하고, 월물구분코드를
-         숫자로 강제 변환(원본이 문자열이라 두 자릿수 랭크가 섞이면 사전식 비교로 틀릴 수 있음).
+         숫자로 강제 변환. 주의: 이 컬럼은 선물 행에서는 항상 공란, 옵션 행에서는 만기 순번이
+         아닌 다른 분류값이라 랭킹에는 쓰이지 않는다(정정 내역은 모듈 docstring 참고) — 원본
+         필드를 그대로 보존하기 위한 타입 정규화일 뿐이다.
     실패 조건: 파일이 없으면 FileNotFoundError(pandas 기본 동작).
     """
     df = pd.read_table(mst_path, sep="|", encoding="cp949", header=None)
@@ -139,18 +158,27 @@ class IndexDerivativesMaster:
     def from_file(cls, mst_path: Path) -> "IndexDerivativesMaster":
         return cls(parse_master_file(mst_path))
 
-    def futures(self, underlying: str = "KOSPI200") -> pd.DataFrame:
+    def futures(self, underlying: str = "KOSPI200", product_type: str = PRODUCT_TYPE_FUTURES) -> pd.DataFrame:
+        """
+        product_type: PRODUCT_TYPE_FUTURES(정규, 기본값) | PRODUCT_TYPE_MINI_FUTURES(미니).
+        해석: 정렬은 "ATM구분" 컬럼 기준 — 이 컬럼이 선물 행에서 실제 월물랭크(1=근월,
+             2=차근월, ...)를 담고 있다("월물구분코드"는 선물 행에서 항상 공란, 모듈 docstring
+             정정 항목 참고). 문자열 공백/빈 값은 숫자 변환 시 NaN이 되어 정렬 맨 뒤로 밀린다.
+        """
         df = self._df
-        return df[(df["상품종류"] == PRODUCT_TYPE_FUTURES) & (df["기초자산명"] == underlying)].sort_values(
-            "월물구분코드"
-        )
+        rows = df[(df["상품종류"] == product_type) & (df["기초자산명"] == underlying)].copy()
+        rows["_월물랭크"] = pd.to_numeric(rows["ATM구분"], errors="coerce")
+        return rows.sort_values("_월물랭크").drop(columns="_월물랭크")
 
-    def front_month_future_code(self, underlying: str = "KOSPI200") -> str | None:
+    def front_month_future_code(
+        self, underlying: str = "KOSPI200", product_type: str = PRODUCT_TYPE_FUTURES
+    ) -> str | None:
         """
-        계산: 정규 지수선물(상품종류='1') 중 월물구분코드가 가장 작은(최근월) 행의 단축코드.
-        실패 조건: 해당 기초자산의 선물이 없으면 None.
+        계산: 지수선물(정규 또는 미니) 중 실제 월물랭크("ATM구분" 컬럼)가 가장 작은(최근월) 행의
+             단축코드.
+        실패 조건: 해당 기초자산·상품종류의 선물이 없으면 None.
         """
-        rows = self.futures(underlying)
+        rows = self.futures(underlying, product_type)
         if rows.empty:
             return None
         return str(rows.iloc[0]["단축코드"])
