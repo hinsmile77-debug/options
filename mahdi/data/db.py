@@ -406,6 +406,42 @@ def latest_shutdown_check(conn: ConnectionLike) -> tuple[datetime, int] | None:
     return row[0], row[1]
 
 
+def record_rate_limiter_status(
+    conn: ConnectionLike, checked_at: datetime, backoff_multiplier: float, last_cycle_overrun_seconds: float
+) -> None:
+    """
+    입력: DB 커넥션, 기록 시각, 공유 _RateLimiter의 현재 배율(1.0=정상), 직전 옵션체인 폴링
+         사이클이 60초 주기를 넘겨 밀린 초(0이면 정상).
+    계산: 싱글턴 행(id=TRUE 고정) upsert — mahdi.main의 poll_option_chain이 매 사이클(60초)마다
+         호출해 COCKPIT이 재시작 없이 "지금 레이트리밋에 얼마나 근접했는지"를 바로 볼 수 있게
+         한다(2026-07-23, 운영점검보고서 §2-1/§4 Fix#4).
+    """
+    row = {
+        "id": True, "checked_at": checked_at,
+        "backoff_multiplier": backoff_multiplier, "last_cycle_overrun_seconds": last_cycle_overrun_seconds,
+    }
+    _upsert(
+        conn, "rate_limiter_status_log",
+        ("id", "checked_at", "backoff_multiplier", "last_cycle_overrun_seconds"), ("id",), row,
+    )
+
+
+def latest_rate_limiter_status(conn: ConnectionLike) -> tuple[datetime, float, float] | None:
+    """
+    계산: 가장 최근 record_rate_limiter_status() 기록을 반환한다.
+    실패 조건: 아직 아무도 기록한 적이 없으면(최초 기동, 이 마이그레이션 적용 전 등) None —
+              호출측(COCKPIT 헬스체크)이 "정보 없음"으로 구분해서 보여줘야 한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT checked_at, backoff_multiplier, last_cycle_overrun_seconds FROM rate_limiter_status_log LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return row[0], float(row[1]), float(row[2])
+
+
 _EXPIRY_LIQUIDITY_1M_COLUMNS = (
     "timestamp", "underlying", "series", "expiry",
     "atm_spread_pct", "depth", "volume", "days_to_expiry",

@@ -683,13 +683,28 @@ async def poll_option_chain(
         loop_now = asyncio.get_running_loop().time()
         next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
         delay = next_tick - loop_now
+        overrun_seconds = max(-delay, 0.0)
         if delay < 0:
             logger.warning(
                 "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, -delay,
+                interval_seconds, overrun_seconds,
             )
             next_tick = loop_now
             delay = 0.0
+        # 2026-07-23(운영점검보고서 §2-1/§4 Fix#4): 관측 루프와 COCKPIT은 별도 프로세스라
+        # 공유 _RateLimiter의 실시간 배율을 COCKPIT이 직접 읽을 수 없다 — 매 사이클(60초)마다
+        # 싱글턴 행에 최신 배율/직전 밀림 초를 기록해 "오늘의 점검 요약" 배지가 재시작 없이
+        # 바로 보게 한다. 기록 실패가 폴링 루프 자체를 막으면 안 되므로 조용히 넘어간다.
+        try:
+            with db.get_connection() as conn:
+                # db.local_now()를 다시 부르지 않고 이번 사이클의 poll_time을 그대로 쓴다 — 일부
+                # 테스트가 db.local_now()를 정해진 시각 시퀀스로 모킹해두는데, 여기서 한 번 더
+                # 부르면 그 시퀀스를 예상보다 빨리 소진시켜 poll_time 자체가 어긋난다.
+                db.record_rate_limiter_status(
+                    conn, poll_time, rest_client.rate_limit_backoff_multiplier, overrun_seconds,
+                )
+        except Exception:
+            logger.warning("레이트리밋 근접도 기록 실패", exc_info=True)
         await asyncio.sleep(delay)
 
 

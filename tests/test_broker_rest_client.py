@@ -341,10 +341,10 @@ def test_rate_limiter_caps_interval_at_max_multiplier():
 def test_rate_limiter_recovers_toward_min_after_sustained_success():
     limiter = _RateLimiter(min_interval=1.0)
     limiter.record_rate_limit_hit()  # 1.0 -> 1.5로 넓어짐
-    for _ in range(7):
+    for _ in range(19):
         limiter.record_success()
-    assert limiter._current_interval == pytest.approx(1.5)  # 임계값(8건) 미달 — 아직 그대로
-    limiter.record_success()  # 8번째 연속 성공 — 이제 한 단계 되돌림
+    assert limiter._current_interval == pytest.approx(1.5)  # 임계값(20건) 미달 — 아직 그대로
+    limiter.record_success()  # 20번째 연속 성공 — 이제 한 단계 되돌림
     assert limiter._current_interval == pytest.approx(1.5 * 0.9)
 
 
@@ -369,9 +369,49 @@ def test_rate_limiter_disabled_when_min_interval_is_zero():
     assert limiter._current_interval == 0.0
 
 
+def test_rate_limiter_current_multiplier_reflects_backoff_state():
+    limiter = _RateLimiter(min_interval=1.0)
+    assert limiter.current_multiplier == pytest.approx(1.0)
+    limiter.record_rate_limit_hit()
+    assert limiter.current_multiplier == pytest.approx(1.5)
+    limiter.record_rate_limit_hit()
+    assert limiter.current_multiplier == pytest.approx(2.25)
+
+
+def test_rate_limiter_current_multiplier_is_one_when_disabled():
+    limiter = _RateLimiter(min_interval=0.0)
+    assert limiter.current_multiplier == 1.0
+
+
+def test_kis_rest_client_exposes_rate_limit_backoff_multiplier():
+    client = KISRestClient(_settings(), _token_daemon(), min_request_interval=1.0)
+    assert client.rate_limit_backoff_multiplier == pytest.approx(1.0)
+    client._rate_limiter.record_rate_limit_hit()
+    assert client.rate_limit_backoff_multiplier == pytest.approx(1.5)
+
+
+def test_rate_limiter_logs_on_backoff_widen(caplog):
+    limiter = _RateLimiter(min_interval=1.0)
+    with caplog.at_level("INFO", logger="mahdi.broker.rest_client"):
+        limiter.record_rate_limit_hit()
+    assert "레이트리밋 백오프 확대" in caplog.text
+    assert "1.50배" in caplog.text
+
+
+def test_rate_limiter_logs_on_backoff_recovery(caplog):
+    limiter = _RateLimiter(min_interval=1.0)
+    limiter.record_rate_limit_hit()  # 1.0 -> 1.5
+    with caplog.at_level("INFO", logger="mahdi.broker.rest_client"):
+        for _ in range(19):
+            limiter.record_success()
+        assert "레이트리밋 백오프 회복" not in caplog.text  # 임계값(20건) 미달까지는 조용함
+        limiter.record_success()  # 20번째 — 여기서만 로깅
+    assert "레이트리밋 백오프 회복" in caplog.text
+
+
 def test_get_widens_rate_limiter_on_egw00201_then_holds_after_one_success():
     # KISRestClient._get()을 통한 통합 검증 — 500+EGW00201을 실제로 받으면 다음 호출부터
-    # 페이싱 간격이 넓어지고, 그 뒤 성공 1건만으로는(임계값 8건 미달) 아직 되돌아가지 않는다.
+    # 페이싱 간격이 넓어지고, 그 뒤 성공 1건만으로는(임계값 20건 미달) 아직 되돌아가지 않는다.
     responses = iter(
         [
             httpx.Response(500, json={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다"}),
@@ -394,7 +434,7 @@ def test_get_widens_rate_limiter_on_egw00201_then_holds_after_one_success():
     assert client._rate_limiter._current_interval == pytest.approx(1.5)
 
     client.get_balance()
-    assert client._rate_limiter._current_interval == pytest.approx(1.5)  # 아직 임계값 미달
+    assert client._rate_limiter._current_interval == pytest.approx(1.5)  # 아직 임계값(20건) 미달
 
 
 def test_get_does_not_widen_rate_limiter_on_unrelated_500():

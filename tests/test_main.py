@@ -541,6 +541,7 @@ class _FakeRestClientChain:
     def __init__(self, resp: dict):
         self._resp = resp
         self.calls: list[str] = []
+        self.rate_limit_backoff_multiplier = 1.0
 
     def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
         self.calls.append(symbol)
@@ -860,6 +861,54 @@ def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeyp
         )
 
     assert sleep_calls == [60.0, 0.0]  # 정상 사이클은 60초 대기, 밀린 사이클은 따라잡지 않고 즉시 재기준
+
+
+def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
+    # 2026-07-23(운영점검보고서 §2-1/§4 Fix#4): COCKPIT이 관측 루프 프로세스의 실시간 배율을
+    # 직접 읽을 수 없으므로, 매 사이클마다 db.record_rate_limiter_status()로 남겨야 한다 —
+    # 이번 사이클이 60초 주기를 30초 넘겨 밀렸다면 그 overrun_seconds도 함께 기록돼야 한다.
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+    rest_client.rate_limit_backoff_multiplier = 2.25
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.record_rate_limiter_status",
+        lambda conn, checked_at, multiplier, overrun: recorded.append((checked_at, multiplier, overrun)),
+    )
+
+    # 1번째 사이클 종료 시각=1000.0 -> next_tick=1000+60=1060, 정상 60초 대기(overrun=0).
+    # 2번째 사이클 종료 시각=1200.0 -> next_tick=1060+60=1120을 이미 지나쳐 80초 밀림.
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=60,
+            )
+        )
+
+    assert len(recorded) == 2
+    assert recorded[0][1] == pytest.approx(2.25)
+    assert recorded[0][2] == pytest.approx(0.0)
+    assert recorded[1][2] == pytest.approx(80.0)
 
 
 class _FakeInvestorFlowRestClient:

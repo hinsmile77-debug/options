@@ -4,6 +4,51 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-24] 일일 운영점검 보고서(07-23) + fix 4건 구현 (레이트리미터 임계값 재검토, 상태전이 로깅, ZN 13:01 패턴 관찰 예정, COCKPIT 레이트리밋 배지)
+
+**트리거:** `docs/persnal-docs/daily_prompt.txt`의 일일 반복 워크플로 — 1차 요청으로 07-23(전날)
+로그를 조사해 `docs/동작점검/2026-07-23_마흐디_운영점검보고서.md` 작성, 2차 요청으로 그 보고서의
+fix 우선순위를 구현 진행. 이번 세션에서는 후속 프로젝트 messiah(`C:\Users\82108\PycharmProjects\fuoption`)
+방문도 사용자가 명시적으로 허용해, 같은 계약의 `_RateLimiter`/`RedisRateLimiter`/구조화 로깅
+패턴을 참고 자료로 활용함.
+
+**보고서 핵심 발견(1차 세션):** 07-22 저녁 fix 3건 중 잔존 프로세스 정리·COCKPIT 기동 마커는
+07-23 첫 실전 테스트를 완전히 통과했고 WS 재연결도 하루 종일 0건(관측 시작 이래 처음)이었다.
+그러나 레이트리미터 회복 임계값 조정(20→8)은 정반대로 작동해 EGW00201 비율·스케줄 밀림·평균/
+최대 지연 4개 지표 전부 07-22보다 악화됐다(같은 방법론으로 두 날을 나란히 집계해 확인). ZN
+이중 실패(KIS+yfinance) Slack 알림이 07-22와 07-23 모두 13:01대에 발생한 것도 우연치고는
+의심스러운 패턴으로 기록해둠.
+
+**구현한 fix (우선순위 순, 전체 370개 테스트 통과 — 신규 10개):**
+1. **`mahdi/broker/rest_client.py`** — `_RECOVERY_SUCCESS_THRESHOLD`를 20으로 원복(근거는
+   [[DECISION_LOG]] 2026-07-23 항목 참고 — 07-22 대 07-23 A/B 비교 + messiah 독립 기본값 20
+   교차검증). `record_rate_limit_hit()`/`record_success()`에 배율 실제 변경 시점 로깅 신규
+   추가(`logger.info`, 확대/회복 각각 1건씩), `KISRestClient.rate_limit_backoff_multiplier`
+   프로퍼티로 현재 배율 노출. `tests/test_broker_rest_client.py`에 신규 테스트 6개(임계값 원복
+   반영 2개 수정 + multiplier 속성 2개 + 로깅 2개).
+2. **`db/migrations/014_rate_limiter_status.sql` + `mahdi/data/db.py`** — `rate_limiter_status_log`
+   싱글턴 테이블(`shutdown_check_log`, migration 013과 동일한 id=TRUE 트릭) 신규.
+   `record_rate_limiter_status()`/`latest_rate_limiter_status()` 함수 쌍 추가.
+3. **`mahdi/main.py` `poll_option_chain()`** — 매 사이클(60초)마다 현재 배율·직전 사이클 밀림
+   초를 DB에 기록. `db.local_now()`를 다시 부르지 않고 이번 사이클의 `poll_time`을 재사용 —
+   처음엔 새로 호출했다가 `test_poll_option_chain_sends_gap_alert_after_5min_then_recovery_notice`가
+   `db.local_now()`를 정해진 시각 시퀀스로 모킹해두는 것과 충돌해 실패하는 것을 실제로 겪고
+   수정함(기록 자체는 best-effort try/except라 실패해도 폴링 루프는 안 죽는다). 신규 테스트 1개
+   (`test_poll_option_chain_records_rate_limiter_status_each_cycle`).
+4. **`mahdi/dashboard/data_source.py`** — `_rate_limiter_health_check()` 신규(배율 1.01배 이하면
+   ok, 초과면 warning, 기록 없으면 info), `get_health_summary()` 9번째→10번째 배지로 추가.
+   `app.py`는 `st.columns(len(health_checks))`로 이미 배지 개수에 완전히 무관하게 렌더링하고
+   있어 코드 변경 불필요(확인만 함). 신규 테스트 4개.
+5. **ZN 13:01 패턴**(우선순위 3): 코드 변경 대상이 아니라 관찰 항목 — [[NEXT_TODO]]에 다음 세션
+   확인 사항으로 기록.
+
+**보류 없음** — 이번 세션은 Docker Desktop 없이도 전부 구현 가능한 코드/테스트 작업이었음. 실제
+DB 라이브 반영(마이그레이션 014 적용, COCKPIT 새 배지 브라우저 렌더링, 내일 실거래일의 레이트
+리미터 로깅 실측)은 다음 세션(2026-07-27, 다음 거래일 전제) 확인 필요 — [[NEXT_TODO]] 참고.
+커밋은 사용자가 별도로 요청하지 않아 보류(작업 트리에 변경사항만 존재).
+
+---
+
 ## [2026-07-22] 2차 — 일일 운영점검 보고서 fix 3건 구현 (기동 전 좀비 프로세스 정리, 레이트리미터 재조정, COCKPIT 기동 마커)
 
 **트리거:** 1차 세션에서 작성한 `docs/동작점검/2026-07-22_마흐디_운영점검보고서.md`의 fix 우선순위대로

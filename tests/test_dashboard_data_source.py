@@ -13,6 +13,7 @@ from mahdi.dashboard.data_source import (
     _is_trading_hours,
     _option_chain_freshness_check,
     _option_chain_leg_balance_check,
+    _rate_limiter_health_check,
     _regime_fit_progress_check,
     _regime_stability_check,
     _schema_integrity_check,
@@ -413,6 +414,8 @@ class _FakeHealthCursor:
             self._kind, self._value = "one", self._responses.get("regime_fit_progress_row")
         elif "shutdown_check_log" in query:
             self._kind, self._value = "one", self._responses.get("shutdown_check_row")
+        elif "rate_limiter_status_log" in query:
+            self._kind, self._value = "one", self._responses.get("rate_limiter_status_row")
         else:
             self._kind, self._value = "one", None
 
@@ -800,6 +803,38 @@ def test_shutdown_reliability_check_handles_query_error():
     assert conn.rollback_calls == 1
 
 
+# --- _rate_limiter_health_check (§2-1/§4 Fix#4 "레이트리밋 근접도 배지") ---------------------------
+
+def test_rate_limiter_health_check_info_when_no_record_yet():
+    conn = _FakeHealthConnection({"rate_limiter_status_row": None})
+    check = _rate_limiter_health_check(conn)
+    assert check.status == "info"
+
+
+def test_rate_limiter_health_check_ok_when_no_backoff():
+    row = (datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc), 1.0, 0.0)
+    conn = _FakeHealthConnection({"rate_limiter_status_row": row})
+    check = _rate_limiter_health_check(conn)
+    assert check.status == "ok"
+    assert "1.00배" in check.detail
+
+
+def test_rate_limiter_health_check_warns_when_backing_off():
+    row = (datetime(2026, 7, 24, 13, 5, tzinfo=timezone.utc), 2.25, 18.7)
+    conn = _FakeHealthConnection({"rate_limiter_status_row": row})
+    check = _rate_limiter_health_check(conn)
+    assert check.status == "warning"
+    assert "2.25배" in check.detail
+    assert "18.7초" in check.detail
+
+
+def test_rate_limiter_health_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _rate_limiter_health_check(conn)
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
 # --- get_health_summary (오케스트레이션) ------------------------------------------------------------
 
 def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
@@ -825,12 +860,13 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
     monkeypatch.setattr("mahdi.dashboard.data_source._shutdown_reliability_check", make_check("shutdown"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._rate_limiter_health_check", make_check("rate_limiter"))
 
     result = get_health_summary()
 
     assert calls == [
         "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
-        "regime", "regime_fit_progress", "shutdown",
+        "regime", "regime_fit_progress", "shutdown", "rate_limiter",
     ]
     assert [c.label for c in result] == calls
 

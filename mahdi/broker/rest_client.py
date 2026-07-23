@@ -5,6 +5,7 @@ TR ID/경로 상수는 tr_codes.py 단일 소스를 사용한다.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -13,6 +14,8 @@ import httpx
 from mahdi.broker import tr_codes
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.config.settings import KISSettings
+
+logger = logging.getLogger("mahdi.broker.rest_client")
 
 # 2026-07-08 실측: main.py의 옵션체인/수급/유동성 폴링 루프 3개가 동시에(asyncio.gather) 60초
 # 주기로 REST를 호출하는데, 각 루프 내부는 순차 호출이라도 서로 다른 asyncio.to_thread 스레드가
@@ -46,14 +49,19 @@ class _RateLimiter:
 
     _BACKOFF_MULTIPLIER = 1.5  # 레이트리밋 감지될 때마다 현재 간격에 곱하는 값
     _MAX_INTERVAL_MULTIPLIER = 4.0  # 기준 간격(min_interval) 대비 최대 몇 배까지 늘어날 수 있는지
-    # 2026-07-22 재조정(운영점검보고서 §2-1): 임계값 20일 때는 4배(최대치)에서 1배로 완전히
-    # 되돌아오는 데 성공 약 260건이 필요했다(0.9배씩 13단계 × 20건) — 그 사이 간격이 계속
-    # 넓어진 채라 사이클이 60초 주기를 넘기는 "스케줄 밀림" 경고가 오늘 57건 발생했고, 그 동안
-    # 새 레이트리밋 적중이 또 겹치면 회복이 사실상 오후 내내 안 되는 패턴을 실측(83건/14,852건,
-    # 오전보다 오후에 집중). 8로 낮추면 같은 완전 회복에 약 104건(0.9배씩 13단계 × 8건)이면
-    # 충분해 회복 속도가 약 2.5배 빨라진다 — 그래도 순간적인 성공 1~2건만으로 바로 되돌리진
-    # 않도록(플래핑 방지) 한 자릿수 이상은 유지한다.
-    _RECOVERY_SUCCESS_THRESHOLD = 8  # 이만큼 연속 성공하면 간격을 한 단계 되돌림
+    # 2026-07-22 재조정 시도(운영점검보고서 §2-1): 임계값 20일 때는 4배(최대치)에서 1배로
+    # 완전히 되돌아오는 데 성공 약 260건이 필요해(0.9배씩 13단계 × 20건) 20으로는 회복이 느려
+    # 보였고, 그날 하루치(EGW00201 83건/14,852건, 스케줄 밀림 57건)를 근거로 8로 낮췄다.
+    # 2026-07-23 재검토(운영점검보고서 §2-1): 8로 바꾼 첫 전체 거래일(임계값 20 그대로였던
+    # 07-22와 동일 방법론으로 나란히 집계) 결과 EGW00201 비율(0.38%→0.48%)·스케줄 밀림
+    # (57→83건)·평균 지연(10.7초→18.7초)·최대 지연(45.5초→76.2초)이 전부 악화됐다 — 임계값을
+    # 너무 낮추면 백오프에서 너무 빨리 벗어나 다시 레이트리밋에 바로 부딪히는 "플래핑"이
+    # 실제로 일어났을 가능성이 높다(당시 커밋 메시지에도 이 위험이 언급돼 있었음). 후속
+    # 프로젝트 messiah(fuoption)도 같은 계약의 RateLimiter를 독립적으로 튜닝하며 기본값 20을
+    # 그대로 유지하고 있어(src/messiah/broker/kis/rest_client.py) 원래 값으로 되돌린다. 이번엔
+    # 아래 record_rate_limit_hit/record_success 로깅을 함께 추가해, 다음에 파라미터를 다시
+    # 바꿀 때는 간접 증상(EGW00201 횟수)이 아니라 실제 배율 전이 로그로 검증할 수 있게 한다.
+    _RECOVERY_SUCCESS_THRESHOLD = 20  # 이만큼 연속 성공하면 간격을 한 단계 되돌림
     _RECOVERY_FACTOR = 0.9  # 되돌릴 때 곱하는 축소 비율(급하게 되돌리지 않고 서서히)
 
     def __init__(self, min_interval: float) -> None:
@@ -62,6 +70,15 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._next_allowed = 0.0
         self._consecutive_successes = 0
+
+    @property
+    def current_multiplier(self) -> float:
+        """계산: 현재 페이싱 간격이 기준 간격(min_interval)의 몇 배인지 — 1.0이면 백오프 없음,
+        _MAX_INTERVAL_MULTIPLIER(4.0)에 가까울수록 레이트리밋에 강하게 걸려 있는 상태다.
+        COCKPIT 헬스체크(§2-1 고도화 방안, "레이트리밋 근접도 배지")가 읽는 값."""
+        if self._min_interval <= 0:
+            return 1.0
+        return self._current_interval / self._min_interval
 
     def wait(self) -> None:
         if self._min_interval <= 0:
@@ -75,18 +92,33 @@ class _RateLimiter:
             time.sleep(delay)
 
     def record_rate_limit_hit(self) -> None:
-        """레이트리밋 실패가 감지되면 호출 — 다음 wait()부터 넓어진 간격이 바로 적용된다."""
+        """레이트리밋 실패가 감지되면 호출 — 다음 wait()부터 넓어진 간격이 바로 적용된다.
+
+        2026-07-23(운영점검보고서 §2-1 Fix#1): 배율 확대 시점마다 이전/이후 배율을 로깅한다 —
+        지금까지는 EGW00201 발생 횟수·스케줄 밀림 같은 간접 증상으로만 백오프 상태를 추정할 수
+        있었고, 그래서 07-22의 임계값 조정이 역효과였다는 것도 다음날 로그를 정밀분석해야만
+        알 수 있었다. 이제는 이 로그 한 줄로 "지금 몇 배 백오프 중인지"를 바로 알 수 있다."""
         if self._min_interval <= 0:
             return
         with self._lock:
             self._consecutive_successes = 0
+            before = self._current_interval
             max_interval = self._min_interval * self._MAX_INTERVAL_MULTIPLIER
             self._current_interval = min(
                 max(self._current_interval, self._min_interval) * self._BACKOFF_MULTIPLIER, max_interval
             )
+            after = self._current_interval
+        if after != before:
+            logger.info(
+                "레이트리밋 백오프 확대: %.2fs -> %.2fs (기준 대비 %.2f배)",
+                before, after, after / self._min_interval,
+            )
 
     def record_success(self) -> None:
-        """호출 성공마다 호출 — 넓어진 간격이 있을 때만 연속 성공을 세어 서서히 되돌린다."""
+        """호출 성공마다 호출 — 넓어진 간격이 있을 때만 연속 성공을 세어 서서히 되돌린다.
+
+        2026-07-23: 실제로 한 단계 되돌린 시점만 로깅한다(성공마다 찍으면 정상 상태에서도
+        매 호출 로그가 남아 record_rate_limit_hit 로그가 파묻힌다)."""
         if self._current_interval <= self._min_interval:
             return
         with self._lock:
@@ -95,7 +127,15 @@ class _RateLimiter:
             self._consecutive_successes += 1
             if self._consecutive_successes >= self._RECOVERY_SUCCESS_THRESHOLD:
                 self._consecutive_successes = 0
+                before = self._current_interval
                 self._current_interval = max(self._current_interval * self._RECOVERY_FACTOR, self._min_interval)
+                after = self._current_interval
+            else:
+                return
+        logger.info(
+            "레이트리밋 백오프 회복: %.2fs -> %.2fs (기준 대비 %.2f배)",
+            before, after, after / self._min_interval,
+        )
 
 
 def _is_kis_rate_limit_error(exc: httpx.HTTPStatusError) -> bool:
@@ -124,6 +164,11 @@ class KISRestClient:
         self._token_daemon = token_daemon
         self._client = client or httpx.Client(timeout=10.0)
         self._rate_limiter = _RateLimiter(min_request_interval)
+
+    @property
+    def rate_limit_backoff_multiplier(self) -> float:
+        """현재 공유 레이트리미터의 배율(1.0=백오프 없음) — COCKPIT 헬스체크가 읽는 값."""
+        return self._rate_limiter.current_multiplier
 
     @property
     def _domain(self) -> str:
