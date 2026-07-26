@@ -4,6 +4,50 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-24] 스케줄 밀림 원인 후보(신규 DB 쓰기)는 제어 흐름을 바꾸지 않고 계측만 먼저 추가; ZN 이중실패 알림은 "즉시 재시도"가 아니라 "스트릭 조건"으로 완화
+
+**결정 1 (레이트리미터 DB 기록 계측):** `poll_option_chain`의 `record_rate_limiter_status()`
+DB 쓰기를 `asyncio.to_thread`로 감싸 이벤트 루프 블로킹을 없애는 방안 대신, 제어 흐름은 그대로
+두고 `time.monotonic()`으로 소요시간만 계측해 `RATE_LIMITER_STATUS_WRITE_SLOW_SECONDS`(0.2초)
+초과 시 경고만 남긴다.
+
+**Why:** 07-24 운영점검보고서 §2-1에서 이 신규 DB 쓰기(07-23 밤 추가, 07-24 첫 실전 가동)를
+스케줄 밀림 3일 연속 악화의 원인 후보로 지목했다. `asyncio.to_thread`로 옮기는 게 더 근본적인
+수정처럼 보이지만, `poll_option_chain`의 next_tick 스케줄링을 검증하는 기존 테스트들
+(`test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work`,
+`test_poll_option_chain_records_rate_limiter_status_each_cycle`)이 `asyncio.get_running_loop()`
+전체를 `.time()`만 있는 가짜 객체로 모킹해뒀다 — `asyncio.to_thread`는 내부적으로 진짜 이벤트
+루프의 `run_in_executor`를 요구하므로, 이 모킹과 충돌해 스케줄링 검증 자체가 깨질 위험이 제어
+흐름을 바꾸는 이득보다 크다고 판단했다. 원인이 확정되지 않은 상태에서 위험한 변경을 먼저 하기보다,
+계측을 먼저 넣어 다음 날 실측으로 가설을 검증하는 게 순서상 안전하다.
+
+**How to apply:** 스케줄링에 민감한 폴링 루프(`poll_option_chain`/`poll_investor_flow`/
+`poll_expiry_liquidity` 등, 전부 같은 next_tick 패턴)에 성능 개선을 적용할 때는 먼저 기존
+스케줄링 테스트가 `asyncio.get_running_loop()`나 `asyncio.sleep()`을 어떻게 모킹해뒀는지 확인할
+것 — 특히 `asyncio.to_thread`/`run_in_executor`처럼 실제 이벤트 루프 기능을 요구하는 API를 새로
+쓰려면 그 모킹 방식 자체를 다시 설계해야 할 수 있다.
+
+**결정 2 (ZN 이중실패 알림 완화 방식):** 처음엔 KIS+yfinance 둘 다 실패한 직후 `asyncio.sleep()`로
+짧게 대기했다 한 번 재시도하는 방식을 설계했으나, 최종적으로는 `MACRO_SNAPSHOT_INSERT_FAILURE_
+ALERT_STREAK`와 동일한 "연속 N회 실패해야 알림" 스트릭 패턴으로 교체했다(`ZN_DUAL_FAILURE_
+ALERT_STREAK=2`).
+
+**Why:** `asyncio.sleep()` 기반 재시도안은 `_collect_macro_snapshot_cycle`(거의 모든
+`poll_macro_snapshot` 테스트가 거치는 공통 경로) 안에 새 sleep 호출을 추가하는 셈이라, 기존
+테스트 11개 전부가 `mahdi.main.asyncio.sleep`을 call-count로 모킹해 사이클 수를 통제하고
+있어 전부 깨졌다(직접 시도해 확인). 반면 스트릭 패턴은 이미 5분 주기로 자연스럽게 도는 다음
+사이클을 "재시도"로 재사용하므로 새 sleep 호출이 전혀 없다 — 실제로 적용해보니 기존 테스트
+11개가 단 하나도 수정 없이 그대로 통과했다. 부수적으로도 스트릭 방식이 더 낫다: 즉시 재시도는
+같은 순간의 동기화된 외부 장애(3일 연속 13:01 재현 패턴이 시사하는 것)를 피하지 못할 가능성이
+높은 반면, 10분 뒤에도 지속되는지 보는 쪽이 "일시적 블립 vs 진짜 결손"을 더 잘 구분한다.
+
+**How to apply:** 기존 폴링 루프에 재시도/완화 로직을 추가할 때, "그 사이클 안에서 즉시 재시도"는
+테스트가 sleep 호출 횟수를 세어 루프를 통제하는 이 코드베이스의 관례와 충돌하기 쉽다 — 대신 이미
+있는 다음 정규 사이클을 재시도 삼아 스트릭 카운터로 처리하는 쪽을 먼저 검토할 것(테스트 영향이
+훨씬 적고, `insert_failure_streak`/`gap_alerted` 등 이미 검증된 동일 패턴이 여럿 있다).
+
+---
+
 ## [2026-07-23] 레이트리미터 회복 임계값을 20으로 되돌림 — 07-22 조정이 역효과였음을 A/B로 확인, 백오프 상태전이 로깅 신규 도입
 
 **결정:** `_RateLimiter._RECOVERY_SUCCESS_THRESHOLD`를 07-22에 낮춘 8에서 원래 값 20으로 되돌린다.

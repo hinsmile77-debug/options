@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -911,6 +912,85 @@ def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
     assert recorded[1][2] == pytest.approx(80.0)
 
 
+def test_poll_option_chain_warns_when_rate_limiter_status_write_is_slow(monkeypatch, caplog):
+    # 2026-07-24(운영점검보고서 §2-1/§4 Fix#1): record_rate_limiter_status() 기록이 07-23 밤
+    # 처음 추가된 뒤 스케줄 밀림이 07-24까지 3일 연속 악화됐다 — 이 동기 DB 왕복 자체가 원인
+    # 후보인지 다음 점검에서 실측으로 가리려면 소요시간이 임계(RATE_LIMITER_STATUS_WRITE_SLOW_
+    # SECONDS=0.2초)를 넘을 때 경고가 남아야 한다. time.monotonic() 자체를 모킹하면 실제
+    # asyncio 이벤트 루프 내부(진짜 to_thread/executor를 쓰는 이 테스트에서는 스케줄링에
+    # time.monotonic()을 광범위하게 씀)까지 같은 전역 함수를 공유해 얼마나 소진되는지 예측할 수
+    # 없다 — 대신 record_rate_limiter_status 자체가 실제로 느리게(time.sleep) 걸리게 해서
+    # 실측 경과시간으로 검증한다.
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "mahdi.main.db.record_rate_limiter_status", lambda *a, **k: time.sleep(0.25)
+    )
+
+    fake_loop = _FakeLoop([1000.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client,
+                    [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                    _FakeMaster(),
+                    interval_seconds=60,
+                )
+            )
+
+    assert "레이트리밋 근접도 기록" in caplog.text
+
+
+def test_poll_option_chain_does_not_warn_when_rate_limiter_status_write_is_fast(monkeypatch, caplog):
+    # 위 테스트의 반대 경우 — 정상 속도(임계 0.2초 미만)면 계측 경고가 남으면 안 된다(잡음 방지).
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+
+    fake_loop = _FakeLoop([1000.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client,
+                    [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                    _FakeMaster(),
+                    interval_seconds=60,
+                )
+            )
+
+    assert "레이트리밋 근접도 기록" not in caplog.text
+
+
 class _FakeInvestorFlowRestClient:
     """섹터(F001/OC01/OP01)별로 다른 응답을 돌려주고, 지정한 섹터는 예외를 던진다."""
 
@@ -1703,9 +1783,11 @@ def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch)
 
 
 def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monkeypatch):
-    # 2026-07-19(§5-4): KIS·yfinance 폴백 둘 다 실패해 zn_front=None인 상태가 적재 성공한 첫
-    # 사이클에 감지되면 Slack으로 한 번만 알린다 — 5분마다 반복 알리면 하루 종일 스팸이 되므로,
-    # 이 프로세스 실행(거래일)당 최초 1회만 보내야 한다.
+    # 2026-07-19(§5-4): KIS·yfinance 폴백 둘 다 실패해 zn_front=None인 상태가 이어지면 Slack으로
+    # 한 번만 알린다 — 5분마다 반복 알리면 하루 종일 스팸이 되므로, 이 프로세스 실행(거래일)당
+    # 최초 1회만 보내야 한다. 2026-07-24(§2-3/§4 Fix#3) 갱신: ZN_DUAL_FAILURE_ALERT_STREAK(=2)
+    # 연속 실패해야 알리도록 바뀌어, 이 테스트가 2사이클을 돌리는 것 자체가 정확히 그 스트릭
+    # 조건을 채우는 경로가 됐다(1사이클만으로는 알림이 안 감 — 별도 테스트로 검증).
     master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
     rest_client = _FakeOverseasRestClient(
         future_prices={
@@ -1745,6 +1827,99 @@ def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monk
     message, level = notify_calls[0]
     assert level == "WARNING"
     assert "ZN" in message
+
+
+def test_poll_macro_snapshot_does_not_alert_zn_on_single_blip(monkeypatch):
+    # 2026-07-24(운영점검보고서 §2-3/§4 Fix#3): 3일 연속 13:01 재현이 확정됐지만, 매 사이클 첫
+    # 실패에 바로 알리면 몇 분짜리 일시적 블립까지 결손으로 보고하게 된다 — 연속 실패가
+    # ZN_DUAL_FAILURE_ALERT_STREAK(=2) 미만(=1회)이면 아직 알리면 안 된다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")  # 딱 1사이클만 돌린다
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 1
+    assert written[0]["zn_front"] is None
+    assert notify_calls == []  # 1회 실패만으로는 알림 없음
+
+
+def test_poll_macro_snapshot_zn_streak_resets_after_recovery(monkeypatch):
+    # 2026-07-24(§4 Fix#3): 연속 실패 스트릭이 중간에 한 번 성공하면 리셋돼야 한다 — 실패 1회 +
+    # 성공 1회 + 실패 2회를 돌리면, 마지막 두 번의 연속 실패에서만 스트릭이 다시 쌓이므로(성공
+    # 사이클이 카운트를 끊으므로) 세 번째 사이클(성공 이후 첫 실패)에서는 아직 알리면 안 되고
+    # 네 번째 사이클(성공 이후 두 번째 연속 실패)에서 비로소 알려야 한다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+    # 사이클 순서대로 ZN 폴백값을 실패/성공/실패/실패로 지정 — fetch_last_close가 사이클마다
+    # 한 번씩(ZN만) 호출되는 것을 이용해 호출 순번으로 결과를 결정한다.
+    zn_results = iter([None, 108.50, None, None])
+
+    def _fetch(symbol: str) -> float | None:
+        if symbol == yfinance_fallback.ZN_FALLBACK_SYMBOL:
+            return next(zn_results)
+        return None
+
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fetch)
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 4:  # 4사이클(실패/성공/실패/실패) 전부 돌린다
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 4
+    assert [row["zn_front"] for row in written] == [None, 108.50, None, None]
+    assert len(notify_calls) == 1  # 성공으로 스트릭이 끊긴 뒤 다시 2연속 실패한 4번째 사이클에서만 알림
 
 
 def test_poll_macro_snapshot_sends_insert_failure_alert_after_streak(monkeypatch):

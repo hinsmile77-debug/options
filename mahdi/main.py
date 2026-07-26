@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from datetime import date, datetime, time as dtime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -90,11 +91,26 @@ CYCLE_RETRY_BACKOFF_SECONDS = 5.0
 # 누적돼) option_analysis_1m 결손을 Slack으로 알린다. 운영점검보고서가 예시로 든 기준(5분)을 그대로 씀.
 OPTION_CHAIN_GAP_ALERT_SECONDS = 300.0
 
+# 2026-07-24(운영점검보고서 2026-07-24 §2-1/§4 Fix#1): record_rate_limiter_status() 기록이
+# 07-23 밤 처음 추가된 뒤 07-24 하루치 실측에서 스케줄 밀림 건수가 레이트리미터 임계값을
+# 20으로 되돌렸는데도(직접 목표였던 EGW00201 비율은 07-22 수준으로 정확히 회복) 3일 연속
+# 최고치를 기록했다 — 이 동기 DB 왕복(커넥션 풀 없이 매번 새 TCP 연결)이 원인 후보로 지목돼,
+# 소요시간이 이 값(초)을 넘으면 경고를 남겨 다음 점검에서 실측 근거로 쓴다. 통상적인 로컬
+# Docker Postgres 왕복(수~수십 ms)보다 넉넉히 잡아 잡음(GC 등 일시적 지연)은 걸러낸다.
+RATE_LIMITER_STATUS_WRITE_SLOW_SECONDS = 0.2
+
 # 2026-07-21(장전 점검 후속) — macro_snapshot_5m INSERT가 연속 실패하면(2026-07-21 실측:
 # db/migrations 010/011 라이브 미적용으로 UndefinedColumn이 종일 반복됨) Slack으로 알린다.
 # 사이클 자체가 이미 5분 주기라 1회 실패는 일시적 DB 지연 등일 수 있어 즉시 알리지 않고, 2회
 # 연속(=10분)부터 스키마 불일치 같은 지속성 문제로 보고 알린다.
 MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK = 2
+
+# 2026-07-24(운영점검보고서 2026-07-24 §2-3/§4 Fix#3): ZN(10년 국채선물) KIS·yfinance 이중
+# 실패가 07-22/07-23/07-24 3일 연속 13:01 근처(±5초)로 재현돼 우연이 아닌 것으로 확정됐다.
+# 그렇다고 매번 첫 실패에 바로 알리면(기존 동작) 몇 분짜리 일시적 블립까지 "결손"으로 보고하게
+# 된다 — MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK와 동일한 패턴으로, 연속 2회(=10분) 이상
+# 지속돼야 진짜 결손으로 보고 알린다(1회는 일시적 블립일 수 있어 조용히 넘어감).
+ZN_DUAL_FAILURE_ALERT_STREAK = 2
 
 # VPIN 등거래량 버킷 크기 — 실거래 일평균거래량 관찰 전까지 쓰는 잠정치. 학계 관례는
 # "일평균거래량/50"이지만 이 모의투자 환경의 실제 거래량 분포를 아직 모른다(2026-07-06 결정).
@@ -695,6 +711,15 @@ async def poll_option_chain(
         # 공유 _RateLimiter의 실시간 배율을 COCKPIT이 직접 읽을 수 없다 — 매 사이클(60초)마다
         # 싱글턴 행에 최신 배율/직전 밀림 초를 기록해 "오늘의 점검 요약" 배지가 재시작 없이
         # 바로 보게 한다. 기록 실패가 폴링 루프 자체를 막으면 안 되므로 조용히 넘어간다.
+        # 2026-07-24(운영점검보고서 §2-1/§4 Fix#1): 이 기록이 07-23 밤 처음 추가된 뒤 07-24
+        # 하루치 실측에서 스케줄 밀림이 임계값 원복과 무관하게 3일 연속 악화됐다 — 이 동기 DB
+        # 왕복(커넥션 풀 없이 매번 새 TCP 연결을 열고 닫음)이 원인 후보다. asyncio.to_thread로
+        # 옮기는 방안도 검토했으나, 위 next_tick 스케줄링을 검증하는 기존 테스트들이
+        # asyncio.get_running_loop()를 시각만 반환하는 가짜 객체로 통째로 모킹해둬(to_thread
+        # 내부는 실제 이벤트 루프의 run_in_executor를 요구) 제어 흐름을 바꾸면 그 모킹과 충돌해
+        # 더 위험해진다. 그래서 우선은 제어 흐름은 그대로 두고 소요시간만 계측한다 —
+        # time.monotonic()은 이벤트 루프 시계와 무관해 기존 스케줄링 테스트에 영향을 주지 않는다.
+        db_write_started = time.monotonic()
         try:
             with db.get_connection() as conn:
                 # db.local_now()를 다시 부르지 않고 이번 사이클의 poll_time을 그대로 쓴다 — 일부
@@ -705,6 +730,12 @@ async def poll_option_chain(
                 )
         except Exception:
             logger.warning("레이트리밋 근접도 기록 실패", exc_info=True)
+        db_write_seconds = time.monotonic() - db_write_started
+        if db_write_seconds > RATE_LIMITER_STATUS_WRITE_SLOW_SECONDS:
+            logger.warning(
+                "레이트리밋 근접도 기록에 %.2f초 소요(임계 %.1f초 초과) — 스케줄 밀림 원인 후보 확인용 계측",
+                db_write_seconds, RATE_LIMITER_STATUS_WRITE_SLOW_SECONDS,
+            )
         await asyncio.sleep(delay)
 
 
@@ -1112,11 +1143,17 @@ async def poll_macro_snapshot(
     실패 조건: 이번 사이클 전체가 실패하면(_collect_macro_snapshot_cycle이 None) 적재를
               건너뛰고 다음 정규 사이클을 기다린다 — 재시도 백오프는 두지 않는다(사이클당
               REST 호출이 4건뿐이라 다른 폴러만큼 레이트리밋에 취약하지 않음).
-    알림(2026-07-19, §5-4; 2026-07-20 문구 갱신): 적재에 성공한 첫 사이클에서 zn_front가 그때도
-              None이면(KIS 미구독 + yfinance 폴백까지 실패 — 둘 다 안 되는 경우만 해당,
-              yfinance_fallback.py 참고) Slack으로 한 번만 알린다. 5분마다 매번 알리면 하루 종일
-              (정규장 기준 최대 78회) 반복 경고가 되므로, 이 프로세스 실행당(=거래일당, 매일
-              재시작되므로) 최초 1회만 보낸다.
+    알림(2026-07-19, §5-4; 2026-07-20 문구 갱신; 2026-07-24 스트릭 조건 추가): zn_front가
+              ZN_DUAL_FAILURE_ALERT_STREAK회 연속(KIS 미구독 + yfinance 폴백까지 실패 — 둘 다
+              안 되는 경우만 해당, yfinance_fallback.py 참고) None이면 Slack으로 한 번만
+              알린다. 2026-07-24 운영점검보고서 §2-3: 이 이중 실패가 07-22/07-23/07-24 3일
+              연속 13:01 근처(±5초)로 재현돼 우연이 아닌 것으로 확정됐지만, 그렇다고 매
+              사이클(5분) 첫 실패에 바로 알리면 몇 분짜리 일시적 블립까지 결손으로 보고하게
+              된다 — insert_failure_streak와 동일한 패턴으로 연속 실패가 누적돼야만 알린다
+              (한 번이라도 성공하면 스트릭만 0으로 리셋). cbot_alert_sent 자체는 기존 설계
+              그대로 이 프로세스 실행당(=거래일당) 영구 latch를 유지한다 — 정규장 최대
+              78사이클 동안 간헐적으로 반복 실패할 경우까지 재알림하면 스팸이 되기 때문
+              (2026-07-19 결정 유지, 스트릭 조건은 "언제" 그 최초 1회를 보낼지만 늦춘다).
     알림(2026-07-21 추가): INSERT 자체가 MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK회 연속
               실패하면(2026-07-21 실측: 마이그레이션 라이브 미적용으로 UndefinedColumn이 종일
               반복됐는데 로그에만 WARNING으로 남고 아무도 알아채지 못함) Slack으로 알린다. 이후
@@ -1125,6 +1162,7 @@ async def poll_macro_snapshot(
     """
     next_tick: float | None = None
     cbot_alert_sent = False
+    zn_dual_failure_streak = 0
     insert_failure_streak = 0
     insert_failure_alerted = False
     while True:
@@ -1156,11 +1194,15 @@ async def poll_macro_snapshot(
                         "— db/migrations 라이브 미적용(스키마 불일치) 등 DB 문제일 수 있습니다. 로그 확인 필요.",
                         "WARNING",
                     )
-            if row["zn_front"] is None and not cbot_alert_sent:
+            if row["zn_front"] is None:
+                zn_dual_failure_streak += 1
+            else:
+                zn_dual_failure_streak = 0
+            if zn_dual_failure_streak >= ZN_DUAL_FAILURE_ALERT_STREAK and not cbot_alert_sent:
                 cbot_alert_sent = True
                 notify.notify(
-                    "ZN(10년 국채선물) 데이터를 KIS·yfinance 폴백 양쪽 모두에서 가져오지 못했습니다 "
-                    "— zn_front가 계속 NULL. 네트워크 상태 또는 yfinance 응답을 확인해주세요.",
+                    f"ZN(10년 국채선물) 데이터를 KIS·yfinance 폴백 양쪽 모두에서 {zn_dual_failure_streak}회 "
+                    "연속 가져오지 못했습니다 — zn_front가 계속 NULL. 네트워크 상태 또는 yfinance 응답을 확인해주세요.",
                     "WARNING",
                 )
 
