@@ -139,6 +139,25 @@ EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 300
 # (근본 수정은 poll_option_chain/poll_investor_flow의 고정 틱 스케줄링, 이건 보조 완화).
 EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS = 30.0
 
+# 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사, 스케줄 밀림 근본원인 확정 후속): 07-09에
+# poll_expiry_liquidity에만 오프셋을 준 뒤로 poll_investor_flow와 poll_macro_snapshot은 여전히
+# 오프셋 없이 poll_option_chain과 같은 순간(t=0)에 기동해왔다 — 이번 재수사에서 라이브 계측
+# (rate_limit_total_calls 전후차)으로 확인한 결과, poll_investor_flow(옵션체인과 동일하게 60초
+# 주기)가 매 사이클 거의 항상 겹쳐 정상 상태 기준선 콜 3건(투자자 수급 3세그먼트) 오염을 유발했고,
+# 콜드스타트 직후에는 4개 폴러 전부가 동시에 첫 사이클을 돌며 20건까지 겹쳐 REST수집이 48.6초까지
+# 치솟는 걸 실측했다(콜당 정확히 ~1.0초씩 REST수집 시간이 늘어남, 옵션체인 사이클 소요 분해
+# 로그의 "타폴러동시호출추정"으로 확인). poll_expiry_liquidity와 동일한 startup_offset_seconds
+# 패턴을 나머지 두 폴러에도 적용해 4개 폴러의 위상을 60초 구간 안에서 0/15/30/45초로 고르게
+# 분산한다 — investor_flow(15초)와 macro_snapshot(45초)은 서로 다른 잔여(mod 60)를 갖도록 골라
+# expiry_liquidity(30초, 300초 주기)와도 겹치지 않는다(15/45는 300으로 나눠도 30과 다른 위상).
+# 공유 _RateLimiter 자체(전체 앱키 공용 1건/초 한도, 2026-07-08/07-20 실측)는 그대로 유지 —
+# 폴러별로 페이서를 분리하면 합산 호출 빈도가 그 실측 한도를 넘어 500 폭주가 재발할 위험이 있어
+# (그 위험 때문에 애초에 단일 공유 리미터로 합쳤던 것, 위 2026-07-08 이력 참고) 이번엔 손대지
+# 않는다 — 위상 분산은 총 호출량이나 페이싱 정책을 바꾸지 않고 "언제 겹치는지"만 조정하는
+# 저위험 완화책이다.
+INVESTOR_FLOW_STARTUP_OFFSET_SECONDS = 15.0
+MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS = 45.0
+
 
 class _WebsocketsAdapter(WSConnection):
     """websockets 라이브러리의 연결 객체를 KISWebSocketClient가 기대하는 프로토콜에 맞춘다."""
@@ -630,24 +649,54 @@ async def poll_option_chain(
     gap_alerted = False
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
+        # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 후속): record_rate_limiter_status()
+        # 소요시간(db_write_seconds, 아래)만 계측해서는 07-27 실측(슬로우 경고 0건)처럼 그
+        # 가설이 반증돼도 다음 후보를 못 좁힌다 — 사이클 전체를 REST수집/DB적재/상태기록/기타
+        # 네 구간으로 나눠 어디가 실제로 늘어나는지 매 사이클 비교할 수 있게 한다.
+        cycle_started = time.monotonic()
         poll_time = db.local_now().replace(second=0, microsecond=0)
+        # 2026-07-28: 공유 _RateLimiter는 이 폴러 혼자 쓰는 게 아니라 poll_investor_flow/
+        # poll_expiry_liquidity/poll_macro_snapshot과 asyncio.gather로 동시에 나눠 쓴다
+        # (main.py의 run_observation_loop가 KISRestClient 인스턴스 하나를 전부에 넘김) — REST수집
+        # 소요시간이 이 사이클이 실제로 시도한 콜 수(own_calls_expected, 아래)만으로 설명되는지,
+        # 아니면 그 사이 다른 폴러가 같은 페이서에 끼어든 콜이 있는지(rate_limit_total_calls
+        # 차이로 역산) 구분하기 위해 전후 값을 남긴다. 속성이 없는 테스트 더블에서도 죽지 않게
+        # getattr 기본값 None을 쓴다(있으면 실측, 없으면 "측정 불가"로 조용히 건너뜀).
+        calls_before = getattr(rest_client, "rate_limit_total_calls", None)
+        collect_started = time.monotonic()
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
             rest_client, books, master, underlying, poll_time, warning_throttle
         )
+        collect_seconds = time.monotonic() - collect_started
 
         if not any_strikes:
             next_tick = None  # 구독 전이므로 아직 고정 스케줄을 시작하지 않음
             await asyncio.sleep(2.0)
             continue
 
+        retried = False
+        own_calls_expected = sum(
+            len(subscription_manager.desired_strikes) * 2
+            for subscription_manager, _ in books
+            if subscription_manager.desired_strikes
+        )
         if not rows:
             logger.warning("옵션 체인 폴링 전체 실패 — %.0f초 후 재시도", retry_backoff_seconds)
             await asyncio.sleep(retry_backoff_seconds)
+            retried = True
+            retry_started = time.monotonic()
             rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
                 rest_client, books, master, underlying, poll_time, warning_throttle
             )
+            collect_seconds += time.monotonic() - retry_started
             if not rows:
                 logger.warning("옵션 체인 폴링 재시도도 실패 — 이번 사이클 포기")
+        calls_after = getattr(rest_client, "rate_limit_total_calls", None)
+        if calls_before is None or calls_after is None:
+            other_poller_calls: int | None = None
+        else:
+            own_calls_actual = own_calls_expected * (2 if retried else 1)
+            other_poller_calls = max((calls_after - calls_before) - own_calls_actual, 0)
 
         if rows:
             if gap_alerted:
@@ -666,6 +715,7 @@ async def poll_option_chain(
 
         _update_atm_iv(regime_state_machine, rows, latest_spot)
 
+        insert_started = time.monotonic()
         if rows:
             with db.get_connection() as conn:
                 for row in rows:
@@ -695,6 +745,10 @@ async def poll_option_chain(
                     except Exception:
                         logger.warning("기초자산 스팟 적재 실패", exc_info=True)
                         conn.rollback()
+        insert_seconds = time.monotonic() - insert_started
+        other_poller_calls_text = (
+            "측정불가" if other_poller_calls is None else f"{other_poller_calls}건"
+        )
 
         loop_now = asyncio.get_running_loop().time()
         next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
@@ -702,8 +756,10 @@ async def poll_option_chain(
         overrun_seconds = max(-delay, 0.0)
         if delay < 0:
             logger.warning(
-                "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, overrun_seconds,
+                "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준 "
+                "(REST수집 %.2f초, DB적재 %.2f초, rows=%d%s, 타폴러동시호출추정=%s)",
+                interval_seconds, overrun_seconds, collect_seconds, insert_seconds, len(rows),
+                ", 재시도함" if retried else "", other_poller_calls_text,
             )
             next_tick = loop_now
             delay = 0.0
@@ -736,6 +792,24 @@ async def poll_option_chain(
                 "레이트리밋 근접도 기록에 %.2f초 소요(임계 %.1f초 초과) — 스케줄 밀림 원인 후보 확인용 계측",
                 db_write_seconds, RATE_LIMITER_STATUS_WRITE_SLOW_SECONDS,
             )
+        # 2026-07-28: 위 db_write_seconds 계측은 07-27 실측(슬로우 경고 0건)으로 "record_rate_
+        # limiter_status 쓰기가 원인"이라는 07-24 가설을 반증했다 — 다음 후보(REST수집/옵션체인
+        # DB적재)를 밀린 사이클뿐 아니라 정상 사이클과도 비교할 수 있도록 매 사이클 INFO로
+        # 남긴다("기타"는 위 세 구간으로 설명 안 되는 나머지 — notify.notify()의 DB 조회,
+        # asyncio.to_thread 컨텍스트 스위칭, 재시도 대기(retry_backoff_seconds), 이벤트 루프
+        # 스케줄링 잡음 등). WARNING이 아니라 INFO인 이유: 정상 사이클도 함께 쌓아야 "밀릴 때만
+        # 유독 어떤 구간이 늘어나는지" 비교 기준선이 생긴다 — 하루 약 405사이클이라 로그 볼륨
+        # 부담도 크지 않다.
+        other_seconds = max(
+            (time.monotonic() - cycle_started) - collect_seconds - insert_seconds - db_write_seconds,
+            0.0,
+        )
+        logger.info(
+            "옵션체인 사이클 소요 분해: REST수집 %.2f초 + DB적재 %.2f초 + 상태기록 %.2f초 + 기타 %.2f초 "
+            "(rows=%d, 밀림=%.1f초%s, 타폴러동시호출추정=%s)",
+            collect_seconds, insert_seconds, db_write_seconds, other_seconds,
+            len(rows), overrun_seconds, ", 재시도함" if retried else "", other_poller_calls_text,
+        )
         await asyncio.sleep(delay)
 
 
@@ -1133,9 +1207,13 @@ async def poll_macro_snapshot(
     rest_client: KISRestClient,
     overseas_master: OverseasFutureMaster,
     interval_seconds: float = MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS,
+    startup_offset_seconds: float = 0.0,
 ) -> None:
     """
-    입력: REST 클라이언트, 해외선물 종목코드 마스터(main() 기동 시 1회 로드).
+    입력: REST 클라이언트, 해외선물 종목코드 마스터(main() 기동 시 1회 로드), 기동 시 최초
+         사이클을 지연시킬 초(startup_offset_seconds — 2026-07-28 추가: poll_expiry_liquidity의
+         2026-07-09 패턴과 동일 — 오프셋 없이는 매 5분마다 poll_option_chain과 같은 순간에
+         겹친다).
     계산: Cross-asset stress 원시값(VIX 기간구조·USDCNH·US10Y, v6 §7.3)을 5분 주기로
          macro_snapshot_5m에 적재한다. poll_option_chain/poll_investor_flow와 동일하게 절대시각
          고정 틱(next_tick)으로 다음 사이클을 예약해 사이클 소요시간에 따라 실제 주기가 밀리지
@@ -1160,6 +1238,9 @@ async def poll_macro_snapshot(
               한 번이라도 성공하면 복구 알림을 보내고 스트릭/알림 상태를 리셋 — gap_alerted
               (poll_option_chain)와 동일한 "지속되면 알리고, 회복되면 알린다" 패턴.
     """
+    if startup_offset_seconds > 0:
+        await asyncio.sleep(startup_offset_seconds)
+
     next_tick: float | None = None
     cbot_alert_sent = False
     zn_dual_failure_streak = 0
@@ -1267,9 +1348,13 @@ async def poll_investor_flow(
     underlying: str = UNDERLYING,
     interval_seconds: float = OPTION_CHAIN_POLL_INTERVAL_SECONDS,
     retry_backoff_seconds: float = CYCLE_RETRY_BACKOFF_SECONDS,
+    startup_offset_seconds: float = 0.0,
 ) -> None:
     """
-    입력: REST 클라이언트, 기초자산 라벨.
+    입력: REST 클라이언트, 기초자산 라벨, 기동 시 최초 사이클을 지연시킬 초(startup_offset_seconds
+         — 2026-07-28 추가: poll_option_chain과 동일하게 60초 주기라 오프셋 없이는 두 폴러의
+         정규 사이클이 계속 같은 순간에 겹친다, poll_expiry_liquidity의 2026-07-09 패턴을 그대로
+         적용).
     계산: KOSPI200 파생상품시장(선물+콜옵션+풋옵션) 세 세그먼트의 투자자별(외국인/기관계/개인)
          순매수 거래대금을 조회해 합산한 뒤 investor_flow_1m에 적재한다. "시장별 투자자매매동향
          (시세)"는 세션 누적치라, 이 값은 "1분간의 변화량"이 아니라 "그 시점까지의 누적 수급
@@ -1282,6 +1367,9 @@ async def poll_investor_flow(
     스케줄: poll_option_chain과 동일하게 절대시각 고정 틱(next_tick)으로 다음 사이클을 예약한다
            (2026-07-09 — "작업 후 sleep" 누적 드리프트로 poll_time이 분 경계를 건너뛰는 것을 방지).
     """
+    if startup_offset_seconds > 0:
+        await asyncio.sleep(startup_offset_seconds)
+
     next_tick: float | None = None
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
@@ -1445,10 +1533,15 @@ async def main() -> None:
             poll_expiry_liquidity(
                 rest_client, books, master, startup_offset_seconds=EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS
             ),
-            poll_investor_flow(rest_client),
+            poll_investor_flow(rest_client, startup_offset_seconds=INVESTOR_FLOW_STARTUP_OFFSET_SECONDS),
         ]
         if overseas_future_master is not None:
-            tasks.append(poll_macro_snapshot(rest_client, overseas_future_master))
+            tasks.append(
+                poll_macro_snapshot(
+                    rest_client, overseas_future_master,
+                    startup_offset_seconds=MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS,
+                )
+            )
         # 2026-07-19(§5-4) — .env에 토큰/채널이 설정된 경우에만 워커를 띄운다. notify.notify()가
         # 이미 미설정 시 조용히 무시하지만, 워커까지 안 띄우면 알림 기능이 꺼진 상태에서 불필요한
         # 태스크가 asyncio.gather에 남지 않는다.

@@ -544,6 +544,10 @@ class _FakeRestClientChain:
         self.calls: list[str] = []
         self.rate_limit_backoff_multiplier = 1.0
 
+    @property
+    def rate_limit_total_calls(self) -> int:
+        return len(self.calls)
+
     def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
         self.calls.append(symbol)
         return self._resp
@@ -991,6 +995,173 @@ def test_poll_option_chain_does_not_warn_when_rate_limiter_status_write_is_fast(
     assert "레이트리밋 근접도 기록" not in caplog.text
 
 
+def test_poll_option_chain_logs_cycle_breakdown_each_cycle(monkeypatch, caplog):
+    # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 후속): record_rate_limiter_status() 소요
+    # 시간만 계측해서는 07-27 실측(슬로우 경고 0건)처럼 그 가설이 반증돼도 다음 후보(REST수집/
+    # 옵션체인 DB적재)를 못 좁힌다 — 매 사이클(정상 사이클 포함) INFO로 4구간(REST수집/DB적재/
+    # 상태기록/기타) 분해를 남겨 다음 점검에서 비교 기준선으로 쓴다. DB 삽입을 실제로 느리게
+    # 만들어(time.sleep) 그 소요시간이 insert_seconds로 정확히 반영되는지 실측 경과시간으로
+    # 검증한다(위 슬로우 경고 테스트와 동일한 이유로 time.monotonic() 자체는 모킹하지 않는다).
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    def slow_insert(conn, row):
+        time.sleep(0.05)
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", slow_insert)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+
+    fake_loop = _FakeLoop([1000.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client,
+                    [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                    _FakeMaster(),
+                    interval_seconds=60,
+                )
+            )
+
+    breakdown_records = [r for r in caplog.records if "옵션체인 사이클 소요 분해" in r.getMessage()]
+    assert len(breakdown_records) == 1
+    (
+        collect_seconds, insert_seconds, db_write_seconds, other_seconds,
+        rows_count, overrun, suffix, other_poller_calls_text,
+    ) = breakdown_records[0].args
+    assert rows_count == 2  # 1개 행사가 x (C, P)
+    assert insert_seconds >= 0.09  # 레그 2건 x 0.05초 슬립 누적(오버헤드 감안 여유)
+    assert overrun == pytest.approx(0.0)
+    assert suffix == ""
+    # rate_limit_total_calls(=len(calls))가 own_calls_expected(2)와 정확히 일치 — 다른 폴러의
+    # 동시 호출이 끼어들지 않은 정상 사이클이라는 뜻(2026-07-28 신규 계측).
+    assert other_poller_calls_text == "0건"
+
+
+class _FakeRestClientChainWithForeignCalls:
+    """rate_limit_total_calls가 이 폴러 자신의 호출 수보다 더 많이 늘어나는 상황(다른 폴러가
+    같은 공유 _RateLimiter에 동시에 끼어든 상황, 2026-07-28 재수사 가설)을 재현한다 — 실제
+    KISRestClient는 poll_investor_flow/poll_expiry_liquidity/poll_macro_snapshot과 하나의
+    _RateLimiter를 asyncio.gather로 공유하므로, 옵션체인 사이클 도중 다른 폴러의 호출도 같은
+    카운터를 함께 증가시킬 수 있다."""
+
+    def __init__(self, resp: dict, foreign_calls_per_own_call: int):
+        self._resp = resp
+        self._foreign_calls_per_own_call = foreign_calls_per_own_call
+        self.calls: list[str] = []
+        self.rate_limit_backoff_multiplier = 1.0
+        self.rate_limit_total_calls = 0
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        self.rate_limit_total_calls += 1 + self._foreign_calls_per_own_call
+        return self._resp
+
+
+def test_poll_option_chain_breakdown_detects_other_poller_contention(monkeypatch, caplog):
+    # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사): REST수집 소요시간이 자기 몫(30콜)
+    # 만으로 설명 안 되는 게 poll_investor_flow 등 다른 폴러가 같은 공유 _RateLimiter에 동시에
+    # 끼어들기 때문인지 확인하려면, rate_limit_total_calls의 사이클 전후 차이가 자기 예상 호출
+    # 수(own_calls_expected)를 초과하는 만큼을 "타폴러동시호출추정"으로 남겨야 한다.
+    rest_client = _FakeRestClientChainWithForeignCalls(_SAMPLE_OPTION_QUOTE, foreign_calls_per_own_call=3)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+
+    fake_loop = _FakeLoop([1000.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client,
+                    [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                    _FakeMaster(),
+                    interval_seconds=60,
+                )
+            )
+
+    breakdown_records = [r for r in caplog.records if "옵션체인 사이클 소요 분해" in r.getMessage()]
+    assert len(breakdown_records) == 1
+    # 1개 행사가 x (C, P) = own_calls_expected 2건, 콜당 foreign 3건 -> 총 증가분 2*(1+3)=8,
+    # 자기 몫 2를 뺀 6건이 다른 폴러가 끼어든 것으로 추정돼야 한다.
+    assert breakdown_records[0].args[-1] == "6건"
+
+
+def test_poll_option_chain_overrun_warning_includes_rest_db_breakdown(monkeypatch, caplog):
+    # §4 Fix#1 후속 — 밀린 사이클의 WARNING 자체에도 REST/DB 구간별 소요시간을 함께 남겨,
+    # "언제 얼마나 밀렸는지"와 "그 사이클에서 어느 구간이 오래 걸렸는지"를 로그 한 줄로 바로
+    # 연결해서 볼 수 있게 한다(따로 떨어진 INFO 분해 로그를 시각으로 대조할 필요가 없어짐).
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+
+    # 1번째 사이클 종료 시각=1000.0 -> next_tick=1060(정상 60초 대기, overrun=0).
+    # 2번째 사이클 종료 시각=1200.0 -> next_tick=1060을 이미 지나쳐 140초 밀림.
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(
+                poll_option_chain(
+                    rest_client,
+                    [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                    _FakeMaster(),
+                    interval_seconds=60,
+                )
+            )
+
+    overrun_records = [
+        r for r in caplog.records if "스케줄이" in r.getMessage() and "밀렸습니다" in r.getMessage()
+    ]
+    assert len(overrun_records) == 1
+    message = overrun_records[0].getMessage()
+    assert "REST수집" in message
+    assert "DB적재" in message
+    assert "rows=2" in message
+
+
 class _FakeInvestorFlowRestClient:
     """섹터(F001/OC01/OP01)별로 다른 응답을 돌려주고, 지정한 섹터는 예외를 던진다."""
 
@@ -1185,6 +1356,58 @@ def test_poll_investor_flow_retries_once_when_all_segments_fail(monkeypatch):
     assert len(written) == 1
     assert written[0]["foreign_net"] == pytest.approx(-150.0)
     assert 5.0 in sleep_calls  # 재시도 backoff가 실제로 대기했다
+
+
+def test_poll_investor_flow_waits_startup_offset_before_first_cycle(monkeypatch):
+    # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사 후속): poll_investor_flow는
+    # poll_option_chain과 동일하게 60초 주기라, poll_expiry_liquidity(2026-07-09)와 달리
+    # 오프셋이 없어 매 사이클 공유 _RateLimiter에서 계속 겹쳤다 — 라이브 계측(타폴러동시호출
+    # 추정)으로 이게 정상 상태 기준선 콜 3건 오염의 주범임을 확인해 동일한 오프셋 패턴을
+    # 적용한다. 최초 사이클 진입 전에 정확히 한 번, startup_offset_seconds만큼 대기하는지 검증.
+    rest_client = _FakeInvestorFlowRestClient({})
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_investor_flow(rest_client, interval_seconds=1, startup_offset_seconds=15.0))
+
+    assert sleep_calls == [15.0]
+    assert rest_client.calls == []  # 오프셋 대기 중이라 아직 사이클에 진입하지 않음
+
+
+def test_poll_investor_flow_default_offset_is_zero_and_skips_wait(monkeypatch):
+    # startup_offset_seconds 기본값(0.0)일 때는 기존 동작(오프셋 없이 바로 사이클 진입)을 그대로
+    # 유지해야 한다 — main() 밖 호출부(테스트 등)의 하위호환 보장.
+    rest_client = _FakeInvestorFlowRestClient(
+        {
+            "F001": _investor_flow_response(-100.0, 200.0, -50.0),
+            "OC01": _investor_flow_response(-30.0, 40.0, -5.0),
+            "OP01": _investor_flow_response(-20.0, 10.0, 15.0),
+        }
+    )
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_investor_flow", lambda *a, **k: None)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_investor_flow(rest_client, interval_seconds=1))
+
+    assert len(rest_client.calls) == 3  # 오프셋 없이 바로 사이클에 진입해 3세그먼트 전부 시도됨
 
 
 def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
@@ -1739,6 +1962,63 @@ def _fallback_stub(zn=None, es=None, move=None):
         return responses.get(symbol)
 
     return _fetch
+
+
+def test_poll_macro_snapshot_waits_startup_offset_before_first_cycle(monkeypatch):
+    # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사 후속): poll_macro_snapshot(300초
+    # 주기)도 poll_expiry_liquidity(2026-07-09)와 동일하게 오프셋 없이는 5분마다
+    # poll_option_chain과 같은 순간에 겹친다 — 라이브 계측(타폴러동시호출추정)으로 실제 영향을
+    # 확인해 동일한 오프셋 패턴을 적용한다. 최초 사이클 진입 전에 정확히 한 번,
+    # startup_offset_seconds만큼 대기하는지 검증.
+    master = _FakeOverseasFutureMaster({})
+    rest_client = _FakeOverseasRestClient(future_prices={})
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1, startup_offset_seconds=45.0))
+
+    assert sleep_calls == [45.0]
+    assert rest_client.future_calls == []  # 오프셋 대기 중이라 아직 사이클에 진입하지 않음
+
+
+def test_poll_macro_snapshot_default_offset_is_zero_and_skips_wait(monkeypatch):
+    # startup_offset_seconds 기본값(0.0)일 때는 기존 동작(오프셋 없이 바로 사이클 진입)을 그대로
+    # 유지해야 한다 — main() 밖 호출부(테스트 등)의 하위호환 보장.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    # 오프셋 없이 바로 사이클에 진입했다는 뜻 — VX/CNH 선물 호출이 시도됨
+    assert set(rest_client.future_calls) == {"VXN26", "VXQ26", "CNHN26"}
 
 
 def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch):

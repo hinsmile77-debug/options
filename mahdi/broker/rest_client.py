@@ -70,6 +70,14 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._next_allowed = 0.0
         self._consecutive_successes = 0
+        # 2026-07-28(운영점검보고서 2026-07-27 후속 재수사): 이 페이서는 poll_option_chain/
+        # poll_investor_flow/poll_expiry_liquidity/poll_macro_snapshot 네 폴러가 asyncio.gather로
+        # 동시에 공유하는 단일 인스턴스다(main.py에서 KISRestClient 한 개를 전부에 넘김) — 옵션체인
+        # 사이클의 REST수집 소요시간이 자기 몫(30콜×1.0초=~30초)만으로 설명 안 되고 32~49초로
+        # 들쭉날쭉한 게 다른 폴러의 동시 호출이 같은 슬롯을 나눠 쓰기 때문인지 확인하려면 "이번
+        # 옵션체인 사이클 동안 실제로 몇 건이 이 페이서를 통과했는지"를 알아야 한다 — 자기 예상
+        # 호출 수(행사가×2×북)를 넘는 초과분이 있으면 다른 폴러가 끼어든 직접 증거가 된다.
+        self._total_calls = 0
 
     @property
     def current_multiplier(self) -> float:
@@ -80,6 +88,13 @@ class _RateLimiter:
             return 1.0
         return self._current_interval / self._min_interval
 
+    @property
+    def total_calls(self) -> int:
+        """계산: 이 페이서가 기동 이래 통과시킨 전체 호출 건수(모든 폴러 합산) — 어느 한 폴러의
+        사이클 전후 값 차이를 구하면 그 구간 동안 다른 폴러가 몇 건이나 끼어들었는지 역산할 수
+        있다(2026-07-28, 스케줄 밀림 재수사)."""
+        return self._total_calls
+
     def wait(self) -> None:
         if self._min_interval <= 0:
             return
@@ -87,6 +102,7 @@ class _RateLimiter:
             now = time.monotonic()
             start = max(now, self._next_allowed)
             self._next_allowed = start + self._current_interval
+            self._total_calls += 1
         delay = start - now
         if delay > 0:
             time.sleep(delay)
@@ -169,6 +185,11 @@ class KISRestClient:
     def rate_limit_backoff_multiplier(self) -> float:
         """현재 공유 레이트리미터의 배율(1.0=백오프 없음) — COCKPIT 헬스체크가 읽는 값."""
         return self._rate_limiter.current_multiplier
+
+    @property
+    def rate_limit_total_calls(self) -> int:
+        """공유 레이트리미터를 통과한 전체 누적 호출 건수(2026-07-28, 스케줄 밀림 재수사용)."""
+        return self._rate_limiter.total_calls
 
     @property
     def _domain(self) -> str:
