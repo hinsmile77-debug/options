@@ -4,6 +4,49 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-28 4차] Phase 2 착수 — Risk Engine(Core Engine 7) 최초 구현
+
+**트리거:** "Phase 2 준비상황 조사하고 구현계획 수립하고 구현진행해" 요청.
+
+**조사 결과:** Phase 1(관측 인프라)은 실질적으로 완료(387개 테스트, 3주+ 라이브 운영점검) —
+Regime Engine HMM 학습 게이트만 미충족(`feature_store` 4,603행/12영업일, 목표 8,000행/
+20영업일, 약 9영업일 더 필요하나 `warmup_fallback()`으로 계속 동작해 착수를 막지 않음).
+`mahdi/{fusion,risk,execution,learning,backtest}/`는 전부 빈 패키지(`__init__.py`만) —
+Phase 2 코드는 0%였다. 반면 DB 스키마(`execution_logs`/`trade_history`/`signal_decisions`/
+`risk_snapshots`/`cc_scorecard` 전부 `001_init.sql`에 이미 존재), 설정(`risk_limits.yaml`/
+`strategy_params.yaml` + `get_risk_limits()`/`get_strategy_params()`), 브로커(`submit_order`/
+`get_balance`/`order_state_machine.py`)는 Phase 1에서 이미 Phase 2용으로 준비돼 있었음.
+
+**구현 순서 판단:** v6 §12가 Risk Engine을 "신호 엔진의 하위 모듈이 아닌 독립 거부권"으로
+규정하고, [[DECISION_LOG]] 2026-07-21 항목이 Execution Engine의 Forced Flat에 "종료
+시퀀스 자기검증 없이는 배포 금지"를 못박아둔 점을 근거로, Execution Engine보다 먼저 그것이
+항상 존중해야 할 Risk Engine을 확립하는 순서로 결정(Signal Fusion/Backtest/하이브리드
+3모드는 그 다음 증분).
+
+**구현:** `mahdi/risk/{sizing,limits,circuit_breaker,engine}.py` — v6 §12.1(8-factor 사이징
+공식, Full Kelly 절대 금지 클램프, DD 자동 축소) / §12.2(한도 체계 6종, 다중 위반 전부 보고)
+/ §12.3(HALT_CONDITIONS 7종, gradual_delever/emergency_flatten 플래그만 반환하고 실제
+청산 실행은 다음 증분 Execution Engine 책임으로 분리) 전부 구현. `RiskEngine` 파사드가
+`evaluate_entry()`(진입 승인/거부+사이즈)/`evaluate_ongoing()`(보유 중 매분 재평가)로
+통합. Portfolio Greeks 한도는 `risk_limits.yaml`에 아직 수치가 없어(v6 표에만 존재) 억지로
+값을 만들지 않고 옵션 인자 미제공 시 `unconfigured_checks`로 드러나게 함(조용히 무시 방지).
+
+**참고했으나 이식하지 않은 것:** 자매 프로젝트 `C:\Users\82108\PycharmProjects\futures`의
+`safety/circuit_breaker.py`/`strategy/entry/position_sizer.py` — State enum·reset_daily()
+같은 구조 패턴만 참고하고, 조건 집합 자체(그쪽은 신호반전·Brier·30분정확도 등 그 프로젝트
+ML 앙상블 전용)는 마흐디 v6 §12 스펙과 달라 이식하지 않음.
+
+**검증:** 신규 테스트 45개(`tests/test_risk_{sizing,limits,circuit_breaker,engine}.py`) +
+기존 387개 = 전체 432개 통과. 테스트 작성 중 `requires_emergency_flatten`이 "이미 HALTED
+상태에서 반복 억제"가 아니라 "그 호출 시점에 조건이 실제로 계속되는지"를 반영해야 한다는
+설계 오류(테스트 쪽 착각)를 발견해 테스트와 docstring을 함께 정정.
+
+**이번 세션에서 하지 않은 것(다음 증분):** `main.py` 라이브 루프 배선(아직 신호/주문 자체가
+없어 배선 대상 없음), `risk_snapshots` DB 영속화(Execution Engine이 생긴 뒤), Execution
+Engine(6-Layer Exit·Forced Flat)·Signal Fusion·Backtest 엔진·하이브리드 3모드.
+
+---
+
 ## [2026-07-24 2차] 일일 운영점검 보고서(07-24) + fix 2건 구현 (레이트리미터 DB 기록 소요시간 계측, ZN 이중실패 알림 스트릭 조건)
 
 **트리거:** 같은 daily_prompt.txt 워크플로 2단계 — 1차 요청으로 07-24 로그를 조사해

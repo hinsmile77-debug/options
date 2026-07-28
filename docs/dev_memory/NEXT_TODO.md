@@ -455,11 +455,27 @@ poll_expiry_liquidity/poll_macro_snapshot)가 공유하는 단일 `_RateLimiter`
       최대 4배, 연속성공 20회마다 서서히 복귀)가 실제 장중 트래픽에서 의도대로 동작하는지 —
       백오프가 걸렸다가 정상적으로 복귀하는 사례를 로그로 한 번 이상 확인할 것.
 
-## Phase 2(판단·실행) — 아직 시작 안 함
+## Phase 2(판단·실행) — Risk Engine 착수(2026-07-28), 나머지는 아직 시작 안 함
 
-- [ ] Signal Fusion + Meta-Labeling (Triple Barrier, Purged CV)
-- [ ] Risk Engine (Kelly 사이징, 한도, Circuit Breaker, Kill Switch) — `mahdi/risk/`는 빈 패키지
-- [ ] Execution Engine (Passive-first 진입, 6-Layer Exit, Forced Flat) — `mahdi/execution/`은 빈 패키지
+- [x] **Risk Engine(Kelly 사이징, 한도, Circuit Breaker, Kill Switch) 최초 구현 완료(2026-07-28)**
+      — `mahdi/risk/{sizing,limits,circuit_breaker,engine}.py`, v6 §12.1~12.3 전부 구현, 신규
+      테스트 45개(`tests/test_risk_*.py`) 전부 통과([[SESSION_LOG]] 2026-07-28 4차 항목 참고).
+      순수 결정 함수 라이브러리로만 구현 — `main.py` 라이브 루프 배선은 아직 없음(아직 신호/
+      주문 자체가 없어 배선할 대상이 없음).
+  - [ ] Portfolio Greeks 한도(`portfolio_greeks_limits`)는 `risk_limits.yaml`에 실제 수치가
+        없어 옵션 인자 미제공 시 그 체크를 건너뛴다(`unconfigured_checks`로 드러남) — 실제
+        Delta/Gamma/Vega 상한값을 계좌 자본 규모 기준으로 정해 `risk_limits.yaml`에 추가할지
+        사용자 결정 필요(Execution Engine이 실제 포지션 Greeks를 계산하기 시작하는 시점에
+        같이 정하는 게 자연스러움).
+  - [ ] `evaluate_ongoing()`(매분 재평가)을 실제로 매분 호출할 루프가 아직 없음 — Execution
+        Engine의 §13.4 확률 기반 청산 루프가 만들어지면 그때 배선.
+  - [ ] `risk_snapshots` 테이블(스키마는 이미 존재) 영속화 — Execution Engine이 생겨 실제로
+        스냅샷할 포지션/Greeks 상태가 생기면 추가.
+- [ ] Signal Fusion + Meta-Labeling (Triple Barrier, Purged CV) — `mahdi/fusion/`은 빈 패키지
+- [ ] Execution Engine (Passive-first 진입, 6-Layer Exit, Forced Flat) — `mahdi/execution/`은
+      빈 패키지. Forced Flat은 [[DECISION_LOG]] 2026-07-21 항목의 "종료 시퀀스 자기검증 없이는
+      배포 금지" 완료조건 체크리스트를 반드시 지킬 것. Risk Engine의 `evaluate_entry()`/
+      `evaluate_ongoing()`을 진입/보유 양쪽에서 반드시 거쳐가도록 배선(v6 §12 "독립 거부권").
 - [ ] 하이브리드 3모드(Advisory→Confirm→Auto)
 - [ ] 백테스트 엔진 + 검증 스택(WFO·MC·DSR) — `mahdi/backtest/`는 빈 패키지
 
