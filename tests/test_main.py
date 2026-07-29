@@ -16,12 +16,14 @@ from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.engines.regime import RegimeLabel, RegimeState
 from mahdi.features.options_intel import OptionLeg, calculate_gex
 from mahdi.features.orderflow import calculate_vpin
+from mahdi.risk.market_halt import MarketHaltMonitor
 from mahdi.main import (
     _atm_liquidity_window,
     _build_account_state_for_candidate,
     _build_signal_inputs,
     _parse_asking_price_leg,
     _parse_futures_tick,
+    _parse_market_operation,
     _parse_option_quote,
     _parse_overseas_daily_last_price,
     _parse_overseas_future_last_price,
@@ -179,6 +181,41 @@ def test_parse_futures_tick_invalid_format_returns_none():
     assert _parse_futures_tick("1^2") is None
 
 
+def _make_h0unmko0(
+    mkop_cls_code: str, trht_yn: str = "N", tr_susp_reas_cntt: str = "", vi_cls_code: str = "0",
+    with_ws_envelope: bool = False,
+) -> str:
+    """H0UNMKO0(국내주식 장운영정보) Layout 순서(TRHT_YN..EXCH_CLS_CODE, 9필드)로 합성한다."""
+    fields = ["0"] * 9
+    fields[0] = trht_yn
+    fields[1] = tr_susp_reas_cntt
+    fields[2] = mkop_cls_code
+    fields[7] = vi_cls_code
+    body = "^".join(fields)
+    return f"0|H0UNMKO0|001|{body}" if with_ws_envelope else body
+
+
+def test_parse_market_operation_valid_h0unmko0_format():
+    raw = _make_h0unmko0("174", trht_yn="Y", vi_cls_code="1")
+    status = _parse_market_operation(raw)
+    assert status is not None
+    assert status.mkop_cls_code == "174"
+    assert status.trht_yn == "Y"
+    assert status.vi_cls_code == "1"
+
+
+def test_parse_market_operation_strips_ws_envelope_header():
+    raw = _make_h0unmko0("175", with_ws_envelope=True)
+    status = _parse_market_operation(raw)
+    assert status is not None
+    assert status.mkop_cls_code == "175"
+
+
+def test_parse_market_operation_invalid_format_returns_none():
+    assert _parse_market_operation("garbage") is None
+    assert _parse_market_operation("1^2") is None
+
+
 class FakeConnection:
     def __init__(self, incoming: list[str]):
         self.sent: list[str] = []
@@ -244,6 +281,7 @@ def test_run_observation_loop_writes_bar_and_regime_on_minute_rollover(monkeypat
             run_observation_loop(
                 ws_client, [subscription_manager], rest_client, futures_symbol="101S03",
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
             )
         )
 
@@ -292,6 +330,7 @@ def test_run_observation_loop_keeps_different_symbols_in_separate_bars(monkeypat
             run_observation_loop(
                 ws_client, [subscription_manager], rest_client, futures_symbol="101S03",
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
             )
         )
 
@@ -370,6 +409,7 @@ def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconne
             run_observation_loop_forever(
                 ws_client, [manager], rest_client, futures_symbol="101S03",
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
                 approval_key="APV1", connect=fake_connect,
             )
         )
@@ -384,7 +424,7 @@ def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconne
     assert any("101S03" in msg for msg in second_conn.sent)  # 선물 구독
     assert manager.desired_strikes == frozenset({347.5, 350.0, 352.5})
     subscribe_msgs = [m for m in second_conn.sent if '"tr_type": "1"' in m]
-    assert len(subscribe_msgs) == 7  # 3 strikes x (C,P) = 6 + 선물 1
+    assert len(subscribe_msgs) == 8  # 3 strikes x (C,P) = 6 + 선물 1 + 장운영정보(H0UNMKO0) 1
 
     # 2026-07-19(§5-4): "연결됨→끊김"(최초) → "끊김→재연결 성공" → "연결됨→끊김"(재재연결 전
     # 두 번째 끊김) 세 번의 상태 전환마다 Slack 알림이 한 번씩만 나가야 한다(재시도마다 매번X).
@@ -426,6 +466,7 @@ def test_run_observation_loop_forever_backoff_caps_and_resets_after_success(monk
             run_observation_loop_forever(
                 ws_client, [manager], rest_client, futures_symbol="101S03",
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
                 approval_key="APV1", connect=fake_connect,
             )
         )
@@ -465,6 +506,7 @@ def test_run_observation_loop_forever_propagates_non_connection_errors(monkeypat
             run_observation_loop_forever(
                 ws_client, [manager], rest_client, futures_symbol="101S03",
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
                 approval_key="APV1", connect=unexpected_connect,
             )
         )
@@ -1500,6 +1542,7 @@ def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
             run_observation_loop(
                 ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol,
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
             )
         )
 
@@ -1554,6 +1597,7 @@ def test_run_observation_loop_computes_vpin_for_option_symbol_too(monkeypatch):
             run_observation_loop(
                 ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol,
                 regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
             )
         )
 
@@ -3168,6 +3212,9 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
     monkeypatch.setattr("mahdi.main.db.max_account_balance_ever", lambda conn: 110.0)
     monkeypatch.setattr("mahdi.main.db.daily_trade_counts_by_strategy", lambda conn, day: {})
+    # 2026-07-29: is_entry 경로에서 RiskEngine.evaluate_entry에 market_halted를 넘기려고
+    # latest_market_halt_state를 조회한다 — 이 테스트는 정상(halt 이력 없음) 케이스만 검증한다.
+    monkeypatch.setattr("mahdi.main.db.latest_market_halt_state", lambda conn: None)
 
     @contextmanager
     def fake_get_connection(settings=None):
@@ -3201,6 +3248,60 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     assert decision == "ENTER"
     assert risk_gate_state["risk_engine"]["approved"] is True
     assert risk_gate_state["risk_engine"]["approved_size"] > 0
+
+
+def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
+    chain_rows = [
+        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.max_account_balance_ever", lambda conn: 110.0)
+    monkeypatch.setattr("mahdi.main.db.daily_trade_counts_by_strategy", lambda conn, day: {})
+    monkeypatch.setattr(
+        "mahdi.main.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 29, 9, 5, 0), "is_halted": True,
+            "mkop_cls_code": "174", "label": "서킷브레이크 발동", "halted_since": datetime(2026, 7, 29, 9, 5, 0),
+        },
+    )
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+            (decision, risk_gate_state)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.TREND_UP_STRONG] = 1.0
+    regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple(prob_vector))
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(regime_state)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=60))
+
+    assert len(recorded) == 1
+    decision, risk_gate_state = recorded[0]
+    assert decision == "ENTER"  # Signal Fusion 판단 자체는 그대로(진입 후보였음)
+    assert risk_gate_state["risk_engine"]["approved"] is False
+    assert risk_gate_state["risk_engine"]["reject_reasons"] == ["market_halt"]
 
 
 def test_poll_signal_fusion_cycle_marks_account_tracker_not_ready(monkeypatch):

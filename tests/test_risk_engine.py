@@ -128,6 +128,29 @@ def test_engine_reuses_same_circuit_breaker_instance_across_calls():
     assert engine.circuit_breaker.state == CircuitBreakerState.HALTED
 
 
+def test_market_halted_rejects_entirely_before_circuit_breaker_or_limits():
+    # 거래소 서킷브레이커/거래정지 중에는 사이징/한도 계산 자체가 무의미하므로 즉시 전량 거부하고,
+    # 내부 CircuitBreaker(daily_loss 등)나 한도 위반 여부는 아예 평가하지 않는다(reject_reasons가
+    # "market_halt" 단일 사유여야 함 — circuit_breaker.py의 상태를 오염시키지 않는지도 확인).
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    decision = engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(), market_halted=True
+    )
+    assert not decision.approved
+    assert decision.approved_size == 0.0
+    assert decision.reject_reasons == ["market_halt"]
+    assert engine.circuit_breaker.state == CircuitBreakerState.NORMAL
+
+
+def test_market_halted_false_falls_through_to_normal_evaluation():
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    decision = engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(), market_halted=False
+    )
+    assert decision.approved
+    assert decision.approved_size > 0
+
+
 def test_unconfigured_portfolio_greeks_check_surfaced_on_approval():
     engine = RiskEngine(risk_limits=_RISK_LIMITS)
     decision = engine.evaluate_entry(

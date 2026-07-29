@@ -449,11 +449,52 @@ def _rate_limiter_health_check(conn) -> HealthCheck:
     return HealthCheck(label, "warning", detail)
 
 
+def _market_halt_check(conn) -> HealthCheck:
+    """
+    해석: 2026-07-29 신규 — 거래소 서킷브레이커/거래정지(mahdi.risk.market_halt) 실시간 감지
+         결과를 "오늘의 점검 요약" 3초 룰 그리드에도 반영한다. 실제 발동 중일 때는 이 그리드
+         배지뿐 아니라 app.py 상단에 별도의 눈에 띄는 배너(st.error)도 함께 뜬다 — 이 배지는
+         "평소엔 조용히 정상, 스크롤 없이도 상시 확인 가능"용이고 배너는 "장중 놓칠 수 없게".
+    """
+    label = "거래소 서킷브레이커/거래정지"
+    try:
+        status = db.latest_market_halt_state(conn)
+    except Exception:
+        conn.rollback()
+        logger.warning("서킷브레이커 상태 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    if status is None:
+        return HealthCheck(label, "ok", "정상(오늘 발동 이력 없음)")
+    if status["is_halted"]:
+        return HealthCheck(
+            label, "warning",
+            f"🚨 {status['label']}({status['mkop_cls_code']}) — {status['halted_since']:%H:%M:%S}부터 신규진입 차단 중",
+        )
+    return HealthCheck(label, "ok", f"정상 — 직전: {status['label']}({status['updated_at']:%H:%M:%S} 해제됨)")
+
+
+def get_market_halt_status() -> dict | None:
+    """
+    계산: app.py 상단 배너용 — `latest_market_halt_state()`를 그대로 반환한다(발동 중일 때만
+         호출측이 st.error()로 크게 표시).
+    실패 조건: DB 조회 실패 시 None — "정상"으로 거짓 안심시키지 않고 배너를 그냥 안 띄운다
+              (오늘의 점검 요약 쪽 `_market_halt_check`가 "조회 실패"로 별도 표시하므로 이중
+              경고가 되지 않도록 여기서는 조용히 로그만 남긴다).
+    """
+    try:
+        with db.get_connection() as conn:
+            return db.latest_market_halt_state(conn)
+    except Exception:
+        logger.warning("서킷브레이커 상태 조회 실패(배너용)", exc_info=True)
+        return None
+
+
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     """
     입력: 기초자산 라벨.
     계산: 운영점검보고서 §1-B 장중 체크리스트 중 SQL로 자동화 가능한 항목들(§5-6 "오늘의 점검
-         요약") — 옵션체인/선물 데이터 결손, 옵션체인 콜/풋 균형(2026-07-20 추가), CBOT 승인
+         요약") — 거래소 서킷브레이커/거래정지(2026-07-29 추가), 옵션체인/선물 데이터 결손,
+         옵션체인 콜/풋 균형(2026-07-20 추가), CBOT 승인
          상태, 스키마 정합성/마이그레이션 적용 여부(2026-07-21 추가), series/symbol 화석 데이터
          잔존 여부, 오늘 레짐 stability_flag 비율, feature_store 20영업일 목표 진행률(§5-7),
          직전 장마감 종료 신뢰성(2026-07-21 §5-3 추가), 레이트리밋 근접도(2026-07-23 §2-1/§4
@@ -466,6 +507,7 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
         with db.get_connection() as conn:
             now = db.local_now()
             return [
+                _market_halt_check(conn),
                 _option_chain_freshness_check(conn, underlying, now),
                 _futures_freshness_check(conn, underlying, now),
                 _option_chain_leg_balance_check(conn, underlying, now),

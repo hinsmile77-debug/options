@@ -45,6 +45,7 @@ from mahdi.fusion.signal_layer import SignalInputs
 from mahdi.logutil import WarningThrottle
 from mahdi.risk.circuit_breaker import MarketConditions
 from mahdi.risk.engine import RiskEngine
+from mahdi.risk.market_halt import MarketHaltMonitor, MarketOperationStatus, SIDECAR_CODES, MKOP_CLS_LABELS
 from mahdi.risk.limits import AccountState
 from mahdi.risk.sizing import PositionSizingInput
 
@@ -90,6 +91,12 @@ MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS = 300
 US10Y_LOOKBACK_DAYS = 10
 UNDERLYING = "KOSPI200"
 OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범위와 동일한 종목을 REST로 주기 조회
+
+# 2026-07-29 신규 — 서킷브레이커/거래정지 감지(mahdi/risk/market_halt.py)용 H0UNMKO0(국내주식
+# 장운영정보) 구독 대상. CB/시장임시정지는 시장 전체 이벤트라 아무 종목이나 구독해도 그 순간의
+# MKOP_CLS_CODE로 시장 전체 상태를 알 수 있다 — KOSPI 최대형주(삼성전자)라 세션 상태 변화를
+# 가장 먼저·확실히 반영한다.
+MARKET_HALT_REFERENCE_SYMBOL = "005930"
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
@@ -213,12 +220,15 @@ async def run_observation_loop(
     rest_client: KISRestClient,
     futures_symbol: str,
     regime_state_machine: RegimeStateMachine,
+    market_halt_monitor: MarketHaltMonitor,
 ) -> None:
     """
     입력: 이미 연결된 WS 클라이언트, 구독 롤링 매니저 목록(2026-07-06부터 리스트 — 먼슬리/위클리
          등 여러 만기 북을 동시에 굴리기 위함, 북마다 별도 인스턴스), REST 클라이언트, 최근월
          지수선물 단축코드(예: "101S03" — 분기마다 바뀌므로 종목코드 마스터파일/설정으로 최신화
-         필요), 레짐 상태머신(mahdi.engines.regime_pipeline.RegimeStateMachine).
+         필요), 레짐 상태머신(mahdi.engines.regime_pipeline.RegimeStateMachine), 서킷브레이커/
+         거래정지 상태머신(mahdi.risk.market_halt.MarketHaltMonitor, 2026-07-29 신규 — WS
+         재연결에도 상태가 이어지도록 run_observation_loop_forever가 만들어 그대로 전달한다).
     계산: "선물옵션 시세"(inquire-price, F 시장)로 초기 스팟(KOSPI200 지수) 조회 → 모든 구독
          매니저를 그 스팟으로 롤링(각자 자기 만기 시리즈에서 ATM±N을 계산) → 선물 실시간체결가
          (H0IFCNT0)도 함께 구독(2026-07-06 추가) → 현재 선물 단축코드를 active_futures_symbol에
@@ -246,6 +256,9 @@ async def run_observation_loop(
     # 시세(H0IFCNT0)도 계좌 무관 공개 데이터라 모의투자 전용 도메인이 없다 — MARKET_DATA_WS_DOMAIN
     # 하나로 옵션 구독과 함께 붙는다.
     await ws_client.subscribe(Subscription(tr_codes.WS_TR_FUTURES_CONTRACT, futures_symbol))
+    # 서킷브레이커/거래정지 감지(2026-07-29 신규, mahdi/risk/market_halt.py) — 같은 이유로
+    # 모의 앱키로도 구독 가능.
+    await ws_client.subscribe(Subscription(tr_codes.WS_TR_MARKET_OPERATION_INFO, MARKET_HALT_REFERENCE_SYMBOL))
 
     with db.get_connection() as conn:
         db.upsert_active_futures_symbol(conn, UNDERLYING, futures_symbol, db.local_now())
@@ -257,10 +270,57 @@ async def run_observation_loop(
     vpin_returns: dict[str, list[float]] = {}
     vpin_volumes: dict[str, list[float]] = {}
 
+    async def handle_market_operation_message(raw: str) -> None:
+        """
+        입력: H0UNMKO0 원시 메시지.
+        계산: 사이드카(387/388/397/398)는 시장 자체를 정지시키지 않으므로 상태머신을 건드리지
+             않고 INFO 알림만 남긴다. 그 외는 MarketHaltMonitor.update()에 맡기고, 실제로
+             차단 여부가 바뀐 경우(changed)에만 DB에 기록하고 Slack을 알린다 — 이 TR은
+             구독종목(005930)의 개별 VI 발동/해제 때도 메시지가 오므로(문서: "연결종목의 VI
+             발동 시와 VI 해제 시에 데이터 수신") MKOP_CLS_CODE가 HALT_TRIGGER/CLEAR 밖이면
+             MarketHaltMonitor가 알아서 무시한다 — 매 수신마다 DB에 쓰면 안 되는 이유이기도 하다.
+        """
+        status = _parse_market_operation(raw)
+        if status is None:
+            return
+        code = status.mkop_cls_code
+        if code in SIDECAR_CODES:
+            notify.notify(
+                f"ℹ️ {MKOP_CLS_LABELS.get(code, code)} — 프로그램매매 호가효력 일시정지(시장 자체는 정상, 신규진입 차단 없음)",
+                "INFO",
+            )
+            return
+        transition = market_halt_monitor.update(status, db.local_now())
+        if not transition.changed:
+            return
+        with db.get_connection() as conn:
+            db.upsert_market_halt_state(
+                conn, db.local_now(), transition.is_halted,
+                market_halt_monitor.current_code, transition.label, market_halt_monitor.halted_since,
+            )
+            db.append_market_halt_event_history(
+                conn, db.local_now(), market_halt_monitor.current_code, transition.label, transition.is_halted,
+            )
+        if transition.is_halted:
+            notify.notify(
+                f"🚨 {transition.label}(코드 {market_halt_monitor.current_code}) — "
+                f"거래소 매매정지 감지, 신규 진입 자동 차단",
+                "CRITICAL",
+            )
+        else:
+            notify.notify(f"✅ {transition.label} — 거래 재개, 신규 진입 차단 해제", "INFO")
+
     async def handle_message(message: dict) -> None:
         raw = message.get("raw")
         if raw is None:
             return  # JSON 제어 메시지(구독 응답/PINGPONG)는 무시
+
+        # H0UNMKO0(장운영정보)는 종목코드가 아니라 헤더의 TR_ID로 구분해야 한다 — 응답 바디에
+        # 종목코드 필드 자체가 없다(_parse_market_operation 주석 참고).
+        header_parts = raw.split("|", 3)
+        if len(header_parts) >= 2 and header_parts[1] == tr_codes.WS_TR_MARKET_OPERATION_INFO:
+            await handle_market_operation_message(raw)
+            return
 
         body = raw.split("|", 3)[-1]
         peek_symbol = body.split("^", 1)[0]
@@ -344,6 +404,7 @@ async def run_observation_loop_forever(
     rest_client: KISRestClient,
     futures_symbol: str,
     regime_state_machine: RegimeStateMachine,
+    market_halt_monitor: MarketHaltMonitor,
     approval_key: str,
     connect=websockets.connect,
 ) -> None:
@@ -381,6 +442,7 @@ async def run_observation_loop_forever(
         await run_observation_loop(
             ws_client, subscription_managers, rest_client,
             futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
+            market_halt_monitor=market_halt_monitor,
         )
         return
     except _WS_DISCONNECT_ERRORS:
@@ -403,6 +465,7 @@ async def run_observation_loop_forever(
                 await run_observation_loop(
                     new_client, subscription_managers, rest_client,
                     futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
+                    market_halt_monitor=market_halt_monitor,
                 )
                 return
         except _WS_DISCONNECT_ERRORS:
@@ -511,6 +574,38 @@ def _parse_futures_tick(raw: str, today: date | None = None) -> tuple[str, Tick]
         return symbol, tick
     except (ValueError, IndexError):
         return None
+
+
+# H0UNMKO0(국내주식 장운영정보, 통합) 응답 필드 인덱스 — "^" 구분, 0-based. 이 TR은 옵션/선물
+# 체결가와 달리 응답에 종목코드 필드가 없다(Layout이 TRHT_YN부터 바로 시작) — 그래서
+# handle_message는 이 TR을 심볼이 아니라 헤더의 TR_ID로 분기한다. 출처: docs/efriend 문서 "국내주식
+# 장운영정보 (통합)" 시트 Response Body(2026-07-29 실측).
+_MKOP_IDX_TRHT_YN = 0
+_MKOP_IDX_TR_SUSP_REAS_CNTT = 1
+_MKOP_IDX_MKOP_CLS_CODE = 2
+_MKOP_IDX_VI_CLS_CODE = 7
+_MKOP_MIN_FIELDS = 9  # TRHT_YN..EXCH_CLS_CODE 9개 필드
+
+
+def _parse_market_operation(raw: str) -> MarketOperationStatus | None:
+    """
+    KIS 실시간 장운영정보(H0UNMKO0) "^" 구분 파서 — 필드 순서는 위 _MKOP_IDX_* 참고.
+
+    입력/계산: 다른 파서들과 동일한 파이프 헤더 스트립(암호화유무|TR_ID|데이터건수 헤더 제거) 후
+         "^" 분리. 종목코드 필드가 없으므로 반환값은 심볼 없이 상태만 담는다 — 호출측이 TR_ID로
+         이 TR인지 이미 확인했다고 가정한다.
+    실패 조건: 필드 수가 부족하면 None(해당 메시지 무시).
+    """
+    body = raw.split("|", 3)[-1]
+    fields = body.split("^")
+    if len(fields) < _MKOP_MIN_FIELDS:
+        return None
+    return MarketOperationStatus(
+        trht_yn=fields[_MKOP_IDX_TRHT_YN],
+        tr_susp_reas_cntt=fields[_MKOP_IDX_TR_SUSP_REAS_CNTT],
+        mkop_cls_code=fields[_MKOP_IDX_MKOP_CLS_CODE],
+        vi_cls_code=fields[_MKOP_IDX_VI_CLS_CODE],
+    )
 
 
 def _parse_option_quote(
@@ -1579,8 +1674,10 @@ async def poll_signal_fusion_cycle(
                             drawdown_pct=account_state.drawdown_pct,
                             portfolio_capacity_remaining_pct=1.0,
                         )
+                        halt_status = db.latest_market_halt_state(conn)
                         risk_decision = risk_engine.evaluate_entry(
-                            sizing_input, account_state, decision.allowed_strategies[0], MarketConditions()
+                            sizing_input, account_state, decision.allowed_strategies[0], MarketConditions(),
+                            market_halted=bool(halt_status and halt_status["is_halted"]),
                         )
                         risk_gate_state["risk_engine"] = {
                             "approved": risk_decision.approved,
@@ -1737,6 +1834,7 @@ async def main() -> None:
     rest_client = KISRestClient(kis_settings, token_daemon)
     approval_key = ApprovalKeyIssuer(kis_settings).issue()
     regime_state_machine = RegimeStateMachine(underlying=UNDERLYING, futures_symbol=futures_symbol)
+    market_halt_monitor = MarketHaltMonitor()
 
     # 시세(H0IOCNT0/H0IOASP0)는 계좌 무관 공개 데이터라 모의투자 전용 도메인이 없다 —
     # is_mock 여부와 상관없이 MARKET_DATA_WS_DOMAIN(실전 도메인) 하나로 접속한다.
@@ -1784,6 +1882,7 @@ async def main() -> None:
                 rest_client,
                 futures_symbol=futures_symbol,
                 regime_state_machine=regime_state_machine,
+                market_halt_monitor=market_halt_monitor,
                 approval_key=approval_key,
             ),
             poll_option_chain(rest_client, books, master, regime_state_machine=regime_state_machine),

@@ -481,6 +481,70 @@ def rate_limiter_status_history_since(conn: ConnectionLike, since: datetime) -> 
     ]
 
 
+_MARKET_HALT_STATUS_COLUMNS = ("id", "updated_at", "is_halted", "mkop_cls_code", "label", "halted_since")
+
+
+def upsert_market_halt_state(
+    conn: ConnectionLike,
+    updated_at: datetime,
+    is_halted: bool,
+    mkop_cls_code: str | None,
+    label: str | None,
+    halted_since: datetime | None,
+) -> None:
+    """
+    입력: 서킷브레이커/거래정지 실시간 감지(mahdi.risk.market_halt.MarketHaltMonitor)의 상태
+         전이 시점 값.
+    계산: 싱글턴 행(id=TRUE 고정) upsert — `rate_limiter_status_log`와 동일한 패턴. main.py의
+         WS 핸들러가 MarketHaltMonitor.update()의 `changed=True`일 때만 호출한다(2026-07-29
+         신규) — 매 WS 메시지가 아니라 실제로 차단 여부가 바뀐 시점에만 갱신된다.
+    """
+    row = {
+        "id": True, "updated_at": updated_at, "is_halted": is_halted,
+        "mkop_cls_code": mkop_cls_code, "label": label, "halted_since": halted_since,
+    }
+    _upsert(conn, "market_halt_status", _MARKET_HALT_STATUS_COLUMNS, ("id",), row)
+
+
+def latest_market_halt_state(conn: ConnectionLike) -> dict | None:
+    """
+    계산: 가장 최근 upsert_market_halt_state() 기록을 반환한다.
+    실패 조건: 아직 CB/거래정지 이벤트가 한 번도 없었으면(정상적인 대부분의 거래일) None —
+              호출측(RiskEngine 게이팅, COCKPIT)이 "정상"으로 취급해야 한다(지어내지 않음 —
+              is_halted=False로 만든 가짜 행을 반환하지 않는다).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT updated_at, is_halted, mkop_cls_code, label, halted_since FROM market_halt_status LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    updated_at, is_halted, mkop_cls_code, label, halted_since = row
+    return {
+        "updated_at": updated_at, "is_halted": bool(is_halted),
+        "mkop_cls_code": mkop_cls_code, "label": label, "halted_since": halted_since,
+    }
+
+
+def append_market_halt_event_history(
+    conn: ConnectionLike, recorded_at: datetime, mkop_cls_code: str | None, label: str | None, is_halted: bool
+) -> None:
+    """
+    입력: upsert_market_halt_state()와 동일한 전이 시점 값.
+    계산: `market_halt_status`(싱글턴)와 달리 append-only라 매 상태 전이마다 새 행을 남긴다
+         (`rate_limiter_status_history`와 동일 패턴) — 그날 CB가 몇 번, 언제 발동·해제됐는지
+         시계열로 되짚어볼 수 있게 한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO market_halt_event_history (recorded_at, mkop_cls_code, label, is_halted) "
+            "VALUES (%s, %s, %s, %s)",
+            (recorded_at, mkop_cls_code, label, is_halted),
+        )
+    conn.commit()
+
+
 _EXPIRY_LIQUIDITY_1M_COLUMNS = (
     "timestamp", "underlying", "series", "expiry",
     "atm_spread_pct", "depth", "volume", "days_to_expiry",

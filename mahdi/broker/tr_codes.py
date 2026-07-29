@@ -67,6 +67,14 @@ WS_TR_OPTION_CONTRACT = "H0IOCNT0"  # 지수옵션 실시간체결가
 WS_TR_OPTION_ORDERBOOK = "H0IOASP0"  # 지수옵션 실시간호가
 WS_TR_FUTURES_CONTRACT = "H0IFCNT0"  # 지수선물 실시간체결가 — "모의 미지원" 문서에도 옵션과 같은 이유로 실전 도메인 구독 가능
 
+# 국내주식 장운영정보(통합, KRX+NXT) — 서킷브레이커(174/175/182/184/185)·시장임시정지(164)·
+# 사이드카(387/388/397/398) 등 MKOP_CLS_CODE 이벤트가 실린다(mahdi/risk/market_halt.py 참고).
+# 계좌 자체와 무관한 시장 전체 상태 브로드캐스트라, 대표 종목(005930 삼성전자) 하나만 구독해도
+# 그 순간의 세션 상태를 시장 전체 기준으로 알 수 있다. "모의 TR_ID: 모의투자 미지원" 문서 표기는
+# 위 두 TR과 동일한 이유(공개 시세성 데이터라 모의 전용 도메인이 아예 없을 뿐) — 모의 앱키로도
+# MARKET_DATA_WS_DOMAIN 구독이 그대로 성공한다.
+WS_TR_MARKET_OPERATION_INFO = "H0UNMKO0"  # 국내주식 장운영정보(통합)
+
 # 선물옵션 실시간체결통보 (계좌별 주문체결 알림 — Phase2에서 사용, 모의/실전 TR_ID·도메인 모두 분리)
 WS_TR_ORDER_NOTICE = {"real": "H0IFCNI0", "vps": "H0IFCNI9"}
 

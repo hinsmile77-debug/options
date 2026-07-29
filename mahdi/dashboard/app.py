@@ -14,6 +14,7 @@ from mahdi.dashboard.data_source import (
     get_account_status_view,
     get_health_summary,
     get_latest_decision_context,
+    get_market_halt_status,
     get_slack_alerts_enabled,
     load_snapshot,
     record_cockpit_startup,
@@ -67,6 +68,18 @@ def render() -> None:
     snapshot = load_snapshot()
 
     st.title("마흐디 COCKPIT — 관측 전용 (Phase 1)")
+
+    # 2026-07-29 신규 — 거래소 서킷브레이커/거래정지(mahdi.risk.market_halt) 실시간 감지. 평시엔
+    # 아무것도 그리지 않는다(상시 배지는 "오늘의 점검 요약" 그리드가 이미 맡고 있음) — 발동 중일
+    # 때만 스크롤 없이 즉시 눈에 띄어야 하므로 st.error로 최상단에 크게 띄운다.
+    halt_status = get_market_halt_status()
+    if halt_status and halt_status["is_halted"]:
+        st.error(
+            f"🚨 거래소 서킷브레이커/거래정지 발동 중 — {halt_status['label']}"
+            f"(코드 {halt_status['mkop_cls_code']}, {halt_status['halted_since']:%H:%M:%S}부터) — "
+            f"신규 진입 자동 차단됨"
+        )
+
     if not snapshot.is_live:
         st.warning("DB에서 데이터를 찾지 못해 합성 리플레이 데이터로 표시 중입니다 (독립 실행 모드).")
 

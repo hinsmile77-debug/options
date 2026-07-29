@@ -11,6 +11,7 @@ from mahdi.dashboard.data_source import (
     _freshness_check,
     _futures_freshness_check,
     _is_trading_hours,
+    _market_halt_check,
     _option_chain_freshness_check,
     _option_chain_leg_balance_check,
     _rate_limiter_health_check,
@@ -22,6 +23,7 @@ from mahdi.dashboard.data_source import (
     get_account_status_view,
     get_health_summary,
     get_latest_decision_context,
+    get_market_halt_status,
     get_slack_alerts_enabled,
     load_snapshot,
     record_cockpit_startup,
@@ -837,6 +839,66 @@ def test_rate_limiter_health_check_handles_query_error():
     assert conn.rollback_calls == 1
 
 
+# --- 서킷브레이커/거래정지(market_halt) --------------------------------------------------------------
+
+def test_market_halt_check_ok_when_no_event_ever(monkeypatch):
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_market_halt_state", lambda conn: None)
+    check = _market_halt_check(object())
+    assert check.status == "ok"
+    assert "발동 이력 없음" in check.detail
+
+
+def test_market_halt_check_warns_when_currently_halted(monkeypatch):
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 29, 9, 5, 0), "is_halted": True,
+            "mkop_cls_code": "174", "label": "서킷브레이크 발동", "halted_since": datetime(2026, 7, 29, 9, 5, 0),
+        },
+    )
+    check = _market_halt_check(object())
+    assert check.status == "warning"
+    assert "서킷브레이크 발동" in check.detail
+    assert "174" in check.detail
+
+
+def test_market_halt_check_ok_when_resumed(monkeypatch):
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 29, 9, 25, 0), "is_halted": False,
+            "mkop_cls_code": "175", "label": "서킷브레이크 해제", "halted_since": None,
+        },
+    )
+    check = _market_halt_check(object())
+    assert check.status == "ok"
+    assert "서킷브레이크 해제" in check.detail
+
+
+def test_get_market_halt_status_returns_latest_state(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {"is_halted": True, "mkop_cls_code": "174", "label": "서킷브레이크 발동"},
+    )
+    status = get_market_halt_status()
+    assert status["is_halted"] is True
+
+
+def test_get_market_halt_status_returns_none_on_db_failure(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        raise ConnectionError("db down")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    assert get_market_halt_status() is None
+
+
 # --- get_health_summary (오케스트레이션) ------------------------------------------------------------
 
 def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
@@ -853,6 +915,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
         return _check
 
     monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source._market_halt_check", make_check("market_halt"))
     monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_freshness_check", make_check("option_chain"))
     monkeypatch.setattr("mahdi.dashboard.data_source._futures_freshness_check", make_check("futures"))
     monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_leg_balance_check", make_check("leg_balance"))
@@ -867,7 +930,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     result = get_health_summary()
 
     assert calls == [
-        "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
+        "market_halt", "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
         "regime", "regime_fit_progress", "shutdown", "rate_limiter",
     ]
     assert [c.label for c in result] == calls

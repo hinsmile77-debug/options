@@ -42,20 +42,34 @@ class RiskEngine:
         market_conditions: MarketConditions,
         portfolio_greeks_limits: dict | None = None,
         current_portfolio_greeks: dict | None = None,
+        market_halted: bool = False,
     ) -> RiskDecision:
         """
-        입력: 사이징 입력, 계좌 상태, 전략 ID, 시장 상태.
-        계산: (1) Circuit Breaker 평가 — HALTED면 즉시 전량 거부 사유에 추가.
+        입력: 사이징 입력, 계좌 상태, 전략 ID, 시장 상태, market_halted(2026-07-29 신규 — KRX
+              서킷브레이커/거래정지가 실시간으로 발동 중인지, mahdi.risk.market_halt.
+              MarketHaltMonitor 기준. 이 모듈 내부의 CircuitBreaker와는 별개 개념이라 별도
+              파라미터로 받는다 — market_conditions에 섞지 않는 이유는 아래 참고).
+        계산: (0) market_halted가 True면 다른 무엇도 보지 않고 즉시 전량 거부한다 — 거래소
+              자체가 정지된 상태에서는 사이징/한도 계산이 무의미하다.
+              (1) Circuit Breaker 평가 — HALTED면 즉시 전량 거부 사유에 추가.
               (2) 한도 체계(§12.2) 점검 — 위반이 있으면 그 사유도 전부 추가.
               (3) 위반이 하나도 없을 때만 사이징 공식(§12.1)으로 최종 사이즈
                   계산.
         해석: approved=False인 경우 approved_size는 항상 0.0 — "거부됐지만
               일부 사이즈는 허용" 같은 애매한 상태를 만들지 않는다(§12
               "독립 거부권" 취지 — 거부는 전량 거부).
+              market_halted를 CircuitBreaker(내부 리스크 킬스위치, daily_loss/drawdown 등)에
+              합치지 않는 이유: CircuitBreaker는 한 번 HALTED면 reset_daily() 전까지 그날 안엔
+              자동 복귀하지 않는 래치 설계인데, 거래소 CB는 KRX가 해제 이벤트를 보내는 즉시
+              실시간으로 풀려야 한다 — 같은 래치를 적용하면 "CB 해제됐는데도 그날 내내 거래
+              차단"이라는 잘못된 동작이 된다(mahdi/risk/market_halt.py 모듈 docstring 참고).
         실패 조건: Circuit Breaker HALTED와 한도 위반이 동시에 있어도 둘 다
               reject_reasons에 남겨 signal_decisions.reject_reason 로그가
               원인을 온전히 담도록 한다(§18.2).
         """
+        if market_halted:
+            return RiskDecision(approved=False, approved_size=0.0, reject_reasons=["market_halt"])
+
         cb_decision = self._circuit_breaker.evaluate(account_state, market_conditions)
 
         reject_reasons: list[str] = []
