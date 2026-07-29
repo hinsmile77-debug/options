@@ -100,10 +100,19 @@ _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason
 
 # 2026-07-28 8차 — 계좌 손익/포지션 상태 추적기 라이브 배선(get_balance() 실측 필드 매핑은
 # [[DECISION_LOG]] 2026-07-28 7차 항목 참고). 이 폴러는 다른 REST 폴러와 동일하게 KIS API를
-# 호출하므로(get_balance()) 레이트리밋 스태거링 대상 — 옵션체인(0초)·투자자수급(15초)·
-# 매크로(45초)와 겹치지 않는 자리에 오프셋을 둔다.
-ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS = 60.0
-ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS = 20.0
+# 호출하므로(get_balance()) 레이트리밋 스태거링 대상이다.
+# 2026-07-29(운영점검보고서 §2-1 재조정): 최초엔 60초 주기·20초 오프셋으로 넣었는데, 이러면
+# 옵션체인(0초)·투자자수급(15초)과 함께 "60초 주기 REST 폴러 3개"가 20초 폭 안에 몰려 스케줄
+# 밀림·레이트리밋 백오프가 99분 만에 07-24 하루치 수준까지 재발함을 실측 확인했다(REST수집
+# 평균 41.8초·최대 133.19초, 밀림 최대 73.4초, 백오프 최대 2.69배 — 전부 역대 최고). 계좌
+# 잔고(현금/증거금/평가손익)는 ADVISORY 모드라 실주문이 없어 60초 단위로 급변하지 않으므로,
+# 주기를 300초로 늘려 애초에 "60초 그룹"에서 빼내고, 오프셋도 300초 그룹(만기유동성 30초·
+# 매크로 45초)과 겹치지 않는 60초로 옮겼다 — 60초 REST 그룹은 다시 옵션체인·투자자수급 2개만
+# 남아 07-27/07-28에 검증된 안정 조합(REST수집 29.0초)으로 되돌아간다. **실거래(CONFIRM/
+# FULL_AUTO) 전환 시점에는 계좌 잔고가 실제로 자주 바뀌므로 이 300초 주기를 재검토할 것**
+# ([[NEXT_TODO]] 참고).
+ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS = 300.0
+ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS = 60.0
 
 # 2026-07-08 실측: 레이트리밋 버스트 등으로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
@@ -805,6 +814,12 @@ async def poll_option_chain(
                 # 테스트가 db.local_now()를 정해진 시각 시퀀스로 모킹해두는데, 여기서 한 번 더
                 # 부르면 그 시퀀스를 예상보다 빨리 소진시켜 poll_time 자체가 어긋난다.
                 db.record_rate_limiter_status(
+                    conn, poll_time, rest_client.rate_limit_backoff_multiplier, overrun_seconds,
+                )
+                # 2026-07-29(운영점검보고서 §2-5/Fix#3): 위 싱글턴 기록은 "지금 상태"만 보존해
+                # 시계열 조회가 불가능하다 — 같은 값을 append-only 테이블에도 남겨 언제부터
+                # 배율이 오르기 시작했는지 등을 사후에 되짚어볼 수 있게 한다.
+                db.append_rate_limiter_status_history(
                     conn, poll_time, rest_client.rate_limit_backoff_multiplier, overrun_seconds,
                 )
         except Exception:
@@ -1651,12 +1666,20 @@ def _configure_logging() -> None:
          유지하고 그 이전은 자동 삭제한다 — 배치파일도 함께 고쳐 stdout 리다이렉트를 없애고
          (콘솔 창엔 여전히 실시간으로 보임) stderr만 별도의 회전 없는 크래시 전용 로그로 남긴다
          (로깅 설정 자체가 안 끝난 극초반 크래시까지 잡기 위함 — 흔치 않은 이벤트라 회전 불필요).
+         2026-07-29(운영점검보고서 §2-5) — 그동안 `format=` 없이 기본 포맷(레벨:로거명:메시지)만
+         썼는데, 그러면 줄마다 발생 시각이 전혀 안 남아 WARNING이 몇 시에 났는지 로그만으로
+         특정할 수 없었다(그날 스케줄 밀림 원인 조사 중 직접 겪음) — `asctime`(시스템 로컬시각
+         =KST, `db.local_now()`의 naive-KST 정책과 그대로 일치, 별도 tz 변환 불필요)을 추가한다.
     실패 조건: logs/ 디렉터리가 없으면 미리 만든다(최초 실행 시).
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
     console_handler = logging.StreamHandler(sys.stdout)
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        handlers=[file_handler, console_handler],
+    )
 
 
 def _log_startup_gap_since_last_run() -> None:

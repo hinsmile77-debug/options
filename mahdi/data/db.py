@@ -442,6 +442,45 @@ def latest_rate_limiter_status(conn: ConnectionLike) -> tuple[datetime, float, f
     return row[0], float(row[1]), float(row[2])
 
 
+def append_rate_limiter_status_history(
+    conn: ConnectionLike, recorded_at: datetime, backoff_multiplier: float, last_cycle_overrun_seconds: float
+) -> None:
+    """
+    입력: record_rate_limiter_status()와 동일한 인자 3종.
+    계산: `rate_limiter_status_log`(싱글턴, "현재 상태"만 보존)와 달리 이 테이블은 append-only라
+         매 호출이 새 행을 남긴다(2026-07-29, 운영점검보고서 §2-5/Fix#3) — 배율이 시간에 따라
+         어떻게 변했는지 시계열로 되짚어볼 수 있게 한다. `poll_option_chain`이 매 사이클
+         `record_rate_limiter_status()` 바로 다음에 같은 값으로 호출한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO rate_limiter_status_history (recorded_at, backoff_multiplier, last_cycle_overrun_seconds) "
+            "VALUES (%s, %s, %s)",
+            (recorded_at, backoff_multiplier, last_cycle_overrun_seconds),
+        )
+    conn.commit()
+
+
+def rate_limiter_status_history_since(conn: ConnectionLike, since: datetime) -> list[dict]:
+    """
+    입력: 조회 시작 시각(이 시각 이상만 반환).
+    계산: `since` 이후 기록을 시간순으로 반환한다 — COCKPIT 추세 차트, 운영점검 시 "언제부터
+         배율이 상승했는지" 같은 분석에 쓴다.
+    실패 조건: 없음 — 기록이 없으면 빈 목록.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT recorded_at, backoff_multiplier, last_cycle_overrun_seconds "
+            "FROM rate_limiter_status_history WHERE recorded_at >= %s ORDER BY recorded_at ASC",
+            (since,),
+        )
+        rows = cur.fetchall()
+    return [
+        {"recorded_at": recorded_at, "backoff_multiplier": float(mult), "last_cycle_overrun_seconds": float(overrun)}
+        for recorded_at, mult, overrun in rows
+    ]
+
+
 _EXPIRY_LIQUIDITY_1M_COLUMNS = (
     "timestamp", "underlying", "series", "expiry",
     "atm_spread_pct", "depth", "volume", "days_to_expiry",
@@ -685,6 +724,31 @@ def insert_signal_decision(
             (timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode),
         )
     conn.commit()
+
+
+def recent_signal_decisions(conn: ConnectionLike, limit: int = 20) -> list[dict]:
+    """
+    입력: 반환할 최대 건수(최신순).
+    계산: COCKPIT "마흐디 판단 현황" 패널(2026-07-29)이 최근 진입 판단 이력을 보여주는 데
+         쓴다 — `insert_signal_decision()`이 남긴 append-only 로그를 그대로 최신순으로 읽는다.
+         `risk_gate_state`는 JSONB 컬럼이라 psycopg3가 자동으로 dict로 역직렬화해 돌려준다
+         (별도 `json.loads` 불필요 — 라이브 DB로 직접 확인함).
+    실패 조건: 없음 — 기록이 없으면 빈 목록.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT timestamp, conviction, decision, reject_reason, risk_gate_state, exec_mode "
+            "FROM signal_decisions ORDER BY timestamp DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "timestamp": timestamp, "conviction": conviction, "decision": decision,
+            "reject_reason": reject_reason, "risk_gate_state": risk_gate_state, "exec_mode": exec_mode,
+        }
+        for timestamp, conviction, decision, reject_reason, risk_gate_state, exec_mode in rows
+    ]
 
 
 def market_bars_between(conn: ConnectionLike, symbol: str, start: datetime, end: datetime) -> list[dict]:

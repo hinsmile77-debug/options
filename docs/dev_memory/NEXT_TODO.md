@@ -528,6 +528,39 @@ poll_expiry_liquidity/poll_macro_snapshot)가 공유하는 단일 `_RateLimiter`
     - [ ] `PositionSizingInput`의 `target_vol`/`realized_vol`/`liquidity_score`/
           `portfolio_capacity_remaining_pct`가 아직 중립값(라이브 계산기 없음) — 실현/내재
           변동성 비율과 호가 두께 기반 유동성 점수를 실제로 계산하는 파이프라인 필요.
+    - [ ] **(2026-07-29 COCKPIT "판단 현황" 패널 사용자 문의 중 발견) `base_size`가 어디에도
+          설정되지 않고 `mahdi/main.py:1573`에 리터럴 `1.0`으로 하드코딩돼 있음** — 더 근본적인
+          문제는 이 "1.0"이 1계약인지, 계좌 자산 대비 비율인지, 명목가치 1단위인지조차 정의된
+          적이 없다는 것. `RiskEngine.evaluate_entry()`가 반환하는 `approved_size`(예:
+          0.06)를 실제 계약 수/주문 수량으로 변환하는 로직이 `mahdi/execution/entry.py`
+          (`EntryPlan` 생성 담당)에 전혀 없음 — 지금 COCKPIT에 보이는 0.06은 순수
+          "위험조정 사이즈 비율"일 뿐, "그래서 몇 계약을 살지"에 대한 답이 아직 없는 상태.
+          Execution Engine을 실제로 라이브 배선하기 전에 반드시 정의해야 할 항목(계좌 자본
+          규모 기준 base_size 단위 결정 + entry.py의 사이즈→계약수 변환 로직 추가) — 위
+          Portfolio Greeks 한도 항목(2026-07-28)과 같은 시점에 함께 정하는 게 자연스러움.
+    - [ ] **[반드시 해결 — Execution Engine 배선 전 필수] "이미 같은 신호로 진입했으면 재진입
+          안 함" 로직이 어디에도 없음(2026-07-29 COCKPIT 판단 현황 패널 사용자 문의 중 발견)** —
+          `poll_signal_fusion_cycle()`은 60초마다 상태 없이 완전히 새로 평가하므로, 신호(레짐·
+          확신도)가 안 바뀌면 "진입 후보"가 매분 반복해서 뜬다. 지금은 ADVISORY라 무해하지만,
+          **이 상태 그대로 FULL_AUTO/CONFIRM에 연결하면 매분 같은 신호로 반복 진입을 시도하게
+          된다.** 이걸 막을 것처럼 보이는 한도가 `risk_limits.yaml`에 있지만 둘 다 사실상
+          무력화돼 있음을 확인:
+          - `max_same_direction_positions: 3`(설정됨) — 하지만 이 값이 세는
+            `same_direction_buy_count`/`sell_count`는 KIS `get_balance()`의 **실제 보유 포지션**
+            에서만 나오는데, ADVISORY라 실주문이 없어 항상 0 → 실행에 연결되기 전까지는 이
+            한도가 절대 작동할 수 없는 죽은 코드.
+          - `max_daily_trades_per_strategy: null` — 아예 미설정(주석은 "strategy_params.yaml에서
+            세팅"이라 하나 실제로는 그 파일 어디에도 없음, `check_limits()`가 `unconfigured_
+            checks`로도 표시 안 하고 조용히 스킵함 — portfolio_greeks와 달리 투명성도 없음).
+          - 실행에 연결된 이후에도 타이밍 공백 존재: 계좌 잔고 폴러(오늘 300초로 완화, Fix#1)와
+            신호평가(60초) 주기가 달라, 실제 첫 진입 체결 후 최대 5분간은 포지션 증가가
+            반영 안 돼 그 사이 추가 중복 진입이 가능하다.
+          - 근본 해결책(둘 다 필요해 보임): (1) `max_daily_trades_per_strategy`를 실제 값으로
+            설정하고 `daily_trade_counts_by_strategy()`가 `trade_history` 대신(또는 함께)
+            `signal_decisions`의 "같은 전략·같은 방향으로 이미 ENTER+승인된" 최근 기록을 보게
+            하거나, (2) Execution Engine에 "이 신호(전략+방향+대략적 만기/행사가 조합)로 이미
+            열려있는 포지션이 있으면 스킵" 판단을 명시적으로 추가. Execution Engine 라이브
+            배선 논의 시 위 base_size 항목과 함께 반드시 다뤄야 함.
     - [x] **관측 루프 기동 완료·라이브 검증 완료(2026-07-28 8차)** — 이전엔 프로세스가 아예 안
           떠 있었음(확인 결과 "재시작"이 아니라 최초 기동). `uv run python -m mahdi.main`을
           백그라운드로 기동 후 로그+DB로 직접 확인: `poll_account_balance_cycle`의

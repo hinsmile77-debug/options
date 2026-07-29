@@ -16,6 +16,7 @@ from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel
 from mahdi.engines.regime_pipeline import FEATURE_VERSION
+from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import OptionLeg, find_gamma_flip, gamma_walls as compute_gamma_walls
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
@@ -479,6 +480,76 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)
         return [HealthCheck("오늘의 점검 요약", "warning", "DB 연결 실패로 조회 불가")]
+
+
+def get_latest_decision_context(limit: int = 20) -> dict:
+    """
+    입력: 이력으로 함께 보여줄 최대 건수.
+    계산: 2026-07-29 신규 "마흐디 판단 현황" 패널용 — `signal_decisions`의 최신 1건과 최근
+         `limit`건 이력을 함께 반환한다(ADVISORY 전용, 실주문 없음 — Signal Fusion이 지금 어떤
+         진입 판단을 내리고 있는지만 보여준다).
+    해석: `latest["risk_gate_state"]["risk_engine"]`은 dict(승인/거부) 또는 문자열
+         `"account_tracker_not_ready"`(계좌 잔고 폴러가 아직 안 돌았음)일 수 있다 — 호출측
+         (decision_panel)이 두 경우를 구분해서 보여줘야 한다.
+    실패 조건: DB 조회 실패 시 `{"latest": None, "history": []}`로 폴백(지어내지 않음).
+    """
+    try:
+        with db.get_connection() as conn:
+            history = db.recent_signal_decisions(conn, limit=limit)
+    except Exception:
+        logger.warning("판단 현황 조회 실패", exc_info=True)
+        return {"latest": None, "history": []}
+    return {"latest": history[0] if history else None, "history": history}
+
+
+def get_account_status_view() -> dict | None:
+    """
+    계산: 2026-07-29 신규 "계좌 현황" 패널용. 최신 계좌 잔고 스냅샷 + 오늘/이번주 자정 이전
+         baseline + 역대 최고치로 `mahdi.execution.account_tracker.build_account_state()`를
+         그대로 호출해 일간/주간 손익률·드로우다운을 계산한다(`RiskEngine`이 쓰는 것과 동일한
+         함수 재사용 — 손익률 계산을 두 곳에서 따로 하지 않는다).
+    해석: `build_account_state()`는 원래 "이 방향으로 진입했을 때"를 가정하는 함수라
+         `candidate_side`를 요구하는데, 이 화면은 방향과 무관한 계좌 현황 표시라 "BUY"를 고정
+         전달하고 반환값의 `same_direction_positions`(candidate_side에 종속)는 쓰지 않는다 —
+         `daily_pnl_pct`/`weekly_pnl_pct`/`drawdown_pct`는 candidate_side와 무관하다.
+    실패 조건: 스냅샷이 아직 하나도 없으면(계좌 잔고 폴러 미기동) `None` — 손익 0으로 지어내지
+              않고 "데이터 없음"을 그대로 호출측(account_panel)에 알린다.
+    """
+    try:
+        with db.get_connection() as conn:
+            latest_row = db.latest_account_balance_snapshot(conn)
+            if latest_row is None:
+                return None
+            now = db.local_now()
+            today_midnight = datetime.combine(now.date(), dtime.min)
+            week_start_midnight = today_midnight - timedelta(days=today_midnight.weekday())
+            latest = BalanceSnapshot(**latest_row)
+            day_before_row = db.account_balance_snapshot_before(conn, today_midnight)
+            week_before_row = db.account_balance_snapshot_before(conn, week_start_midnight)
+            peak = db.max_account_balance_ever(conn)
+            account_state = build_account_state(
+                latest,
+                BalanceSnapshot(**day_before_row) if day_before_row is not None else None,
+                BalanceSnapshot(**week_before_row) if week_before_row is not None else None,
+                peak,
+                candidate_side="BUY",
+                daily_trades_by_strategy={},
+            )
+    except Exception:
+        logger.warning("계좌 현황 조회 실패", exc_info=True)
+        return None
+    return {
+        "timestamp": latest.timestamp,
+        "prsm_dpast": latest.prsm_dpast,
+        "dnca_cash": latest.dnca_cash,
+        "ord_psbl_cash": latest.ord_psbl_cash,
+        "mgna_tota": latest.mgna_tota,
+        "evlu_pfls_amt_smtl": latest.evlu_pfls_amt_smtl,
+        "trad_pfls_amt_smtl": latest.trad_pfls_amt_smtl,
+        "daily_pnl_pct": account_state.daily_pnl_pct,
+        "weekly_pnl_pct": account_state.weekly_pnl_pct,
+        "drawdown_pct": account_state.drawdown_pct,
+    }
 
 
 def load_snapshot(underlying: str = "KOSPI200") -> DashboardSnapshot:

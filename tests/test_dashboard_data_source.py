@@ -19,7 +19,9 @@ from mahdi.dashboard.data_source import (
     _schema_integrity_check,
     _shutdown_reliability_check,
     _synthetic_snapshot,
+    get_account_status_view,
     get_health_summary,
+    get_latest_decision_context,
     get_slack_alerts_enabled,
     load_snapshot,
     record_cockpit_startup,
@@ -939,3 +941,109 @@ def test_record_cockpit_startup_handles_corrupted_marker_and_recovers(monkeypatc
 
     assert "직전 COCKPIT 기동 기록 확인 실패" in message
     assert fake_marker.read_text(encoding="utf-8") == now.isoformat()  # 손상된 마커도 이번 기록으로 복구됨
+
+
+# --- get_latest_decision_context / get_account_status_view (2026-07-29 "판단 현황"/"계좌 현황") ---
+
+def test_get_latest_decision_context_returns_latest_and_history(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    history = [
+        {
+            "timestamp": datetime(2026, 7, 29, 9, 5, 0), "conviction": "STANDARD", "decision": "ENTER",
+            "reject_reason": None, "risk_gate_state": {"allowed_strategies": ["atm_long"]}, "exec_mode": "ADVISORY",
+        },
+        {
+            "timestamp": datetime(2026, 7, 29, 9, 0, 0), "conviction": "NO_TRADE", "decision": "REJECT",
+            "reject_reason": "no_strategy_for_this_cell", "risk_gate_state": {}, "exec_mode": "ADVISORY",
+        },
+    ]
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.recent_signal_decisions", lambda conn, limit: history)
+
+    result = get_latest_decision_context()
+
+    assert result["latest"] == history[0]
+    assert result["history"] == history
+
+
+def test_get_latest_decision_context_handles_no_rows(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.recent_signal_decisions", lambda conn, limit: [])
+
+    result = get_latest_decision_context()
+
+    assert result == {"latest": None, "history": []}
+
+
+def test_get_latest_decision_context_falls_back_when_db_unavailable(monkeypatch):
+    @contextmanager
+    def broken_connection(settings=None):
+        raise ConnectionError("DB 없음")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
+
+    assert get_latest_decision_context() == {"latest": None, "history": []}
+
+
+_ACCOUNT_ROW_LATEST = {
+    "timestamp": datetime(2026, 7, 29, 9, 0, 0), "prsm_dpast": 51_000_000.0,
+    "evlu_pfls_amt_smtl": 500_000.0, "trad_pfls_amt_smtl": 0.0,
+    "dnca_cash": 50_500_000.0, "ord_psbl_cash": 50_500_000.0, "mgna_tota": 0.0,
+    "same_direction_buy_count": 0, "same_direction_sell_count": 0,
+}
+_ACCOUNT_ROW_YESTERDAY = {**_ACCOUNT_ROW_LATEST, "prsm_dpast": 50_000_000.0}
+
+
+def test_get_account_status_view_computes_pnl_via_build_account_state(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_ROW_LATEST
+    )
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.account_balance_snapshot_before", lambda conn, before: _ACCOUNT_ROW_YESTERDAY
+    )
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.max_account_balance_ever", lambda conn: 51_000_000.0)
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 7, 29, 9, 0, 0)
+    )
+
+    result = get_account_status_view()
+
+    assert result["prsm_dpast"] == 51_000_000.0
+    assert result["daily_pnl_pct"] == pytest.approx(0.02)
+    assert result["weekly_pnl_pct"] == pytest.approx(0.02)
+    assert result["drawdown_pct"] == pytest.approx(0.0)
+
+
+def test_get_account_status_view_returns_none_when_no_snapshot(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_account_balance_snapshot", lambda conn: None)
+
+    assert get_account_status_view() is None
+
+
+def test_get_account_status_view_falls_back_when_db_unavailable(monkeypatch):
+    @contextmanager
+    def broken_connection(settings=None):
+        raise ConnectionError("DB 없음")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
+
+    assert get_account_status_view() is None

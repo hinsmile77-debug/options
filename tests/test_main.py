@@ -892,6 +892,7 @@ def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
         "mahdi.main.db.record_rate_limiter_status",
         lambda conn, checked_at, multiplier, overrun: recorded.append((checked_at, multiplier, overrun)),
     )
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
     # 1번째 사이클 종료 시각=1000.0 -> next_tick=1000+60=1060, 정상 60초 대기(overrun=0).
     # 2번째 사이클 종료 시각=1200.0 -> next_tick=1060+60=1120을 이미 지나쳐 80초 밀림.
@@ -920,6 +921,50 @@ def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
     assert recorded[1][2] == pytest.approx(80.0)
 
 
+def test_poll_option_chain_appends_rate_limiter_status_history_each_cycle(monkeypatch):
+    # 2026-07-29(운영점검보고서 §2-5/Fix#3) — 싱글턴 기록(record_rate_limiter_status)만으로는
+    # 시계열 조회가 안 돼, 같은 값을 append-only 히스토리 테이블에도 남겨야 한다.
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+    rest_client.rate_limit_backoff_multiplier = 1.75
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+
+    appended: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.append_rate_limiter_status_history",
+        lambda conn, recorded_at, multiplier, overrun: appended.append((recorded_at, multiplier, overrun)),
+    )
+
+    fake_loop = _FakeLoop([1000.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=60,
+            )
+        )
+
+    assert len(appended) == 1
+    assert appended[0][1] == pytest.approx(1.75)
+    assert appended[0][2] == pytest.approx(0.0)
+
+
 def test_poll_option_chain_warns_when_rate_limiter_status_write_is_slow(monkeypatch, caplog):
     # 2026-07-24(운영점검보고서 §2-1/§4 Fix#1): record_rate_limiter_status() 기록이 07-23 밤
     # 처음 추가된 뒤 스케줄 밀림이 07-24까지 3일 연속 악화됐다 — 이 동기 DB 왕복 자체가 원인
@@ -941,6 +986,7 @@ def test_poll_option_chain_warns_when_rate_limiter_status_write_is_slow(monkeypa
     monkeypatch.setattr(
         "mahdi.main.db.record_rate_limiter_status", lambda *a, **k: time.sleep(0.25)
     )
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
     fake_loop = _FakeLoop([1000.0])
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
@@ -976,6 +1022,7 @@ def test_poll_option_chain_does_not_warn_when_rate_limiter_status_write_is_fast(
     monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
     monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
     monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
     fake_loop = _FakeLoop([1000.0])
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
@@ -1019,6 +1066,7 @@ def test_poll_option_chain_logs_cycle_breakdown_each_cycle(monkeypatch, caplog):
     monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", slow_insert)
     monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
     monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
     fake_loop = _FakeLoop([1000.0])
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
@@ -1089,6 +1137,7 @@ def test_poll_option_chain_breakdown_detects_other_poller_contention(monkeypatch
     monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
     monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
     monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
     fake_loop = _FakeLoop([1000.0])
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
@@ -1130,6 +1179,7 @@ def test_poll_option_chain_overrun_warning_includes_rest_db_breakdown(monkeypatc
     monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
     monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
     monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
     # 1번째 사이클 종료 시각=1000.0 -> next_tick=1060(정상 60초 대기, overrun=0).
     # 2번째 사이클 종료 시각=1200.0 -> next_tick=1060을 이미 지나쳐 140초 밀림.
@@ -2730,6 +2780,10 @@ def test_configure_logging_uses_rotating_file_handler(monkeypatch, tmp_path):
 
     stream_handlers = [h for h in handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)]
     assert len(stream_handlers) == 1
+
+    # 2026-07-29(운영점검보고서 §2-5): 타임스탬프가 없어 WARNING 발생 시각을 로그만으로 특정할
+    # 수 없었던 문제 — asctime이 포맷에 포함되는지 확인.
+    assert "%(asctime)s" in basic_config_calls[0]["format"]
 
 
 def test_log_startup_gap_writes_marker_when_none_exists(monkeypatch, tmp_path, caplog):

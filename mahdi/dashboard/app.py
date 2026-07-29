@@ -11,12 +11,16 @@ import time
 import streamlit as st
 
 from mahdi.dashboard.data_source import (
+    get_account_status_view,
     get_health_summary,
+    get_latest_decision_context,
     get_slack_alerts_enabled,
     load_snapshot,
     record_cockpit_startup,
     set_slack_alerts_enabled,
 )
+from mahdi.dashboard.panels.account_panel import build_account_summary_cards
+from mahdi.dashboard.panels.decision_panel import build_decision_history_table, build_decision_summary_cards
 from mahdi.dashboard.panels.flow_radar_panel import (
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
@@ -27,6 +31,21 @@ from mahdi.dashboard.panels.gamma_map_panel import build_gamma_profile_chart
 from mahdi.dashboard.panels.macro_panel import build_macro_snapshot_table
 from mahdi.dashboard.panels.position_panel import build_position_flow_chart
 from mahdi.dashboard.panels.regime_panel import REGIME_LABEL_KO, build_regime_probability_chart
+
+_CARD_BADGE = {"ok": st.success, "warning": st.warning, "info": st.info, "neutral": st.info}
+
+
+def _render_cards(cards: list[dict]) -> None:
+    """카드 dict(label/value/status/help) 리스트를 st.columns 배지로 렌더링한다 — "3초 룰"
+    (스크롤 없이 한눈에 파악)을 위해 `get_health_summary()`의 기존 배지 스타일을 그대로 재사용.
+    향후 카드가 늘어나도 이 함수는 그대로고, 호출측 리스트에 dict만 추가하면 된다."""
+    cols = st.columns(len(cards))
+    for col, card in zip(cols, cards):
+        badge = _CARD_BADGE.get(card["status"], st.info)
+        with col:
+            badge(f"**{card['label']}**\n\n{card['value']}")
+            if card.get("help"):
+                st.caption(card["help"])
 
 st.set_page_config(page_title="마흐디 COCKPIT v1", layout="wide")
 
@@ -75,6 +94,20 @@ def render() -> None:
     for col, check in zip(health_cols, health_checks):
         badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
         badge(f"**{check.label}**\n\n{check.detail}")
+
+    # 2026-07-29 신규 — ADVISORY 모드지만 마흐디가 지금 어떤 진입 판단을 내리고 있는지(청산
+    # 단계는 ExecutionEngine 미배선이라 자리만 확보) + 계좌 현황/수익률을 "3초 룰"로 최상단에
+    # 노출한다(운영점검보고서 2026-07-29 요청 사항).
+    st.subheader("마흐디 판단 현황 (ADVISORY — 참고용, 실주문 없음)")
+    decision_context = get_latest_decision_context()
+    _render_cards(build_decision_summary_cards(decision_context["latest"]))
+    if decision_context["history"]:
+        st.plotly_chart(build_decision_history_table(decision_context["history"]), width='stretch')
+    else:
+        st.caption("아직 Signal Fusion 판단 이력이 없습니다.")
+
+    st.subheader("계좌 현황")
+    _render_cards(build_account_summary_cards(get_account_status_view()))
 
     col1, col2, col3 = st.columns(3)
     col1.metric("현재 레짐", REGIME_LABEL_KO[snapshot.regime])

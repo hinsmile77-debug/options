@@ -620,3 +620,62 @@ def test_daily_trade_counts_by_strategy_groups_by_strategy_id():
 
 def test_daily_trade_counts_by_strategy_empty_when_no_trades():
     assert db.daily_trade_counts_by_strategy(FakeReadConnection([]), date(2026, 7, 28)) == {}
+
+
+def test_recent_signal_decisions_maps_rows_and_respects_limit():
+    # 2026-07-29 신규 — COCKPIT "마흐디 판단 현황" 패널이 최근 이력을 최신순으로 보여주는 데 씀.
+    rows = [
+        (
+            datetime(2026, 7, 29, 9, 5), "STANDARD", "ENTER", None,
+            {"direction": 1.0, "risk_engine": {"approved": True, "approved_size": 1.0, "reject_reasons": []}},
+            "ADVISORY",
+        ),
+    ]
+    conn = FakeReadConnection(rows)
+
+    result = db.recent_signal_decisions(conn, limit=5)
+
+    assert result == [
+        {
+            "timestamp": datetime(2026, 7, 29, 9, 5), "conviction": "STANDARD", "decision": "ENTER",
+            "reject_reason": None,
+            "risk_gate_state": {
+                "direction": 1.0, "risk_engine": {"approved": True, "approved_size": 1.0, "reject_reasons": []},
+            },
+            "exec_mode": "ADVISORY",
+        }
+    ]
+    assert conn.store["params"] == (5,)
+
+
+def test_recent_signal_decisions_empty_when_no_rows():
+    assert db.recent_signal_decisions(FakeReadConnection([])) == []
+
+
+def test_append_rate_limiter_status_history_is_plain_insert():
+    # 2026-07-29(운영점검보고서 §2-5/Fix#3) — rate_limiter_status_log(싱글턴)와 달리 이 테이블은
+    # append-only라 매 호출이 새 행을 남겨야 한다(upsert 아님).
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 29, 9, 0)
+
+    db.append_rate_limiter_status_history(conn, ts, backoff_multiplier=1.5, last_cycle_overrun_seconds=10.0)
+
+    assert conn.committed is True
+    assert "INSERT INTO rate_limiter_status_history" in conn.store["query"]
+    assert "ON CONFLICT" not in conn.store["query"]
+    assert conn.store["params"] == (ts, 1.5, 10.0)
+
+
+def test_rate_limiter_status_history_since_maps_rows():
+    conn = FakeReadConnection([(datetime(2026, 7, 29, 9, 0), 1.5, 10.0)])
+
+    result = db.rate_limiter_status_history_since(conn, datetime(2026, 7, 29, 7, 30))
+
+    assert result == [
+        {"recorded_at": datetime(2026, 7, 29, 9, 0), "backoff_multiplier": 1.5, "last_cycle_overrun_seconds": 10.0}
+    ]
+    assert "recorded_at >= %s" in conn.store["query"]
+
+
+def test_rate_limiter_status_history_since_empty_when_no_rows():
+    assert db.rate_limiter_status_history_since(FakeReadConnection([]), datetime(2026, 7, 29)) == []
