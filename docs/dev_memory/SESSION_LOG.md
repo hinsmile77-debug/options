@@ -4,6 +4,195 @@ _최신 세션이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-28 8차] 계좌 추적기 실제 구현 + 관측 루프 최초 기동 + ML 실학습 파이프라인 통합 점검
+
+**트리거:** "계좌 추적기 실제 구현, 관측 루프 재시작, ML 실학습 이어서 구현계획 수립하고
+구현진행해" 요청. Plan 모드로 먼저 사전 조사(Docker 컨테이너 상태, 실제 프로세스 실행 여부,
+`trade_history` 실제 행수) 후 설계 확정.
+
+**사전 조사 핵심 발견:** `mahdi.main`/COCKPIT 둘 다 실행 중이 아니었다 — 이번 "재시작"은
+실제로는 최초 기동이었다. `trade_history` 0건 확인 — ML 실학습은 근본적으로 이번에도 불가능
+(Execution Engine이 여전히 ADVISORY라 실주문이 없어 데이터가 안 쌓임)함을 먼저 명확히 하고
+진행.
+
+**구현:**
+- **계좌 추적기**: `db/migrations/015_account_balance_snapshots.sql`(신규 테이블, 라이브 DB
+  적용 완료) + `mahdi/data/db.py` 5개 함수(`insert_account_balance_snapshot`/
+  `latest_account_balance_snapshot`/`account_balance_snapshot_before`/
+  `max_account_balance_ever`/`daily_trade_counts_by_strategy`) + `mahdi/execution/
+  account_tracker.py`(`parse_balance_response`/`build_account_state` — 2026-07-28 7차 실측
+  필드 매핑 그대로) + `mahdi/main.py` `poll_account_balance_cycle()` 신규.
+- **`poll_signal_fusion_cycle()` 확장**: 진입 후보(`decision="ENTER"`)일 때
+  `RiskEngine.evaluate_entry()`를 실제로 호출해 `signal_decisions.risk_gate_state.risk_engine`
+  에 승인여부/사이즈/거부사유 기록 — v6 §12 "독립 거부권"을 라이브에서 처음 작동시킴. 여전히
+  실주문은 안 함(ExecutionEngine 미사용). 계좌 추적기가 스냅샷을 못 쌓았으면
+  `"account_tracker_not_ready"`로 명시.
+- **라이브 DB 왕복 스모크 테스트 중 버그 발견·수정**: `latest_account_balance_snapshot()`/
+  `account_balance_snapshot_before()`가 DECIMAL 컬럼을 float 변환 안 해 `Decimal`/`float`
+  혼합 연산 `TypeError` 위험이 있었음 — 단위테스트(순수 float 픽스처)로는 못 잡고 실제 Docker
+  DB 왕복으로만 발견, 즉시 수정([[DECISION_LOG]] 참고).
+- **ML 실학습 파이프라인 통합 점검**: `scripts/fit_signal_fusion_meta_label.py`를 라이브 DB로
+  실행해 `db.get_trade_history()`가 실제 Postgres 스키마에 문제없이 동작함을 확인(0건이라
+  "데이터 없음" 에러로 정상 종료 — 기대 동작 재확인, 실제 모델은 여전히 학습 불가).
+- **관측 루프 최초 기동 + 라이브 검증**: `uv run python -m mahdi.main`을 백그라운드로 기동.
+  로그+DB 직접 확인 결과: `get_balance()` 호출이 4개 필수 파라미터 전부 포함해 200 OK,
+  `poll_signal_fusion_cycle`/`poll_account_balance_cycle` 둘 다 에러 로그 0건,
+  `signal_decisions`/`account_balance_snapshots`에 실제로 행이 쌓임을 확인(현재 장외시간이라
+  신호는 NO_TRADE/REJECT뿐 — 정규장에서 재확인 필요). 사소한 발견: 배치파일을 안 거치고 직접
+  실행하면 `PYTHONUTF8` 미설정으로 콘솔에 특수문자 로깅 시 `UnicodeEncodeError`(파일 로그는
+  영향 없음, 정식 배치파일 경로면 발생 안 함) — 별도 조치 불필요, 기록만.
+
+**검증:** 신규 테스트 26개(db.py 9 + account_tracker 10 + main.py 7) + 기존 579개 = 전체
+605개 통과. `ruff check` 통과. 마이그레이션 015 라이브 적용 완료. 관측 루프는 현재도 계속
+실행 중(사용자가 필요시 `scripts/stop_mahdi_marketclose.bat` 또는 직접 종료 가능).
+
+**이번 세션에서 하지 않은 것(다음 증분):** 실제 ML 모델 학습(데이터 0건, 근본적으로 불가),
+COCKPIT에서 signal_decisions/account_balance_snapshots 확인 패널, `PositionSizingInput`의
+target_vol/realized_vol/liquidity_score 실계산, 정규장 중 재검증(오늘은 장외시간 기동).
+
+---
+
+## [2026-07-28 7차] 계좌 추적기 착수 전 손익 조사 — `get_balance()` 필수 파라미터 누락 버그 발견·수정
+
+**트리거:** "남은 작업(계좌 추적기, 실제 ML 학습, 관측 루프 재시작 등)을 이어서 하는 경우
+손익을 조사해" 요청 — 구현 전 조사 단계.
+
+**조사:** `mahdi/broker/rest_client.py`의 `get_balance()`가 실제로 어떤 응답을 주는지 확인하기
+위해 스크래치패드에 1회성 스크립트를 작성해 라이브 모의계좌로 직접 호출. 첫 시도는
+`msg_cd=OPSQ2001, "ERROR : INPUT_FIELD_NAME MGNA_DVSN"`로 실패 — `docs/efriend` KIS 공식
+문서 xlsx를 `uv run --with openpyxl`(프로젝트에 영구 의존성 추가 없이 1회성 실행)로 열어
+"선물옵션 잔고현황"(CTFO6118R/VTFO6118R) 시트를 확인한 결과 `MGNA_DVSN`/`EXCC_STAT_CD`/
+`CTX_AREA_FK200`/`CTX_AREA_NK200` 4개가 전부 Required인데 기존 코드는 `CANO`/`ACNT_PRDT_CD`만
+보내고 있었다 — Phase 1부터 있던 함수지만 실제로 호출해 검증한 적이 없었던 것으로 보인다.
+(xlsx를 Read 도구로 직접 열면 이전 세션들처럼 인코딩이 깨지는데, openpyxl로 읽어 UTF-8
+파일에 쓴 뒤 Read 도구로 다시 읽으니 정상 — 콘솔 stdout 캡처가 mojibake 원인이었을 가능성.)
+
+더 상세한 손익 API인 "선물옵션 잔고평가손익내역"(CTFO6159R)은 문서에 "모의투자 미지원"으로
+명시돼 있어 실전 전용임을 확인 — 계좌 추적기는 `get_balance()` 하나로 손익까지 전부 충당해야
+하는데, 다행히 응답 자체(`output2.prsm_dpast`=추정예탁자산, `evlu_pfls_amt_smtl`/
+`trad_pfls_amt_smtl`=평가·실현손익합계, `output1[].sll_buy_dvsn_name`=종목별 매수/매도
+방향)에 필요한 필드가 이미 다 있어 충분함을 확인.
+
+**수정:** `get_balance()`에 `margin_division`(기본 "02"=유지)/`settlement_status`(기본
+"1"=정산가격) 파라미터를 추가해 4개 필수 필드를 채워 보내도록 수정. 라이브 모의계좌로
+재호출해 `rt_cd="0"` 성공 확인 — 현재 계좌 상태: 현금예수금 5,000만원, 포지션 0건, 손익 전부
+0(한 번도 거래한 적 없는 깨끗한 시작 상태).
+
+**검증:** 신규 테스트 2개(필수 필드 전송 확인, 커스텀 margin_division/settlement_status 확인)
+추가, 전체 579개 테스트 통과, `ruff check` 통과.
+
+**다음 단계:** 이번 조사로 계좌 추적기가 필요로 하는 필드 매핑이 전부 확인됐다
+([[DECISION_LOG]] 2026-07-28 7차 항목에 상세 기록) — 실제 추적기 모듈(주기 폴링 +
+`prsm_dpast` 일별 스냅샷 + `AccountState` 변환) 구현은 다음 요청으로 넘김. 관측 루프 재시작과
+ML 실학습은 이번 세션에서 다루지 않음.
+
+---
+
+## [2026-07-28 6차] Phase 2 잔여 4항목 — Signal Fusion 라이브 배선(ADVISORY)·WFO/MC/DSR·실데이터 백테스트 어댑터·ML 학습 스캐폴딩
+
+**트리거:** "남은 작업(실제 ML 모델 학습, 라이브 배선, 실데이터 기반 백테스트, WFO/MC/DSR)
+구현계획수립하고 구현진행해" 요청. Plan 모드로 조사 후 두 가지 근본 제약을 발견해
+AskUserQuestion으로 범위를 먼저 확정: (1) 계좌 손익/포지션 추적 인프라가 전혀 없어
+`RiskEngine.evaluate_entry()`를 라이브에서 의미 있게 호출하려면 그 추적기부터 새로 만들어야
+함(원래 4항목에 없던 서브시스템) — 사용자가 "Signal Fusion만 라이브 연결"(ADVISORY 전용,
+실주문 없음) 선택. (2) `trade_history`/`prediction_logs`가 0건이라 오늘 실제 ML 학습은
+불가능 — 사용자가 "학습 스크립트만 미리 만들어둔다" 선택.
+
+**구현:**
+- **Signal Fusion 라이브 배선(`mahdi/main.py`)**: `_build_signal_inputs()`(체인/스팟/투자자수급
+  DB 조회 + `legs_from_chain_rows`+`calculate_gex`/`find_gamma_flip` 재사용 — OFI/큐임밸런스는
+  라이브 집계 파이프라인이 없어 항상 None) + `poll_signal_fusion_cycle()`(다른 폴러와 동일한
+  절대시각 고정 틱 스케줄링, `signal_decisions`에 기록) 신규, `main()` 태스크 목록에 추가.
+  **이번 폴러는 KIS REST를 전혀 호출하지 않아(DB 조회+계산만) 레이트리밋 스태거링 대상이
+  아님** — 다른 폴러들과 다른 성격이라 문서화. Risk/Execution Engine은 아직 호출하지 않음(계좌
+  추적기 부재). `mahdi/features/options_intel.py`에 `legs_from_chain_rows()`(체인 dict→
+  OptionLeg 변환, `dashboard/data_source.py`의 기존 인라인 로직과 같은 패턴을 재사용 가능한
+  함수로 분리) 신규, `mahdi/engines/regime_pipeline.py`의 `RegimeStateMachine`에 `last_state`
+  속성 추가(다른 폴러가 재계산 없이 최신 레짐 참조), `mahdi/data/db.py`에 `insert_signal_decision()`
+  신규(append-only 단순 INSERT, upsert 아님).
+  **main.py 코드는 작성했지만 실제 관측 루프 재시작은 아직 하지 않음** — 재시작은 사용자
+  확인 후 별도로 진행.
+- **WFO/MC/DSR(`mahdi/backtest/validation.py`)**: `walk_forward_splits()`(앵커드 walk-forward +
+  embargo), `monte_carlo_resample()`(거래 순서 복원추출 부트스트랩), `deflated_sharpe_ratio()`
+  (Bailey & de Prado 2014 — 다중 시행 기대 최대 Sharpe 근사 + PSR 공식). 순수 통계 함수라
+  데이터 양과 무관하게 지금 바로 정확 — 정확한 참조값 대신 속성 기반 검증(시행 횟수가
+  늘수록 DSR이 낮아짐, MC가 시드에 재현됨 등)으로 테스트, 값 자체는 실행해서 직접 확인 후
+  테스트에 고정(추측으로 assert하지 않음).
+- **실데이터 백테스트 어댑터(`mahdi/backtest/data_adapter.py`)**: `db.py`에 "as-of"(과거 특정
+  시각 기준) 조회 3종(`market_bars_between`/`option_chain_as_of`/`investor_flow_as_of`) 신규
+  추가(기존 `latest_*`는 전부 "지금 기준"이라 과거 리플레이 불가), `load_backtest_steps_from_db()`
+  가 이를 조합해 `BacktestStep` 시퀀스를 만든다. **알려진 단순화**: 레짐은 라벨만 복원(과거
+  prob_vector 미저장이라 원-핫으로 근사), `AccountState`/`MarketConditions`는 항상 중립
+  기본값(과거 손익 재구성 인프라 없음) — 실행 경로 검증용이지 실제 과거 손익 재현 아님.
+- **ML 학습 스캐폴딩**: `mahdi/data/db.py`에 `get_trade_history()`(읽기 전용, insert는 아직 아무도
+  안 씀), `mahdi/fusion/trainer.py`(`build_training_matrix`/`train_tabular_classifier`/
+  `save`/`load` — `scripts/fit_regime_engine.py`와 동일한 pickle 패턴), `scripts/fit_signal_
+  fusion_meta_label.py`(같은 스크립트 구조, 최소 샘플 수 미달이어도 경고만 하고 학습은
+  진행 — `fit_regime_engine.py`와 동일 철학). `xgboost_tabular`라는 멤버 이름과 달리 실제로는
+  이미 설치된 scikit-learn `GradientBoostingClassifier`를 씀(신규 의존성 없음). **오늘 실행하면
+  `trade_history` 0건이라 "데이터 없음" 에러만 남기고 종료 — 기대된 동작.** `xgboost_tabular`가
+  이 학습 결과를 실제로 로드해 신호에 반영하도록 배선하지는 않음(신호 생성 경로 자체는 이번에
+  변경하지 않는다는 사용자 선택 그대로).
+
+**검증:** 신규 테스트 41개(validation 12 + options_intel 4 + regime_pipeline 1 + db.py 15 +
+main.py 6 + backtest data_adapter 4 + fusion trainer 5, 일부 중복 제외 실측 41개) + 기존
+536개 = 전체 577개 통과. `ruff check` 신규/수정 모듈 전부 통과(기존에 있던 `test_regime_
+pipeline.py`의 무관한 미사용 import 경고 1건은 이번 변경과 무관해 손대지 않음).
+
+**이번 세션에서 하지 않은 것(다음 증분):** 계좌 손익/포지션 추적기(Risk/Execution Engine
+라이브 배선의 전제조건), 실제 ML 모델 학습(데이터 0건), WFO/MC/DSR을 실제 백테스트 결과에
+적용해보는 것(실데이터 자체가 아직 부족), main.py 재시작(사용자 확인 필요) — 전부
+[[NEXT_TODO]]에 반영.
+
+---
+
+## [2026-07-28 5차] Phase 2 다음 증분 — Signal Fusion·Execution Engine(하이브리드 3모드 포함)·Backtest 최초 구현
+
+**트리거:** "Phase2 다음 증분(Execution Engine → Signal Fusion → Backtest → 하이브리드 3모드)
+구현계획 수립 후 구현진행해" 요청. Plan 모드로 먼저 설계를 확정한 뒤 승인받아 구현.
+
+**구현 순서/범위 판단:** v6 문서가 하이브리드 3모드(§13.1)를 Execution Engine(Core Engine 8)
+본문 안에 정의하고 있어 별도 모듈 없이 `mahdi/execution/hybrid_mode.py`로 합쳐 구현(중복
+방지). 근본 제약 두 가지를 먼저 확정: (1) 학습된 ML 모델이 아직 없다(`trade_history`
+0건) — Regime Engine의 `warmup_fallback()`과 같은 원칙으로, Signal Fusion 앙상블
+6개 멤버 중 `xgboost_tabular`/`lstm_temporal`은 항상 None 처리(가중치 0, 나머지 4개로
+재정규화)하고 Meta-Label도 §11.2 입력 목록을 그대로 받는 결정론적 프록시로 구현 —
+Phase 3(Champion-Challenger)에서 실제 분류기로 교체 예정임을 코드에 명시. (2) Risk
+Engine 때와 같은 이유로 Execution Engine도 순수 오케스트레이션 라이브러리로만
+구현하고 `main.py` 라이브 루프 배선은 하지 않음 — Signal Fusion이 검증 안 된 휴리스틱
+단계라 실시간 주문(모의계좌라도)을 계속 내보내는 건 시기상조라는 판단.
+
+**구현:**
+- `mahdi/fusion/{signal_layer,ensemble,conflict_resolution,meta_label,strategy_palette,
+  engine}.py` — Primary Signal Layer(4개 계산 가능 멤버, 부호 기반 방향 점수) → 앙상블
+  가중 평균(존재하는 멤버만 재정규화, `regime_pipeline.compute_macro_score_proxy()`와
+  동일 원칙) → Conflict Resolution(동조/반대 개수로 "뚜렷한 합의" 여부 판정) →
+  Meta-Label 프록시(TradePermission 4단계) → Strategy Palette(레짐×VRP 매트릭스 +
+  프리미엄 매도 게이트 + 하루 우선전략 상한). `SignalFusionEngine` 파사드로 통합.
+- `mahdi/execution/{hybrid_mode,entry,exit_stack,forced_flat,order_manager,engine}.py` —
+  하이브리드 3모드(ADVISORY/CONFIRM/FULL_AUTO, Hard Stop/Circuit Breaker/Forced Flat은
+  모드 무관 항상 자동) + Passive-first 진입(물타기 금지 포함) + 6-Layer Exit Stack(§13.3
+  순서대로 점검, Belief Decay는 §13.4 EV 공식+4대 악화 항목 pseudocode 그대로 구현) +
+  Forced Flat 자기검증(`verify_forced_flat()` — FILLED 아닌 모든 상태를 잔존으로 취급,
+  [[DECISION_LOG]] 2026-07-21 배포 금지 조건 충족) + 주문 제출/체결통보-REST 이중 확인.
+  `ExecutionEngine` 파사드가 진입/재평가 양쪽에서 `RiskEngine.evaluate_entry()`/
+  `evaluate_ongoing()`을 항상 경유하도록 배선(v6 §12 "독립 거부권").
+- `mahdi/backtest/{simulated_broker,metrics,engine}.py` — LIMIT 터치 체결/MARKET 다음봉
+  시가+슬리피지 체결 시뮬레이터, `cc_scorecard` 컬럼과 1:1 대응하는 지표 계산,
+  `BacktestEngine`이 `SignalFusionEngine`→`ExecutionEngine`(내부 `RiskEngine` 경유)을
+  실거래와 동일하게 재사용하는 재생 루프(실행 경로 이원화 없음). 실거래 이력 부족으로
+  합성 픽스처로만 검증, WFO/MC/DSR 검증 스택은 범위 밖으로 명시적으로 미룸.
+- `mahdi/config/strategy_params.yaml`에 `meta_label_thresholds`/`exit_rules` 섹션 신규 추가.
+
+**검증:** 신규 테스트 104개(fusion 43 + execution 46 + backtest 15) + 기존 432개 = 전체
+536개 통과. `ruff check`로 신규 모듈 전체 린트 통과.
+
+**이번 세션에서 하지 않은 것(다음 증분):** `main.py` 라이브 배선, ML 모델 실학습(Triple
+Barrier/Purged CV), 실제 과거 데이터 기반 백테스트, WFO/MC/DSR 검증 스택 — 전부
+[[NEXT_TODO]] Phase 2 절에 하위 체크리스트로 남김.
+
+---
+
 ## [2026-07-28 4차] Phase 2 착수 — Risk Engine(Core Engine 7) 최초 구현
 
 **트리거:** "Phase 2 준비상황 조사하고 구현계획 수립하고 구현진행해" 요청.

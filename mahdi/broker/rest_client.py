@@ -330,10 +330,24 @@ class KISRestClient:
             },
         )
 
-    def get_balance(self) -> dict:
+    def get_balance(self, margin_division: str = "02", settlement_status: str = "1") -> dict:
         """
-        계산: PATH_FUTUREOPTION_BALANCE GET 호출 (계좌번호는 설정에서 사용).
-        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 전파.
+        입력: margin_division("01"=개시/"02"=유지, 기본값 유지 — 계좌 손익 추적기가 매 사이클
+             조회하는 용도로는 "유지" 증거금 기준이 자연스럽다), settlement_status("1"=정산가격/
+             "2"=매입가격 기준 잔고 조회).
+        계산: PATH_FUTUREOPTION_BALANCE GET 호출(계좌번호는 설정에서 사용). 2026-07-28 6차
+             실측(docs/efriend xlsx "선물옵션 잔고현황" 시트)으로 MGNA_DVSN/EXCC_STAT_CD/
+             CTX_AREA_FK200/CTX_AREA_NK200이 전부 Required임을 확인 — 이 넷이 빠져 있으면 KIS가
+             "ERROR : INPUT_FIELD_NAME MGNA_DVSN"(msg_cd=OPSQ2001)로 거부한다(과거 버전은 이
+             네 필드 없이 호출해 항상 실패했었음). CTX_AREA_*200은 연속조회(페이지네이션)용이라
+             최초 조회 시 빈 문자열.
+        해석: 응답 output2의 `prsm_dpast`(추정예탁자산)를 일자별로 스냅샷하면 daily_pnl_pct/
+             drawdown_pct 계산의 기준값이 되고, `evlu_pfls_amt_smtl`/`trad_pfls_amt_smtl`이
+             평가/실현 손익 합계, output1(배열)의 `sll_buy_dvsn_name`으로 종목별 매수/매도
+             방향을 셀 수 있다(Risk Engine `AccountState.same_direction_positions` 계산 재료).
+        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 전파. 모의투자(VTFO6118R)는 실전과 동일한
+             필드셋으로 지원되지만, 자매 API인 "선물옵션 잔고평가손익내역"(CTFO6159R)은 모의투자
+             미지원이라 이 함수로 완전히 대체해야 한다.
         """
         tr_id = tr_codes.TR_BALANCE_INQUIRY[self._env_key]
         return self._get(
@@ -342,6 +356,10 @@ class KISRestClient:
             params={
                 "CANO": self._settings.kis_account_no,
                 "ACNT_PRDT_CD": self._settings.kis_account_product_code,
+                "MGNA_DVSN": margin_division,
+                "EXCC_STAT_CD": settlement_status,
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
             },
         )
 

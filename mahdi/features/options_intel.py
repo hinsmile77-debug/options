@@ -10,7 +10,7 @@ import contextlib
 import io
 import warnings
 from dataclasses import dataclass
-from datetime import time
+from datetime import date, time
 from typing import Sequence
 
 from vollib.black_scholes.greeks.analytical import gamma as _bs_gamma
@@ -30,6 +30,31 @@ class OptionLeg:
     gamma: float
     vanna: float = 0.0
     charm: float = 0.0
+
+
+def legs_from_chain_rows(chain_rows: Sequence[dict], today: date) -> list[OptionLeg]:
+    """
+    입력: `db.latest_option_chain()`/`db.option_chain_as_of()`가 반환하는 형태의 dict 목록
+         (strike/option_type/oi/iv/gamma/expiry 키), 잔존만기 계산 기준일.
+    계산: `mahdi/dashboard/data_source.py`의 체인 dict -> `OptionLeg` 변환과 동일한 규칙 —
+         option_type을 소문자로, t_years=max((expiry-today).days, 0)/365. vanna/charm은 이
+         조회 결과에 없어 기본값(0.0)을 그대로 둔다(있는 값을 억지로 채우지 않음).
+    해석: 만기가 지난(또는 없는) 레그는 제외한다 — expiry가 None인 행, 또는 today 이후 값이
+         없는 비정상 행은 만들지 않는다.
+    실패 조건: chain_rows가 비어있으면 빈 목록.
+    """
+    return [
+        OptionLeg(
+            strike=row["strike"],
+            option_type=row["option_type"].lower(),
+            oi=row["oi"],
+            iv=row["iv"],
+            t_years=max((row["expiry"] - today).days, 0) / 365.0,
+            gamma=row["gamma"],
+        )
+        for row in chain_rows
+        if row.get("expiry") is not None
+    ]
 
 
 def calculate_gex(legs: Sequence[OptionLeg], spot: float, multiplier: float = 250_000) -> float:

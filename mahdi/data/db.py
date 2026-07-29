@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Iterator, Protocol
 
 import psycopg
@@ -658,3 +658,217 @@ def insert_regime_state(
         ("timestamp",),
         row,
     )
+
+
+def insert_signal_decision(
+    conn: ConnectionLike,
+    timestamp: datetime,
+    conviction: str,
+    decision: str,
+    reject_reason: str | None,
+    risk_gate_state: dict,
+    exec_mode: str,
+) -> None:
+    """
+    입력: 시각, conviction(v6 §11.1 4단계 문자열), decision("ENTER"/"HOLD"/"REJECT"),
+         거절 사유(있으면), 리스크/신호 게이트 상태 요약(JSONB 직렬화), 실행 모드
+         ("ADVISORY"/"CONFIRM"/"AUTO").
+    계산: `signal_decisions`는 `decision_id`가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이
+         새 행을 남기는 append-only 로그(§18.2 "거절된 신호도 기록한다")라 단순 INSERT만 한다.
+    실패 조건: reject_reason이 50자를 넘으면 DB가 자르지 않고 에러를 낼 수 있다 — 호출측이
+              미리 축약해서 넘겨야 한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
+            "risk_gate_state, exec_mode) VALUES (%s, %s, %s, %s, %s, %s)",
+            (timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode),
+        )
+    conn.commit()
+
+
+def market_bars_between(conn: ConnectionLike, symbol: str, start: datetime, end: datetime) -> list[dict]:
+    """
+    입력: 선물/옵션 단축코드, 조회 구간(start 이상 end 미만, 시간순).
+    계산: `market_raw_1m`에서 해당 구간의 1분봉(OHLC)을 시간순으로 반환한다 — 백테스트
+         데이터 어댑터(`mahdi/backtest/data_adapter.py`)가 `Bar` 시퀀스를 만드는 데 쓴다.
+    해석: `market_raw_1m`은 실시간 수집만 하고(백테스트 재처리 대상 아님) 이 함수는 순수 조회다.
+    실패 조건: 구간에 데이터가 없으면 빈 목록.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT timestamp, open, high, low, close FROM market_raw_1m "
+            "WHERE symbol=%s AND timestamp >= %s AND timestamp < %s ORDER BY timestamp ASC",
+            (symbol, start, end),
+        )
+        rows = cur.fetchall()
+    return [
+        {"timestamp": ts, "open": float(o), "high": float(h), "low": float(low), "close": float(c)}
+        for ts, o, h, low, c in rows
+    ]
+
+
+def option_chain_as_of(conn: ConnectionLike, underlying: str, as_of: datetime) -> list[dict]:
+    """
+    `latest_option_chain()`과 완전히 같은 형태를 반환하되, "지금 기준 최신"이 아니라 `as_of`
+    시각 기준 각 레그(strike, option_type)의 최신값을 취한다 — 백테스트 과거 리플레이 전용
+    (`latest_option_chain()`은 실시간 대시보드 전용으로 그대로 둔다).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (strike, option_type)
+                strike, option_type, oi, iv, gamma, gex, expiry, timestamp
+            FROM option_analysis_1m
+            WHERE underlying=%s AND timestamp <= %s
+            ORDER BY strike, option_type, timestamp DESC
+            """,
+            (underlying, as_of),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "strike": float(strike),
+            "option_type": option_type,
+            "oi": float(oi) if oi is not None else 0.0,
+            "iv": float(iv) if iv is not None else 0.0,
+            "gamma": float(gamma) if gamma is not None else 0.0,
+            "gex": float(gex) if gex is not None else 0.0,
+            "expiry": expiry,
+            "timestamp": timestamp,
+        }
+        for strike, option_type, oi, iv, gamma, gex, expiry, timestamp in rows
+    ]
+
+
+def investor_flow_as_of(conn: ConnectionLike, underlying: str, as_of: datetime) -> tuple[float, float, float] | None:
+    """`latest_investor_flow()`와 같은 형태를 `as_of` 시각 기준으로 반환(백테스트 리플레이 전용)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT foreign_net, institution_net, individual_net FROM investor_flow_1m "
+            "WHERE underlying=%s AND timestamp <= %s ORDER BY timestamp DESC LIMIT 1",
+            (underlying, as_of),
+        )
+        row = cur.fetchone()
+    return (float(row[0]), float(row[1]), float(row[2])) if row else None
+
+
+def get_trade_history(conn: ConnectionLike, strategy_id: str | None = None) -> list[dict]:
+    """
+    입력: 전략 ID(None이면 전체 전략).
+    계산: `trade_history`에서 ML 학습에 필요한 컬럼(regime_entry/confidence_entry/net_pnl)만
+         뽑는다 — `scripts/fit_signal_fusion_meta_label.py`가 이 함수로 읽어 학습 매트릭스를
+         만든다(`mahdi/fusion/trainer.py`의 `build_training_matrix()` 참고).
+    해석: 아직 아무 곳도 `trade_history`에 쓰지 않으므로(실주문 실행이 없음) 현재는 항상 빈
+         목록을 반환한다 — 그 자체가 "학습 스크립트가 오늘은 데이터 부족으로 종료돼야 한다"는
+         기대 동작과 일치한다.
+    실패 조건: 없음 — 행이 없으면 빈 목록.
+    """
+    query = "SELECT regime_entry, confidence_entry, net_pnl FROM trade_history"
+    params: tuple = ()
+    if strategy_id is not None:
+        query += " WHERE strategy_id=%s"
+        params = (strategy_id,)
+    query += " ORDER BY entry_time ASC"
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    return [
+        {"regime_entry": regime_entry, "confidence_entry": float(confidence_entry), "net_pnl": float(net_pnl)}
+        for regime_entry, confidence_entry, net_pnl in rows
+        if regime_entry is not None and confidence_entry is not None and net_pnl is not None
+    ]
+
+
+_ACCOUNT_BALANCE_SNAPSHOT_COLUMNS = (
+    "timestamp", "prsm_dpast", "evlu_pfls_amt_smtl", "trad_pfls_amt_smtl",
+    "dnca_cash", "ord_psbl_cash", "mgna_tota",
+    "same_direction_buy_count", "same_direction_sell_count",
+)
+_ACCOUNT_BALANCE_SNAPSHOT_DECIMAL_COLUMNS = (
+    "prsm_dpast", "evlu_pfls_amt_smtl", "trad_pfls_amt_smtl", "dnca_cash", "ord_psbl_cash", "mgna_tota",
+)
+
+
+def _account_balance_snapshot_row_to_dict(row: tuple) -> dict:
+    """DECIMAL 컬럼(psycopg가 `decimal.Decimal`로 반환)을 float으로 변환한다 — 라이브 DB
+    실측에서 `account_tracker.build_account_state()`가 다른 float 값과 섞어 연산할 때
+    `Decimal`/`float` 혼합 TypeError를 내는 걸 확인해 수정함(2026-07-28 8차)."""
+    values = dict(zip(_ACCOUNT_BALANCE_SNAPSHOT_COLUMNS, row))
+    for col in _ACCOUNT_BALANCE_SNAPSHOT_DECIMAL_COLUMNS:
+        if values[col] is not None:
+            values[col] = float(values[col])
+    return values
+
+
+def insert_account_balance_snapshot(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: `account_balance_snapshots` 컬럼과 동일한 키를 가진 dict(`mahdi.execution.
+         account_tracker.BalanceSnapshot`을 dict로 펼친 것 — `parse_balance_response()` 참고).
+    계산: INSERT ... ON CONFLICT (timestamp) DO UPDATE — 재처리에도 멱등.
+    """
+    _upsert(conn, "account_balance_snapshots", _ACCOUNT_BALANCE_SNAPSHOT_COLUMNS, ("timestamp",), row)
+
+
+def latest_account_balance_snapshot(conn: ConnectionLike) -> dict | None:
+    """가장 최근 계좌 잔고 스냅샷 1건. 계좌 추적기 폴러가 아직 한 번도 안 돌았으면 None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(_ACCOUNT_BALANCE_SNAPSHOT_COLUMNS)} FROM account_balance_snapshots "
+            "ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return _account_balance_snapshot_row_to_dict(row)
+
+
+def account_balance_snapshot_before(conn: ConnectionLike, before: datetime) -> dict | None:
+    """
+    입력: 기준 시각.
+    계산: `before` 이전의 마지막 스냅샷 1건을 반환한다 — `latest_regime_before()`/
+         `compute_gap_zscore()`와 동일한 as-of 패턴. 호출측이 `before`에 오늘 자정을 넣으면
+         "어제 종가 기준"(일간 손익 baseline), 이번주 월요일 자정을 넣으면 "지난주 금요일 종가
+         기준"(주간 손익 baseline)이 된다 — 별도 함수를 두지 않고 하나로 재사용한다.
+    실패 조건: 그 이전에 스냅샷이 없으면(운영 첫 날 등) None — 호출측이 "baseline 없음"으로
+              처리해야 한다(`build_account_state()`는 이 경우 0.0으로 폴백).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(_ACCOUNT_BALANCE_SNAPSHOT_COLUMNS)} FROM account_balance_snapshots "
+            "WHERE timestamp < %s ORDER BY timestamp DESC LIMIT 1",
+            (before,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return _account_balance_snapshot_row_to_dict(row)
+
+
+def max_account_balance_ever(conn: ConnectionLike) -> float | None:
+    """계산: 역대 최고 `prsm_dpast` — 드로우다운(`drawdown_pct`) 계산의 기준 피크값."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(prsm_dpast) FROM account_balance_snapshots")
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def daily_trade_counts_by_strategy(conn: ConnectionLike, day: date) -> dict[str, int]:
+    """
+    입력: 집계할 날짜(거래일).
+    계산: `trade_history`를 `entry_time::date`로 필터링해 전략별 거래 횟수를 센다 —
+         `RiskEngine`의 `max_daily_trades_per_strategy` 한도 체크(`AccountState.
+         daily_trades_by_strategy`) 재료.
+    해석: 아직 아무도 `trade_history`에 쓰지 않으므로(실주문 실행이 없음) 현재는 항상 빈
+         dict를 반환한다.
+    실패 조건: 없음 — 행이 없으면 빈 dict.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT strategy_id, count(*) FROM trade_history WHERE entry_time::date=%s GROUP BY strategy_id",
+            (day,),
+        )
+        rows = cur.fetchall()
+    return {strategy_id: int(count) for strategy_id, count in rows if strategy_id is not None}

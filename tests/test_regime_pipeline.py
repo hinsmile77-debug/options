@@ -189,6 +189,29 @@ def test_state_machine_switches_to_predict_after_warmup(monkeypatch, tmp_path):
     assert state.regime == RegimeLabel.TREND_UP_STRONG
 
 
+def test_step_caches_result_on_last_state_for_other_pollers_to_read(monkeypatch, tmp_path):
+    # Signal Fusion 라이브 배선(poll_signal_fusion_cycle)이 재계산 없이 최신 레짐을 읽을 수 있도록
+    # step()이 반환값을 last_state에도 남겨야 한다.
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    assert machine.last_state is None
+
+    monkeypatch.setattr(db, "daily_closes", lambda conn, symbol, days: [])
+    monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
+    monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
+    monkeypatch.setattr(db, "recent_us10y_daily_series", lambda conn, days: [])
+    monkeypatch.setattr(db, "insert_feature_store", lambda conn, ts, symbol, features, version: None)
+    monkeypatch.setattr(regime_pipeline, "compute_gap_zscore", lambda conn, underlying: 0.0)
+    monkeypatch.setattr(regime_pipeline, "compute_macro_score_proxy", lambda conn, underlying: 0.0)
+    monkeypatch.setattr(regime_pipeline, "latest_prior_close_regime", lambda conn: RegimeLabel.VOL_COMPRESSION)
+
+    machine.update_bar(_bar(close=100.0, high=100.5, low=99.5))
+    state = machine.step(conn=None, timestamp=datetime(2026, 7, 10, 9, 30))
+
+    assert machine.last_state is state
+
+
 class _FakeCursor:
     def __init__(self, results: list):
         self._results = results  # 같은 리스트 참조 — 커넥션당 여러 cursor() 호출이 큐를 공유해야 함

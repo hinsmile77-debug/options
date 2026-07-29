@@ -18,16 +18,20 @@ from mahdi.features.options_intel import OptionLeg, calculate_gex
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.main import (
     _atm_liquidity_window,
+    _build_account_state_for_candidate,
+    _build_signal_inputs,
     _parse_asking_price_leg,
     _parse_futures_tick,
     _parse_option_quote,
     _parse_overseas_daily_last_price,
     _parse_overseas_future_last_price,
     _parse_tick,
+    poll_account_balance_cycle,
     poll_expiry_liquidity,
     poll_investor_flow,
     poll_macro_snapshot,
     poll_option_chain,
+    poll_signal_fusion_cycle,
     run_observation_loop,
     run_observation_loop_forever,
 )
@@ -2893,3 +2897,378 @@ def test_poll_option_chain_leg_fetch_failure_logs_kis_response_body_and_is_throt
     logged_message = fetch_failure_records[0].getMessage()
     assert "EGW00201" in logged_message  # 응답 바디(KIS 원인 코드)가 로그에 남음
     assert "초당 거래건수를 초과하였습니다" in logged_message
+
+
+# --- Signal Fusion 라이브 배선(2026-07-28 2차, ADVISORY 전용) --------------------------------
+
+
+def test_build_signal_inputs_computes_gex_and_gamma_flip_from_chain_and_spot(monkeypatch):
+    chain_rows = [
+        {"strike": 350.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+        {"strike": 350.0, "option_type": "P", "oi": 80.0, "iv": 0.20, "gamma": 0.018,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 350.5)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, -100.0, -200.0))
+
+    regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=(1.0,) + (0.0,) * 7)
+    inputs = _build_signal_inputs(conn=object(), regime_state=regime_state, underlying="KOSPI200")
+
+    assert inputs.regime_state is regime_state
+    assert inputs.spot == 350.5
+    assert inputs.gex is not None  # 콜/풋 감마가 있으니 계산됨
+    assert inputs.foreign_net_flow == 500.0
+    assert inputs.ofi is None  # 라이브 OFI 집계 파이프라인 없음 — 항상 None
+    assert inputs.queue_imbalance is None
+
+
+def test_build_signal_inputs_handles_missing_chain_and_flow_gracefully(monkeypatch):
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
+
+    inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert inputs.regime_state is None
+    assert inputs.gex is None
+    assert inputs.gamma_flip is None
+    assert inputs.spot is None
+    assert inputs.foreign_net_flow is None
+
+
+class _FakeRegimeStateMachineWithLastState:
+    def __init__(self, last_state):
+        self.last_state = last_state
+
+
+def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+            (ts, conviction, decision, reject_reason, risk_gate_state, exec_mode)
+        ),
+    )
+
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(None)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=60))
+
+    assert len(recorded) == 2
+    _ts, conviction, decision, _reject_reason, _risk_gate_state, exec_mode = recorded[0]
+    assert conviction == "NO_TRADE"  # 신호 원재료가 전부 없으니 NO_TRADE
+    assert decision == "REJECT"
+    assert exec_mode == "ADVISORY"  # 이번 증분은 항상 ADVISORY — 실주문 없음
+
+
+def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeypatch):
+    chain_rows = [
+        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    # 2026-07-28 8차: is_entry일 때 계좌 추적기를 조회하므로, 이 테스트는 "추적기 미준비"
+    # 경로로 흘려보내 기존 검증 범위(진입 후보 로깅 자체)를 그대로 유지한다.
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+            (ts, conviction, decision, reject_reason, risk_gate_state, exec_mode)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.TREND_UP_STRONG] = 1.0
+    regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple(prob_vector))
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(regime_state)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=60))
+
+    assert len(recorded) == 1
+    _ts, _conviction, decision, reject_reason, risk_gate_state, _exec_mode = recorded[0]
+    assert decision == "ENTER"
+    assert reject_reason is None
+    assert risk_gate_state["direction"] > 0
+
+
+def test_poll_signal_fusion_cycle_waits_startup_offset_before_first_cycle(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(None)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=1, startup_offset_seconds=10.0))
+
+    assert sleep_calls == [10.0]
+
+
+def test_poll_signal_fusion_cycle_continues_after_cycle_failure(monkeypatch):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        raise RuntimeError("DB 연결 실패")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(None)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=1))
+
+    assert len(sleep_calls) == 1  # DB 실패해도 로깅만 하고 다음 사이클 대기로 넘어감
+
+
+# --- 계좌 손익/포지션 추적기 라이브 배선(2026-07-28 8차) --------------------------------------
+
+
+_ACCOUNT_SNAPSHOT_ROW = {
+    "timestamp": None, "prsm_dpast": 110.0, "evlu_pfls_amt_smtl": 10.0, "trad_pfls_amt_smtl": 0.0,
+    "dnca_cash": 100.0, "ord_psbl_cash": 90.0, "mgna_tota": 5.0,
+    "same_direction_buy_count": 0, "same_direction_sell_count": 0,
+}
+_BASELINE_SNAPSHOT_ROW = {**_ACCOUNT_SNAPSHOT_ROW, "prsm_dpast": 100.0}
+
+
+def test_build_account_state_for_candidate_none_when_tracker_not_ready(monkeypatch):
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
+    result = _build_account_state_for_candidate(
+        conn=object(), candidate_side="BUY", poll_time=datetime(2026, 7, 28, 10, 0)
+    )
+    assert result is None
+
+
+def test_build_account_state_for_candidate_computes_state_from_snapshots(monkeypatch):
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.max_account_balance_ever", lambda conn: 110.0)
+    monkeypatch.setattr("mahdi.main.db.daily_trade_counts_by_strategy", lambda conn, day: {})
+
+    state = _build_account_state_for_candidate(
+        conn=object(), candidate_side="BUY", poll_time=datetime(2026, 7, 28, 10, 0)
+    )
+
+    assert state is not None
+    assert state.daily_pnl_pct == pytest.approx(0.10)
+    assert state.drawdown_pct == pytest.approx(0.0)
+    assert state.same_direction_positions == 0
+
+
+def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(monkeypatch):
+    chain_rows = [
+        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.max_account_balance_ever", lambda conn: 110.0)
+    monkeypatch.setattr("mahdi.main.db.daily_trade_counts_by_strategy", lambda conn, day: {})
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+            (decision, risk_gate_state)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.TREND_UP_STRONG] = 1.0
+    regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple(prob_vector))
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(regime_state)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=60))
+
+    assert len(recorded) == 1
+    decision, risk_gate_state = recorded[0]
+    assert decision == "ENTER"
+    assert risk_gate_state["risk_engine"]["approved"] is True
+    assert risk_gate_state["risk_engine"]["approved_size"] > 0
+
+
+def test_poll_signal_fusion_cycle_marks_account_tracker_not_ready(monkeypatch):
+    chain_rows = [
+        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+            (decision, risk_gate_state)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.TREND_UP_STRONG] = 1.0
+    regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple(prob_vector))
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(regime_state)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=60))
+
+    assert recorded[0][1]["risk_engine"] == "account_tracker_not_ready"
+
+
+class _FakeBalanceRestClient:
+    def __init__(self, response: dict):
+        self.response = response
+        self.calls = 0
+
+    def get_balance(self):
+        self.calls += 1
+        return self.response
+
+
+_SAMPLE_BALANCE_RESPONSE = {
+    "rt_cd": "0",
+    "output1": [],
+    "output2": {"prsm_dpast": "50000000", "evlu_pfls_amt_smtl": "0", "trad_pfls_amt_smtl": "0",
+                "dnca_cash": "50000000", "ord_psbl_cash": "50000000", "mgna_tota": "0"},
+}
+
+
+def test_poll_account_balance_cycle_records_snapshot_each_cycle(monkeypatch):
+    rest_client = _FakeBalanceRestClient(_SAMPLE_BALANCE_RESPONSE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_account_balance_snapshot", lambda conn, row: recorded.append(row)
+    )
+
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_account_balance_cycle(rest_client, interval_seconds=60))
+
+    assert len(recorded) == 2
+    assert recorded[0]["prsm_dpast"] == 50000000.0
+    assert rest_client.calls == 2
+
+
+def test_poll_account_balance_cycle_waits_startup_offset(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    rest_client = _FakeBalanceRestClient(_SAMPLE_BALANCE_RESPONSE)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_account_balance_cycle(rest_client, interval_seconds=1, startup_offset_seconds=20.0))
+
+    assert sleep_calls == [20.0]
+    assert rest_client.calls == 0
+
+
+def test_poll_account_balance_cycle_continues_after_failure(monkeypatch):
+    class _FailingRestClient:
+        def get_balance(self):
+            raise RuntimeError("KIS 500")
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_account_balance_cycle(_FailingRestClient(), interval_seconds=1))
+
+    assert len(sleep_calls) == 1  # 실패해도 로깅만 하고 다음 사이클 대기로 넘어감

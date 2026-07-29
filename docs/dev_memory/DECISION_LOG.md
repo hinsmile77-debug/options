@@ -4,6 +4,157 @@ _최신 항목이 위에 오도록 역순 정렬_
 
 ---
 
+## [2026-07-28 8차] 계좌 스냅샷 조회 함수의 `Decimal`/`float` 혼합 버그 — 라이브 DB 왕복으로만 발견
+
+**결정:** `db.latest_account_balance_snapshot()`/`db.account_balance_snapshot_before()`가
+DECIMAL 컬럼을 float으로 변환하지 않고 psycopg가 반환한 `decimal.Decimal` 그대로 dict에
+담고 있던 것을 발견해 수정했다 — 두 함수 모두 `_ACCOUNT_BALANCE_SNAPSHOT_DECIMAL_COLUMNS`에
+대해 명시적으로 `float()` 변환하도록 고침.
+
+**근거:** 단위테스트(`FakeReadConnection`)는 픽스처로 순수 `float`/`int` 튜플을 직접 넣어주기
+때문에 이 타입 불일치를 절대 잡을 수 없다 — 실제 psycopg가 `DECIMAL` 컬럼을 `Decimal` 객체로
+반환한다는 사실은 라이브 DB에 실제로 왕복시켜봐야만 드러난다. 이번엔 계좌 추적기 구현 직후
+스크래치패드 스모크 스크립트로 실제 Docker DB에 저장→조회를 실행해봤기 때문에 배포 전에
+잡을 수 있었다(`max_account_balance_ever()`는 이미 `float(row[0])`로 변환하고 있어서, 이
+값과 `latest_account_balance_snapshot()`의 미변환 `Decimal`을 나중에 같이 연산하면
+`TypeError`가 났을 것 — `build_account_state()`의 `_pct_change()`가 정확히 이 조합을 씀).
+
+**How to apply:** DB에서 읽어온 DECIMAL/NUMERIC 컬럼을 다루는 새 함수를 추가할 때는, 단위테스트
+통과만으로 안심하지 말고 **최소 1회는 실제 라이브(또는 로컬 Docker) DB로 왕복시켜 타입까지
+확인할 것** — 이 프로젝트의 다른 `latest_*` 함수들(`latest_investor_flow`,
+`latest_underlying_spot` 등)은 전부 이미 `float()` 변환을 하고 있었는데, 이번 신규 함수 2개만
+그 관례를 놓쳤었다. 새 DB 조회 함수를 기존 함수들과 나란히 볼 것.
+
+---
+
+## [2026-07-28 7차] 계좌 추적기 착수 전 실측 — `get_balance()` 필수 파라미터 누락 버그 발견·수정
+
+**트리거:** "남은 작업(계좌 추적기 등)을 이어서 하는 경우 손익을 조사해" 요청 — 계좌 추적기
+설계 전 `get_balance()` 응답 필드를 실측 확인하기로 함([[DECISION_LOG]] 2026-07-28 6차
+항목 "추적기 설계 시 get_balance() 응답 필드 확인부터 시작할 것" 그대로).
+
+**조사 방법:** `docs/efriend/한국투자증권_오픈API_전체문서_*.xlsx`를 과거 세션들처럼 Read
+도구로 직접 열면 인코딩이 깨진다 — 이번엔 `uv run --with openpyxl`(프로젝트 의존성에
+영구 추가하지 않는 임시 실행)으로 셀 값을 UTF-8 파일에 써서 Read 도구로 다시 읽는 방식으로
+우회했다(콘솔 stdout 캡처 자체가 mojibake의 원인이었고 파일 경유 시 정상 표시됨 — 이전
+세션들의 "인코딩 문제로 파싱 불가"는 xlsx 라이브러리 부재+콘솔 인코딩이 겹친 문제였을
+가능성).
+
+**발견 1 — `get_balance()`가 실제로는 항상 실패하고 있었다:** "선물옵션 잔고현황"
+(CTFO6118R/VTFO6118R) 시트 실측 결과 `MGNA_DVSN`(증거금구분)·`EXCC_STAT_CD`(정산상태코드)·
+`CTX_AREA_FK200`·`CTX_AREA_NK200`이 전부 Required인데 기존 `get_balance()`는 `CANO`/
+`ACNT_PRDT_CD`만 보내고 있었다. 라이브 모의계좌로 직접 호출해 재현: `msg_cd=OPSQ2001,
+"ERROR : INPUT_FIELD_NAME MGNA_DVSN"`로 매번 거부되고 있었음(이 함수가 Phase 1부터 있었지만
+실제로 호출해 검증한 적이 없었던 것으로 보임 — main.py도 아직 안 부름).
+
+**발견 2 — 더 상세한 P&L API(CTFO6159R "선물옵션 잔고평가손익내역")는 모의투자 미지원:**
+문서에 "모의 TR_ID: 모의투자 미지원"으로 명시 — 실전 계좌 전용이다. 즉 계좌 추적기는
+`get_balance()`(CTFO6118R/VTFO6118R) 하나로 손익까지 전부 충당해야 한다(다행히 이 응답
+자체에 `evlu_pfls_amt_smtl`/`trad_pfls_amt_smtl` 등 필요한 손익 필드가 이미 다 있어서
+충분함).
+
+**조치:** `mahdi/broker/rest_client.py`의 `get_balance()`에 `margin_division`(기본 "02"=유지)/
+`settlement_status`(기본 "1"=정산가격) 파라미터 추가, 네 필수 필드를 전부 채워 보냄. 라이브
+모의계좌로 재호출해 `rt_cd="0"` 성공 확인 — 현재 계좌 상태: 현금예수금 5,000만원, 포지션
+0건, 손익 전부 0(한 번도 거래한 적 없는 깨끗한 시작 상태). 신규 테스트 2개(필수 필드 전송
+확인, 커스텀 값 확인) 추가, 전체 579개 테스트 통과.
+
+**How to apply(계좌 추적기 설계 시 참고):**
+- 일간/주간 손익(`AccountState.daily_pnl_pct`/`weekly_pnl_pct`)·드로우다운(`drawdown_pct`)은
+  `output2.prsm_dpast`(추정예탁자산)를 매 사이클 스냅샷해 하루/일주일 전 값과 비교하면 된다
+  (별도 손익 계산 API 불필요).
+- `output2.evlu_pfls_amt_smtl`(평가손익합계)/`trad_pfls_amt_smtl`(실현손익합계)로 즉시
+  손익 분해 가능(선물/옵션 개별은 `futr_*`/`opt_*` 접두사).
+- `output1`(배열, 보유 종목별)의 `sll_buy_dvsn_name`("BUY"/"SLL")을 세면
+  `AccountState.same_direction_positions` 계산 가능.
+- `output2.dnca_cash`/`ord_psbl_cash`로 주문 가능 현금 확인 가능(사이징 상한 검증에 활용 가능).
+- 위 필드 전부 문자열(string) 타입으로 온다 — 계좌 추적기는 `float()` 변환을 책임져야 한다.
+
+---
+
+## [2026-07-28 6차] main.py 라이브 배선은 Signal Fusion까지만 — Risk/Execution은 계좌 추적기가 생길 때까지 보류
+
+**결정:** "남은 작업(ML 학습·라이브 배선·실데이터 백테스트·WFO/MC/DSR) 구현" 요청을 조사하는
+과정에서, `RiskEngine.evaluate_entry()`/`ExecutionEngine.evaluate_entry()`를 라이브에서 의미
+있게 호출하려면 계좌 손익(`daily_pnl_pct`/`weekly_pnl_pct`/`drawdown_pct`)과 포지션 상태를
+실시간으로 추적하는 인프라가 필요한데, 이게 전혀 존재하지 않음을 발견했다(`get_balance()`
+REST는 있지만 아무도 폴링하지 않고, 손익 계산 로직 자체가 없다). 사용자에게 "Signal Fusion만
+라이브 연결(계좌 추적기 없이 안전하게 가능)" vs "계좌 추적기까지 새로 만들어 Risk/Execution도
+라이브로 태운다(범위 훨씬 큼)" 중 선택지를 제시했고, 전자를 선택받았다.
+
+**근거:** 계좌 추적기는 원래 이번 4개 항목("ML 학습/라이브 배선/실데이터 백테스트/WFO·MC·DSR")
+어디에도 명시되지 않은 새 서브시스템이다 — 발견했다고 바로 범위를 늘리기보다, 사용자에게
+먼저 확인받는 게 맞다고 판단(과거 세션들도 스코프가 커지는 지점마다 확인받아온 관행과 일치).
+Signal Fusion만 로그로 남기는 건 계좌 상태와 무관하게 안전하고(ADVISORY, 실주문 없음), v6
+§13.1 "Advisory부터 개시"라는 로드맵 자체와도 정확히 일치한다.
+
+**How to apply:** 계좌 손익/포지션 추적기를 새로 설계·구현하기 전까지는 Risk/Execution
+Engine을 `main.py`에 배선하지 말 것(그 전에 배선해도 `AccountState`가 항상 "손익 0, 포지션
+없음"인 가짜 상태라 게이트가 무의미해진다). 추적기 설계 시 `get_balance()` 응답 필드 확인부터
+시작할 것 — 실측된 적이 없다.
+
+---
+
+## [2026-07-28 6차] `xgboost_tabular` 멤버는 XGBoost가 아니라 scikit-learn으로 구현 — 이름은 v6 설정 키 유지
+
+**결정:** Signal Fusion 앙상블의 `xgboost_tabular` 멤버를 학습하는 스캐폴딩(`mahdi/fusion/
+trainer.py`)을 만들며, 실제 XGBoost 라이브러리 대신 이미 설치된 scikit-learn의
+`GradientBoostingClassifier`를 썼다. 변수/설정 키 이름(`xgboost_tabular`)은 v6 `strategy_
+params.yaml`의 `ensemble` 섹션과 1:1 대응을 유지하기 위해 그대로 뒀다(로직만 교체, 이름
+변경은 무관한 마이그레이션 비용을 만듦 — [[DECISION_LOG]] 2026-07-10 "함수 시그니처는
+유지하고 내부만 교체" 항목과 같은 원칙).
+
+**근거:** `trade_history`가 0건이라 오늘은 어차피 실제로 학습되지 않는다(스캐폴딩만 확인
+가능) — 이런 상태에서 새 무거운 의존성(xgboost/torch)을 추가하는 건 이득 없이 설치 크기만
+늘리는 것이다. 데이터가 쌓여 실제로 성능 비교가 필요해지는 시점에 XGBoost/LightGBM 등으로
+교체할지 재검토하면 된다(그때는 실제 벤치마크 근거가 생김).
+
+**How to apply:** `lstm_temporal`처럼 딥러닝 프레임워크(torch 등) 도입이 필요한 멤버는 별도
+사용자 결정 없이는 시작하지 말 것 — 신규 무거운 의존성 추가는 항상 실익이 명확해진 뒤에.
+
+---
+
+## [2026-07-28 2차] Signal Fusion — 미학습 ML 멤버는 None 처리 + Meta-Label은 결정론적 프록시로 대체
+
+**결정:** v6 §11.3 앙상블 6개 멤버 중 `xgboost_tabular`/`lstm_temporal`은 학습된 모델이 생기기
+전까지 항상 None을 반환하고, 가중 평균은 나머지 4개(regime_hmm/options_flow/orderflow_ofi_vpin/
+flow_position) `base_w`만으로 재정규화한다. Meta-Label(§11.2, 실제로는 López de Prado 2단계
+RandomForest+Triple Barrier+Purged K-Fold)도 이번 증분에서는 실제 분류기 대신 §11.2가 명시한
+입력 목록(regime confidence/신호 동조 개수/슬리피지/감마 레짐/외국인 플로우 정합성/이벤트
+근접도/최근 동일 셋업 성과)을 그대로 받는 결정론적 점수 함수로 구현했다.
+
+**근거:** `trade_history`가 0건이라 실제로 학습할 데이터 자체가 없다 — 가짜 가중치나 가짜
+학습 결과를 지어내면 "미완성을 완성으로 위장"하는 것이 된다. `engines/regime.py`의
+`warmup_fallback()`이 HMM 학습 전 결정론적 대체값을 쓰는 것, `regime_pipeline.
+compute_macro_score_proxy()`가 "존재하는 신호만 평균"하는 것과 같은 이미 검증된 패턴을
+그대로 재사용했다.
+
+**How to apply:** `trade_history`가 Phase 3(Champion-Challenger) 수준으로 쌓이면(수백~수천
+거래 단위) `mahdi/fusion/meta_label.py`의 `classify()`를 학습된 분류기 호출로, `signal_layer.py`
+의 xgboost_tabular/lstm_temporal 자리를 실제 모델 추론으로 교체한다. 그 전까지 이 프록시의
+임계값(`strategy_params.yaml`의 `meta_label_thresholds`)은 미보정 추정치로 취급할 것 —
+`VPIN_BUCKET_SIZE=50` 등 기존 "미보정 추정치" 항목들과 같은 취급([[NEXT_TODO]] 참고).
+
+---
+
+## [2026-07-28 2차] Execution Engine도 Risk Engine과 같은 이유로 main.py 라이브 배선 보류
+
+**결정:** Execution Engine(`mahdi/execution/`) 최초 구현에서 `evaluate_entry()`/
+`evaluate_exit()`가 실제로 KIS 브로커에 주문을 내도록 `main.py`의 관측 루프에 배선하지
+않았다 — Risk Engine 구현 때와 동일한 판단.
+
+**근거:** Signal Fusion이 검증되지 않은 휴리스틱(위 항목 참고) 단계인 상태에서 실시간으로
+계속 실제 주문(모의계좌라도)을 내보내면, 나쁜 신호가 실제 체결로 이어져도 원인이 "휴리스틱
+미검증"인지 "Execution 로직 버그"인지 구분하기 어려워진다. 순수 라이브러리로 완성해두고
+단위테스트로 개별 결정 로직을 검증하는 편이, 실거래 결과로만 디버깅하는 것보다 안전하다.
+
+**How to apply:** Signal Fusion이 최소한의 신뢰도를 실거래/백테스트로 확인받기 전까지
+`main.py`에 `ExecutionEngine`을 배선하지 말 것. 배선 시점엔 15:10 Forced Flat 자기검증
+([[DECISION_LOG]] 2026-07-21 항목의 완료조건 체크리스트)을 반드시 먼저 실운영 스케줄(15:10)에
+맞춰 검증한 뒤 진행한다.
+
+---
+
 ## [2026-07-28] ZN 13:01 패턴 — `fast_info` 검토 후 기각, `interval="1m"` 제거로 대체(라이브 검증 완료)
 
 **결정:** `mahdi/data/yfinance_fallback.fetch_last_close()`의 `yf.Ticker(symbol).history(period="1d",

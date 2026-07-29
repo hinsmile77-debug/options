@@ -34,10 +34,19 @@ from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.data.overseas_future_master import OverseasFutureMaster, load_overseas_future_master
 from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivatives_master
 from mahdi.data import yfinance_fallback
+from mahdi.engines.regime import RegimeState
 from mahdi.engines.regime_pipeline import RegimeStateMachine
-from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp
+from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state, parse_balance_response, snapshot_to_row
+from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp, find_gamma_flip, legs_from_chain_rows
 from mahdi.features.orderflow import calculate_vpin
+from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
+from mahdi.fusion.meta_label import TradePermission
+from mahdi.fusion.signal_layer import SignalInputs
 from mahdi.logutil import WarningThrottle
+from mahdi.risk.circuit_breaker import MarketConditions
+from mahdi.risk.engine import RiskEngine
+from mahdi.risk.limits import AccountState
+from mahdi.risk.sizing import PositionSizingInput
 
 logger = logging.getLogger("mahdi.main")
 
@@ -81,6 +90,20 @@ MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS = 300
 US10Y_LOOKBACK_DAYS = 10
 UNDERLYING = "KOSPI200"
 OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범위와 동일한 종목을 REST로 주기 조회
+
+# 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
+# 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
+# 아니라 오프셋은 순전히 기동 로그 가독성을 위한 것.
+SIGNAL_FUSION_POLL_INTERVAL_SECONDS = 60.0
+SIGNAL_FUSION_STARTUP_OFFSET_SECONDS = 10.0
+_SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason VARCHAR(50)
+
+# 2026-07-28 8차 — 계좌 손익/포지션 상태 추적기 라이브 배선(get_balance() 실측 필드 매핑은
+# [[DECISION_LOG]] 2026-07-28 7차 항목 참고). 이 폴러는 다른 REST 폴러와 동일하게 KIS API를
+# 호출하므로(get_balance()) 레이트리밋 스태거링 대상 — 옵션체인(0초)·투자자수급(15초)·
+# 매크로(45초)와 겹치지 않는 자리에 오프셋을 둔다.
+ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS = 60.0
+ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS = 20.0
 
 # 2026-07-08 실측: 레이트리밋 버스트 등으로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
@@ -1407,6 +1430,217 @@ async def poll_investor_flow(
         await asyncio.sleep(delay)
 
 
+def _build_signal_inputs(conn, regime_state: RegimeState | None, underlying: str = UNDERLYING) -> SignalInputs:
+    """
+    입력: DB 커넥션, 이번 사이클의 최신 레짐 상태(RegimeStateMachine.last_state), underlying 라벨.
+    계산: option_analysis_1m 체인 스냅샷(legs_from_chain_rows) + underlying_spot_1m 스팟으로
+         GEX/Gamma Flip을, investor_flow_1m 최신값으로 외국인 순매수 부호를 구성한다. OFI/큐
+         임밸런스는 아직 라이브 집계 파이프라인이 없어(체결 틱 기반 실시간 호가 집계 미구현)
+         None으로 둔다 — orderflow_ofi_vpin 멤버는 이번 증분에서 항상 미가용.
+    해석: 체인/스팟 조회가 비어있거나 실패하면 그 부분만 None으로 남기고 계속 진행한다(다른
+         폴러들의 "부분 실패 허용" 원칙과 동일 — Signal Fusion 자체가 None을 안전하게 처리하도록
+         설계돼 있음).
+    실패 조건: 없음 — 개별 조회 결과 부재는 SignalInputs 필드의 None으로 흡수된다.
+    """
+    chain_rows = db.latest_option_chain(conn, underlying)
+    spot = db.latest_underlying_spot(conn, underlying)
+    flow = db.latest_investor_flow(conn, underlying)
+
+    gex = gamma_flip = None
+    if chain_rows and spot is not None:
+        legs = legs_from_chain_rows(chain_rows, today=db.local_now().date())
+        if legs:
+            gex = calculate_gex(legs, spot)
+            gamma_flip = find_gamma_flip(legs, spot)
+
+    return SignalInputs(
+        regime_state=regime_state,
+        gex=gex,
+        gamma_flip=gamma_flip,
+        spot=spot,
+        ofi=None,
+        queue_imbalance=None,
+        foreign_net_flow=flow[0] if flow is not None else None,
+    )
+
+
+def _account_state_snapshot_from_row(row: dict | None) -> BalanceSnapshot | None:
+    return BalanceSnapshot(**row) if row is not None else None
+
+
+def _build_account_state_for_candidate(conn, candidate_side: str, poll_time: datetime) -> AccountState | None:
+    """
+    입력: 후보 진입 방향("BUY"/"SELL"), 이번 사이클 시각.
+    계산: `account_balance_snapshots`에 최신 스냅샷이 없으면(계좌 잔고 폴러가 아직 한 번도
+         못 돌았거나 막 기동한 직후) None을 반환해 호출측이 Risk Engine 호출 자체를 건너뛰게
+         한다 — 가짜 `AccountState`(전부 0)로 "위반 없음"을 흉내내지 않기 위함. 오늘/이번주
+         자정 이전 마지막 스냅샷을 baseline으로, 역대 최고치를 드로우다운 기준으로 넘긴다.
+    """
+    latest_row = db.latest_account_balance_snapshot(conn)
+    if latest_row is None:
+        return None
+
+    today_midnight = datetime.combine(poll_time.date(), dtime.min)
+    week_start_midnight = today_midnight - timedelta(days=today_midnight.weekday())
+
+    return build_account_state(
+        _account_state_snapshot_from_row(latest_row),
+        _account_state_snapshot_from_row(db.account_balance_snapshot_before(conn, today_midnight)),
+        _account_state_snapshot_from_row(db.account_balance_snapshot_before(conn, week_start_midnight)),
+        db.max_account_balance_ever(conn),
+        candidate_side=candidate_side,
+        daily_trades_by_strategy=db.daily_trade_counts_by_strategy(conn, poll_time.date()),
+    )
+
+
+async def poll_signal_fusion_cycle(
+    regime_state_machine: RegimeStateMachine,
+    underlying: str = UNDERLYING,
+    interval_seconds: float = SIGNAL_FUSION_POLL_INTERVAL_SECONDS,
+    startup_offset_seconds: float = 0.0,
+) -> None:
+    """
+    입력: 다른 폴러가 매 선물봉마다 갱신하는 RegimeStateMachine(최신 레짐은 last_state로 읽음 —
+         2026-07-28 2차 신규), underlying 라벨.
+    계산: 매 사이클 `SignalFusionEngine.evaluate()`를 실행해 방향/확신도/거래허가/전략 후보를
+         계산하고 `signal_decisions`에 기록한다. **실제 주문은 절대 내지 않는다**(ADVISORY
+         전용) — 다만 2026-07-28 8차부터 계좌 추적기가 생겨, 진입 후보(`decision="ENTER"`)일
+         때는 `RiskEngine.evaluate_entry()`까지 실제로 호출해 "만약 지금 승인 게이트를
+         거쳤다면 어떻게 됐을지"를 `risk_gate_state.risk_engine`에 함께 기록한다(v6 §12
+         "독립 거부권" — 이 값은 Signal Fusion의 `decision` 자체를 바꾸지 않는다, 별개 게이트).
+         `ExecutionEngine`(주문 상태머신/하이브리드 모드 게이트)은 여전히 안 씀 — 포지션
+         생애주기 추적이 없어 아직 의미가 없다.
+    해석: 계좌 잔고 폴러(`poll_account_balance_cycle`)가 아직 스냅샷을 하나도 못 쌓았으면
+         `risk_gate_state.risk_engine`은 `"account_tracker_not_ready"` 문자열로 남는다(가짜
+         AccountState로 승인/거부를 지어내지 않음). `PositionSizingInput`의 `target_vol`/
+         `realized_vol`/`liquidity_score`/`portfolio_capacity_remaining_pct`는 라이브로 계산하는
+         곳이 아직 없어 중립값으로 둔다(백테스트 데이터 어댑터와 동일한 종류의 단순화, 알려진
+         한계로 문서화).
+    실패 조건: 이번 사이클 조회/계산/적재가 실패하면 로그만 남기고 다음 사이클을 기다린다(다른
+              폴러와 동일한 장애 격리 원칙).
+    """
+    if startup_offset_seconds > 0:
+        await asyncio.sleep(startup_offset_seconds)
+
+    fusion_engine = SignalFusionEngine()
+    risk_engine = RiskEngine()
+    next_tick: float | None = None
+    while True:
+        poll_time = db.local_now().replace(second=0, microsecond=0)
+        try:
+            with db.get_connection() as conn:
+                signal_inputs = _build_signal_inputs(conn, regime_state_machine.last_state, underlying)
+                decision = fusion_engine.evaluate(signal_inputs, MetaLabelContext())
+
+                is_entry = (
+                    decision.trade_permission != TradePermission.NO_TRADE and bool(decision.allowed_strategies)
+                )
+                reject_reason = (
+                    decision.reject_reasons[0][:_SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH]
+                    if decision.reject_reasons
+                    else None
+                )
+                risk_gate_state: dict = {
+                    "direction": decision.direction,
+                    "conviction_score": decision.conviction_score,
+                    "signal_agreement_count": decision.signal_agreement_count,
+                    "available_member_count": decision.available_member_count,
+                    "allowed_strategies": decision.allowed_strategies,
+                }
+
+                if is_entry:
+                    candidate_side = "BUY" if decision.direction > 0 else "SELL"
+                    account_state = _build_account_state_for_candidate(conn, candidate_side, poll_time)
+                    if account_state is None:
+                        risk_gate_state["risk_engine"] = "account_tracker_not_ready"
+                    else:
+                        sizing_input = PositionSizingInput(
+                            base_size=1.0,
+                            regime_confidence=decision.conviction_score,
+                            signal_quality=decision.conviction_score,
+                            target_vol=0.01,
+                            realized_vol=0.01,
+                            liquidity_score=1.0,
+                            drawdown_pct=account_state.drawdown_pct,
+                            portfolio_capacity_remaining_pct=1.0,
+                        )
+                        risk_decision = risk_engine.evaluate_entry(
+                            sizing_input, account_state, decision.allowed_strategies[0], MarketConditions()
+                        )
+                        risk_gate_state["risk_engine"] = {
+                            "approved": risk_decision.approved,
+                            "approved_size": risk_decision.approved_size,
+                            "reject_reasons": risk_decision.reject_reasons,
+                        }
+
+                db.insert_signal_decision(
+                    conn,
+                    poll_time,
+                    conviction=decision.trade_permission.value,
+                    decision="ENTER" if is_entry else "REJECT",
+                    reject_reason=reject_reason,
+                    risk_gate_state=risk_gate_state,
+                    exec_mode="ADVISORY",
+                )
+        except Exception:
+            logger.warning("Signal Fusion 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
+
+        loop_now = asyncio.get_running_loop().time()
+        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
+        delay = next_tick - loop_now
+        if delay < 0:
+            logger.warning(
+                "Signal Fusion 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
+                interval_seconds, -delay,
+            )
+            next_tick = loop_now
+            delay = 0.0
+        await asyncio.sleep(delay)
+
+
+async def poll_account_balance_cycle(
+    rest_client: KISRestClient,
+    interval_seconds: float = ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS,
+    startup_offset_seconds: float = 0.0,
+) -> None:
+    """
+    입력: REST 클라이언트, 기동 시 최초 사이클을 지연시킬 초(다른 REST 폴러와 겹치지 않게 —
+         이 폴러는 실제로 KIS API를 호출하므로 스태거링 대상).
+    계산: `rest_client.get_balance()`(2026-07-28 7차에 실측·수정한 필수 파라미터 포함 버전,
+         [[DECISION_LOG]] 참고)를 `asyncio.to_thread`로 호출(다른 동기 REST 호출과 동일 패턴) →
+         `account_tracker.parse_balance_response()` → `account_balance_snapshots`에 적재한다.
+         `poll_signal_fusion_cycle`이 이 테이블을 읽어 `RiskEngine.evaluate_entry()`를 호출할
+         AccountState를 만든다.
+    실패 조건: 이번 사이클 조회/파싱/적재가 실패하면 로그만 남기고 다음 사이클을 기다린다(다른
+              폴러와 동일한 장애 격리 원칙 — 계좌 조회 실패가 관측 루프 전체를 막으면 안 됨).
+    """
+    if startup_offset_seconds > 0:
+        await asyncio.sleep(startup_offset_seconds)
+
+    next_tick: float | None = None
+    while True:
+        poll_time = db.local_now().replace(second=0, microsecond=0)
+        try:
+            response = await asyncio.to_thread(rest_client.get_balance)
+            snapshot = parse_balance_response(response, poll_time)
+            with db.get_connection() as conn:
+                db.insert_account_balance_snapshot(conn, snapshot_to_row(snapshot))
+        except Exception:
+            logger.warning("계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
+
+        loop_now = asyncio.get_running_loop().time()
+        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
+        delay = next_tick - loop_now
+        if delay < 0:
+            logger.warning(
+                "계좌 잔고 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
+                interval_seconds, -delay,
+            )
+            next_tick = loop_now
+            delay = 0.0
+        await asyncio.sleep(delay)
+
+
 def _configure_logging() -> None:
     """
     계산: 콘솔(stdout)과 로테이션 파일(logs/observation_loop.log) 양쪽에 동시에 로깅한다.
@@ -1534,6 +1768,12 @@ async def main() -> None:
                 rest_client, books, master, startup_offset_seconds=EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS
             ),
             poll_investor_flow(rest_client, startup_offset_seconds=INVESTOR_FLOW_STARTUP_OFFSET_SECONDS),
+            poll_signal_fusion_cycle(
+                regime_state_machine, startup_offset_seconds=SIGNAL_FUSION_STARTUP_OFFSET_SECONDS
+            ),
+            poll_account_balance_cycle(
+                rest_client, startup_offset_seconds=ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS
+            ),
         ]
         if overseas_future_master is not None:
             tasks.append(

@@ -31,3 +31,36 @@ weekly_0dte:
   size_cap_pct_of_normal: 0.50
   time_stop_pct_of_normal: 0.50
   charm_drift_priority_after: "14:00"
+
+# Signal Fusion 메타 라벨링(v6 §11.2) 결정론적 프록시 임계값 — 학습된 분류기가
+# 생기기 전까지(Phase 3) conviction_score를 TradePermission으로 매핑하는 데 쓴다.
+meta_label_thresholds:
+  no_trade_max: 0.15       # score < 이 값 -> NO_TRADE
+  small_test_max: 0.35     # 이 값 미만 -> SMALL_TEST
+  standard_max: 0.65       # 이 값 미만 -> STANDARD, 이상 -> HIGH_CONVICTION
+  slippage_penalty_factor: 0.7        # 최근 슬리피지 악화 시 score 배율
+  gamma_regime_penalty_factor: 0.85   # 감마 레짐 불리 시 score 배율
+  foreign_flow_penalty_factor: 0.8    # 외국인 수급 방향 불일치 시 score 배율
+  event_proximity_penalty_minutes: 15 # 다음 이벤트까지 이 분 미만이면 아래 배율 적용
+  event_proximity_penalty_factor: 0.5
+
+# Execution Engine 6-Layer Exit(v6 §13.5) 레짐별 파라미터 — trailing/profit_target/stop은
+# 진입가 대비 비율, time_stop은 분 단위.
+exit_rules:
+  TREND_STRONG:
+    trailing: 0.015
+    profit_target: null
+    time_stop: 120
+  RANGE_TIGHT:
+    profit_target: 0.015
+    stop: -0.008
+    time_stop: 30
+    theta_exit: true
+  VOL_EXPANSION:
+    stop: -0.010
+    gamma_scalping: true
+    time_stop: 45
+  EXPIRY_DAY_0DTE:
+    stop: -0.008
+    time_stop: 15
+    size_cap: 0.5

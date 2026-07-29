@@ -1,6 +1,6 @@
 import contextlib
 import io
-from datetime import time
+from datetime import date, time
 
 import pytest
 
@@ -11,12 +11,44 @@ from mahdi.features.options_intel import (
     calculate_vrp,
     find_gamma_flip,
     gamma_walls,
+    legs_from_chain_rows,
     vanna_charm_drift,
 )
 
 
 def test_calculate_gex_empty_is_zero():
     assert calculate_gex([], spot=350) == 0.0
+
+
+def test_legs_from_chain_rows_converts_db_rows_to_option_legs():
+    rows = [
+        {"strike": 350.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 123.0, "expiry": date(2026, 8, 13), "timestamp": None},
+        {"strike": 350.0, "option_type": "P", "oi": 50.0, "iv": 0.20, "gamma": 0.015,
+         "gex": -80.0, "expiry": date(2026, 8, 13), "timestamp": None},
+    ]
+    legs = legs_from_chain_rows(rows, today=date(2026, 7, 28))
+
+    assert len(legs) == 2
+    assert legs[0] == OptionLeg(
+        strike=350.0, option_type="c", oi=100.0, iv=0.18, t_years=pytest.approx(16 / 365), gamma=0.02
+    )
+    assert legs[1].option_type == "p"
+
+
+def test_legs_from_chain_rows_skips_rows_without_expiry():
+    rows = [{"strike": 350.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01, "expiry": None}]
+    assert legs_from_chain_rows(rows, today=date(2026, 7, 28)) == []
+
+
+def test_legs_from_chain_rows_empty_input_is_empty():
+    assert legs_from_chain_rows([], today=date(2026, 7, 28)) == []
+
+
+def test_legs_from_chain_rows_clamps_expired_rows_to_zero_t_years():
+    rows = [{"strike": 350.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01, "expiry": date(2026, 7, 1)}]
+    legs = legs_from_chain_rows(rows, today=date(2026, 7, 28))
+    assert legs[0].t_years == 0.0
 
 
 def test_calculate_gex_call_positive_put_negative():

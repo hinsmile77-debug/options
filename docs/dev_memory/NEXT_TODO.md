@@ -455,7 +455,7 @@ poll_expiry_liquidity/poll_macro_snapshot)가 공유하는 단일 `_RateLimiter`
       최대 4배, 연속성공 20회마다 서서히 복귀)가 실제 장중 트래픽에서 의도대로 동작하는지 —
       백오프가 걸렸다가 정상적으로 복귀하는 사례를 로그로 한 번 이상 확인할 것.
 
-## Phase 2(판단·실행) — Risk Engine 착수(2026-07-28), 나머지는 아직 시작 안 함
+## Phase 2(판단·실행) — Risk Engine(07-28)에 이어 Signal Fusion/Execution/Backtest 최초 구현(07-28 2차)
 
 - [x] **Risk Engine(Kelly 사이징, 한도, Circuit Breaker, Kill Switch) 최초 구현 완료(2026-07-28)**
       — `mahdi/risk/{sizing,limits,circuit_breaker,engine}.py`, v6 §12.1~12.3 전부 구현, 신규
@@ -467,17 +467,116 @@ poll_expiry_liquidity/poll_macro_snapshot)가 공유하는 단일 `_RateLimiter`
         Delta/Gamma/Vega 상한값을 계좌 자본 규모 기준으로 정해 `risk_limits.yaml`에 추가할지
         사용자 결정 필요(Execution Engine이 실제 포지션 Greeks를 계산하기 시작하는 시점에
         같이 정하는 게 자연스러움).
-  - [ ] `evaluate_ongoing()`(매분 재평가)을 실제로 매분 호출할 루프가 아직 없음 — Execution
-        Engine의 §13.4 확률 기반 청산 루프가 만들어지면 그때 배선.
-  - [ ] `risk_snapshots` 테이블(스키마는 이미 존재) 영속화 — Execution Engine이 생겨 실제로
-        스냅샷할 포지션/Greeks 상태가 생기면 추가.
-- [ ] Signal Fusion + Meta-Labeling (Triple Barrier, Purged CV) — `mahdi/fusion/`은 빈 패키지
-- [ ] Execution Engine (Passive-first 진입, 6-Layer Exit, Forced Flat) — `mahdi/execution/`은
-      빈 패키지. Forced Flat은 [[DECISION_LOG]] 2026-07-21 항목의 "종료 시퀀스 자기검증 없이는
-      배포 금지" 완료조건 체크리스트를 반드시 지킬 것. Risk Engine의 `evaluate_entry()`/
-      `evaluate_ongoing()`을 진입/보유 양쪽에서 반드시 거쳐가도록 배선(v6 §12 "독립 거부권").
-- [ ] 하이브리드 3모드(Advisory→Confirm→Auto)
-- [ ] 백테스트 엔진 + 검증 스택(WFO·MC·DSR) — `mahdi/backtest/`는 빈 패키지
+  - [ ] `risk_snapshots` 테이블(스키마는 이미 존재) 영속화 — main.py 라이브 배선 시점에 추가.
+- [x] **Signal Fusion(Core Engine 6) 최초 구현 완료(2026-07-28 2차)** — `mahdi/fusion/
+      {signal_layer,ensemble,conflict_resolution,meta_label,strategy_palette,engine}.py`,
+      v6 §11.1~§11.4 전부 구현, 신규 테스트 43개 통과. **학습된 ML 모델이 아직 없어(trade_history
+      0건) 앙상블 6개 멤버 중 `xgboost_tabular`/`lstm_temporal`은 항상 None(가중치 0, 나머지
+      4개로 재정규화) — Meta-Label도 실제 RandomForest 대신 §11.2 입력 목록을 그대로 받는
+      결정론적 프록시**(`meta_label.classify()`, 임계값은 `strategy_params.yaml`의
+      `meta_label_thresholds`). Phase 3(Champion-Challenger)에서 `trade_history`가 쌓이면
+      실제 학습된 분류기로 교체 예정 — 이 사실이 코드 docstring에 명시돼 있음.
+  - [ ] `xgboost_tabular`/`lstm_temporal` 실학습(피처는 이미 존재) 및 Meta-Label을 실제
+        RandomForest/XGBoost + Triple Barrier + Purged K-Fold로 교체 — `trade_history` 축적 필요.
+  - [ ] `options_flow`(GEX/Gamma Flip 반전 로직)·`orderflow_ofi_vpin`(OFI+잔량 불균형 부호
+        평균)의 부호 기반 방향 추정이 실제 시장에서 의미 있는지 실거래 데이터로 검증 필요
+        (현재는 결정론적 프록시일 뿐, 계수 자체를 백테스트/실운영으로 검증한 적 없음).
+- [x] **Execution Engine(Core Engine 8) + 하이브리드 3모드 최초 구현 완료(2026-07-28 2차)** —
+      `mahdi/execution/{hybrid_mode,entry,exit_stack,forced_flat,order_manager,engine}.py`,
+      v6 §13.1~§13.5 전부 구현, 신규 테스트 46개 통과. Forced Flat은 [[DECISION_LOG]]
+      2026-07-21 "종료 시퀀스 자기검증 없이는 배포 금지" 조건대로 `verify_forced_flat()`이
+      FILLED가 아닌 모든 주문(PENDING/PARTIAL/CANCELLED/REJECTED)을 잔존으로 취급. `ExecutionEngine`
+      파사드는 진입/재평가 양쪽에서 `RiskEngine.evaluate_entry()`/`evaluate_ongoing()`을 항상
+      경유(§12 "독립 거부권" 배선 요구사항 충족). **순수 오케스트레이션 라이브러리로만 구현
+      — Risk Engine과 같은 이유로 `main.py` 라이브 루프 배선은 이번에도 하지 않음**(Signal
+      Fusion이 검증 안 된 휴리스틱이라 실시간으로 실제 주문을 계속 내보내는 건 시기상조라는
+      판단, [[DECISION_LOG]] 참고).
+  - [ ] `forced_flat.py`/`order_manager.py`가 실제 KIS 브로커(모의계좌)로 제출→폴링→자기검증
+        전체 사이클을 도는지 실거래 검증 필요 — 지금은 목 브로커로만 테스트됨.
+  - [x] **Signal Fusion만 main.py 라이브 배선 완료(2026-07-28 6차, ADVISORY 전용)** —
+        `poll_signal_fusion_cycle()`이 매 사이클 `signal_decisions`에 기록. Risk/Execution
+        Engine은 여전히 라이브 미배선(계좌 손익/포지션 추적 인프라가 없어 `RiskEngine.
+        evaluate_entry()`를 의미 있게 호출할 수 없음 — 아래 새 항목 참고). **main.py 코드는
+        작성했으나 실제 관측 루프 재시작은 아직 안 함** — 사용자 확인 후 진행할 것.
+    - [x] **계좌 추적기 설계를 위한 실측 완료(2026-07-28 7차)** — `get_balance()`가
+          `MGNA_DVSN`/`EXCC_STAT_CD`/`CTX_AREA_FK200`/`CTX_AREA_NK200` 필수 파라미터 누락으로
+          **호출될 때마다 항상 실패하고 있던 버그**를 발견·수정(`msg_cd=OPSQ2001`). 라이브
+          모의계좌 재확인 결과 현재 현금예수금 5,000만원/포지션 0건/손익 0(깨끗한 시작 상태).
+          필요한 손익 필드가 이미 응답에 다 있어(`prsm_dpast`=추정예탁자산으로 일간/주간
+          손익·드로우다운 계산, `evlu_pfls_amt_smtl`/`trad_pfls_amt_smtl`=평가/실현손익합계,
+          `output1[].sll_buy_dvsn_name`=종목별 매수/매도 방향) 별도 API 없이 `get_balance()`
+          하나로 계좌 추적기를 만들 수 있음을 확인([[DECISION_LOG]] 2026-07-28 7차 항목에
+          필드 매핑 전체 기록).
+    - [x] **계좌 손익/포지션 상태 추적기 실제 구현 완료(2026-07-28 8차)** —
+          `db/migrations/015_account_balance_snapshots.sql`(신규 테이블, 라이브 DB 적용 완료) +
+          `mahdi/data/db.py`(`insert_account_balance_snapshot`/`latest_account_balance_snapshot`/
+          `account_balance_snapshot_before`/`max_account_balance_ever`/
+          `daily_trade_counts_by_strategy`) + `mahdi/execution/account_tracker.py`
+          (`parse_balance_response`/`build_account_state`) + `mahdi/main.py`
+          `poll_account_balance_cycle()`(신규, `get_balance()` 주기 폴링) 신규. **라이브 DB
+          왕복 스모크 테스트 중 실제 버그 하나 더 발견·수정**: `latest_account_balance_snapshot`/
+          `account_balance_snapshot_before`가 psycopg의 `Decimal` 타입을 float으로 변환하지
+          않아, `max_account_balance_ever()`(float 반환)와 섞어 연산하면 `TypeError`가 나는
+          걸 실측으로 확인(단위테스트는 순수 float/int 픽스처만 써서 못 잡았음) — 두 함수 모두
+          DECIMAL 컬럼을 float 변환하도록 수정, 재검증 완료.
+    - [x] **`poll_signal_fusion_cycle()`이 이제 진입 후보일 때 `RiskEngine.evaluate_entry()`를
+          실제로 호출(2026-07-28 8차)** — `signal_decisions.risk_gate_state.risk_engine`에
+          승인여부/승인사이즈/거부사유 기록. **여전히 실주문은 안 함**(ExecutionEngine의
+          order_manager/hybrid_mode는 안 씀) — v6 §12 "독립 거부권"을 실제로 라이브에서
+          작동시키는 첫 단계. 계좌 추적기가 아직 스냅샷을 못 쌓았으면(기동 직후 등)
+          `risk_gate_state.risk_engine == "account_tracker_not_ready"`로 명시.
+    - [ ] `PositionSizingInput`의 `target_vol`/`realized_vol`/`liquidity_score`/
+          `portfolio_capacity_remaining_pct`가 아직 중립값(라이브 계산기 없음) — 실현/내재
+          변동성 비율과 호가 두께 기반 유동성 점수를 실제로 계산하는 파이프라인 필요.
+    - [x] **관측 루프 기동 완료·라이브 검증 완료(2026-07-28 8차)** — 이전엔 프로세스가 아예 안
+          떠 있었음(확인 결과 "재시작"이 아니라 최초 기동). `uv run python -m mahdi.main`을
+          백그라운드로 기동 후 로그+DB로 직접 확인: `poll_account_balance_cycle`의
+          `get_balance()` 호출이 (7차에서 고친) 4개 필수 파라미터 전부 포함해 200 OK,
+          `poll_signal_fusion_cycle`도 매 사이클 정상 동작(에러 로그 0건) —
+          `signal_decisions`/`account_balance_snapshots`에 실제로 행이 쌓이는 것까지 실측
+          확인. 현재 장외시간이라 신호는 전부 NO_TRADE/REJECT로 나오는데, 이는 실데이터 부재
+          상황에서 기대되는 정상 동작.
+    - [ ] COCKPIT이 열려있지 않은 상태에서 기동했다 — COCKPIT은 이번 요청 범위 밖이라 별도로
+          기동 필요(사용자 요청 시).
+    - [ ] `signal_decisions`/`account_balance_snapshots`를 COCKPIT에서 확인할 방법(직접 쿼리
+          또는 신규 패널) 아직 없음.
+    - [ ] **사소한 발견**: `scripts/start_mahdi_premarket.bat`를 거치지 않고 `python -m
+          mahdi.main`을 직접 실행하면 `PYTHONUTF8=1`이 설정 안 돼 콘솔(cp949)에 특수문자(예:
+          "—" em-dash)가 포함된 로그 줄에서 `UnicodeEncodeError`가 난다(ZN CBOT 실패 로그에서
+          발생 확인) — Python 로깅 모듈이 내부적으로 잡아 프로세스는 안 죽고, 실제
+          `logs/observation_loop.log`(UTF-8 명시)는 영향 없음(직접 확인). 정식 배치파일 경로로
+          기동하면 애초에 발생 안 함 — 별도 조치 불필요, 기록만.
+    - [ ] **거래일 정규장(09:00~15:45)에 실제로 유의미한 ENTER/HIGH_CONVICTION 신호가 나오는지,
+          RiskEngine 승인/거부가 실제로 갈리는지 확인 필요** — 오늘은 장외시간 기동이라
+          NO_TRADE만 확인됨.
+- [x] **백테스트 엔진 프레임워크 최초 구현 완료(2026-07-28 2차)** — `mahdi/backtest/
+      {simulated_broker,metrics,engine}.py`, 신규 테스트 15개 통과. `BacktestEngine`이
+      `SignalFusionEngine`→`ExecutionEngine`(내부에서 `RiskEngine` 경유)을 실거래와 동일하게
+      재사용해 합성 봉 시퀀스를 재생 — 실행 경로 이원화 없음.
+  - [x] **실데이터 어댑터 + WFO/MC/DSR 검증 스택 구현 완료(2026-07-28 6차)** —
+        `mahdi/backtest/data_adapter.py`(`load_backtest_steps_from_db()`, DB에 신규 "as-of"
+        조회 3종 추가) + `mahdi/backtest/validation.py`(`walk_forward_splits`/
+        `monte_carlo_resample`/`deflated_sharpe_ratio`). **알려진 단순화**: 어댑터가 만드는
+        `AccountState`/`MarketConditions`는 항상 중립 기본값(과거 손익 재구성 인프라 없음,
+        위 계좌 추적기 항목과 동일 제약)이라 실행 경로 검증용이지 실제 과거 손익 재현이
+        아니다. 레짐도 라벨만 복원(원-핫 근사, 과거 prob_vector 미저장).
+  - [ ] 실거래 이력이 아직 3주 남짓이라 `load_backtest_steps_from_db()`로 실제 돌려봐도
+        통계적으로 유의미한 백테스트 결과는 아니다 — 데이터가 몇 달치 쌓인 뒤 실제로 실행해
+        `deflated_sharpe_ratio()`로 다중 시행 편향까지 확인하는 절차 필요.
+  - [ ] 계좌 추적기가 생기면 `AccountState`/`MarketConditions`를 과거 시점 실제값으로
+        재구성하는 것도 검토(현재는 항상 중립 — 위 항목 참고).
+- [x] **ML 학습 스캐폴딩 구현 완료(2026-07-28 6차)** — `mahdi/fusion/trainer.py` +
+      `scripts/fit_signal_fusion_meta_label.py`(`scripts/fit_regime_engine.py`와 동일 패턴),
+      `db.get_trade_history()` 신규(읽기 전용). `xgboost_tabular` 멤버는 이미 설치된
+      scikit-learn `GradientBoostingClassifier`로 구현(신규 의존성 없음). **`trade_history`가
+      0건이라 오늘 스크립트를 실행하면 "데이터 없음" 에러만 남기고 종료 — 기대된 동작.**
+      `xgboost_tabular`가 이 학습 결과를 실제로 로드해 신호에 반영하도록 배선하지 않음
+      (신호 생성 경로 자체는 이번에 변경 안 함).
+  - [ ] `trade_history`에 실제로 쓰는 곳이 아직 없다(실주문 실행이 없어서) — 계좌 추적기 +
+        Execution Engine 라이브 배선이 생기면 그때 `trade_history` INSERT도 함께 추가해야
+        스크립트가 실제로 학습할 데이터가 쌓인다.
+  - [ ] `lstm_temporal` 멤버는 여전히 미착수 — 딥러닝 프레임워크(torch 등) 도입 여부는 별도
+        사용자 결정 필요, 이번에도 다루지 않음.
 
 ## 기타
 

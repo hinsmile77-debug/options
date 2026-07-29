@@ -130,6 +130,49 @@ def test_get_balance_uses_account_settings():
     assert "CANO=12345678" in captured["url"]
 
 
+def test_get_balance_sends_required_margin_and_settlement_fields():
+    # 2026-07-28 6차 실측(docs/efriend xlsx): MGNA_DVSN/EXCC_STAT_CD/CTX_AREA_FK200/
+    # CTX_AREA_NK200이 전부 Required — 빠지면 KIS가 "ERROR : INPUT_FIELD_NAME MGNA_DVSN"
+    # (msg_cd=OPSQ2001)로 거부한다(실제 라이브 모의계좌 호출로 재현·확인함).
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    client.get_balance()
+
+    assert "MGNA_DVSN=02" in captured["url"]
+    assert "EXCC_STAT_CD=1" in captured["url"]
+    assert "CTX_AREA_FK200=" in captured["url"]
+    assert "CTX_AREA_NK200=" in captured["url"]
+
+
+def test_get_balance_accepts_custom_margin_division_and_settlement_status():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    client.get_balance(margin_division="01", settlement_status="2")
+
+    assert "MGNA_DVSN=01" in captured["url"]
+    assert "EXCC_STAT_CD=2" in captured["url"]
+
+
 def test_submit_order_maps_sell_and_buy_direction_codes():
     captured = []
 

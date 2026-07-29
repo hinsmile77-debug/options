@@ -468,3 +468,155 @@ def test_expiry_liquidity_fossil_series_returns_values_outside_whitelist():
     assert conn.store["params"][0] == "KOSPI200"
     assert set(conn.store["params"][1]) == {"regular", "weekly_mon", "weekly_thu"}
     assert "series != ALL(%s)" in conn.store["query"]
+
+
+def test_insert_signal_decision_is_plain_insert_not_upsert():
+    # signal_decisions는 decision_id가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이 새 행.
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 28, 10, 0)
+
+    db.insert_signal_decision(
+        conn, ts, conviction="HIGH_CONVICTION", decision="ENTER",
+        reject_reason=None, risk_gate_state={"direction": 1.0}, exec_mode="ADVISORY",
+    )
+
+    assert conn.committed is True
+    assert "INSERT INTO signal_decisions" in conn.store["query"]
+    assert "ON CONFLICT" not in conn.store["query"]
+    params = conn.store["params"]
+    assert params[0] == ts
+    assert params[1] == "HIGH_CONVICTION"
+    assert params[2] == "ENTER"
+    assert params[3] is None
+    assert json.loads(params[4]) == {"direction": 1.0}
+    assert params[5] == "ADVISORY"
+
+
+def test_market_bars_between_maps_rows_to_bar_dicts():
+    rows = [(datetime(2026, 7, 28, 9, 0), 100.0, 101.0, 99.0, 100.5)]
+    conn = FakeReadConnection(rows)
+
+    bars = db.market_bars_between(
+        conn, "101S03", datetime(2026, 7, 28, 9, 0), datetime(2026, 7, 28, 9, 5)
+    )
+
+    assert bars == [
+        {"timestamp": datetime(2026, 7, 28, 9, 0), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}
+    ]
+
+
+def test_market_bars_between_empty_range_is_empty():
+    assert db.market_bars_between(FakeReadConnection([]), "101S03", datetime(2026, 1, 1), datetime(2026, 1, 2)) == []
+
+
+def test_option_chain_as_of_matches_latest_option_chain_shape():
+    rows = [(1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31))]
+    conn = FakeReadConnection(rows)
+
+    chain = db.option_chain_as_of(conn, "KOSPI200", datetime(2026, 7, 6, 9, 31))
+
+    assert chain == [
+        {
+            "strike": 1340.0, "option_type": "C", "oi": 363.0, "iv": 0.9, "gamma": 0.0047,
+            "gex": 123.4, "expiry": date(2026, 7, 9), "timestamp": datetime(2026, 7, 6, 9, 31),
+        }
+    ]
+    assert "timestamp <= %s" in conn.store["query"]
+
+
+def test_investor_flow_as_of_returns_tuple():
+    conn = FakeReadConnection([(500.0, -200.0, -300.0)])
+    result = db.investor_flow_as_of(conn, "KOSPI200", datetime(2026, 7, 6, 9, 31))
+    assert result == (500.0, -200.0, -300.0)
+
+
+def test_investor_flow_as_of_returns_none_when_no_rows():
+    assert db.investor_flow_as_of(FakeReadConnection([]), "KOSPI200", datetime(2026, 7, 6)) is None
+
+
+def test_get_trade_history_maps_rows_and_filters_nulls():
+    rows = [
+        (0, 0.8, 15.0),
+        (None, 0.5, -3.0),  # regime_entry 없음 -> 제외
+    ]
+    conn = FakeReadConnection(rows)
+
+    result = db.get_trade_history(conn)
+
+    assert result == [{"regime_entry": 0, "confidence_entry": 0.8, "net_pnl": 15.0}]
+
+
+def test_get_trade_history_filters_by_strategy_id():
+    conn = FakeReadConnection([])
+    db.get_trade_history(conn, strategy_id="vrp_harvest")
+    assert "WHERE strategy_id=%s" in conn.store["query"]
+    assert conn.store["params"] == ("vrp_harvest",)
+
+
+def test_get_trade_history_empty_when_no_trades():
+    assert db.get_trade_history(FakeReadConnection([])) == []
+
+
+_ACCOUNT_SNAPSHOT_ROW = (
+    datetime(2026, 7, 28, 10, 0), 50000000.0, 0.0, 0.0, 50000000.0, 50000000.0, 0.0, 0, 0,
+)
+
+
+def test_insert_account_balance_snapshot_upserts_on_timestamp():
+    conn = FakeConnection()
+    row = {
+        "timestamp": datetime(2026, 7, 28, 10, 0), "prsm_dpast": 50000000.0,
+        "evlu_pfls_amt_smtl": 0.0, "trad_pfls_amt_smtl": 0.0, "dnca_cash": 50000000.0,
+        "ord_psbl_cash": 50000000.0, "mgna_tota": 0.0,
+        "same_direction_buy_count": 0, "same_direction_sell_count": 0,
+    }
+    db.insert_account_balance_snapshot(conn, row)
+
+    assert conn.committed is True
+    assert "INSERT INTO account_balance_snapshots" in conn.store["query"]
+    assert "ON CONFLICT (timestamp) DO UPDATE" in conn.store["query"]
+
+
+def test_latest_account_balance_snapshot_maps_row_to_dict():
+    conn = FakeReadConnection([_ACCOUNT_SNAPSHOT_ROW])
+    result = db.latest_account_balance_snapshot(conn)
+    assert result["prsm_dpast"] == 50000000.0
+    assert result["same_direction_buy_count"] == 0
+
+
+def test_latest_account_balance_snapshot_none_when_empty():
+    assert db.latest_account_balance_snapshot(FakeReadConnection([])) is None
+
+
+def test_account_balance_snapshot_before_queries_strict_less_than():
+    conn = FakeReadConnection([_ACCOUNT_SNAPSHOT_ROW])
+    before = datetime(2026, 7, 28, 0, 0)
+
+    result = db.account_balance_snapshot_before(conn, before)
+
+    assert result["prsm_dpast"] == 50000000.0
+    assert "timestamp < %s" in conn.store["query"]
+    assert conn.store["params"] == (before,)
+
+
+def test_account_balance_snapshot_before_none_when_no_prior_snapshot():
+    assert db.account_balance_snapshot_before(FakeReadConnection([]), datetime(2026, 7, 28)) is None
+
+
+def test_max_account_balance_ever_returns_float():
+    assert db.max_account_balance_ever(FakeReadConnection([(51000000.0,)])) == 51000000.0
+
+
+def test_max_account_balance_ever_none_when_no_snapshots():
+    assert db.max_account_balance_ever(FakeReadConnection([(None,)])) is None
+
+
+def test_daily_trade_counts_by_strategy_groups_by_strategy_id():
+    conn = FakeReadConnection([("vrp_harvest", 3), ("gamma_scalp", 1)])
+    result = db.daily_trade_counts_by_strategy(conn, date(2026, 7, 28))
+    assert result == {"vrp_harvest": 3, "gamma_scalp": 1}
+    assert conn.store["params"] == (date(2026, 7, 28),)
+
+
+def test_daily_trade_counts_by_strategy_empty_when_no_trades():
+    assert db.daily_trade_counts_by_strategy(FakeReadConnection([]), date(2026, 7, 28)) == {}

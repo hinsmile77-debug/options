@@ -229,6 +229,7 @@ class RegimeStateMachine:
         self.feature_builder = RegimeFeatureBuilder()
         self._bar_count = 0
         self._gap_zscore: float | None = None  # 세션 첫 계산값을 캐싱(갭은 장중 재계산 대상이 아님)
+        self.last_state: RegimeState | None = None  # 다른 폴러(Signal Fusion)가 재계산 없이 참조
         try:
             self.engine: RegimeEngine | None = RegimeEngine.load(model_path)
         except FileNotFoundError:
@@ -258,10 +259,13 @@ class RegimeStateMachine:
         db.insert_feature_store(conn, timestamp, self.underlying, dict(zip(FEATURE_NAMES, features)), FEATURE_VERSION)
 
         if self.engine is not None and self._bar_count >= _MIN_WARMUP_BARS:
-            return self.engine.predict(np.array([features]))
+            state = self.engine.predict(np.array([features]))
+        else:
+            if self._gap_zscore is None:
+                self._gap_zscore = compute_gap_zscore(conn, self.underlying)
+            macro_score = compute_macro_score_proxy(conn, self.underlying)
+            prior_regime = latest_prior_close_regime(conn)
+            state = warmup_fallback(prior_regime, macro_score=macro_score, gap_zscore=self._gap_zscore)
 
-        if self._gap_zscore is None:
-            self._gap_zscore = compute_gap_zscore(conn, self.underlying)
-        macro_score = compute_macro_score_proxy(conn, self.underlying)
-        prior_regime = latest_prior_close_regime(conn)
-        return warmup_fallback(prior_regime, macro_score=macro_score, gap_zscore=self._gap_zscore)
+        self.last_state = state
+        return state
