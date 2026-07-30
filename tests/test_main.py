@@ -18,9 +18,11 @@ from mahdi.engines.regime import RegimeLabel, RegimeState
 from mahdi.features.options_intel import OptionLeg, calculate_gex
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.risk.market_halt import MarketHaltMonitor
+import mahdi.main as mahdi_main
 from mahdi.main import (
     _advance_fixed_tick,
     _books_due_this_cycle,
+    _macro_items_due,
     _atm_liquidity_window,
     _build_account_state_for_candidate,
     _build_signal_inputs,
@@ -42,6 +44,10 @@ from mahdi.main import (
 )
 
 _NUM_FIELDS = 45  # _MIN_FIELDS in mahdi.main (index 0..44)
+# 2026-07-31: 매크로 항목별 갱신 주기(ZN 1시간 / MOVE·일봉 6시간)와 무관하게 "매 사이클 전부
+# 조회"로 고정하고 싶은 테스트용 — 스트릭/알림처럼 주기와 별개인 동작을 검증할 때 쓴다.
+_MACRO_ITEMS_EVERY_CYCLE = {item: 0.0 for item in mahdi_main.MACRO_ITEM_REFRESH_SECONDS}
+_FALLBACK_PRICE = 99.9  # yfinance 폴백 스텁이 돌려줄 값(실제 값과 구분되는 임의 숫자)
 _FUT_NUM_FIELDS = 40  # _FUT_MIN_FIELDS(38) in mahdi.main
 
 
@@ -2208,7 +2214,11 @@ def test_poll_macro_snapshot_sends_cbot_alert_once_when_zn_front_stays_none(monk
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
     with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+        # 2026-07-31: ZN 조회는 기본 1시간 주기라, 스트릭/알림 로직만 보는 이 테스트는
+        # 전 항목을 매 사이클 조회하도록 고정한다(조회 주기 자체는 별도 테스트에서 검증).
+        _run(poll_macro_snapshot(
+            rest_client, master, interval_seconds=1, item_refresh_seconds=_MACRO_ITEMS_EVERY_CYCLE
+        ))
 
     assert len(written) == 2  # 두 사이클 모두 적재는 성공(zn_front만 None)
     assert len(notify_calls) == 1  # 두 번째 사이클에서 재알림 없이 딱 한 번만
@@ -2303,7 +2313,10 @@ def test_poll_macro_snapshot_zn_streak_resets_after_recovery(monkeypatch):
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
     with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+        # 2026-07-31: 스트릭 리셋 동작만 보는 테스트라 ZN을 매 사이클 조회하도록 고정한다.
+        _run(poll_macro_snapshot(
+            rest_client, master, interval_seconds=1, item_refresh_seconds=_MACRO_ITEMS_EVERY_CYCLE
+        ))
 
     assert len(written) == 4
     assert [row["zn_front"] for row in written] == [None, 108.50, None, None]
@@ -3859,3 +3872,170 @@ def test_poll_option_chain_polls_all_books_on_even_minutes(monkeypatch):
         _run(poll_option_chain(rest_client, _books_for_cadence_test(), _SeriesRecordingMaster(), interval_seconds=60))
 
     assert set(requested_series) == {"regular", "weekly_mon", "weekly_thu"}
+
+
+# ===== 2026-07-31 매크로 항목별 갱신 주기 분리 =====
+
+
+def test_macro_items_due_returns_everything_on_first_cycle():
+    # 기동 직후에는 종전과 동일하게 모든 값이 한 번에 채워져야 한다(마지막 조회 기록이 없음).
+    assert _macro_items_due({}, 1000.0) == frozenset(mahdi_main.MACRO_ITEM_REFRESH_SECONDS)
+
+
+def test_macro_items_due_excludes_items_within_their_refresh_window():
+    last = {item: 1000.0 for item in mahdi_main.MACRO_ITEM_REFRESH_SECONDS}
+    # 5분(=매크로 폴러 1사이클) 뒤 — 가장 짧은 주기(ZN 1시간)에도 한참 못 미친다.
+    assert _macro_items_due(last, 1000.0 + 300.0) == frozenset()
+
+
+def test_macro_items_due_reopens_zn_after_an_hour_but_not_the_daily_series():
+    last = {item: 1000.0 for item in mahdi_main.MACRO_ITEM_REFRESH_SECONDS}
+    due = _macro_items_due(last, 1000.0 + 3600.0)
+    assert "zn" in due and "es_kis_probe" in due
+    assert "daily_series" not in due and "move" not in due  # 6시간 주기라 아직
+
+
+def test_macro_items_due_reopens_daily_series_after_six_hours():
+    last = {item: 1000.0 for item in mahdi_main.MACRO_ITEM_REFRESH_SECONDS}
+    assert _macro_items_due(last, 1000.0 + 21600.0) == frozenset(mahdi_main.MACRO_ITEM_REFRESH_SECONDS)
+
+
+def test_macro_refresh_periods_are_multiples_of_the_poll_interval():
+    # 폴러가 5분마다 도는데 주기가 그 배수가 아니면 실제 갱신 간격이 들쭉날쭉해진다.
+    interval = mahdi_main.MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS
+    for item, period in mahdi_main.MACRO_ITEM_REFRESH_SECONDS.items():
+        assert period % interval == 0, f"{item} 주기 {period}초가 폴링 주기 {interval}초의 배수가 아니다"
+
+
+def _macro_cycle_recorder(monkeypatch, written):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: written.append(row))
+
+
+def test_poll_macro_snapshot_skips_low_frequency_items_after_first_cycle(monkeypatch):
+    # 핵심 회귀 방지: ZN의 KIS 호출(하루 99건 100% 실패)과 US10Y/USDKRW 일봉 조회가 매 사이클
+    # 반복되지 않아야 한다. ES 값(yfinance)과 VIX/USDCNH는 매 사이클 그대로 채워져야 한다.
+    master = _FakeOverseasFutureMaster(
+        {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"),
+         "ZN": ("ZNU26", "ZNZ26"), "ES": ("ESU26", "ESZ26")}
+    )
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+            "ZNU26": _future_price_response(108.50),
+            "ESU26": _future_price_response(7380.0),
+        },
+        daily_chart=_daily_chart_response(4.54),
+        usdkrw_daily_chart=_daily_chart_response(1352.0),
+    )
+    written: list[dict] = []
+    _macro_cycle_recorder(monkeypatch, written)
+    monkeypatch.setattr(
+        "mahdi.main.yfinance_fallback.fetch_last_close",
+        _fallback_stub(zn=_FALLBACK_PRICE, es=_FALLBACK_PRICE, move=_FALLBACK_PRICE),
+    )
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert len(written) == 3
+    # 1번째 사이클엔 전부 due → 값이 있고, 2·3번째는 저빈도 항목이 NULL로 남는다.
+    assert [row["zn_front"] for row in written] == [108.50, None, None]
+    assert [row["us10y_yield"] for row in written] == [4.54, None, None]
+    assert [row["usdkrw"] for row in written] == [1352.0, None, None]
+    assert [row["move_index"] for row in written] == [_FALLBACK_PRICE, None, None]
+    # 반면 신호에 실제로 쓰이는 값들은 매 사이클 유지돼야 한다.
+    assert all(row["vix_front"] == 17.50 for row in written)
+    assert all(row["usdcnh"] == 6.7803 for row in written)
+    assert all(row["es_front"] is not None for row in written)
+
+
+def test_poll_macro_snapshot_keeps_es_value_every_cycle_via_fallback(monkeypatch):
+    # ES는 compute_macro_score_proxy의 실제 입력이라 값 자체는 매 사이클 있어야 한다 —
+    # 저빈도로 돌리는 건 100% 실패가 확정된 KIS 시도(es_kis_probe)뿐이다.
+    master = _FakeOverseasFutureMaster(
+        {"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26"), "ES": ("ESU26", "ESZ26")}
+    )
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },  # ESU26 없음 → KIS 실패 → yfinance 폴백
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+    _macro_cycle_recorder(monkeypatch, written)
+    monkeypatch.setattr(
+        "mahdi.main.yfinance_fallback.fetch_last_close",
+        _fallback_stub(zn=_FALLBACK_PRICE, es=_FALLBACK_PRICE, move=_FALLBACK_PRICE),
+    )
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert all(row["es_front"] == _FALLBACK_PRICE for row in written)
+    assert all(row["es_front_source"] == "yfinance_fallback" for row in written)
+
+
+def test_poll_macro_snapshot_does_not_count_unfetched_zn_cycles_as_failures(monkeypatch):
+    # ZN 미조회 사이클의 NULL은 "실패"가 아니다 — 그걸 세면 조회 주기(1시간)와 무관하게
+    # 매 5분 스트릭이 올라 ZN_DUAL_FAILURE_ALERT_STREAK(=2)를 곧바로 넘겨 오경보가 된다.
+    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
+    rest_client = _FakeOverseasRestClient(
+        future_prices={
+            "VXN26": _future_price_response(17.50),
+            "VXQ26": _future_price_response(17.80),
+            "CNHN26": _future_price_response(6.7803),
+        },
+        daily_chart=_daily_chart_response(4.54),
+    )
+    written: list[dict] = []
+    _macro_cycle_recorder(monkeypatch, written)
+    # ZN은 첫 사이클에 성공 → 스트릭 0. 이후 사이클은 아예 조회 안 함(NULL).
+    monkeypatch.setattr(
+        "mahdi.main.yfinance_fallback.fetch_last_close",
+        _fallback_stub(zn=_FALLBACK_PRICE, es=_FALLBACK_PRICE, move=_FALLBACK_PRICE),
+    )
+
+    notify_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
+
+    call_count = {"n": 0}
+
+    async def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 5:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
+
+    assert [row["zn_front"] for row in written] == [_FALLBACK_PRICE, None, None, None, None]
+    assert notify_calls == []  # 미조회 NULL 4건이 이중실패로 오인되지 않아야 한다

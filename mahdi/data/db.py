@@ -159,12 +159,17 @@ def macro_snapshot_columns() -> tuple[str, ...]:
 
 def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
     """
-    계산: us10y_yield/usdkrw는 하루 대부분 NULL이라(위 insert_macro_snapshot_5m 설명 참고), 최신
-         행에 값이 없으면 값이 채워진 마지막 행에서 하나 더 가져와 각각 LOCF(forward-fill)한다.
-         zn_front/es_front/move_index는 5분마다(또는 폴백으로) 갱신되므로 별도 LOCF가 필요 없다.
+    계산: 최신 행에 값이 없는 컬럼은 값이 채워진 마지막 행에서 하나 더 가져와 LOCF(forward-fill)한다.
     해석: 대시보드/레짐 피처가 "지금 시점의 매크로 상태"를 한 번에 조회할 수 있게 한다.
          *_source 필드도 함께 반환해 COCKPIT이 "kis"(실제 체결가)와 "yfinance_fallback"(근사치,
          mahdi/data/yfinance_fallback.py 참고)를 구분해 보여줄 수 있게 한다.
+         **LOCF 대상(2026-07-31 확대)**: 원래는 일봉 전용이라 하루 대부분 NULL인 us10y_yield/usdkrw
+         둘뿐이었다. 같은 날 매크로 항목별 갱신 주기를 분리하면서(main.py `MACRO_ITEM_REFRESH_SECONDS`
+         — ZN 1시간 / MOVE·일봉 6시간) zn_front·move_index도 대부분의 5분 행에서 NULL이 됐으므로
+         함께 LOCF한다. 그러지 않으면 COCKPIT 매크로 패널이 조회 주기 사이에 빈칸으로 보인다.
+         값과 짝인 `*_source`는 **반드시 같은 행에서** 가져와야 한다 — 값만 이월하고 출처를 놓치면
+         "yfinance 폴백인데 출처 미상"으로 표시돼 CBOT 승인 여부 판정이 어긋난다.
+         es_front는 여전히 매 사이클 갱신되므로(ES는 macro_score의 실제 입력) LOCF 대상이 아니다.
     실패 조건: 폴링이 한 번도 안 돌았으면 None.
     """
     with conn.cursor() as cur:
@@ -180,22 +185,25 @@ def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
         timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, usdkrw,
         zn_front, zn_front_source, es_front, es_front_source, move_index, move_index_source,
     ) = row
+
+    def _locf(columns: tuple[str, ...]) -> tuple:
+        """columns를 한 묶음으로(같은 행에서) 최근 non-null 값을 가져온다 — 값+출처 짝 유지용."""
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(columns)} FROM macro_snapshot_5m "
+                f"WHERE {columns[0]} IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+            )
+            fallback = cur.fetchone()
+        return fallback if fallback else (None,) * len(columns)
+
     if us10y_yield is None:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT us10y_yield FROM macro_snapshot_5m "
-                "WHERE us10y_yield IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
-            )
-            fallback = cur.fetchone()
-        us10y_yield = fallback[0] if fallback else None
+        (us10y_yield,) = _locf(("us10y_yield",))
     if usdkrw is None:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT usdkrw FROM macro_snapshot_5m "
-                "WHERE usdkrw IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
-            )
-            fallback = cur.fetchone()
-        usdkrw = fallback[0] if fallback else None
+        (usdkrw,) = _locf(("usdkrw",))
+    if zn_front is None:
+        zn_front, zn_front_source = _locf(("zn_front", "zn_front_source"))
+    if move_index is None:
+        move_index, move_index_source = _locf(("move_index", "move_index_source"))
     return {
         "timestamp": timestamp,
         "vix_front": float(vix_front) if vix_front is not None else None,

@@ -195,7 +195,48 @@ MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK = 2
 # 그렇다고 매번 첫 실패에 바로 알리면(기존 동작) 몇 분짜리 일시적 블립까지 "결손"으로 보고하게
 # 된다 — MACRO_SNAPSHOT_INSERT_FAILURE_ALERT_STREAK와 동일한 패턴으로, 연속 2회(=10분) 이상
 # 지속돼야 진짜 결손으로 보고 알린다(1회는 일시적 블립일 수 있어 조용히 넘어감).
+# 2026-07-31 갱신: 아래 MACRO_ITEM_REFRESH_SECONDS로 ZN 조회가 매 5분 → 1시간이 되면서, 이 값의
+# 벽시계 의미가 "연속 2회(=10분)"에서 **"연속 2회 시도(=2시간)"** 로 바뀌었다. 스트릭은 ZN을 실제로
+# 조회한 사이클에서만 증감한다(미조회 사이클의 NULL을 실패로 세면 안 된다 — poll_macro_snapshot
+# 참고). ZN은 어떤 신호 계산에도 안 쓰이는 표시 전용 값이라 알림 지연 2시간을 감수할 수 있다고
+# 판단했다.
 ZN_DUAL_FAILURE_ALERT_STREAK = 2
+
+# 2026-07-31(운영점검보고서 2026-07-30 후속, 사용자 문의 "한국 장중에 변화가 없지 않은가 / 5분마다
+# 가져올 필요가 있는가"에서 출발한 조사 결과) — 매크로 항목별 갱신 주기 분리.
+#
+# **전제 확인**: ZN/ES는 CME Globex에서 거의 23시간 거래되고 한국 정규장(09:00~15:45 KST =
+# 시카고 19:00~01:45)은 그 야간(아시아) 세션 한복판이라 **실제로 움직인다** — 07-30 실측으로
+# ES는 99사이클 중 71개가 서로 다른 값(장중 변동폭 0.404%), ZN은 17개(0.231%)였다. "장중에 안
+# 변한다"는 전제는 데이터로 반박됐다.
+#
+# **그럼에도 주기를 나눈 이유**: 소비처를 전수 추적한 결과 항목마다 필요한 해상도가 달랐다.
+#   - ES     : `compute_macro_score_proxy`가 최근 12버킷(≈1시간) 추세를 씀      → 5분 유지
+#   - USDCNH : `cross_asset_stress`가 24버킷(≈2시간) z-score를 씀                → 5분 유지
+#   - VIX    : macro_score의 콘탱고/백워데이션 판단                              → 5분 유지
+#   - USDKRW : `cross_asset_stress`/macro_score 둘 다 **일별 시계열만** 조회      → 하루 몇 회면 충분
+#   - US10Y  : 위와 동일(일봉 전용). 07-30 하루 고유값 **1개**                    → 하루 몇 회면 충분
+#   - MOVE   : **소비처 없음**(COCKPIT 표시 전용). 하루 고유값 **1개**            → 하루 몇 회면 충분
+#   - ZN     : **소비처 없음**(COCKPIT 표시 + CBOT 승인 배지). `recent_zn_front_series` 자체가
+#              없다 — `cross_asset_stress`가 받는 건 USDKRW/USDCNH/US10Y 셋뿐                → 1시간
+#
+# **ZN/ES의 KIS 호출을 완전히 없애지 않고 저빈도 "프로브"로 남기는 이유**: 이 두 호출은 계좌에
+# CBOT/CME 시세 신청이 안 돼 하루 198건 전부 EGW00552/EGW00550으로 실패한다(값은 yfinance 폴백이
+# 채운다). 그렇다고 호출을 아예 빼면 **나중에 신청이 승인돼도 알아챌 방법이 없어진다** —
+# COCKPIT의 CBOT 승인 배지가 `zn_front_source == "kis"` 여부로 판정하기 때문이다. 1시간에 한 번
+# 두드려보면 승인 당일 안에 감지되고, 실패 로그도 하루 198건 → 16건으로 줄어든다(사람이 읽는
+# 로그의 61%를 차지하던 반복 트레이스백이 사실상 사라진다).
+#
+# 참고: 이 실패들은 페이서 백오프를 키우지는 않는다 — `_is_kis_rate_limit_error()`가 msg_cd가
+# 정확히 EGW00201일 때만 백오프를 트리거하고 ZN/ES는 EGW00552/EGW00550이다(2026-07-20 설계 확인).
+# 즉 이번 조치의 목적은 백오프 완화가 아니라 (1) 확정 실패 호출 제거 (2) 로그 가독성 (3) yfinance
+# 요청량 감소(07-28에 잡은 "13:01 패턴" 재발 위험 추가 완화)다.
+MACRO_ITEM_REFRESH_SECONDS: dict[str, float] = {
+    "zn": 3600.0,             # ZN 값(yfinance) + KIS 승인 프로브 — 신호 미사용, 표시 전용
+    "es_kis_probe": 3600.0,   # ES의 KIS 시도만 저빈도로. 값 자체(yfinance)는 매 사이클 갱신한다
+    "daily_series": 21600.0,  # US10Y + USDKRW — 둘 다 일봉 전용이라 6시간(정규장 기준 하루 2회)
+    "move": 21600.0,          # MOVE — 소비처 없음 + 일별 인덱스라 하루 종일 불변
+}
 
 # VPIN 등거래량 버킷 크기 — 실거래 일평균거래량 관찰 전까지 쓰는 잠정치. 학계 관례는
 # "일평균거래량/50"이지만 이 모의투자 환경의 실제 거래량 분포를 아직 모른다(2026-07-06 결정).
@@ -877,6 +918,30 @@ async def _collect_option_chain_cycle(
     return rows, latest_spot, any_strikes
 
 
+def _macro_items_due(
+    last_fetched_at: dict[str, float],
+    now_monotonic: float,
+    item_refresh_seconds: dict[str, float] | None = None,
+) -> frozenset[str]:
+    """
+    입력: 항목별 마지막 조회 시각(monotonic 초, 아직 한 번도 안 했으면 키 없음), 현재 monotonic 시각,
+         (선택) 항목별 갱신 주기 — 기본은 `MACRO_ITEM_REFRESH_SECONDS`. 테스트가 전부 0으로 넘기면
+         매 사이클 전 항목이 due가 되어 주기 분리 이전과 동일하게 동작한다(스트릭/알림 로직처럼
+         조회 주기와 무관한 동작을 검증할 때 쓰는 이음새).
+    계산: 주어진 항목 중 갱신 주기가 지난 것들의 집합을 반환한다.
+    해석: 2026-07-31 — 매크로 항목마다 필요한 해상도가 달라 5분 사이클 안에서 선택적으로만
+         조회한다(상세 근거는 `MACRO_ITEM_REFRESH_SECONDS` 주석). 첫 사이클에는 키가 없어
+         전부 due가 되므로, 기동 직후에는 종전과 동일하게 모든 값이 한 번에 채워진다.
+    실패 조건: 없음 — 알 수 없는 항목은 애초에 딕셔너리에 없으므로 반환되지 않는다.
+    """
+    refresh = MACRO_ITEM_REFRESH_SECONDS if item_refresh_seconds is None else item_refresh_seconds
+    return frozenset(
+        item
+        for item, refresh_seconds in refresh.items()
+        if now_monotonic - last_fetched_at.get(item, float("-inf")) >= refresh_seconds
+    )
+
+
 def _books_due_this_cycle(
     books: list[tuple[RollingSubscriptionManager, str]], poll_time: datetime
 ) -> list[tuple[RollingSubscriptionManager, str]]:
@@ -1366,10 +1431,15 @@ def _log_kis_call_failure(
 
 
 async def _collect_macro_snapshot_cycle(
-    rest_client: KISRestClient, overseas_master: OverseasFutureMaster, poll_time: datetime
+    rest_client: KISRestClient,
+    overseas_master: OverseasFutureMaster,
+    poll_time: datetime,
+    due_items: frozenset[str] = frozenset(MACRO_ITEM_REFRESH_SECONDS),
 ) -> dict | None:
     """
-    입력: REST 클라이언트, 해외선물 종목코드 마스터, 폴링 시각(분 단위로 자름).
+    입력: REST 클라이언트, 해외선물 종목코드 마스터, 폴링 시각(분 단위로 자름), 이번 사이클에
+         조회할 저빈도 항목 집합(`_macro_items_due()` 결과 — 기본값은 전부 조회라 기존 호출부/
+         테스트는 종전과 동일하게 동작한다).
     계산: VIX 선물(CBOE VX) 근월·차근월, USDCNH 선물(HKEx CNH) 근월 현재가를 조회해 콘탱고/
          백워데이션(vix_term_structure = vix_next/vix_front - 1)을 계산하고, US10Y·USDKRW는 일봉
          API(해외주식 종목_지수_환율기간별시세, 국채구분 I / 환율구분 X)로 최신 종가를, ZN·ES
@@ -1424,57 +1494,66 @@ async def _collect_macro_snapshot_cycle(
     date_to = poll_time.strftime("%Y%m%d")
     date_from = (poll_time - timedelta(days=US10Y_LOOKBACK_DAYS)).strftime("%Y%m%d")
 
+    # 2026-07-31: 아래 항목들은 due_items에 들어있는 사이클에만 조회한다(주기별 근거는
+    # MACRO_ITEM_REFRESH_SECONDS 주석). 조회하지 않은 항목은 이 행에서 None으로 남고,
+    # db.latest_macro_snapshot()이 직전 값으로 LOCF(forward-fill)해 COCKPIT 표시가 끊기지 않는다.
     us10y_yield = None
-    try:
-        us10y_yield = _parse_overseas_daily_last_price(
-            await asyncio.to_thread(
-                rest_client.get_overseas_daily_chartprice,
-                tr_codes.FID_MRKT_DIV_OVERSEAS_TREASURY,
-                tr_codes.FID_INPUT_ISCD_US10Y,
-                date_from,
-                date_to,
-            )
-        )
-    except Exception as exc:
-        _log_kis_call_failure("US10Y 일봉 조회 실패", exc)
-
     usdkrw = None
-    try:
-        usdkrw = _parse_overseas_daily_last_price(
-            await asyncio.to_thread(
-                rest_client.get_overseas_daily_chartprice,
-                tr_codes.FID_MRKT_DIV_OVERSEAS_FX,
-                tr_codes.FID_INPUT_ISCD_USDKRW,
-                date_from,
-                date_to,
+    if "daily_series" in due_items:
+        try:
+            us10y_yield = _parse_overseas_daily_last_price(
+                await asyncio.to_thread(
+                    rest_client.get_overseas_daily_chartprice,
+                    tr_codes.FID_MRKT_DIV_OVERSEAS_TREASURY,
+                    tr_codes.FID_INPUT_ISCD_US10Y,
+                    date_from,
+                    date_to,
+                )
             )
-        )
-    except Exception as exc:
-        _log_kis_call_failure("USDKRW 일봉 조회 실패", exc)
+        except Exception as exc:
+            _log_kis_call_failure("US10Y 일봉 조회 실패", exc)
+
+        try:
+            usdkrw = _parse_overseas_daily_last_price(
+                await asyncio.to_thread(
+                    rest_client.get_overseas_daily_chartprice,
+                    tr_codes.FID_MRKT_DIV_OVERSEAS_FX,
+                    tr_codes.FID_INPUT_ISCD_USDKRW,
+                    date_from,
+                    date_to,
+                )
+            )
+        except Exception as exc:
+            _log_kis_call_failure("USDKRW 일봉 조회 실패", exc)
 
     zn_front = None
     zn_front_source = None
-    if zn_front_code is not None:
-        try:
-            zn_front = _parse_overseas_future_last_price(
-                await asyncio.to_thread(rest_client.get_overseas_future_price, zn_front_code)
+    if "zn" in due_items:
+        if zn_front_code is not None:
+            try:
+                zn_front = _parse_overseas_future_last_price(
+                    await asyncio.to_thread(rest_client.get_overseas_future_price, zn_front_code)
+                )
+                if zn_front is not None:
+                    zn_front_source = "kis"
+            except Exception as exc:
+                _log_kis_call_failure(f"ZN(10년 국채선물) 근월물 조회 실패: {zn_front_code}", exc)
+
+        if zn_front is None:
+            # CME|CBOT 실시간시세는 KIS 유료 항목(HTS [7936] 확인: 월 228.8불)이라 모의투자 개발
+            # 단계에서는 미구독 상태다 — KIS 조회가 안 됐을 때만(마스터 미매핑이든 호출 실패든)
+            # 여기서 yfinance 폴백을 시도한다. 폴백도 실패하면 zn_front_source는 None으로 남는다.
+            zn_front = await asyncio.to_thread(
+                yfinance_fallback.fetch_last_close, yfinance_fallback.ZN_FALLBACK_SYMBOL
             )
             if zn_front is not None:
-                zn_front_source = "kis"
-        except Exception as exc:
-            _log_kis_call_failure(f"ZN(10년 국채선물) 근월물 조회 실패: {zn_front_code}", exc)
-
-    if zn_front is None:
-        # CME|CBOT 실시간시세는 KIS 유료 항목(HTS [7936] 확인: 월 228.8불)이라 모의투자 개발
-        # 단계에서는 미구독 상태다 — KIS 조회가 안 됐을 때만(마스터 미매핑이든 호출 실패든) 여기서
-        # yfinance 폴백을 시도한다. 폴백도 실패하면 zn_front_source는 None으로 남는다.
-        zn_front = await asyncio.to_thread(yfinance_fallback.fetch_last_close, yfinance_fallback.ZN_FALLBACK_SYMBOL)
-        if zn_front is not None:
-            zn_front_source = "yfinance_fallback"
+                zn_front_source = "yfinance_fallback"
 
     es_front = None
     es_front_source = None
-    if es_front_code is not None:
+    # ES는 macro_score의 실제 입력이라 **값 자체는 매 사이클** 갱신한다 — 저빈도로 돌리는 건
+    # 100% 실패가 확정된 KIS 시도(es_kis_probe)뿐이고, 값은 아래 yfinance 폴백이 계속 채운다.
+    if "es_kis_probe" in due_items and es_front_code is not None:
         try:
             es_front = _parse_overseas_future_last_price(
                 await asyncio.to_thread(rest_client.get_overseas_future_price, es_front_code)
@@ -1493,8 +1572,13 @@ async def _collect_macro_snapshot_cycle(
 
     # MOVE(ICE BofA MOVE Index)는 장외 파생 인덱스라 KIS 해외선물옵션 마스터파일에 상품 자체가
     # 없다 — KIS 시도 없이 처음부터 yfinance 폴백만 쓴다.
-    move_index = await asyncio.to_thread(yfinance_fallback.fetch_last_close, yfinance_fallback.MOVE_FALLBACK_SYMBOL)
-    move_index_source = "yfinance_fallback" if move_index is not None else None
+    move_index = None
+    move_index_source = None
+    if "move" in due_items:
+        move_index = await asyncio.to_thread(
+            yfinance_fallback.fetch_last_close, yfinance_fallback.MOVE_FALLBACK_SYMBOL
+        )
+        move_index_source = "yfinance_fallback" if move_index is not None else None
 
     vix_term_structure = (vix_next / vix_front - 1) if (vix_front and vix_next) else None
 
@@ -1521,6 +1605,7 @@ async def poll_macro_snapshot(
     overseas_master: OverseasFutureMaster,
     interval_seconds: float = MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS,
     startup_offset_seconds: float = 0.0,
+    item_refresh_seconds: dict[str, float] | None = None,
 ) -> None:
     """
     입력: REST 클라이언트, 해외선물 종목코드 마스터(main() 기동 시 1회 로드), 기동 시 최초
@@ -1559,9 +1644,18 @@ async def poll_macro_snapshot(
     zn_dual_failure_streak = 0
     insert_failure_streak = 0
     insert_failure_alerted = False
+    # 2026-07-31: 항목별 마지막 조회 시각(monotonic). 첫 사이클에는 비어 있어 전부 due가 된다.
+    macro_last_fetched_at: dict[str, float] = {}
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
-        row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time)
+        fetch_started = time.monotonic()
+        due_items = _macro_items_due(macro_last_fetched_at, fetch_started, item_refresh_seconds)
+        row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time, due_items)
+        if row is not None:
+            # 조회를 실제로 시도한 항목만 "했다"고 기록한다 — row가 None이면 VIX/USDCNH 전부 실패로
+            # 조기 반환된 것이라 저빈도 항목은 시도조차 안 됐다(다음 사이클에 다시 due로 남는다).
+            for item in due_items:
+                macro_last_fetched_at[item] = fetch_started
 
         if row is None:
             logger.warning("매크로 스냅샷 폴링 전체 실패 — 이번 사이클 건너뜀")
@@ -1588,10 +1682,14 @@ async def poll_macro_snapshot(
                         "— db/migrations 라이브 미적용(스키마 불일치) 등 DB 문제일 수 있습니다. 로그 확인 필요.",
                         "WARNING",
                     )
-            if row["zn_front"] is None:
-                zn_dual_failure_streak += 1
-            else:
-                zn_dual_failure_streak = 0
+            # 2026-07-31: ZN을 실제로 조회한 사이클에서만 스트릭을 증감한다 — 미조회 사이클의
+            # NULL은 "실패"가 아니라 "이번엔 안 봤다"는 뜻이라, 그걸 세면 조회 주기(1시간)와
+            # 무관하게 매 5분 스트릭이 올라 오경보가 된다.
+            if "zn" in due_items:
+                if row["zn_front"] is None:
+                    zn_dual_failure_streak += 1
+                else:
+                    zn_dual_failure_streak = 0
             if zn_dual_failure_streak >= ZN_DUAL_FAILURE_ALERT_STREAK and not cbot_alert_sent:
                 cbot_alert_sent = True
                 notify.notify(

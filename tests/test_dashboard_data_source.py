@@ -406,6 +406,13 @@ class _FakeHealthCursor:
             self._kind, self._value = "one", self._responses.get("macro_fallback_row")
         elif "macro_snapshot_5m" in query and "usdkrw IS NOT NULL" in query:
             self._kind, self._value = "one", self._responses.get("usdkrw_fallback_row")
+        # 2026-07-31: 매크로 항목별 갱신 주기 분리로 zn_front/move_index도 LOCF 대상이 됐다
+        # (값+출처를 같은 행에서 가져오므로 2컬럼 튜플). 이 분기가 없으면 아래 범용 분기가
+        # 13컬럼짜리 macro_row를 돌려줘 언패킹이 깨진다.
+        elif "macro_snapshot_5m" in query and "zn_front IS NOT NULL" in query:
+            self._kind, self._value = "one", self._responses.get("zn_fallback_row", (None, None))
+        elif "macro_snapshot_5m" in query and "move_index IS NOT NULL" in query:
+            self._kind, self._value = "one", self._responses.get("move_fallback_row", (None, None))
         elif "macro_snapshot_5m" in query:
             self._kind, self._value = "one", self._responses.get("macro_row")
         elif "information_schema.columns" in query:
