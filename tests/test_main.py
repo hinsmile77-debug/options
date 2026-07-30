@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -19,6 +20,7 @@ from mahdi.features.orderflow import calculate_vpin
 from mahdi.risk.market_halt import MarketHaltMonitor
 from mahdi.main import (
     _advance_fixed_tick,
+    _books_due_this_cycle,
     _atm_liquidity_window,
     _build_account_state_for_candidate,
     _build_signal_inputs,
@@ -3713,21 +3715,26 @@ def test_five_minute_pollers_are_spread_across_the_window_not_clustered():
 
     # 07-29 fix가 계좌잔고를 60초 그룹에서 빼냈지만 만기유동성(30초)·매크로(45초) 바로 옆
     # (60초)에 놓아, 매 5분마다 REST 41건이 30초 폭에 몰렸다(07-30 실측: 분%5=3 구간만
-    # 타폴러동시호출 평균 22.9건). 세 폴러가 5분 창 안에서 충분히 벌어져 있는지 고정한다.
-    offsets = sorted(
-        [
-            mahdi_main.EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS,
-            mahdi_main.MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS,
-            mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS,
-        ]
+    # 타폴러동시호출 평균 22.9건).
+    # 2026-07-31: 축소안 (c)로 만기유동성 주기가 600초가 되어 세 폴러의 주기가 더 이상 같지
+    # 않다 — "오프셋 간 간격"만 보면 부족하고, **공통 주기(LCM) 안의 실제 발사 시각**을 전부
+    # 펼쳐서 겹치는지 확인해야 한다. 상수에서 직접 재계산하므로 앞으로 주기/오프셋을 어떻게
+    # 바꾸든 충돌이 생기면 이 테스트가 잡는다.
+    schedules = [
+        (mahdi_main.EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS, mahdi_main.EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS),
+        (mahdi_main.MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS, mahdi_main.MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS),
+        (mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS, mahdi_main.ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS),
+    ]
+    horizon = math.lcm(*(int(interval) for _offset, interval in schedules))
+    firings = sorted(
+        offset + interval * k
+        for offset, interval in schedules
+        for k in range(int(horizon // interval))
     )
-    interval = 300.0
-    assert mahdi_main.EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS == interval
-    assert mahdi_main.MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS == interval
-    assert mahdi_main.ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS == interval
-    assert all(0 <= o < interval for o in offsets)
-    gaps = [b - a for a, b in zip(offsets, offsets[1:])]
-    assert min(gaps) >= 60.0, f"5분 폴러가 다시 뭉쳤다: {offsets}"
+    assert len(firings) == len(set(firings)), f"두 폴러가 정확히 같은 시각에 발사된다: {firings}"
+    # 창 끝에서 다음 창 시작으로 넘어가는 구간(wrap)도 함께 본다.
+    gaps = [b - a for a, b in zip(firings, firings[1:])] + [firings[0] + horizon - firings[-1]]
+    assert min(gaps) >= 60.0, f"5/10분 폴러가 다시 뭉쳤다: 발사시각={firings}, 최소간격={min(gaps)}초"
 
 
 def test_sixty_second_pollers_do_not_collide_with_five_minute_group_phase():
@@ -3741,3 +3748,114 @@ def test_sixty_second_pollers_do_not_collide_with_five_minute_group_phase():
         mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS,
     ):
         assert offset % 60.0 >= 30.0, f"오프셋 {offset}이 옵션체인 수집 구간(t=0~30초)과 겹친다"
+
+
+# ===== 2026-07-31 총 REST 수요 축소안 (a): 위클리 2북 격분 폴링 =====
+
+
+def _books_for_cadence_test():
+    return [
+        (_FakeSubscriptionManagerWithStrikes(), "regular"),
+        (_FakeSubscriptionManagerWithStrikes(), "weekly_mon"),
+        (_FakeSubscriptionManagerWithStrikes(), "weekly_thu"),
+    ]
+
+
+def test_books_due_includes_all_three_on_even_minutes():
+    due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 30))
+    assert [series for _m, series in due] == ["regular", "weekly_mon", "weekly_thu"]
+
+
+def test_books_due_drops_weeklies_on_odd_minutes():
+    due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 31))
+    assert [series for _m, series in due] == ["regular"]  # 먼슬리는 언제나 매분
+
+
+def test_books_due_halves_weekly_call_volume_over_an_hour():
+    # 축소안 (a)의 정량 목표: 위클리 호출량이 정확히 절반이 되는지(먼슬리는 그대로).
+    books = _books_for_cadence_test()
+    counts = {"regular": 0, "weekly_mon": 0, "weekly_thu": 0}
+    for minute in range(60):
+        for _m, series in _books_due_this_cycle(books, datetime(2026, 7, 31, 9, minute)):
+            counts[series] += 1
+    assert counts["regular"] == 60
+    assert counts["weekly_mon"] == 30
+    assert counts["weekly_thu"] == 30
+
+
+def test_books_due_keeps_unknown_series_every_cycle():
+    # 새 북을 추가했을 때 조용히 폴링에서 빠지는 것보다, 모르면 매 사이클 도는 쪽이 안전하다.
+    books = [(_FakeSubscriptionManagerWithStrikes(), "quarterly_new")]
+    assert len(_books_due_this_cycle(books, datetime(2026, 7, 31, 9, 31))) == 1
+
+
+def test_books_due_preserves_input_order_so_monthly_is_polled_first():
+    # _update_atm_iv가 rows 기준으로 ATM을 고르므로 주력 북(먼슬리)이 먼저 조회돼야 한다.
+    due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 30))
+    assert due[0][1] == "regular"
+
+
+def test_poll_option_chain_skips_weekly_books_on_odd_minutes(monkeypatch):
+    # 실제 폴러 경로에서도 위클리 심볼이 조회되지 않는지 확인한다(헬퍼 단위테스트만으로는
+    # 호출측이 due_books를 실제로 쓰는지 보장되지 않는다).
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    requested_series: list[str] = []
+
+    class _SeriesRecordingMaster:
+        def option_symbol(self, option_type, strike, underlying="KOSPI200", series="regular"):
+            requested_series.append(series)
+            return f"SYM{int(strike)}{option_type}"
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 7, 31, 9, 31, 5))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_option_chain(rest_client, _books_for_cadence_test(), _SeriesRecordingMaster(), interval_seconds=60))
+
+    assert set(requested_series) == {"regular"}
+
+
+def test_poll_option_chain_polls_all_books_on_even_minutes(monkeypatch):
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+
+    requested_series: list[str] = []
+
+    class _SeriesRecordingMaster:
+        def option_symbol(self, option_type, strike, underlying="KOSPI200", series="regular"):
+            requested_series.append(series)
+            return f"SYM{int(strike)}{option_type}"
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 7, 31, 9, 30, 5))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_option_chain(rest_client, _books_for_cadence_test(), _SeriesRecordingMaster(), interval_seconds=60))
+
+    assert set(requested_series) == {"regular", "weekly_mon", "weekly_thu"}

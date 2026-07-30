@@ -94,6 +94,36 @@ US10Y_LOOKBACK_DAYS = 10
 UNDERLYING = "KOSPI200"
 OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범위와 동일한 종목을 REST로 주기 조회
 
+# 2026-07-31(운영점검보고서 2026-07-30 §5-2 "총 REST 수요 축소안" (a), 사용자 승인) — 위클리 2북만
+# 격분(2분) 주기로 늦춘다.
+#
+# **배경**: 공유 `_RateLimiter`의 실측 한도는 앱키당 1건/초인데, 07-30 하루 실측 총수요가
+# 19,606건/493분 = **0.663건/초로 이미 용량의 66%**였다. 백오프 배율이 1.51배만 넘으면
+# (1/1.51 = 0.66건/초) 수요가 용량을 구조적으로 초과하는데, 실제로 오후 시간당 평균 배율이
+# 1.29배·최대 2.61배까지 올라 옵션체인 25사이클(5.1%)이 통째로 유실됐다. 지금까지의 스태거링
+# 조치(07-09/07-27/07-29/07-31)는 전부 "언제 호출하느냐"만 옮겼을 뿐 총량은 그대로였다 —
+# 총수요가 한계선에 붙어 있으면 아무리 재배치해도 해결되지 않는다. 용량을 늘리는 쪽(폴러별
+# 페이서 분리)은 2026-07-08 500 폭주로 203분치를 날린 전례가 있어 봉인 상태다.
+#
+# **왜 옵션체인인가**: 5분당 호출 실측 분해에서 옵션체인이 146건으로 **전체의 72%**다(만기유동성
+# 33 / 투자자수급 15 / 매크로 7 / 계좌잔고 1). 여기를 안 건드리면 유의미한 감축이 불가능하다.
+#
+# **왜 위클리만인가**: 먼슬리는 감마 구조 판단의 주력 북이라 1분 해상도를 유지해야 한다. 위클리
+# 2북(월/목)만 2분으로 늦추면 옵션체인 수요가 5분당 146 → 97건으로 줄어든다. 잃는 것은 **위클리
+# 그릭스(IV/델타/감마/OI)의 REST 갱신 주기 1분 → 2분**뿐이고, 위클리 **체결 데이터는 WS 실시간
+# 구독이라 전혀 영향받지 않는다**(1분봉은 그대로 매분 쌓인다).
+#
+# **화면/신호에 미치는 영향**: `db.latest_option_chain()`은 `DISTINCT ON (strike, option_type)`으로
+# **레그별 최신값**을 취하므로, 위클리를 안 조회한 분에는 직전 값이 그대로 이월돼 체인 스냅샷에
+# 구멍이 생기지 않는다(GEX/감마플립 계산 입력이 끊기지 않음).
+#
+# **격분 판정을 벽시계 분(짝수/홀수)으로 하는 이유**: 프로세스 기동 시각에 좌우되는 내부 카운터
+# 대신 `poll_time.minute`을 쓰면 재시작해도 위상이 같고, 로그/DB만 보고도 "이 분에 위클리를 봤어야
+# 하는가"를 바로 검증할 수 있다. 사이클이 밀려 분을 건너뛰면 짝수 분이 연달아 나올 수 있는데,
+# 그건 벽시계 기준으로는 여전히 2분에 1회 이하라 부하가 늘지 않는다.
+OPTION_CHAIN_SLOW_SERIES = frozenset({"weekly_mon", "weekly_thu"})
+OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
+
 # 2026-07-29 신규 — 서킷브레이커/거래정지 감지(mahdi/risk/market_halt.py)용 H0UNMKO0(국내주식
 # 장운영정보) 구독 대상. CB/시장임시정지는 시장 전체 이벤트라 아무 종목이나 구독해도 그 순간의
 # MKOP_CLS_CODE로 시장 전체 상태를 알 수 있다 — KOSPI 최대형주(삼성전자)라 세션 상태 변화를
@@ -184,7 +214,15 @@ _VPIN_HISTORY_LIMIT = 500  # calculate_vpin 기본 window(50)의 10배 — 무�
 # 판단이 아니라 20거래일 기준선 축적이라 촘촘히 볼 필요가 없다(사용자 확인 후 %스프레드 포함
 # 정식 스펙대로 진행하되, 호출빈도로 부하를 완화하기로 결정).
 LIQUIDITY_ATM_EACH_SIDE = 2
-EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 300
+# 2026-07-31(운영점검보고서 2026-07-30 §5-2 "총 REST 수요 축소안" (c), 사용자 승인): 300 → 600초.
+# 이 폴러는 5분당 33건(호가 30 + 만기확인 3)으로 옵션체인 다음으로 큰 소비자다. 위 도입 주석이
+# 이미 명시했듯 **이 지표의 용도는 실시간 판단이 아니라 20거래일 기준선 축적**이라, 해상도를
+# 5분 → 10분으로 늦춰도 용도상 손실이 가장 작다(세 축소안 중 유일하게 신호 계산 입력을 건드리지
+# 않는다). 단독 효과는 0.663 → 0.62건/초로 작아서, 축소안 (a)(위클리 격분화)와 함께 적용해
+# **합계 0.663 → 약 0.456건/초(용량의 46%, 백오프 2.19배까지 여유)** 를 목표로 한다.
+# COCKPIT 신선도 배지(`_STALE_DATA_THRESHOLD_SECONDS`=300초)는 `option_analysis_1m`/선물만
+# 대상이라 이 변경으로 경고가 뜨지 않는다(확인함).
+EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 600
 
 # 2026-07-09 실측: poll_option_chain(60초, ~28콜)과 poll_expiry_liquidity(300초, ~11콜)가 같은
 # 순간에 공유 _RateLimiter 큐에 들어가면 그 사이클만 대기시간이 늘어나 poll_option_chain의
@@ -230,6 +268,13 @@ INVESTOR_FLOW_STARTUP_OFFSET_SECONDS = 15.0
 # 셋 다 각 분의 35초 지점(=옵션체인이 t=0~30초를 쓰고 난 뒤)에 놓아 60초 그룹과도 어긋나게 한다.
 # 검증 기준: 다음 거래일에 분%5별 타폴러동시호출 평균이 22.9건에서 내려가고 60초 초과 비율이
 # 균등해지는지(특정 분에만 몰리지 않는지) 확인할 것.
+#
+# 2026-07-31 갱신: 축소안 (c)로 만기유동성 주기가 600초가 되면서 세 폴러의 공통 주기(LCM)는
+# 10분이 됐다. 그 10분 창 안의 발사 시각은 아래와 같아 여전히 겹치지 않는다(최소 간격 60초):
+#   0:35 만기유동성 / 2:35 매크로 / 4:35 계좌잔고 / 7:35 매크로 / 9:35 계좌잔고
+# 오프셋 값 자체는 바꾸지 않았다 — 주기만 늘어나 만기유동성 발사 횟수가 절반이 됐을 뿐이다.
+# (이 성질은 `test_five_minute_pollers_are_spread_across_the_window_not_clustered`가 상수에서
+#  직접 재계산해 검증하므로, 앞으로 주기/오프셋을 바꾸면 테스트가 충돌을 잡아준다.)
 MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS = 155.0
 
 
@@ -832,6 +877,28 @@ async def _collect_option_chain_cycle(
     return rows, latest_spot, any_strikes
 
 
+def _books_due_this_cycle(
+    books: list[tuple[RollingSubscriptionManager, str]], poll_time: datetime
+) -> list[tuple[RollingSubscriptionManager, str]]:
+    """
+    입력: 전체 (구독 매니저, series) 목록, 이번 사이클의 분 단위 시각.
+    계산: `OPTION_CHAIN_SLOW_SERIES`(위클리 2북)는 `poll_time.minute`이
+         `OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES`의 배수인 사이클에만 포함하고, 나머지 북
+         (먼슬리)은 항상 포함한다.
+    해석: 2026-07-31 총 REST 수요 축소안 (a) — 상세 근거는 `OPTION_CHAIN_SLOW_SERIES` 주석 참고.
+         반환 순서는 입력 순서를 유지한다(먼슬리를 먼저 조회해 스팟/ATM IV가 항상 주력 북 기준으로
+         잡히도록 — 호출측 `_update_atm_iv`가 rows 기준으로 ATM을 고르기 때문).
+    실패 조건: 없음 — 알 수 없는 series는 "느린 북이 아니다"로 보아 매 사이클 포함한다(새 북을
+              추가했을 때 조용히 폴링에서 빠지는 쪽보다 안전하다).
+    """
+    return [
+        (manager, series)
+        for manager, series in books
+        if series not in OPTION_CHAIN_SLOW_SERIES
+        or poll_time.minute % OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == 0
+    ]
+
+
 def _update_atm_iv(regime_state_machine: RegimeStateMachine | None, rows: list[dict], latest_spot: float | None) -> None:
     """
     입력: 레짐 상태머신(없으면 아무 것도 안 함), 이번 사이클에서 파싱된 옵션체인 행들, 최신 스팟.
@@ -863,6 +930,8 @@ async def poll_option_chain(
          집합을 공유), 종목코드 마스터.
     계산: 북마다 WS 구독 중인 행사가×콜/풋 각각에 대해 주기적으로 get_quote()를 호출해
          그릭스/IV/OI를 option_analysis_1m에, 기초자산 스팟을 underlying_spot_1m에 적재한다.
+         **2026-07-31부터 위클리 2북은 격분(2분)에만 조회한다**(총 REST 수요 축소안 (a) —
+         `_books_due_this_cycle`/`OPTION_CHAIN_SLOW_SERIES` 주석 참고). 먼슬리는 매분 그대로다.
          get_quote()는 동기(블로킹) httpx 호출이라 asyncio.to_thread로 실행해 WS 수신 루프를
          막지 않는다. 구독 종목이 있는데 한 건도 성공하지 못했다면(레이트리밋 버스트 등으로
          사이클 전체가 실패) retry_backoff_seconds 뒤 그 사이클을 한 번만 재시도한다.
@@ -904,9 +973,13 @@ async def poll_option_chain(
         # 차이로 역산) 구분하기 위해 전후 값을 남긴다. 속성이 없는 테스트 더블에서도 죽지 않게
         # getattr 기본값 None을 쓴다(있으면 실측, 없으면 "측정 불가"로 조용히 건너뜀).
         calls_before = getattr(rest_client, "rate_limit_total_calls", None)
+        # 2026-07-31 총 REST 수요 축소안 (a): 위클리 2북은 격분에만 조회한다(_books_due_this_cycle).
+        # 이후 이 사이클의 모든 계산(수집/재시도/자기콜수 추정)은 due_books 기준이어야 한다 —
+        # 전체 books로 own_calls_expected를 세면 "타폴러동시호출추정"이 홀수 분마다 20건씩 부풀려진다.
+        due_books = _books_due_this_cycle(books, poll_time)
         collect_started = time.monotonic()
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
-            rest_client, books, master, underlying, poll_time, warning_throttle
+            rest_client, due_books, master, underlying, poll_time, warning_throttle
         )
         collect_seconds = time.monotonic() - collect_started
 
@@ -918,7 +991,7 @@ async def poll_option_chain(
         retried = False
         own_calls_expected = sum(
             len(subscription_manager.desired_strikes) * 2
-            for subscription_manager, _ in books
+            for subscription_manager, _ in due_books
             if subscription_manager.desired_strikes
         )
         if not rows:
@@ -927,7 +1000,7 @@ async def poll_option_chain(
             retried = True
             retry_started = time.monotonic()
             rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
-                rest_client, books, master, underlying, poll_time, warning_throttle
+                rest_client, due_books, master, underlying, poll_time, warning_throttle
             )
             collect_seconds += time.monotonic() - retry_started
             if not rows:
