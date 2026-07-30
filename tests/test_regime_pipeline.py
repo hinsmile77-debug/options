@@ -117,7 +117,7 @@ def test_state_machine_uses_warmup_fallback_when_no_model(monkeypatch, tmp_path)
     )
     assert machine.engine is None
 
-    monkeypatch.setattr(db, "daily_closes", lambda conn, symbol, days: [])
+    monkeypatch.setattr(db, "underlying_daily_closes", lambda conn, underlying, days: [])
     monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
     monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
     monkeypatch.setattr(db, "recent_us10y_daily_series", lambda conn, days: [])
@@ -141,7 +141,7 @@ def test_state_machine_feeds_real_macro_series_into_cross_asset_stress(monkeypat
         underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
     )
 
-    monkeypatch.setattr(db, "daily_closes", lambda conn, symbol, days: [])
+    monkeypatch.setattr(db, "underlying_daily_closes", lambda conn, underlying, days: [])
     monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [1350.0, 1351.0, 1352.0])
     # USDCNH가 최근 급등 — 마지막 값이 baseline 대비 확 튀도록 구성.
     monkeypatch.setattr(
@@ -176,7 +176,7 @@ def test_state_machine_switches_to_predict_after_warmup(monkeypatch, tmp_path):
 
     machine.engine = _StubEngine()
 
-    monkeypatch.setattr(db, "daily_closes", lambda conn, symbol, days: [])
+    monkeypatch.setattr(db, "underlying_daily_closes", lambda conn, underlying, days: [])
     monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
     monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
     monkeypatch.setattr(db, "recent_us10y_daily_series", lambda conn, days: [])
@@ -197,7 +197,7 @@ def test_step_caches_result_on_last_state_for_other_pollers_to_read(monkeypatch,
     )
     assert machine.last_state is None
 
-    monkeypatch.setattr(db, "daily_closes", lambda conn, symbol, days: [])
+    monkeypatch.setattr(db, "underlying_daily_closes", lambda conn, underlying, days: [])
     monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
     monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
     monkeypatch.setattr(db, "recent_us10y_daily_series", lambda conn, days: [])

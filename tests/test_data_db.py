@@ -679,3 +679,63 @@ def test_rate_limiter_status_history_since_maps_rows():
 
 def test_rate_limiter_status_history_since_empty_when_no_rows():
     assert db.rate_limiter_status_history_since(FakeReadConnection([]), datetime(2026, 7, 29)) == []
+
+
+# ===== 2026-07-30 운영점검 Fix#5: rv_ratio 입력을 선물 종목코드 → 지수로 =====
+
+
+def test_underlying_daily_closes_returns_oldest_first_from_index_table():
+    # 선물은 분기마다 종목코드가 바뀌어 일별 이력이 리셋되지만 지수는 롤오버가 없다 —
+    # rv_ratio(21개 필요)가 롤오버 때마다 중립값 1.0으로 되돌아가던 원인 제거.
+    conn = FakeReadConnection(
+        [(date(2026, 7, 30), 421.5), (date(2026, 7, 29), 420.0), (date(2026, 7, 28), 418.25)]
+    )
+    assert db.underlying_daily_closes(conn, "KOSPI200", days=30) == [418.25, 420.0, 421.5]
+
+
+def test_underlying_daily_closes_queries_underlying_spot_not_market_raw():
+    conn = FakeReadConnection([])
+    db.underlying_daily_closes(conn, "KOSPI200", days=30)
+    query = conn.store["query"]
+    assert "underlying_spot_1m" in query
+    assert "market_raw_1m" not in query  # 종목코드 기준으로 되돌아가면 롤오버 결함이 재발한다
+    # 라이브 DB 왕복에서 발견: 장외 폴링 행이 그 날짜의 "종가"로 잡혀 07-16/17/19가 전부 같은
+    # 값(1080.36)이 됐다 — 정규장(09:00~15:45) 필터가 빠지면 일간 수익률에 가짜 0이 섞인다.
+    assert "timestamp::time BETWEEN '09:00' AND '15:45'" in query
+    assert conn.store["params"] == ("KOSPI200", 30)
+
+
+def test_underlying_daily_closes_empty_when_no_rows():
+    assert db.underlying_daily_closes(FakeReadConnection([]), "KOSPI200", days=30) == []
+
+
+# ===== 2026-07-30 운영점검 Fix#6: risk_snapshots 적재 =====
+
+
+def test_insert_risk_snapshot_upserts_by_timestamp_and_serializes_jsonb():
+    conn = FakeConnection()
+    ts = datetime(2026, 7, 31, 9, 30)
+
+    db.insert_risk_snapshot(
+        conn, ts,
+        greeks={"scope": "market", "gex": 1234.5},
+        loss_buffer=0.02,
+        cb_state={"circuit_breaker_state": "NORMAL", "market_halted": False},
+    )
+
+    assert conn.committed is True
+    assert "INSERT INTO risk_snapshots" in conn.store["query"]
+    # 같은 분에 두 번 들어와도 마지막 값으로 덮어써야 한다(폴러가 분 단위로 자른 시각을 씀).
+    assert "ON CONFLICT (timestamp) DO UPDATE" in conn.store["query"]
+    params = conn.store["params"]
+    assert params[0] == ts
+    assert json.loads(params[1]) == {"scope": "market", "gex": 1234.5}
+    assert params[2] == 0.02
+    assert json.loads(params[3]) == {"circuit_breaker_state": "NORMAL", "market_halted": False}
+
+
+def test_insert_risk_snapshot_accepts_null_loss_buffer():
+    # 계좌 스냅샷이 아직 없으면 손실 여유를 지어내지 않고 NULL로 남긴다.
+    conn = FakeConnection()
+    db.insert_risk_snapshot(conn, datetime(2026, 7, 31, 9, 30), greeks={}, loss_buffer=None, cb_state={})
+    assert conn.store["params"][2] is None

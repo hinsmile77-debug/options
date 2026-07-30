@@ -22,6 +22,18 @@ _DEFENSIVE_ONLY = frozenset({RegimeLabel.LIQUIDITY_THIN, RegimeLabel.CRISIS_DEFE
 
 _PREMIUM_SELL_STRATEGIES = frozenset({"limited_premium_sell", "highly_limited_premium_sell"})
 
+# 2026-07-30(운영점검보고서 §2-2): §11.4 매트릭스의 "fair" 열에는 실제 진입 전략이 아니라
+# **관망 지시**가 들어있는 셀이 둘 있다 — RANGE_TIGHT×fair의 `wait_and_see`(관망)와
+# VOL_COMPRESSION×fair의 `breakout_wait`(돌파 대기). 둘 다 "지금은 들어가지 말고 기다려라"라는
+# 뜻인데, 호출측이 `bool(allowed_strategies)`만 보고 진입 후보 여부를 판정하면 **비어있지 않은
+# 리스트라는 이유만으로 진입으로 계수**된다. 07-30 실측에서 정확히 이 일이 벌어져 08:45~15:44
+# 419분 내내 `decision="ENTER"`가 기록됐다(전부 allowed_strategies=["wait_and_see"]).
+#
+# 매트릭스 자체에서 빼지 않고 별도 집합으로 분리하는 이유: `wait_and_see`는 v6 §11.4가 정의한
+# 정당한 셀 값이고, COCKPIT "판단 현황" 패널이 "지금 왜 안 들어가는지"를 보여주려면 그 값이
+# 그대로 남아있어야 한다. 팔레트는 사실 그대로 반환하고, **진입 여부 판정만** 이 집합을 걸러낸다.
+NON_ENTRY_STRATEGIES = frozenset({"wait_and_see", "breakout_wait"})
+
 
 @dataclass(frozen=True, slots=True)
 class StrategyPaletteResult:
@@ -92,6 +104,18 @@ def select_strategies(
     if not allowed:
         return StrategyPaletteResult(allowed_strategies=[], reason="no_strategy_for_this_cell")
     return StrategyPaletteResult(allowed_strategies=allowed)
+
+
+def entry_strategies(allowed_strategies: list[str]) -> list[str]:
+    """
+    입력: `select_strategies()`(또는 `FusionDecision.allowed_strategies`)가 반환한 허용 전략 목록.
+    계산: `NON_ENTRY_STRATEGIES`(관망/대기 지시)를 제거하고 남은 실제 진입 전략만 순서대로 반환.
+    해석: 반환값이 비어 있으면 "팔레트가 관망만 지시했다" — 진입 후보가 아니다. 호출측은
+         `bool(allowed_strategies)`가 아니라 **이 함수의 결과**로 진입 여부를 판정해야 한다
+         (2026-07-30 운영점검 §2-2, 419건 오계수의 재발 방지 지점).
+    실패 조건: 없음 — 입력이 비어 있으면 빈 목록.
+    """
+    return [s for s in allowed_strategies if s not in NON_ENTRY_STRATEGIES]
 
 
 def enforce_daily_strategy_cap(

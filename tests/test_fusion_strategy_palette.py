@@ -1,5 +1,10 @@
 from mahdi.engines.regime import RegimeLabel
-from mahdi.fusion.strategy_palette import enforce_daily_strategy_cap, select_strategies
+from mahdi.fusion.strategy_palette import (
+    NON_ENTRY_STRATEGIES,
+    enforce_daily_strategy_cap,
+    entry_strategies,
+    select_strategies,
+)
 
 
 def test_defensive_regimes_always_return_empty():
@@ -65,3 +70,38 @@ def test_enforce_daily_strategy_cap_prioritizes_continuing_strategies():
 def test_enforce_daily_strategy_cap_zero_cap_blocks_everything():
     result = enforce_daily_strategy_cap(["a"], already_used_today=frozenset({"a"}), cap=0)
     assert result == []
+
+
+# --- 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 관망 전략 계수 오류 회귀 방지 ---
+
+
+def test_range_balanced_fair_vrp_returns_wait_and_see_which_is_not_an_entry():
+    # 07-30 하루 419건의 잘못된 ENTER가 정확히 이 셀에서 나왔다 — 팔레트는 여전히
+    # wait_and_see를 반환해야 하지만(v6 §11.4 정당한 셀 값), 진입 후보로는 세지 않아야 한다.
+    result = select_strategies(RegimeLabel.RANGE_BALANCED, vrp=0.0)
+    assert result.allowed_strategies == ["wait_and_see"]
+    assert entry_strategies(result.allowed_strategies) == []
+
+
+def test_vol_compression_fair_vrp_breakout_wait_is_not_an_entry_either():
+    result = select_strategies(RegimeLabel.VOL_COMPRESSION, vrp=0.0)
+    assert result.allowed_strategies == ["breakout_wait"]
+    assert entry_strategies(result.allowed_strategies) == []
+
+
+def test_entry_strategies_keeps_real_strategies_and_preserves_order():
+    assert entry_strategies(["wait_and_see", "atm_long", "breakout_wait", "debit_spread"]) == [
+        "atm_long", "debit_spread",
+    ]
+
+
+def test_entry_strategies_on_empty_palette_is_empty():
+    assert entry_strategies([]) == []
+
+
+def test_non_entry_strategies_are_all_actually_produced_by_the_matrix():
+    # NON_ENTRY_STRATEGIES에 매트릭스에 없는 오타가 들어가면 필터가 조용히 무력해진다 —
+    # 두 값 모두 실제 팔레트 셀에서 나오는지 확인한다.
+    produced = set(select_strategies(RegimeLabel.RANGE_BALANCED, vrp=0.0).allowed_strategies)
+    produced |= set(select_strategies(RegimeLabel.VOL_COMPRESSION, vrp=0.0).allowed_strategies)
+    assert NON_ENTRY_STRATEGIES == produced

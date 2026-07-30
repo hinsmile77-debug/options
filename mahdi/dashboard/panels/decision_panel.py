@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import plotly.graph_objects as go
 
+from mahdi.fusion.strategy_palette import NON_ENTRY_STRATEGIES
+
 CONVICTION_LABEL_KO: dict[str, str] = {
     "NO_TRADE": "거래 없음",
     "SMALL_TEST": "소규모 테스트",
@@ -37,6 +39,27 @@ _EXIT_STAGE_NOT_WIRED_CARD = {
     "help": "ExecutionEngine의 6-레이어 청산 스택은 아직 관측 루프에 연결되지 않았습니다 — "
     "ADVISORY 모드는 진입 신호 평가까지만 수행합니다.",
 }
+
+
+def _allowed_strategy_card(allowed_strategies: list[str]) -> dict:
+    """
+    입력: `risk_gate_state["allowed_strategies"]`(v6 §11.4 팔레트 원문).
+    계산: 첫 전략을 표시하되, 그것이 관망 계열(`NON_ENTRY_STRATEGIES`)이면 "(관망)"을 덧붙이고
+         help로 이유를 설명한다.
+    해석: 2026-07-30 운영점검 §2-2 — `wait_and_see`는 정당한 팔레트 값이지만 진입 전략이 아니다.
+         카드에 전략명만 덩그러니 뜨면 "이 전략으로 진입 중"으로 오독되기 쉬워 구분해 표시한다.
+    """
+    if not allowed_strategies:
+        return {"label": "허용 전략", "value": "-", "status": "neutral", "help": None}
+    top = allowed_strategies[0]
+    if top in NON_ENTRY_STRATEGIES:
+        return {
+            "label": "허용 전략",
+            "value": f"{top} (관망)",
+            "status": "info",
+            "help": "팔레트가 관망을 지시한 상태 — 진입 전략이 아니라 '기다리라'는 결론이다.",
+        }
+    return {"label": "허용 전략", "value": top, "status": "neutral", "help": None}
 
 
 def _risk_engine_card(risk_gate_state: dict) -> dict:
@@ -100,12 +123,7 @@ def build_decision_summary_cards(latest: dict | None) -> list[dict]:
             "help": latest.get("reject_reason"),
         },
         {"label": "확신도", "value": conviction_label, "status": "neutral", "help": None},
-        {
-            "label": "허용 전략",
-            "value": allowed_strategies[0] if allowed_strategies else "-",
-            "status": "neutral",
-            "help": None,
-        },
+        _allowed_strategy_card(allowed_strategies),
         _risk_engine_card(risk_gate_state),
         _EXIT_STAGE_NOT_WIRED_CARD,
     ]

@@ -717,6 +717,42 @@ def latest_regime_before(conn: ConnectionLike, before: datetime) -> int | None:
     return int(row[0]) if row is not None and row[0] is not None else None
 
 
+def underlying_daily_closes(conn: ConnectionLike, underlying: str, days: int) -> list[float]:
+    """
+    입력: 기초자산 라벨("KOSPI200"), 조회할 최근 거래일 수(rv_ratio가 21개를 요구).
+    계산: `underlying_spot_1m`을 날짜별로 묶어 각 날짜의 마지막 지수값(종가)을 뽑는다.
+         시간순(오래된 순)으로 반환한다 — `daily_closes()`와 동일한 계약.
+    해석: 2026-07-30(운영점검보고서 §2-3/§4 Fix#5) — 종전에는 `daily_closes(futures_symbol)`로
+         **선물 종목코드별** 이력을 셌다. 선물은 분기마다 종목코드가 바뀌므로(A01609 → 다음 월물)
+         롤오버 직후 이력이 0일로 리셋되고, 21일 임계를 다시 채울 때까지 한 달 가까이 rv_ratio가
+         중립값 1.0으로 고정된다 — 실제로 07-30까지 `feature_store` 전체 5,394건의 rv_ratio가
+         **단 한 건도 1.0이 아닌 적이 없었다**(A01609 누적 18일 < 21일). 지수는 롤오버가 없어
+         이력이 끊기지 않으므로 rv_ratio 입력으로 더 적합하다.
+         **정규장 시간대(09:00~15:45)로 제한**하는 이유: 개발 세션 재시작 등으로 장외 시간에
+         폴러가 돌면 그 시각의 행이 그 날짜의 마지막 행이 되어 "종가"로 잡힌다. 실제로 라이브 DB
+         왕복 검증에서 07-16/07-17/07-19 세 날짜의 종가가 전부 정확히 같은 값(1080.36)으로
+         나왔는데, 이는 장외 폴링이 직전 세션의 마지막 값을 그대로 되돌려준 결과였다 — 그대로
+         두면 일간 수익률에 인위적인 0이 섞여 rv_ratio가 실제보다 낮게 나온다.
+         v6 §16.1 거래시간(09:00~15:45) 기준이며, 이 프로젝트의 timestamp는 KST 벽시계 값이
+         그대로 저장돼 있어(local_now() docstring 참고) `timestamp::time` 비교가 곧 KST 비교다.
+    실패 조건: 없음 — 데이터가 부족하면 짧은 리스트를 그대로 반환하고, 21개 미만일 때의 중립값
+              처리는 `mahdi.features.regime_features.rv_ratio`가 담당한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (timestamp::date) timestamp::date AS d, spot
+            FROM underlying_spot_1m
+            WHERE underlying=%s AND timestamp::time BETWEEN '09:00' AND '15:45'
+            ORDER BY d DESC, timestamp DESC
+            LIMIT %s
+            """,
+            (underlying, days),
+        )
+        rows = cur.fetchall()
+    return [float(spot) for _, spot in reversed(rows)]
+
+
 def daily_closes(conn: ConnectionLike, symbol: str, days: int) -> list[float]:
     """
     입력: 선물 심볼, 조회할 최근 거래일 수(넉넉히, 예: 30 — rv_ratio가 21개를 요구).
@@ -788,6 +824,36 @@ def insert_signal_decision(
             (timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode),
         )
     conn.commit()
+
+
+def insert_risk_snapshot(
+    conn: ConnectionLike,
+    timestamp: datetime,
+    greeks: dict,
+    loss_buffer: float | None,
+    cb_state: dict,
+) -> None:
+    """
+    입력: 시각, 그릭스/시장 감마 구조 요약(JSONB), 일간 손실한도까지 남은 여유(비율, 예: 0.02 =
+         2%p 남음 — 한도를 이미 넘겼으면 음수), Circuit Breaker/거래정지 상태 요약(JSONB).
+    계산: `risk_snapshots`(timestamp PK 하이퍼테이블)에 upsert한다 — Signal Fusion 폴러가 매
+         사이클(60초) 같은 분에 한 번씩 남기므로, 같은 분에 두 번 들어와도 마지막 값으로 덮어쓴다.
+    해석: 2026-07-30(운영점검보고서 §2-9/§4 Fix#6) — RiskEngine이 하루 419회 평가를 수행했는데도
+         `risk_snapshots`가 0행이라 사후에 "그 시점 리스크 상태가 어땠는지"를 재구성할 수 없었다.
+         `signal_decisions.risk_gate_state`에는 승인여부/사이즈만 남아 CB 상태·손실 여유가 빠져 있다.
+    실패 조건: 없음 — 호출측이 예외를 잡아 폴링 루프를 막지 않도록 처리한다(다른 폴러와 동일).
+
+    **읽는 함수를 나중에 추가할 때 주의**: `loss_buffer`는 DECIMAL 컬럼이라 psycopg가
+    `decimal.Decimal`로 돌려준다(라이브 왕복으로 확인) — 이 프로젝트의 다른 `latest_*` 함수들처럼
+    반드시 `float()`로 변환할 것([[DECISION_LOG]] 2026-07-28 8차 "Decimal/float 혼합 버그" 참고).
+    """
+    _upsert(
+        conn, "risk_snapshots", ("timestamp", "greeks", "loss_buffer", "cb_state"), ("timestamp",),
+        {
+            "timestamp": timestamp, "greeks": json.dumps(greeks),
+            "loss_buffer": loss_buffer, "cb_state": json.dumps(cb_state),
+        },
+    )
 
 
 def recent_signal_decisions(conn: ConnectionLike, limit: int = 20) -> list[dict]:

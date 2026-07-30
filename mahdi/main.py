@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta
@@ -26,7 +27,7 @@ from mahdi.broker import tr_codes
 from mahdi.broker.rest_client import KISRestClient
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.broker.ws_client import ApprovalKeyIssuer, KISWebSocketClient, Subscription, WSConnection
-from mahdi.config.settings import PROJECT_ROOT, get_db_settings, get_kis_settings, get_slack_settings
+from mahdi.config.settings import PROJECT_ROOT, get_db_settings, get_kis_settings, get_risk_limits, get_slack_settings
 from mahdi import notify
 from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
@@ -42,6 +43,7 @@ from mahdi.features.orderflow import calculate_vpin
 from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
 from mahdi.fusion.meta_label import TradePermission
 from mahdi.fusion.signal_layer import SignalInputs
+from mahdi.fusion.strategy_palette import entry_strategies
 from mahdi.logutil import WarningThrottle
 from mahdi.risk.circuit_breaker import MarketConditions
 from mahdi.risk.engine import RiskEngine
@@ -98,6 +100,16 @@ OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범
 # 가장 먼저·확실히 반영한다.
 MARKET_HALT_REFERENCE_SYMBOL = "005930"
 
+# 2026-07-30(운영점검보고서 §2-4/§4 Fix#4): CB 감지는 "상태 전이가 있을 때만 기록"이라 정상적인
+# 거래일에는 로그도 DB 행도 전혀 남기지 않는다 — 07-30 하루 전수 조사에서 `market_halt_status`
+# 0행·관련 로그 0건이 나왔는데, 그게 "CB가 없었다"인지 "구독/파싱이 깨져 CB가 와도 못 잡는다"인지
+# **구분할 방법이 아예 없었다**. 리스크 최종 안전장치가 라이브 검증 불가능한 상태였던 셈이다.
+# 조치는 둘: (1) 구독 직후 현재 상태("정상")를 한 번 upsert해 COCKPIT이 "데이터 없음"이 아니라
+# "정상"을 표시하게 하고, (2) 메시지를 실제로 받을 때마다 카운트해서 주기적으로 INFO 로그를
+# 남기고 최신 수신 시각을 DB에 반영한다(전이 시에만 알림/이력을 남기는 절제 원칙은 그대로).
+MARKET_HALT_HEARTBEAT_SECONDS = 300.0  # 전이가 없어도 이 간격마다 최신 수신 시각을 DB에 갱신
+MARKET_HALT_RECEIVE_LOG_EVERY = 20  # 수신 N건마다 INFO 1줄(첫 수신은 항상 남김)
+
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
 # 아니라 오프셋은 순전히 기동 로그 가독성을 위한 것.
@@ -118,8 +130,12 @@ _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason
 # 남아 07-27/07-28에 검증된 안정 조합(REST수집 29.0초)으로 되돌아간다. **실거래(CONFIRM/
 # FULL_AUTO) 전환 시점에는 계좌 잔고가 실제로 자주 바뀌므로 이 300초 주기를 재검토할 것**
 # ([[NEXT_TODO]] 참고).
+# 2026-07-30(운영점검보고서 §2-1/§4 Fix#2): 위 07-29 조치의 "300초 그룹과 겹치지 않는 60초"는
+# 60초 그룹 기준으로는 맞았지만 300초 그룹 기준으로는 틀렸다 — 만기유동성(30초)·매크로(45초)와
+# 같은 5분 창의 첫 60초 안에 셋이 모여 41건 버스트를 만들었다. 60 → 275초로 옮겨 5분 창의
+# 끝자락(4분대)에 단독 배치한다(상세 근거는 MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS 주석).
 ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS = 300.0
-ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS = 60.0
+ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS = 275.0
 
 # 2026-07-08 실측: 레이트리밋 버스트 등으로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
@@ -176,7 +192,9 @@ EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 300
 # 정확히 5분 간격(EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS 배수)으로 옵션체인 1분봉이 통째로
 # 유실되는 패턴을 DB로 확인했다 — 두 폴러의 사이클 시작을 어긋나게 둬 충돌 확률 자체를 낮춘다
 # (근본 수정은 poll_option_chain/poll_investor_flow의 고정 틱 스케줄링, 이건 보조 완화).
-EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS = 30.0
+# 2026-07-30(운영점검보고서 §2-1/§4 Fix#2): 아래 "5분 그룹 재스태거링" 주석 참고 — 30.0 →
+# 35.0. 옵션체인이 매 분 t=0~30초 구간을 쓰므로(30콜×1.0초) 그 뒤로 5초 물린다.
+EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS = 35.0
 
 # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사, 스케줄 밀림 근본원인 확정 후속): 07-09에
 # poll_expiry_liquidity에만 오프셋을 준 뒤로 poll_investor_flow와 poll_macro_snapshot은 여전히
@@ -195,7 +213,60 @@ EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS = 30.0
 # 않는다 — 위상 분산은 총 호출량이나 페이싱 정책을 바꾸지 않고 "언제 겹치는지"만 조정하는
 # 저위험 완화책이다.
 INVESTOR_FLOW_STARTUP_OFFSET_SECONDS = 15.0
-MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS = 45.0
+
+# 2026-07-30(운영점검보고서 §2-1/§4 Fix#2) — "5분 그룹 재스태거링".
+#
+# 07-29 Fix#1이 계좌 잔고 폴러를 60초 그룹에서 빼내는 데는 성공했지만, 옮겨 넣은 자리가 하필
+# 이미 만기유동성(30초)·매크로(45초)가 있던 300초 그룹의 바로 옆(60초)이었다. 결과적으로
+# **매 5분마다 약 41건의 REST가 30초 폭에 집중**됐다:
+#   t=30s 만기유동성 33건 / t=45s 매크로 7건 / t=60s 계좌잔고 1건
+# 07-30 하루치 실측에서 이 클러스터가 직접 확인됐다 — 사이클 종료 분(mod 5)별로 나눠보면
+# 분%5=3 구간만 타폴러동시호출 평균 22.9건·REST수집 58.2초·60초 초과 40%(다른 구간은 1.7~6.0건,
+# 39~41초)로 극단적으로 튀었고, 그 여파로 옵션체인 25사이클(전체의 5.1%)이 통째로 유실됐다.
+#
+# 조치: 세 폴러를 5분 창 안에서 고르게 흩어 버스트를 3개로 쪼갠다(총 호출량은 그대로 —
+# "언제 겹치는지"만 바꾸는 저위험 조치라는 점은 위 2026-07-28 주석과 동일한 원칙).
+#   만기유동성 t=35s(0분대) / 매크로 t=155s(2분대) / 계좌잔고 t=275s(4분대)
+# 셋 다 각 분의 35초 지점(=옵션체인이 t=0~30초를 쓰고 난 뒤)에 놓아 60초 그룹과도 어긋나게 한다.
+# 검증 기준: 다음 거래일에 분%5별 타폴러동시호출 평균이 22.9건에서 내려가고 60초 초과 비율이
+# 균등해지는지(특정 분에만 몰리지 않는지) 확인할 것.
+MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS = 155.0
+
+
+def _advance_fixed_tick(next_tick: float | None, interval_seconds: float, loop_now: float) -> tuple[float, float, float]:
+    """
+    입력: 직전 예약 시각(첫 사이클이면 None), 폴링 주기, 현재 이벤트 루프 시각.
+    계산: 다음 틱을 **원래 위상 격자 위에서만** 예약한다 — 사이클이 주기를 넘겨 예약 시각을
+         이미 지나쳤으면, 지나친 틱들을 통째로 건너뛰되 격자에서 벗어나지 않도록 주기의 정수배만
+         더한다. 반환값은 (다음 예약 시각, 대기 시간, 밀린 시간).
+    해석: 2026-07-30 운영점검 §2-1 원인(b). 종전에는 밀리면 `next_tick = loop_now`로 **현재 시각에
+         위상을 다시 못박았다**. 이러면 한 번 밀릴 때마다 그 폴러의 위상이 조금씩 이동하고,
+         이동한 자리가 5분 폴러 버스트 구간이면 계속 겹쳐 또 밀리는 식으로 위상이 끌려다닌다 —
+         07-30 실측에서 REST수집 평균이 07시 32.0초 → 14시 58.2초로 단조 악화하고 시간당 사이클
+         수가 60 → 52로 줄어든 것이 이 메커니즘과 정합적이다. 격자에 스냅하면 폴러 간 상대 위상이
+         하루 종일 고정돼 겹침이 예측 가능한 횟수(5분에 1회)로 제한된다.
+         부수 효과로 밀린 직후 즉시 재시작(delay=0) 대신 다음 격자까지 잠깐 쉬게 되는데, 이는
+         공유 `_RateLimiter`가 record_success로 백오프를 회복할 여유를 준다는 점에서도 유리하다
+         (밀린 사이클의 데이터 자체는 어느 쪽이든 이미 유실된 뒤다 — poll_time이 사이클 시작
+         시각 기준이라 즉시 재시작해도 건너뛴 분을 되찾지는 못한다).
+    실패 조건: interval_seconds <= 0이면 격자를 정의할 수 없으므로 현재 시각 기준으로 예약한다.
+    """
+    if next_tick is None:
+        return loop_now + interval_seconds, interval_seconds, 0.0
+
+    scheduled = next_tick + interval_seconds
+    delay = scheduled - loop_now
+    if delay >= 0:
+        return scheduled, delay, 0.0
+
+    overrun_seconds = -delay
+    if interval_seconds <= 0:
+        return loop_now, 0.0, overrun_seconds
+
+    # 지나친 틱 수만큼 주기를 통째로 더해 격자 위의 첫 미래 시각으로 이동한다.
+    missed_ticks = math.floor(overrun_seconds / interval_seconds) + 1
+    snapped = scheduled + missed_ticks * interval_seconds
+    return snapped, snapped - loop_now, overrun_seconds
 
 
 class _WebsocketsAdapter(WSConnection):
@@ -262,6 +333,12 @@ async def run_observation_loop(
 
     with db.get_connection() as conn:
         db.upsert_active_futures_symbol(conn, UNDERLYING, futures_symbol, db.local_now())
+        # 2026-07-30 Fix#4: 구독 직후 현재 상태를 한 번 남겨 "감지기가 붙어 있다"를 증명한다 —
+        # 값은 MarketHaltMonitor의 실제 현재 상태라 재연결 시에도 진행 중인 차단을 덮어쓰지 않는다.
+        db.upsert_market_halt_state(
+            conn, db.local_now(), market_halt_monitor.is_halted,
+            market_halt_monitor.current_code, market_halt_monitor.label, market_halt_monitor.halted_since,
+        )
 
     # ATM±N 구독은 최대 14개 옵션 종목(행사가×C/P) + 선물 1건을 동시에 켜두므로, 종목별로 별도
     # 집계기가 필요하다 — 하나를 공유하면 서로 다른 종목의 체결가가 한 봉에 뒤섞인다.
@@ -269,6 +346,9 @@ async def run_observation_loop(
     volume_buckets: dict[str, VolumeBucketAggregator] = {}
     vpin_returns: dict[str, list[float]] = {}
     vpin_volumes: dict[str, list[float]] = {}
+
+    market_operation_message_count = 0
+    market_halt_heartbeat_at = 0.0
 
     async def handle_market_operation_message(raw: str) -> None:
         """
@@ -279,10 +359,29 @@ async def run_observation_loop(
              구독종목(005930)의 개별 VI 발동/해제 때도 메시지가 오므로(문서: "연결종목의 VI
              발동 시와 VI 해제 시에 데이터 수신") MKOP_CLS_CODE가 HALT_TRIGGER/CLEAR 밖이면
              MarketHaltMonitor가 알아서 무시한다 — 매 수신마다 DB에 쓰면 안 되는 이유이기도 하다.
+        생존 계측(2026-07-30 Fix#4): 전이가 없어도 (a) 수신 건수를 세어 첫 수신과 이후
+             MARKET_HALT_RECEIVE_LOG_EVERY건마다 INFO를 남기고, (b) 최소
+             MARKET_HALT_HEARTBEAT_SECONDS 간격으로 현재 상태를 다시 upsert해 "마지막으로 장운영
+             정보를 받은 시각"이 DB에 남게 한다. 알림(Slack)/이력 테이블은 종전대로 전이 시에만.
         """
+        nonlocal market_operation_message_count, market_halt_heartbeat_at
+
         status = _parse_market_operation(raw)
         if status is None:
             return
+
+        market_operation_message_count += 1
+        if (
+            market_operation_message_count == 1
+            or market_operation_message_count % MARKET_HALT_RECEIVE_LOG_EVERY == 0
+        ):
+            logger.info(
+                "장운영정보(H0UNMKO0) 수신 %d건 — 최근 MKOP_CLS_CODE=%s(%s), 현재 차단여부=%s",
+                market_operation_message_count, status.mkop_cls_code,
+                MKOP_CLS_LABELS.get(status.mkop_cls_code, "정상 세션 전환/VI 등"),
+                market_halt_monitor.is_halted,
+            )
+
         code = status.mkop_cls_code
         if code in SIDECAR_CODES:
             notify.notify(
@@ -292,6 +391,20 @@ async def run_observation_loop(
             return
         transition = market_halt_monitor.update(status, db.local_now())
         if not transition.changed:
+            # 전이는 없지만 "방금 수신했다"는 사실 자체는 남겨야 한다 — 매 메시지마다 쓰면 DB
+            # 부하가 되므로 하트비트 간격으로만 갱신한다(값은 현재 상태 그대로라 덮어써도 안전).
+            now_monotonic = time.monotonic()
+            if now_monotonic - market_halt_heartbeat_at >= MARKET_HALT_HEARTBEAT_SECONDS:
+                market_halt_heartbeat_at = now_monotonic
+                try:
+                    with db.get_connection() as conn:
+                        db.upsert_market_halt_state(
+                            conn, db.local_now(), market_halt_monitor.is_halted,
+                            market_halt_monitor.current_code, market_halt_monitor.label,
+                            market_halt_monitor.halted_since,
+                        )
+                except Exception:
+                    logger.warning("장운영정보 하트비트 기록 실패 — 감지 자체에는 영향 없음", exc_info=True)
             return
         with db.get_connection() as conn:
             db.upsert_market_halt_state(
@@ -761,7 +874,8 @@ async def poll_option_chain(
            사이클을 예약한다 — 사이클 소요시간(레이트리밋 대기 포함)만큼 실제 주기가 매번 밀리면
            poll_time(분 단위로 자른 시각)이 분 경계를 건너뛰어 그 분의 1분봉이 통째로 유실되는
            현상을 2026-07-09에 DB로 확인했다. 사이클이 interval_seconds보다 오래 걸려 다음 틱을
-           이미 지나쳤으면(delay<0) 따라잡으려 하지 않고 그 시점으로 스케줄을 재기준한다.
+           이미 지나쳤으면 따라잡으려 하지 않되, 2026-07-30(운영점검 §2-1/§4 Fix#3)부터는 현재
+           시각으로 재기준하지 않고 **원래 위상 격자의 다음 틱으로 스냅**한다(`_advance_fixed_tick`).
     알림(2026-07-19, §5-4): 마지막으로 rows를 받은 시각(last_success_time) 대비
               OPTION_CHAIN_GAP_ALERT_SECONDS(5분)를 넘겨도 재시도까지 계속 실패하면 결손을
               Slack으로 한 번 알리고(gap_alerted), 다음에 rows가 다시 들어오면 복구를 한 번
@@ -878,18 +992,14 @@ async def poll_option_chain(
         )
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
-        delay = next_tick - loop_now
-        overrun_seconds = max(-delay, 0.0)
-        if delay < 0:
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        if overrun_seconds > 0:
             logger.warning(
-                "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준 "
+                "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기 "
                 "(REST수집 %.2f초, DB적재 %.2f초, rows=%d%s, 타폴러동시호출추정=%s)",
-                interval_seconds, overrun_seconds, collect_seconds, insert_seconds, len(rows),
+                interval_seconds, overrun_seconds, delay, collect_seconds, insert_seconds, len(rows),
                 ", 재시도함" if retried else "", other_poller_calls_text,
             )
-            next_tick = loop_now
-            delay = 0.0
         # 2026-07-23(운영점검보고서 §2-1/§4 Fix#4): 관측 루프와 COCKPIT은 별도 프로세스라
         # 공유 _RateLimiter의 실시간 배율을 COCKPIT이 직접 읽을 수 없다 — 매 사이클(60초)마다
         # 싱글턴 행에 최신 배율/직전 밀림 초를 기록해 "오늘의 점검 요약" 배지가 재시작 없이
@@ -1124,15 +1234,12 @@ async def poll_expiry_liquidity(
                         continue
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
-        delay = next_tick - loop_now
-        if delay < 0:
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        if overrun_seconds > 0:
             logger.warning(
-                "만기 유동성 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, -delay,
+                "만기 유동성 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
             )
-            next_tick = loop_now
-            delay = 0.0
         await asyncio.sleep(delay)
 
 
@@ -1421,15 +1528,12 @@ async def poll_macro_snapshot(
                 )
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
-        delay = next_tick - loop_now
-        if delay < 0:
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        if overrun_seconds > 0:
             logger.warning(
-                "매크로 스냅샷 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, -delay,
+                "매크로 스냅샷 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
             )
-            next_tick = loop_now
-            delay = 0.0
         await asyncio.sleep(delay)
 
 
@@ -1528,15 +1632,12 @@ async def poll_investor_flow(
                 )
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
-        delay = next_tick - loop_now
-        if delay < 0:
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        if overrun_seconds > 0:
             logger.warning(
-                "투자자 수급 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, -delay,
+                "투자자 수급 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
             )
-            next_tick = loop_now
-            delay = 0.0
         await asyncio.sleep(delay)
 
 
@@ -1603,6 +1704,62 @@ def _build_account_state_for_candidate(conn, candidate_side: str, poll_time: dat
     )
 
 
+def _record_risk_snapshot(
+    conn,
+    poll_time: datetime,
+    signal_inputs: SignalInputs,
+    account_state: AccountState | None,
+    risk_engine: RiskEngine,
+    *,
+    halt_status: dict | None,
+    market_halted: bool,
+    decision_label: str,
+    risk_engine_state: object,
+) -> None:
+    """
+    입력: 이번 사이클의 신호 원재료/계좌 상태/RiskEngine 인스턴스/거래정지 상태/판단 라벨.
+    계산: `risk_snapshots`에 (a) 시장 감마 구조(greeks), (b) 일간 손실한도까지 남은 여유
+         (loss_buffer), (c) Circuit Breaker·거래소 정지 상태(cb_state)를 한 행으로 남긴다.
+    해석: 2026-07-30(운영점검보고서 §2-9/§4 Fix#6) — RiskEngine이 하루 419회 평가를 돌렸는데도
+         이 테이블이 0행이라 사후 리스크 재구성이 불가능했다. `signal_decisions.risk_gate_state`
+         는 승인여부/사이즈까지만 담고 CB 상태·손실 여유는 담지 않는다.
+         `greeks`에 담는 건 **포트폴리오 그릭스가 아니라 시장 감마 구조**다 — 포지션 생애주기
+         추적이 아직 없어(ExecutionEngine 미배선) 보유 그릭스라는 개념 자체가 없으므로, 지어내지
+         않고 `scope`/`portfolio` 필드로 그 사실을 명시한다.
+         `circuit_breaker_state`는 "마지막으로 evaluate()가 불린 시점"의 값이다 — 진입 후보가
+         아닌 사이클에서는 CircuitBreaker.evaluate()를 부르지 않는다(일간 래치 설계라 매분
+         호출하면 의도치 않게 HALTED로 고착될 수 있어 의도적으로 부르지 않음).
+    실패 조건: 기록 실패가 폴링 루프를 막으면 안 되므로 로그만 남기고 넘어간다.
+    """
+    daily_loss_limit = (get_risk_limits().get("limits") or {}).get("daily_loss_pct")
+    loss_buffer = None
+    if account_state is not None and daily_loss_limit is not None:
+        # 남은 여유 = 오늘 손익률 - 일간 손실한도(음수) → 양수면 아직 여유, 음수면 한도 초과.
+        loss_buffer = round(account_state.daily_pnl_pct - float(daily_loss_limit), 4)
+
+    greeks = {
+        "scope": "market",
+        "portfolio": None,
+        "note": "포지션 생애주기 추적 미배선 — 보유 포트폴리오 그릭스 없음(ExecutionEngine 미사용)",
+        "gex": signal_inputs.gex,
+        "gamma_flip": signal_inputs.gamma_flip,
+        "spot": signal_inputs.spot,
+    }
+    cb_state = {
+        "circuit_breaker_state": risk_engine.circuit_breaker.state.value,
+        "circuit_breaker_state_is_last_evaluated": True,
+        "market_halted": market_halted,
+        "market_halt_label": (halt_status or {}).get("label"),
+        "decision": decision_label,
+        "risk_engine": risk_engine_state,
+        "account_tracker_ready": account_state is not None,
+    }
+    try:
+        db.insert_risk_snapshot(conn, poll_time, greeks, loss_buffer, cb_state)
+    except Exception:
+        logger.warning("risk_snapshots 기록 실패 — 판단 자체에는 영향 없음", exc_info=True)
+
+
 async def poll_signal_fusion_cycle(
     regime_state_machine: RegimeStateMachine,
     underlying: str = UNDERLYING,
@@ -1642,25 +1799,41 @@ async def poll_signal_fusion_cycle(
                 signal_inputs = _build_signal_inputs(conn, regime_state_machine.last_state, underlying)
                 decision = fusion_engine.evaluate(signal_inputs, MetaLabelContext())
 
-                is_entry = (
-                    decision.trade_permission != TradePermission.NO_TRADE and bool(decision.allowed_strategies)
-                )
-                reject_reason = (
-                    decision.reject_reasons[0][:_SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH]
-                    if decision.reject_reasons
-                    else None
-                )
+                # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)
+                # 만 봤는데, §11.4 매트릭스의 "fair" 셀에는 관망 지시(wait_and_see/breakout_wait)가
+                # 들어있어 "관망하라"는 결론이 진입 후보로 계수됐다(07-30 하루 419건 전부 이 경우).
+                # entry_strategies()로 관망 계열을 걸러낸 뒤 남는 게 있을 때만 진입으로 본다.
+                entry_candidates = entry_strategies(decision.allowed_strategies)
+                is_entry = decision.trade_permission != TradePermission.NO_TRADE and bool(entry_candidates)
+                if decision.reject_reasons:
+                    reject_reason = decision.reject_reasons[0][:_SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH]
+                elif not is_entry and decision.allowed_strategies:
+                    # 팔레트는 셀을 찾았지만 그 내용이 관망뿐이라 진입이 아닌 경우 — 신호 부재
+                    # (meta_label:no_trade)와 구분해서 남긴다.
+                    reject_reason = "strategy_palette:wait_only"
+                else:
+                    reject_reason = None
                 risk_gate_state: dict = {
                     "direction": decision.direction,
                     "conviction_score": decision.conviction_score,
                     "signal_agreement_count": decision.signal_agreement_count,
                     "available_member_count": decision.available_member_count,
                     "allowed_strategies": decision.allowed_strategies,
+                    # 팔레트 원문(allowed_strategies)과 진입 대상(entry_strategies)을 둘 다 남긴다 —
+                    # COCKPIT은 "관망 중"을 표시할 수 있어야 하고, 사후 분석은 실제 진입 후보만
+                    # 세야 한다.
+                    "entry_strategies": entry_candidates,
                 }
 
+                # 2026-07-30 Fix#6: halt 상태와 계좌 상태는 진입 여부와 무관하게 매 사이클 구해
+                # 둔다 — risk_snapshots에 "그 시점 리스크 상태"를 남기려면 REJECT 사이클에도
+                # 필요하기 때문이다(진입 사이클에서만 조회하면 하루 대부분이 공백이 된다).
+                halt_status = db.latest_market_halt_state(conn)
+                market_halted = bool(halt_status and halt_status["is_halted"])
+                candidate_side = "BUY" if decision.direction > 0 else "SELL"
+                account_state = _build_account_state_for_candidate(conn, candidate_side, poll_time)
+
                 if is_entry:
-                    candidate_side = "BUY" if decision.direction > 0 else "SELL"
-                    account_state = _build_account_state_for_candidate(conn, candidate_side, poll_time)
                     if account_state is None:
                         risk_gate_state["risk_engine"] = "account_tracker_not_ready"
                     else:
@@ -1674,10 +1847,9 @@ async def poll_signal_fusion_cycle(
                             drawdown_pct=account_state.drawdown_pct,
                             portfolio_capacity_remaining_pct=1.0,
                         )
-                        halt_status = db.latest_market_halt_state(conn)
                         risk_decision = risk_engine.evaluate_entry(
-                            sizing_input, account_state, decision.allowed_strategies[0], MarketConditions(),
-                            market_halted=bool(halt_status and halt_status["is_halted"]),
+                            sizing_input, account_state, entry_candidates[0], MarketConditions(),
+                            market_halted=market_halted,
                         )
                         risk_gate_state["risk_engine"] = {
                             "approved": risk_decision.approved,
@@ -1694,19 +1866,22 @@ async def poll_signal_fusion_cycle(
                     risk_gate_state=risk_gate_state,
                     exec_mode="ADVISORY",
                 )
+                _record_risk_snapshot(
+                    conn, poll_time, signal_inputs, account_state, risk_engine,
+                    halt_status=halt_status, market_halted=market_halted,
+                    decision_label="ENTER" if is_entry else "REJECT",
+                    risk_engine_state=risk_gate_state.get("risk_engine"),
+                )
         except Exception:
             logger.warning("Signal Fusion 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
-        delay = next_tick - loop_now
-        if delay < 0:
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        if overrun_seconds > 0:
             logger.warning(
-                "Signal Fusion 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, -delay,
+                "Signal Fusion 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
             )
-            next_tick = loop_now
-            delay = 0.0
         await asyncio.sleep(delay)
 
 
@@ -1741,15 +1916,12 @@ async def poll_account_balance_cycle(
             logger.warning("계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick = interval_seconds + (loop_now if next_tick is None else next_tick)
-        delay = next_tick - loop_now
-        if delay < 0:
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        if overrun_seconds > 0:
             logger.warning(
-                "계좌 잔고 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 이번 틱은 즉시 재기준",
-                interval_seconds, -delay,
+                "계좌 잔고 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
             )
-            next_tick = loop_now
-            delay = 0.0
         await asyncio.sleep(delay)
 
 

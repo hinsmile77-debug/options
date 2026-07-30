@@ -841,11 +841,30 @@ def test_rate_limiter_health_check_handles_query_error():
 
 # --- 서킷브레이커/거래정지(market_halt) --------------------------------------------------------------
 
-def test_market_halt_check_ok_when_no_event_ever(monkeypatch):
+def test_market_halt_check_warns_when_detector_never_recorded_anything(monkeypatch):
+    # 2026-07-30(운영점검 §2-4/§4 Fix#4): 관측 루프가 구독 직후 "정상" 행을 반드시 남기므로,
+    # 조회 결과가 None이라는 건 "CB가 없었다"가 아니라 감지기가 아예 안 붙었다는 뜻이다 —
+    # 예전에는 이걸 "ok/정상"으로 표시해 라이브 검증 불가 상태를 안심 신호로 덮고 있었다.
     monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_market_halt_state", lambda conn: None)
+    check = _market_halt_check(object())
+    assert check.status == "warning"
+    assert "미기록" in check.detail
+
+
+def test_market_halt_check_ok_with_heartbeat_when_no_transition_yet(monkeypatch):
+    # 하트비트만 갱신된 정상 상태(전이 이력 없음 → mkop_cls_code=None) — "직전: ... 해제됨"이
+    # 아니라 "감지기 갱신 시각"을 보여줘야 한다.
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 31, 9, 5, 0), "is_halted": False,
+            "mkop_cls_code": None, "label": "정상", "halted_since": None,
+        },
+    )
     check = _market_halt_check(object())
     assert check.status == "ok"
     assert "발동 이력 없음" in check.detail
+    assert "09:05:00" in check.detail
 
 
 def test_market_halt_check_warns_when_currently_halted(monkeypatch):

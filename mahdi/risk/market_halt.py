@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 # MKOP_CLS_CODE(장운영 구분 코드) — docs/efriend 문서 "장운영구분코드" 표 실측(2026-07-29).

@@ -464,12 +464,20 @@ def _market_halt_check(conn) -> HealthCheck:
         logger.warning("서킷브레이커 상태 점검 조회 실패", exc_info=True)
         return HealthCheck(label, "warning", "조회 실패")
     if status is None:
-        return HealthCheck(label, "ok", "정상(오늘 발동 이력 없음)")
+        # 2026-07-30(운영점검 §2-4/§4 Fix#4): 관측 루프가 구독 직후 "정상" 행을 반드시 남기므로,
+        # 여기서 None이라는 건 "CB가 없었다"가 아니라 **감지기가 아예 안 붙었다**는 뜻이다
+        # (관측 루프 미기동/구독 실패). 예전엔 이 경우를 "정상"으로 표시해 라이브 검증 불가
+        # 상태를 안심 신호로 덮고 있었다.
+        return HealthCheck(label, "warning", "감지 상태 미기록 — 관측 루프 미기동 또는 구독 실패 여부 확인 필요")
     if status["is_halted"]:
         return HealthCheck(
             label, "warning",
             f"🚨 {status['label']}({status['mkop_cls_code']}) — {status['halted_since']:%H:%M:%S}부터 신규진입 차단 중",
         )
+    if status["mkop_cls_code"] is None:
+        # 전이가 한 번도 없었던 정상 상태 — 하트비트가 갱신한 "마지막 갱신 시각"을 함께 보여줘
+        # 감지기가 살아있음을 눈으로 확인할 수 있게 한다.
+        return HealthCheck(label, "ok", f"정상(발동 이력 없음) — 감지기 갱신 {status['updated_at']:%H:%M:%S}")
     return HealthCheck(label, "ok", f"정상 — 직전: {status['label']}({status['updated_at']:%H:%M:%S} 해제됨)")
 
 

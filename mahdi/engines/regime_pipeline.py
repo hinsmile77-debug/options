@@ -249,7 +249,11 @@ class RegimeStateMachine:
              워밍업(_MIN_WARMUP_BARS)이 끝났으면 predict(), 아니면 실데이터 기반 warmup_fallback()을
              반환한다.
         """
-        daily_closes = db.daily_closes(conn, self.futures_symbol, days=_DAILY_CLOSES_LOOKBACK_DAYS)
+        # 2026-07-30(운영점검보고서 §2-3/§4 Fix#5): 선물 종목코드 기준(db.daily_closes)에서 지수
+        # 기준(db.underlying_daily_closes)으로 교체 — 선물은 분기 롤오버 때마다 종목코드가 바뀌어
+        # 일별 이력이 0으로 리셋되고, 그동안 rv_ratio가 중립값 1.0에 고정된다(실측: feature_store
+        # 전체 5,394건 중 rv_ratio != 1.0인 행 0건). 지수는 롤오버가 없다.
+        daily_closes = db.underlying_daily_closes(conn, self.underlying, days=_DAILY_CLOSES_LOOKBACK_DAYS)
         usdkrw_daily_series = db.recent_usdkrw_daily_series(conn, days=_MACRO_STRESS_DAILY_LOOKBACK_DAYS)
         usdcnh_recent_series = db.recent_usdcnh_series(conn, limit=_MACRO_STRESS_USDCNH_RECENT_BUCKETS)
         us10y_daily_series = db.recent_us10y_daily_series(conn, days=_MACRO_STRESS_DAILY_LOOKBACK_DAYS)

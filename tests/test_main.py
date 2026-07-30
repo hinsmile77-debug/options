@@ -18,6 +18,7 @@ from mahdi.features.options_intel import OptionLeg, calculate_gex
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.risk.market_halt import MarketHaltMonitor
 from mahdi.main import (
+    _advance_fixed_tick,
     _atm_liquidity_window,
     _build_account_state_for_candidate,
     _build_signal_inputs,
@@ -275,6 +276,7 @@ def test_run_observation_loop_writes_bar_and_regime_on_minute_rollover(monkeypat
     monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", fake_insert_market_raw_1m)
     monkeypatch.setattr("mahdi.main.db.insert_regime_state", fake_insert_regime_state)
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
 
     with pytest.raises(ConnectionError):
         _run(
@@ -324,6 +326,7 @@ def test_run_observation_loop_keeps_different_symbols_in_separate_bars(monkeypat
     monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: written_bars.append(row))
     monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
 
     with pytest.raises(ConnectionError):
         _run(
@@ -378,6 +381,7 @@ def _patch_run_observation_loop_db(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: None)
     monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
 
 
 def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconnect(monkeypatch):
@@ -887,8 +891,9 @@ def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeyp
     monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
 
     # 1번째 사이클 종료 시각=1000.0 -> next_tick=1000+60=1060(정상 60초 대기 예상).
-    # 2번째 사이클 종료 시각=1200.0(가상으로 사이클이 오래 걸려 next_tick 1060을 이미 지나침)
-    # -> 밀린 걸 따라잡지 않고 그 시점으로 재기준, delay=0.0이어야 한다.
+    # 2번째 사이클 종료 시각=1200.0(가상으로 사이클이 오래 걸려 예정 틱 1120을 80초 지나침)
+    # -> 2026-07-30(운영점검 §4 Fix#3)부터는 현재 시각으로 재기준(delay=0)하지 않고 **원래 위상
+    #    격자의 다음 틱**으로 스냅한다: 1120 + 60*2 = 1240 -> delay=40.0.
     fake_loop = _FakeLoop([1000.0, 1200.0])
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
 
@@ -911,7 +916,8 @@ def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeyp
             )
         )
 
-    assert sleep_calls == [60.0, 0.0]  # 정상 사이클은 60초 대기, 밀린 사이클은 따라잡지 않고 즉시 재기준
+    # 정상 사이클은 60초 대기, 밀린 사이클은 따라잡지 않되 위상 격자를 지켜 다음 틱까지 대기.
+    assert sleep_calls == [60.0, 40.0]
 
 
 def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
@@ -1536,6 +1542,7 @@ def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: written_bars.append(row))
     monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
 
     with pytest.raises(ConnectionError):
         _run(
@@ -1591,6 +1598,7 @@ def test_run_observation_loop_computes_vpin_for_option_symbol_too(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: written_bars.append(row))
     monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
 
     with pytest.raises(ConnectionError):
         _run(
@@ -3041,11 +3049,21 @@ class _FakeRegimeStateMachineWithLastState:
         self.last_state = last_state
 
 
+def _patch_signal_fusion_cycle_db_defaults(monkeypatch):
+    """2026-07-30(운영점검 §4 Fix#4/#6): poll_signal_fusion_cycle이 이제 **진입 여부와 무관하게**
+    매 사이클 거래정지 상태와 계좌 스냅샷을 조회하고 risk_snapshots를 남긴다 — 그 기본 스텁을
+    한 곳에 모은다(개별 테스트는 이 호출 뒤에 필요한 것만 다시 덮어쓰면 된다)."""
+    monkeypatch.setattr("mahdi.main.db.latest_market_halt_state", lambda conn: None)
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
+    monkeypatch.setattr("mahdi.main.db.insert_risk_snapshot", lambda *a, **k: None)
+
+
 def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule(monkeypatch):
     @contextmanager
     def fake_get_connection(settings=None):
         yield object()
 
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
     monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
@@ -3081,6 +3099,7 @@ def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule
 
 
 def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeypatch):
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
     chain_rows = [
         {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
          "gex": 0.0, "expiry": date(2026, 8, 13)},
@@ -3305,6 +3324,7 @@ def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
 
 
 def test_poll_signal_fusion_cycle_marks_account_tracker_not_ready(monkeypatch):
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
     chain_rows = [
         {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
          "gex": 0.0, "expiry": date(2026, 8, 13)},
@@ -3427,3 +3447,297 @@ def test_poll_account_balance_cycle_continues_after_failure(monkeypatch):
         _run(poll_account_balance_cycle(_FailingRestClient(), interval_seconds=1))
 
     assert len(sleep_calls) == 1  # 실패해도 로깅만 하고 다음 사이클 대기로 넘어감
+
+
+# ===== 2026-07-30 운영점검 Fix#3: 스케줄 밀림 시 위상 격자 스냅 =====
+
+
+def test_advance_fixed_tick_first_cycle_schedules_one_full_interval():
+    next_tick, delay, overrun = _advance_fixed_tick(None, 60.0, 1000.0)
+    assert (next_tick, delay, overrun) == (1060.0, 60.0, 0.0)
+
+
+def test_advance_fixed_tick_normal_cycle_keeps_absolute_grid():
+    # 사이클이 10초 걸렸어도 다음 틱은 1060 그대로 — 절대시각 고정 틱(2026-07-09 도입)의 핵심.
+    next_tick, delay, overrun = _advance_fixed_tick(1000.0, 60.0, 1010.0)
+    assert (next_tick, delay, overrun) == (1060.0, 50.0, 0.0)
+
+
+def test_advance_fixed_tick_overrun_snaps_to_grid_instead_of_rebasing_to_now():
+    # 예정 틱 1060을 140초 지나쳐 끝남 → 종전에는 next_tick=1200(현재 시각)으로 위상을 옮겼다.
+    # 이제는 격자를 유지해 1060 + 60*3 = 1240으로 스냅하고 40초 대기한다.
+    next_tick, delay, overrun = _advance_fixed_tick(1000.0, 60.0, 1200.0)
+    assert next_tick == 1240.0
+    assert delay == 40.0
+    assert overrun == 140.0
+
+
+def test_advance_fixed_tick_keeps_phase_stable_across_many_overruns():
+    # 위상 고착 회귀 방지: 몇 번을 밀리든 next_tick은 항상 원래 격자(1000 + 60k) 위에 있어야 한다.
+    next_tick = 1000.0
+    for elapsed in (1201.0, 1337.0, 1400.0, 1999.0):
+        next_tick, _delay, _overrun = _advance_fixed_tick(next_tick, 60.0, elapsed)
+        assert (next_tick - 1000.0) % 60.0 == pytest.approx(0.0)
+        assert next_tick > elapsed
+
+
+def test_advance_fixed_tick_exactly_on_time_does_not_count_as_overrun():
+    next_tick, delay, overrun = _advance_fixed_tick(1000.0, 60.0, 1060.0)
+    assert (next_tick, delay, overrun) == (1060.0, 0.0, 0.0)
+
+
+# ===== 2026-07-30 운영점검 Fix#1: 관망 전용 팔레트는 ENTER가 아니다 =====
+
+
+def test_poll_signal_fusion_cycle_rejects_when_palette_only_says_wait(monkeypatch):
+    # 07-30에 419건 연속 ENTER를 만든 조합(RANGE_BALANCED + VRP 적정 → ["wait_and_see"])을
+    # 그대로 재현해, 이제는 REJECT + reject_reason="strategy_palette:wait_only"가 되는지 검증한다.
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    chain_rows = [
+        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+            (decision, reject_reason, risk_gate_state)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.RANGE_BALANCED] = 1.0
+    regime_state = RegimeState(regime=RegimeLabel.RANGE_BALANCED, prob_vector=tuple(prob_vector))
+    regime_state_machine = _FakeRegimeStateMachineWithLastState(regime_state)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=60))
+
+    decision, reject_reason, risk_gate_state = recorded[0]
+    assert decision == "REJECT"
+    assert reject_reason == "strategy_palette:wait_only"
+    # 팔레트 원문은 그대로 남고(COCKPIT이 "관망 중"을 표시할 수 있어야 함), 진입 대상만 빈 목록.
+    assert risk_gate_state["allowed_strategies"] == ["wait_and_see"]
+    assert risk_gate_state["entry_strategies"] == []
+    assert "risk_engine" not in risk_gate_state  # 진입이 아니므로 RiskEngine 호출 자체가 없어야 한다
+
+
+# ===== 2026-07-30 운영점검 Fix#6: risk_snapshots 매 사이클 적재 =====
+
+
+def test_poll_signal_fusion_cycle_records_risk_snapshot_even_when_rejecting(monkeypatch):
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_signal_decision", lambda *a, **k: None)
+
+    snapshots: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_risk_snapshot",
+        lambda conn, ts, greeks, loss_buffer, cb_state: snapshots.append((ts, greeks, loss_buffer, cb_state)),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+    assert len(snapshots) == 1  # REJECT 사이클에도 남아야 한다(07-30엔 하루 419건 평가에 0행이었음)
+    _ts, greeks, loss_buffer, cb_state = snapshots[0]
+    # 보유 포트폴리오 그릭스는 아직 개념 자체가 없다 — 지어내지 않고 명시해야 한다.
+    assert greeks["scope"] == "market"
+    assert greeks["portfolio"] is None
+    assert cb_state["decision"] == "REJECT"
+    assert cb_state["market_halted"] is False
+    assert cb_state["account_tracker_ready"] is False
+    assert loss_buffer is None  # 계좌 스냅샷이 없으면 손실 여유를 계산하지 않는다
+
+
+def test_poll_signal_fusion_cycle_risk_snapshot_failure_does_not_break_cycle(monkeypatch):
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    decisions: list = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, **kwargs: decisions.append(kwargs["decision"]),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("risk_snapshots 쓰기 실패")
+
+    monkeypatch.setattr("mahdi.main.db.insert_risk_snapshot", boom)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+    # 스냅샷 기록이 실패해도 판단 자체(signal_decisions)는 이미 남았고 루프는 정상 진행해야 한다.
+    assert decisions == ["REJECT"]
+
+
+# ===== 2026-07-30 운영점검 Fix#4: CB 감지 생존 계측 =====
+
+
+def _run_observation_loop_with_market_operation_messages(monkeypatch, incoming_raws: list[str]) -> list[tuple]:
+    """H0UNMKO0 메시지를 흘려보내고 upsert_market_halt_state 호출 인자를 순서대로 돌려준다."""
+    conn = FakeConnection(incoming_raws)
+    ws_client = KISWebSocketClient(approval_key="APV", connection=conn)
+    subscription_manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1
+    )
+    rest_client = FakeRestClient(spot=350.0)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    halt_writes: list[tuple] = []
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_market_halt_event_history", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "mahdi.main.db.upsert_market_halt_state",
+        lambda conn, updated_at, is_halted, code, label, halted_since: halt_writes.append(
+            (is_halted, code, label)
+        ),
+    )
+
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [subscription_manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+            )
+        )
+    return halt_writes
+
+
+def test_run_observation_loop_records_market_halt_baseline_row_on_subscribe(monkeypatch):
+    # 07-30 하루 전체에서 market_halt_status가 0행이라 "CB가 없었다"와 "감지기가 죽었다"를
+    # 구분할 수 없었다 — 구독 직후 현재 상태("정상")를 반드시 한 번 남겨야 한다.
+    halt_writes = _run_observation_loop_with_market_operation_messages(monkeypatch, [])
+
+    assert halt_writes  # 메시지가 하나도 없어도 기준행은 남는다
+    is_halted, code, label = halt_writes[0]
+    assert is_halted is False
+    assert code is None
+    assert label == "정상"
+
+
+def test_market_operation_heartbeat_updates_state_without_transition(monkeypatch):
+    # 차단 여부가 안 바뀌는 코드(정상 세션 전환/VI 등)에도 "방금 수신했다"는 사실은 남아야 한다.
+    # 하트비트 간격 기본값(300초)이면 첫 수신은 곧바로 기록된다(마지막 기록 시각 초기값 0.0).
+    halt_writes = _run_observation_loop_with_market_operation_messages(
+        monkeypatch, [_make_h0unmko0("11", with_ws_envelope=True)]
+    )
+
+    assert len(halt_writes) == 2  # 구독 직후 기준행 + 하트비트 1건
+    assert halt_writes[1] == (False, None, "정상")
+
+
+def test_market_operation_heartbeat_is_throttled_between_messages(monkeypatch):
+    # 매 수신마다 DB에 쓰면 안 된다 — 하트비트 간격 안에 연달아 온 메시지는 한 번만 기록한다.
+    halt_writes = _run_observation_loop_with_market_operation_messages(
+        monkeypatch,
+        [
+            _make_h0unmko0("11", with_ws_envelope=True),
+            _make_h0unmko0("11", with_ws_envelope=True),
+            _make_h0unmko0("11", with_ws_envelope=True),
+        ],
+    )
+
+    assert len(halt_writes) == 2  # 기준행 1 + 하트비트 1(나머지 2건은 간격 미달로 생략)
+
+
+def test_market_operation_halt_transition_still_records_and_wins_over_heartbeat(monkeypatch):
+    # 생존 계측을 붙였다고 원래 목적(전이 기록)이 흐려지면 안 된다.
+    halt_writes = _run_observation_loop_with_market_operation_messages(
+        monkeypatch,
+        [
+            _make_h0unmko0("174", with_ws_envelope=True),  # 서킷브레이크 발동
+            _make_h0unmko0("175", with_ws_envelope=True),  # 해제
+        ],
+    )
+
+    assert halt_writes[0] == (False, None, "정상")  # 기준행
+    assert halt_writes[1] == (True, "174", "서킷브레이크 발동")
+    assert halt_writes[2] == (False, "175", "서킷브레이크 해제")
+
+
+# ===== 2026-07-30 운영점검 Fix#2: 5분 그룹 재스태거링 =====
+
+
+def test_five_minute_pollers_are_spread_across_the_window_not_clustered():
+    import mahdi.main as mahdi_main
+
+    # 07-29 fix가 계좌잔고를 60초 그룹에서 빼냈지만 만기유동성(30초)·매크로(45초) 바로 옆
+    # (60초)에 놓아, 매 5분마다 REST 41건이 30초 폭에 몰렸다(07-30 실측: 분%5=3 구간만
+    # 타폴러동시호출 평균 22.9건). 세 폴러가 5분 창 안에서 충분히 벌어져 있는지 고정한다.
+    offsets = sorted(
+        [
+            mahdi_main.EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS,
+            mahdi_main.MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS,
+            mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS,
+        ]
+    )
+    interval = 300.0
+    assert mahdi_main.EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS == interval
+    assert mahdi_main.MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS == interval
+    assert mahdi_main.ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS == interval
+    assert all(0 <= o < interval for o in offsets)
+    gaps = [b - a for a, b in zip(offsets, offsets[1:])]
+    assert min(gaps) >= 60.0, f"5분 폴러가 다시 뭉쳤다: {offsets}"
+
+
+def test_sixty_second_pollers_do_not_collide_with_five_minute_group_phase():
+    import mahdi.main as mahdi_main
+
+    # 60초 그룹(옵션체인 0초 + 투자자수급 15초)은 매 분 t=0~30초 구간을 쓴다 —
+    # 5분 폴러들은 그 뒤(35초 이후)에 놓여야 한다.
+    for offset in (
+        mahdi_main.EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS,
+        mahdi_main.MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS,
+        mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS,
+    ):
+        assert offset % 60.0 >= 30.0, f"오프셋 {offset}이 옵션체인 수집 구간(t=0~30초)과 겹친다"
