@@ -957,7 +957,9 @@ def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.record_rate_limiter_status",
-        lambda conn, checked_at, multiplier, overrun: recorded.append((checked_at, multiplier, overrun)),
+        lambda conn, checked_at, multiplier, overrun, total_calls=None: recorded.append(
+            (checked_at, multiplier, overrun, total_calls)
+        ),
     )
     monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
@@ -1007,7 +1009,9 @@ def test_poll_option_chain_appends_rate_limiter_status_history_each_cycle(monkey
     appended: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.append_rate_limiter_status_history",
-        lambda conn, recorded_at, multiplier, overrun: appended.append((recorded_at, multiplier, overrun)),
+        lambda conn, recorded_at, multiplier, overrun, total_calls=None: appended.append(
+            (recorded_at, multiplier, overrun, total_calls)
+        ),
     )
 
     fake_loop = _FakeLoop([1000.0])

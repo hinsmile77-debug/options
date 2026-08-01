@@ -415,22 +415,28 @@ def latest_shutdown_check(conn: ConnectionLike) -> tuple[datetime, int] | None:
 
 
 def record_rate_limiter_status(
-    conn: ConnectionLike, checked_at: datetime, backoff_multiplier: float, last_cycle_overrun_seconds: float
+    conn: ConnectionLike, checked_at: datetime, backoff_multiplier: float,
+    last_cycle_overrun_seconds: float, total_calls: int | None = None,
 ) -> None:
     """
     입력: DB 커넥션, 기록 시각, 공유 _RateLimiter의 현재 배율(1.0=정상), 직전 옵션체인 폴링
-         사이클이 60초 주기를 넘겨 밀린 초(0이면 정상).
+         사이클이 60초 주기를 넘겨 밀린 초(0이면 정상), 페이서를 통과한 누적 호출 수
+         (`KISRestClient.rate_limit_total_calls`, 2026-08-01 신규 — 마이그레이션 019).
     계산: 싱글턴 행(id=TRUE 고정) upsert — mahdi.main의 poll_option_chain이 매 사이클(60초)마다
          호출해 COCKPIT이 재시작 없이 "지금 레이트리밋에 얼마나 근접했는지"를 바로 볼 수 있게
          한다(2026-07-23, 운영점검보고서 §2-1/§4 Fix#4).
+    해석(2026-08-01): total_calls는 **누적 카운터**라 그 자체로는 의미가 없고, 두 시점의 차이로만
+         수요(건/초)가 나온다 — 계산은 `mahdi.ops.db_metrics.rest_demand()`가 전담한다
+         (COCKPIT 배지와 일일 리포트가 그 함수를 공유해 서로 다른 답을 내지 않게 한다).
     """
     row = {
         "id": True, "checked_at": checked_at,
         "backoff_multiplier": backoff_multiplier, "last_cycle_overrun_seconds": last_cycle_overrun_seconds,
+        "total_calls": total_calls,
     }
     _upsert(
         conn, "rate_limiter_status_log",
-        ("id", "checked_at", "backoff_multiplier", "last_cycle_overrun_seconds"), ("id",), row,
+        ("id", "checked_at", "backoff_multiplier", "last_cycle_overrun_seconds", "total_calls"), ("id",), row,
     )
 
 
@@ -451,10 +457,11 @@ def latest_rate_limiter_status(conn: ConnectionLike) -> tuple[datetime, float, f
 
 
 def append_rate_limiter_status_history(
-    conn: ConnectionLike, recorded_at: datetime, backoff_multiplier: float, last_cycle_overrun_seconds: float
+    conn: ConnectionLike, recorded_at: datetime, backoff_multiplier: float,
+    last_cycle_overrun_seconds: float, total_calls: int | None = None,
 ) -> None:
     """
-    입력: record_rate_limiter_status()와 동일한 인자 3종.
+    입력: record_rate_limiter_status()와 동일한 인자 4종.
     계산: `rate_limiter_status_log`(싱글턴, "현재 상태"만 보존)와 달리 이 테이블은 append-only라
          매 호출이 새 행을 남긴다(2026-07-29, 운영점검보고서 §2-5/Fix#3) — 배율이 시간에 따라
          어떻게 변했는지 시계열로 되짚어볼 수 있게 한다. `poll_option_chain`이 매 사이클
@@ -462,9 +469,10 @@ def append_rate_limiter_status_history(
     """
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO rate_limiter_status_history (recorded_at, backoff_multiplier, last_cycle_overrun_seconds) "
-            "VALUES (%s, %s, %s)",
-            (recorded_at, backoff_multiplier, last_cycle_overrun_seconds),
+            "INSERT INTO rate_limiter_status_history "
+            "(recorded_at, backoff_multiplier, last_cycle_overrun_seconds, total_calls) "
+            "VALUES (%s, %s, %s, %s)",
+            (recorded_at, backoff_multiplier, last_cycle_overrun_seconds, total_calls),
         )
     conn.commit()
 
@@ -554,6 +562,49 @@ def latest_market_halt_state(conn: ConnectionLike) -> dict | None:
         "updated_at": updated_at, "is_halted": bool(is_halted),
         "mkop_cls_code": mkop_cls_code, "label": label, "halted_since": halted_since,
         "last_message_at": last_message_at,
+    }
+
+
+_WS_STATUS_COLUMNS = ("id", "updated_at", "connected_since", "last_message_at", "reconnect_count_today")
+
+
+def upsert_ws_status(
+    conn: ConnectionLike,
+    updated_at: datetime,
+    connected_since: datetime | None,
+    last_message_at: datetime | None,
+    reconnect_count_today: int,
+) -> None:
+    """
+    입력: 하트비트 시각과 `mahdi.main.WsLiveness`의 현재 값.
+    계산: 싱글턴 행(id=TRUE) upsert — `market_halt_status`와 동일 패턴.
+    해석: 2026-08-01 §5-4. `updated_at`은 **메시지 수신과 무관한 독립 하트비트**(300초)가 갱신하며
+         "관측 루프의 WS 파트가 살아있다"를 뜻한다. 07-31 재연결 0회처럼 아무 일도 없는 날에도
+         이 값이 갱신되는 것이 생존의 증거다(마이그레이션 020 주석 참고).
+    """
+    row = {
+        "id": True, "updated_at": updated_at, "connected_since": connected_since,
+        "last_message_at": last_message_at, "reconnect_count_today": reconnect_count_today,
+    }
+    _upsert(conn, "ws_status", _WS_STATUS_COLUMNS, ("id",), row)
+
+
+def latest_ws_status(conn: ConnectionLike) -> dict | None:
+    """
+    계산: 가장 최근 upsert_ws_status() 기록.
+    실패 조건: 관측 루프가 아직 안 돌았으면 None — 호출측(COCKPIT)이 "미기록"으로 구분해야 한다
+              (지어내지 않는다).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT updated_at, connected_since, last_message_at, reconnect_count_today FROM ws_status LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "updated_at": row[0], "connected_since": row[1],
+        "last_message_at": row[2], "reconnect_count_today": int(row[3]),
     }
 
 

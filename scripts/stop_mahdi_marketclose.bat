@@ -26,6 +26,13 @@ powershell -NoProfile -Command "$procs = Get-CimInstance Win32_Process | Where-O
 cd /d "%PROJECT_DIR%"
 uv run python scripts\log_marketclose_stop.py
 
+REM 2026-08-01(운영점검보고서 2026-07-31 §5-2): 하루치 운영 지표를 자동 집계해
+REM docs\동작점검\auto\에 마크다운 + JSON 사이드카로 남긴다. 이 시점이 적기인 이유는 두 가지다 —
+REM 위 taskkill로 관측 루프가 이미 종료돼 **로그가 완결**돼 있고, DB/Redis는 의도적으로 계속
+REM 실행 중이라 SQL 집계가 가능하다. 스크립트가 최상위에서 예외를 삼키므로(exit 0) 실패해도
+REM 아래 종료 로그까지 정상적으로 진행된다.
+uv run python scripts\daily_ops_report.py >> "%LOG_FILE%" 2>&1
+
 echo [%date% %time%] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"
 
 endlocal

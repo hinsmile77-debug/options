@@ -101,12 +101,19 @@ def render() -> None:
     # 2026-07-19(§5-6 "오늘의 점검 요약") — 운영점검보고서 §1-B 장중 체크리스트 중 SQL로
     # 자동화 가능한 항목들(데이터 결손율·CBOT 상태·series 화이트리스트 위반·레짐 stability_flag
     # 비율)을 매번 사람이 DB를 직접 조회하지 않고 상단 배지로 상시 노출한다.
+    # 2026-08-01(§5-5): 배지가 11 → 15개가 되면서 한 줄에 다 펴면 각 열이 너무 좁다. "인프라"와
+    # "관측 품질"을 나눠 2행으로 낸다 — 07-31에 **인프라 지표는 전부 좋아졌는데 판단 입력 품질
+    # (먼슬리 커버리지)은 오히려 후퇴한** 사례가 있었고, 두 그룹을 나란히 놓아야 그게 보인다.
     st.subheader("오늘의 점검 요약")
     health_checks = get_health_summary()
-    health_cols = st.columns(len(health_checks))
-    for col, check in zip(health_cols, health_checks):
-        badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
-        badge(f"**{check.label}**\n\n{check.detail}")
+    groups: dict[str, list] = {}
+    for check in health_checks:
+        groups.setdefault(check.group, []).append(check)
+    for group_name, checks in groups.items():
+        st.caption(group_name)
+        for col, check in zip(st.columns(len(checks)), checks):
+            badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
+            badge(f"**{check.label}**\n\n{check.detail}")
 
     # 2026-07-29 신규 — ADVISORY 모드지만 마흐디가 지금 어떤 진입 판단을 내리고 있는지(청산
     # 단계는 ExecutionEngine 미배선이라 자리만 확보) + 계좌 현황/수익률을 "3초 룰"로 최상단에

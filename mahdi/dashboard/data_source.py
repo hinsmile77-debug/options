@@ -18,6 +18,7 @@ from mahdi.engines.regime import RegimeLabel
 from mahdi.engines.regime_pipeline import FEATURE_VERSION
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import OptionLeg, find_gamma_flip, gamma_walls as compute_gamma_walls
+from mahdi.ops import db_metrics
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
 
@@ -116,6 +117,9 @@ class HealthCheck:
     label: str
     status: str  # "ok" | "warning" | "info"
     detail: str
+    # 2026-08-01(§5-5): 배지가 11 → 15개가 되면서 한 줄에 다 펴면 각 열이 너무 좁아진다.
+    # app.py가 이 값으로 묶어 2행으로 렌더링한다. 기본값은 기존 배지와의 하위호환.
+    group: str = "인프라"
 
 
 # 2026-07-19(§5-6 "오늘의 점검 요약") — 1-B 장중 체크리스트의 "결손 여부" 기준(§5-4 Slack 알림의
@@ -435,6 +439,18 @@ _RATE_LIMITER_OK_MULTIPLIER = 1.01
 # (2026-07-31 실측: 하루 총 2건, 09:00 이후 6시간 45분 무수신이 정상 상태였다).
 _MARKET_HALT_HEARTBEAT_STALE_SECONDS = 600.0
 
+# ===== 2026-08-01(운영점검보고서 2026-07-31 §5-5) 관측 품질 배지 임계 =====
+#
+# 07-31에 "밀림 83→46건인데 먼슬리 커버리지 95.0%→90.5%"라는 사례가 있었다 — **인프라 지표는
+# 전부 좋아졌는데 판단 입력 품질은 오히려 나빠졌다.** 인프라 배지만 보면 놓치므로 나란히 둔다.
+_REST_DEMAND_WARNING_PCT = 60.0  # 07-31 실측 43.6%. 60%를 넘으면 폴러 추가를 멈추고 예산부터 본다.
+# 백오프가 적자 임계에 이만큼 근접하면 경고 — 넘어가면 수요가 용량을 구조적으로 초과한다.
+_BACKOFF_HEADROOM_WARNING_RATIO = 0.9
+_MONTHLY_COVERAGE_WARNING_PCT = 95.0  # GEX/감마플립 입력의 1분 연속성(07-31 실측 90.3%)
+_OVERRUN_COUNT_WARNING = 30  # 07-31 실측 46건. 페이서 분리 재개 조건과 같은 숫자다.
+# WS 하트비트(mahdi.main.WS_HEARTBEAT_SECONDS=300초)의 2배. CB 하트비트와 같은 기준이다.
+_WS_HEARTBEAT_STALE_SECONDS = 600.0
+
 
 def _rate_limiter_health_check(conn) -> HealthCheck:
     """
@@ -531,6 +547,131 @@ def get_market_halt_status() -> dict | None:
         return None
 
 
+def _rest_demand_check(conn, now: datetime) -> HealthCheck:
+    """
+    해석: 2026-07-31에 처음 계량된 "총 REST 수요 43.6%"는 그때까지 **로그를 하루치 세야만** 알 수
+         있는 값이었다 — COCKPIT은 배율만 볼 수 있었다. 마이그레이션 019로 누적 호출 수를 함께
+         기록하게 되면서 당일 바로 볼 수 있다(§5-5). 계산은 일일 리포트와 **같은 함수**를 쓴다.
+    """
+    label = "REST 수요 / 페이서 용량"
+    try:
+        demand = db_metrics.rest_demand(conn, now.date())
+    except Exception:
+        conn.rollback()
+        logger.warning("REST 수요 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    pct = demand.get("capacity_pct")
+    if pct is None:
+        return HealthCheck(
+            label, "info", "집계 전(마이그레이션 019 적용 전이거나 표본 2건 미만)", group="관측 품질"
+        )
+    detail = (
+        f"{demand['calls_per_second']:.3f}건/초 = 용량의 {pct:.1f}% "
+        f"(적자 시작 배율 {demand['deficit_threshold_multiplier']:.2f}배)"
+    )
+    status = "warning" if pct >= _REST_DEMAND_WARNING_PCT else "ok"
+    return HealthCheck(label, status, detail, group="관측 품질")
+
+
+def _backoff_headroom_check(conn, now: datetime) -> HealthCheck:
+    """오늘 최대 백오프 배율이 적자 임계에 얼마나 근접했는지 — 넘으면 수요가 용량을 초과한다."""
+    label = "백오프 여유(적자 임계 대비)"
+    try:
+        demand = db_metrics.rest_demand(conn, now.date())
+        limiter = db_metrics._rate_limiter(conn, now.date())
+    except Exception:
+        conn.rollback()
+        logger.warning("백오프 여유 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    threshold = demand.get("deficit_threshold_multiplier")
+    observed = limiter.get("max_multiplier")
+    if threshold is None or observed is None:
+        return HealthCheck(label, "info", "집계 전", group="관측 품질")
+    ratio = observed / threshold
+    detail = f"오늘 최대 {observed:.2f}배 / 적자 임계 {threshold:.2f}배 ({ratio * 100:.0f}%)"
+    status = "warning" if ratio >= _BACKOFF_HEADROOM_WARNING_RATIO else "ok"
+    return HealthCheck(label, status, detail, group="관측 품질")
+
+
+def _monthly_coverage_check(conn, underlying: str, now: datetime) -> HealthCheck:
+    """
+    해석: **GEX/감마플립 입력의 1분 연속성.** 07-31에 인프라 지표(밀림 83→46건)가 좋아지는 동안
+         이 값은 95.0% → 90.5%로 후퇴했다 — 인프라 배지 옆에 두지 않으면 놓치는 종류의 지표다.
+    """
+    label = "먼슬리 분 커버리지"
+    if not _is_trading_hours(now):
+        return HealthCheck(label, "info", "장중 아님(평일 09:00~15:45 외)", group="관측 품질")
+    elapsed = int((datetime.combine(now.date(), now.time()) - datetime.combine(now.date(), _TRADING_DAY_START)).total_seconds() // 60) + 1
+    try:
+        coverage = db_metrics.monthly_book_coverage(conn, now.date(), elapsed, underlying)
+    except Exception:
+        conn.rollback()
+        logger.warning("먼슬리 커버리지 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    pct = coverage.get("coverage_pct")
+    if pct is None:
+        # 만기유동성 폴러의 첫 행이 08:31 부근이라 그 전에는 먼슬리 만기를 특정할 수 없다.
+        return HealthCheck(label, "info", coverage.get("reason") or "집계 전", group="관측 품질")
+    detail = f"{coverage['minutes']}분 / 경과 {elapsed}분 = {pct:.1f}% (만기 {coverage['expiry']})"
+    status = "warning" if pct < _MONTHLY_COVERAGE_WARNING_PCT else "ok"
+    return HealthCheck(label, status, detail, group="관측 품질")
+
+
+def _overrun_count_check(conn, now: datetime) -> HealthCheck:
+    """당일 누적 스케줄 밀림 — 다음날 로그를 뒤지지 않고 그날 바로 악화를 본다."""
+    label = "스케줄 밀림(당일 누적)"
+    try:
+        limiter = db_metrics._rate_limiter(conn, now.date())
+    except Exception:
+        conn.rollback()
+        logger.warning("밀림 누적 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    if not limiter.get("rows"):
+        return HealthCheck(label, "info", "아직 사이클 이력 없음", group="관측 품질")
+    count = limiter["overrun_rows"]
+    detail = f"{count}건 / 사이클 {limiter['rows']}건 (평균 배율 {limiter['mean_multiplier']:.2f}배)"
+    status = "warning" if count >= _OVERRUN_COUNT_WARNING else "ok"
+    return HealthCheck(label, status, detail, group="관측 품질")
+
+
+def _ws_liveness_check(conn, now: datetime) -> HealthCheck:
+    """
+    해석: 2026-08-01 §5-4 — 07-31 WS 재연결 **0회**였지만 재연결 로직이 살아있는지는 증명되지
+         않았다(CB 감지와 같은 구조의 사각지대). 이제 독립 하트비트가 `updated_at`을 갱신하므로
+         **오래됐다는 건 관측 루프의 WS 파트가 멈췄다는 뜻**이다.
+         `last_message_at`에는 **장중에만** 임계를 건다 — 장외에는 체결이 없어 비어 있는 게
+         정상이고, 여기에 임계를 걸면 CB 감지에서 겪은 상시 오경보를 반복한다.
+    """
+    label = "WS 연결/재연결 감지"
+    try:
+        status = db.latest_ws_status(conn)
+    except Exception:
+        conn.rollback()
+        logger.warning("WS 생존 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    if status is None:
+        return HealthCheck(
+            label, "warning", "감지 상태 미기록 — 관측 루프 미기동 여부 확인 필요", group="관측 품질"
+        )
+    age = (now - _as_naive(status["updated_at"])).total_seconds()
+    reconnects = status["reconnect_count_today"]
+    seen = status["last_message_at"]
+    seen_text = f"최근 수신 {_as_naive(seen):%H:%M:%S}" if seen else "수신 이력 없음"
+    if age > _WS_HEARTBEAT_STALE_SECONDS:
+        return HealthCheck(
+            label, "warning",
+            f"하트비트 {age / 60:.0f}분째 정지({_as_naive(status['updated_at']):%H:%M:%S}) — "
+            f"관측 루프 WS 파트 확인 필요 · {seen_text}",
+            group="관측 품질",
+        )
+    since = status["connected_since"]
+    since_text = f"{_as_naive(since):%H:%M:%S}부터" if since else "연결 시각 미기록"
+    detail = f"연결 {since_text} · 오늘 재연결 {reconnects}회 · {seen_text}"
+    # 재연결이 일어났다는 것 자체는 이상 신호다(0회가 정상) — 다만 지금 붙어 있으면 경고까지는 아니다.
+    status_level = "warning" if reconnects > 0 else "ok"
+    return HealthCheck(label, status_level, detail, group="관측 품질")
+
+
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     """
     입력: 기초자산 라벨.
@@ -560,6 +701,13 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _regime_fit_progress_check(conn, underlying),
                 _shutdown_reliability_check(conn),
                 _rate_limiter_health_check(conn),
+                # 2026-08-01(§5-5) 관측 품질 — 인프라 지표가 좋아져도 판단 입력 품질은 나빠질 수
+                # 있다(07-31 실측). 두 그룹을 나란히 봐야 그 어긋남이 보인다.
+                _rest_demand_check(conn, now),
+                _backoff_headroom_check(conn, now),
+                _monthly_coverage_check(conn, underlying, now),
+                _overrun_count_check(conn, now),
+                _ws_liveness_check(conn, now),
             ]
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)

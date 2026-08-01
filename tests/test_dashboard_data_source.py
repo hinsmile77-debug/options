@@ -5,6 +5,10 @@ import pytest
 
 from mahdi.data import db
 from mahdi.dashboard.data_source import (
+    _rest_demand_check,
+    _backoff_headroom_check,
+    _monthly_coverage_check,
+    _overrun_count_check,
     HealthCheck,
     _cbot_status_check,
     _fossil_data_check,
@@ -1010,12 +1014,19 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
     monkeypatch.setattr("mahdi.dashboard.data_source._shutdown_reliability_check", make_check("shutdown"))
     monkeypatch.setattr("mahdi.dashboard.data_source._rate_limiter_health_check", make_check("rate_limiter"))
+    # 2026-08-01(§5-5) 관측 품질 4종
+    monkeypatch.setattr("mahdi.dashboard.data_source._rest_demand_check", make_check("rest_demand"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._backoff_headroom_check", make_check("backoff_headroom"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._monthly_coverage_check", make_check("monthly_coverage"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._overrun_count_check", make_check("overrun_count"))
+    monkeypatch.setattr("mahdi.dashboard.data_source._ws_liveness_check", make_check("ws_liveness"))
 
     result = get_health_summary()
 
     assert calls == [
         "market_halt", "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
         "regime", "regime_fit_progress", "shutdown", "rate_limiter",
+        "rest_demand", "backoff_headroom", "monthly_coverage", "overrun_count", "ws_liveness",
     ]
     assert [c.label for c in result] == calls
 
@@ -1194,3 +1205,110 @@ def test_get_account_status_view_falls_back_when_db_unavailable(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", broken_connection)
 
     assert get_account_status_view() is None
+
+
+# ===== 2026-08-01(운영점검보고서 2026-07-31 §5-5) 관측 품질 배지 4종 =====
+
+
+def _demand(pct, threshold=2.29):
+    return {"calls": 12947, "calls_per_second": round(pct / 100, 3), "capacity_pct": pct,
+            "deficit_threshold_multiplier": threshold}
+
+
+def test_rest_demand_badge_warns_above_the_budget_threshold(monkeypatch):
+    # 07-31 실측 43.6%는 ok, 60% 이상이면 "폴러 추가를 멈추고 예산부터 본다".
+    monkeypatch.setattr("mahdi.dashboard.data_source.db_metrics.rest_demand", lambda conn, d: _demand(43.6))
+    assert _rest_demand_check(object(), datetime(2026, 8, 3, 10, 0)).status == "ok"
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db_metrics.rest_demand", lambda conn, d: _demand(61.0))
+    check = _rest_demand_check(object(), datetime(2026, 8, 3, 10, 0))
+    assert check.status == "warning"
+    assert check.group == "관측 품질"
+
+
+def test_rest_demand_badge_says_not_yet_instead_of_inventing_a_number(monkeypatch):
+    # 마이그레이션 019 적용 전이거나 표본 2건 미만이면 지어내지 않는다.
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.rest_demand",
+        lambda conn, d: {"calls": None, "calls_per_second": None, "capacity_pct": None,
+                         "deficit_threshold_multiplier": None},
+    )
+    check = _rest_demand_check(object(), datetime(2026, 8, 3, 10, 0))
+    assert check.status == "info"
+    assert "집계 전" in check.detail
+
+
+def test_backoff_headroom_badge_warns_when_approaching_the_deficit_threshold(monkeypatch):
+    monkeypatch.setattr("mahdi.dashboard.data_source.db_metrics.rest_demand", lambda conn, d: _demand(43.6, 2.29))
+    # 07-31 실측 최대 2.25배 / 임계 2.29배 = 98% → 경고(적자 진입 직전이었다).
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics._rate_limiter",
+        lambda conn, d: {"rows": 447, "overrun_rows": 46, "max_multiplier": 2.25, "mean_multiplier": 1.13},
+    )
+    assert _backoff_headroom_check(object(), datetime(2026, 8, 3, 10, 0)).status == "warning"
+
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics._rate_limiter",
+        lambda conn, d: {"rows": 447, "overrun_rows": 5, "max_multiplier": 1.30, "mean_multiplier": 1.05},
+    )
+    assert _backoff_headroom_check(object(), datetime(2026, 8, 3, 10, 0)).status == "ok"
+
+
+def test_monthly_coverage_badge_warns_below_95_percent(monkeypatch):
+    # 핵심 지표: 07-31에 밀림은 83→46건으로 좋아졌는데 이 값은 95.0%→90.3%로 후퇴했다.
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
+        lambda conn, d, elapsed, u: {"expiry": date(2026, 8, 13), "minutes": 447,
+                                     "elapsed_minutes": 495, "coverage_pct": 90.3},
+    )
+    check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 15, 0))
+    assert check.status == "warning"
+    assert "90.3%" in check.detail
+
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
+        lambda conn, d, elapsed, u: {"expiry": date(2026, 8, 13), "minutes": 490,
+                                     "elapsed_minutes": 495, "coverage_pct": 99.0},
+    )
+    assert _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 15, 0)).status == "ok"
+
+
+def test_monthly_coverage_badge_is_info_before_the_expiry_can_be_resolved(monkeypatch):
+    # 만기유동성 첫 행이 08:31 부근이라 장전에는 먼슬리 만기를 특정할 수 없다 — 경고가 아니다.
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
+        lambda conn, d, elapsed, u: {"expiry": None, "minutes": None, "coverage_pct": None,
+                                     "reason": "만기유동성 미적재(장전)"},
+    )
+    check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 9, 5))
+    assert check.status == "info"
+
+
+def test_monthly_coverage_badge_is_quiet_outside_trading_hours(monkeypatch):
+    check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 1, 20, 0))
+    assert check.status == "info"
+    assert "장중 아님" in check.detail
+
+
+def test_overrun_count_badge_warns_at_the_pacer_split_reopen_threshold(monkeypatch):
+    # 30건은 페이서 분리 재개 조건과 같은 숫자다(2026-08-01 DECISION_LOG).
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics._rate_limiter",
+        lambda conn, d: {"rows": 447, "overrun_rows": 46, "max_multiplier": 2.25, "mean_multiplier": 1.13},
+    )
+    assert _overrun_count_check(object(), datetime(2026, 8, 3, 15, 0)).status == "warning"
+
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics._rate_limiter",
+        lambda conn, d: {"rows": 447, "overrun_rows": 12, "max_multiplier": 1.5, "mean_multiplier": 1.05},
+    )
+    assert _overrun_count_check(object(), datetime(2026, 8, 3, 15, 0)).status == "ok"
+
+
+def test_health_checks_carry_a_group_so_the_cockpit_can_split_rows():
+    # app.py가 group으로 2행을 만든다 — 기존 배지는 기본값 "인프라"를 유지해야 한다.
+    from mahdi.dashboard.data_source import HealthCheck
+
+    assert HealthCheck("a", "ok", "b").group == "인프라"
+    monkeypatched = HealthCheck("a", "ok", "b", group="관측 품질")
+    assert monkeypatched.group == "관측 품질"

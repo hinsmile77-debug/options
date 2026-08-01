@@ -21,7 +21,14 @@ research/scratch/
 # Logs
 *.log
 logs/
+# 2026-08-01: 운영 지표 파서(mahdi/ops/log_metrics.py)의 테스트 픽스처는 로그 형식 자체가
+# 검증 대상이라 반드시 커밋돼야 한다 — 실운영 로그(logs/)와 달리 손으로 만든 120줄짜리다.
+!tests/fixtures/*.log
 
 # OS / IDE
 .DS_Store
 .idea/
+
+# 일일 운영 지표 자동 집계 산출물(장마감 훅이 매일 생성) — 전일 델타 계산에 쓰는 JSON은
+# 로컬에만 두고, 해석이 담긴 사람 보고서만 커밋한다(2026-08-01, 운영점검 §5-2).
+docs/동작점검/auto/

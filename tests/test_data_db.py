@@ -663,7 +663,8 @@ def test_append_rate_limiter_status_history_is_plain_insert():
     assert conn.committed is True
     assert "INSERT INTO rate_limiter_status_history" in conn.store["query"]
     assert "ON CONFLICT" not in conn.store["query"]
-    assert conn.store["params"] == (ts, 1.5, 10.0)
+    # 2026-08-01(마이그레이션 019): total_calls가 뒤에 붙었다(미지정이면 NULL).
+    assert conn.store["params"] == (ts, 1.5, 10.0, None)
 
 
 def test_rate_limiter_status_history_since_maps_rows():
@@ -782,3 +783,51 @@ def test_latest_market_halt_state_returns_both_liveness_signals():
 
 def test_latest_market_halt_state_returns_none_when_detector_never_recorded():
     assert db.latest_market_halt_state(FakeReadConnection([])) is None
+
+
+# ===== 2026-08-01(운영점검보고서 2026-07-31 §5-4/§5-5) WS 생존 신호 + 레이트리밋 호출 수 =====
+
+
+def test_upsert_ws_status_writes_the_singleton_row():
+    conn = FakeConnection()
+    db.upsert_ws_status(conn, datetime(2026, 8, 3, 15, 43), datetime(2026, 8, 3, 7, 31), None, 0)
+
+    assert "INSERT INTO ws_status" in conn.store["query"]
+    assert "ON CONFLICT (id) DO UPDATE" in conn.store["query"]
+    assert conn.store["params"][0] is True  # id
+
+
+def test_latest_ws_status_returns_all_four_signals():
+    conn = FakeReadConnection(
+        [(datetime(2026, 8, 3, 15, 43), datetime(2026, 8, 3, 7, 31), datetime(2026, 8, 3, 15, 33), 0)]
+    )
+    state = db.latest_ws_status(conn)
+
+    assert state["updated_at"] == datetime(2026, 8, 3, 15, 43)
+    assert state["connected_since"] == datetime(2026, 8, 3, 7, 31)
+    assert state["last_message_at"] == datetime(2026, 8, 3, 15, 33)
+    assert state["reconnect_count_today"] == 0
+
+
+def test_latest_ws_status_returns_none_when_observation_loop_never_ran():
+    assert db.latest_ws_status(FakeReadConnection([])) is None
+
+
+def test_rate_limiter_status_records_total_calls_for_demand_calculation():
+    # 마이그레이션 019 — 두 행의 total_calls 차이로만 "초당 수요"가 나온다.
+    conn = FakeConnection()
+    db.record_rate_limiter_status(conn, datetime(2026, 8, 3, 10, 0), 1.2, 0.0, 5000)
+    assert "total_calls" in conn.store["query"]
+    assert conn.store["params"][-1] == 5000
+
+    conn = FakeConnection()
+    db.append_rate_limiter_status_history(conn, datetime(2026, 8, 3, 10, 0), 1.2, 0.0, 5000)
+    assert "total_calls" in conn.store["query"]
+    assert conn.store["params"][-1] == 5000
+
+
+def test_rate_limiter_status_tolerates_missing_total_calls():
+    # 019 적용 전 호출부(테스트 더블 등)와의 하위호환 — NULL 허용이라 그대로 들어간다.
+    conn = FakeConnection()
+    db.record_rate_limiter_status(conn, datetime(2026, 8, 3, 10, 0), 1.2, 0.0)
+    assert conn.store["params"][-1] is None

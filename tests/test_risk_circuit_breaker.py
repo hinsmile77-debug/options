@@ -131,3 +131,44 @@ def test_triggered_conditions_accumulate_across_calls():
     cb.evaluate(_account(daily_pnl_pct=-0.03), _market())
     decision = cb.evaluate(_account(daily_pnl_pct=-0.03), _market(vix=45))
     assert set(decision.triggered_conditions) == {"daily_loss_pct", "vix_spike"}
+
+
+# ===== 2026-08-01(운영점검보고서 2026-07-31 §5-4) 상태를 바꾸지 않는 평가 경로 =====
+
+
+def test_evaluate_readonly_does_not_latch_the_breaker():
+    # 핵심 계약: 매분 부를 수 있어야 한다. 상태를 바꾸면 일간 래치가 의도치 않게 고착된다 —
+    # 그 위험 때문에 07-31까지 라이브에서 한 번도 안 불렀고, 그래서 킬스위치 생존이 미증명이었다.
+    breaker = CircuitBreaker(_RISK_LIMITS)
+    account = _account(daily_pnl_pct=-0.05)  # 한도 위반
+
+    decision = breaker.evaluate_readonly(account, _market())
+
+    assert decision.state == CircuitBreakerState.HALTED
+    assert "daily_loss_pct" in decision.triggered_conditions
+    assert breaker.state == CircuitBreakerState.NORMAL  # 내부 상태는 그대로
+
+
+def test_evaluate_readonly_reflects_only_the_current_input_not_past_latches():
+    breaker = CircuitBreaker(_RISK_LIMITS)
+    breaker.evaluate(_account(daily_pnl_pct=-0.05), _market())  # 래치 발생
+    assert breaker.state == CircuitBreakerState.HALTED
+
+    # 조건이 해소된 입력을 readonly로 보면 NORMAL이다(래치는 self.state가 따로 들고 있다).
+    assert breaker.evaluate_readonly(_account(daily_pnl_pct=0.01), _market()).state == (
+        CircuitBreakerState.NORMAL
+    )
+    assert breaker.state == CircuitBreakerState.HALTED  # 래치는 유지
+
+
+def test_evaluate_and_evaluate_readonly_share_one_condition_path():
+    # 두 경로가 조건 로직을 따로 들고 있으면 "계측된 것과 실제 동작이 다르다"는, 계측이 없는
+    # 지금보다 나쁜 상태가 된다 — 같은 입력에 같은 발동 조건이 나와야 한다.
+    account = _account(daily_pnl_pct=-0.05)
+    conditions = _market(vpin=0.95, vix=45.0)
+
+    readonly = CircuitBreaker(_RISK_LIMITS).evaluate_readonly(account, conditions)
+    latched = CircuitBreaker(_RISK_LIMITS).evaluate(account, conditions)
+
+    assert set(readonly.triggered_conditions) == set(latched.triggered_conditions)
+    assert readonly.requires_emergency_flatten == latched.requires_emergency_flatten

@@ -1,0 +1,96 @@
+# 마흐디 가설 검정 파일 — "예측 → 실측" 대조를 자동화한다 (운영점검보고서 2026-07-31 §5-1).
+#
+# 규약: **fix를 구현하는 세션은 그 자리에서 여기에 예측치를 적는다.**
+#       다음 거래일 `scripts/daily_ops_report.py`가 자동으로 실측과 대조해 리포트 §0에 낸다.
+#       예측치를 못 적겠으면 그 fix는 아직 근거가 부족한 것이다 — 07-30의 "밀린 데이터는
+#       어차피 유실"이라는 추론이 예측치 형태로 강제됐다면 그날 바로 걸렀을 것이다.
+#
+# 필드:
+#   id            고유 식별자(날짜-항목)
+#   구현일/검증예정일  검증예정일이 지난 pending 항목은 확정될 때까지 계속 표에 남는다
+#   가설          한 문장
+#   예측[].metric 지표 경로. 로그 지표는 그대로, DB 지표는 `db.` 접두사
+#                 (사용 가능한 경로는 docs/동작점검/auto/YYYY-MM-DD_지표.json 참고)
+#   예측[].expect "<= 5" / ">= 95" / "0 ~ 10" 만 자동 판정한다. 그 외는 "수기 판정"으로 남는다
+#   상태          pending | confirmed | refuted | inconclusive
+#                 **자동으로 바뀌지 않는다** — 사람이 보고서를 쓰면서 손으로 확정한다
+#                 (자동 판정이 틀렸을 때 조용히 덮이는 것을 막기 위함)
+
+- id: "2026-08-01-p1-expiry-burst"
+  구현일: 2026-08-01
+  검증예정일: 2026-08-03
+  가설: "만기유동성 30레그 버스트를 북별 홀수분 슬롯(1/3/5)으로 나누면 mod10=2 충돌이 사라진다"
+  근거: "07-31 실측 — 버스트 점유 중앙 55.5초(최대 109초)가 2분대 짝수분 사이클을 덮어 밀림 17건"
+  예측:
+    - metric: bursts.만기유동성.occupancy_seconds.median
+      expect: "<= 20"
+    - metric: bursts.만기유동성.calls_per_burst_median
+      expect: "<= 12"
+  상태: pending
+
+- id: "2026-08-01-p2-catchup"
+  구현일: 2026-08-01
+  검증예정일: 2026-08-03
+  가설: "밀린 분을 먼슬리 10레그로 회수하면 먼슬리 커버리지가 95% 이상으로 돌아온다"
+  근거: "07-31 실측 — Fix#3(격자 스냅) 이후 밀림 1회 = 결손 1분 확정, 커버리지 95.0%→90.3%"
+  예측:
+    - metric: db.monthly_coverage.coverage_pct
+      expect: ">= 95"
+    - metric: rest.calls_per_second
+      expect: "<= 0.46"
+  주의: "회수 로그가 적게 나오는 건 실패가 아니라 성공 신호다(우선순위 1이 밀림 자체를 줄이면
+        발동 횟수도 준다) — 밀림 건수와 회수 건수를 함께 읽을 것."
+  상태: pending
+
+- id: "2026-08-01-p3-slow-call-attribution"
+  구현일: 2026-08-01
+  검증예정일: 2026-08-03
+  가설: "느린 호출을 페이서대기/HTTP로 나눠 재면 mod10=0 구간의 8~9초 정체 원인이 특정된다"
+  근거: "07-31 실측 — 연속 지연 에피소드 7건이 전부 mod10=0, 페이서 배율(최대 1.82배)로 설명 불가"
+  예측:
+    - metric: slow_calls.count
+      expect: ">= 1"
+  주의: "이 항목은 '고친다'가 아니라 '원인을 특정한다'가 목표다. 페이서대기 우세면 예약 큐 경합,
+        HTTP 우세면 KIS 서버/커넥션 풀, 둘 다 작으면 이벤트 루프·스레드풀 블로킹.
+        RemoteProtocolError 8건(07-31)이 같은 시각대에 있었던 것도 함께 볼 것."
+  상태: pending
+
+- id: "2026-08-01-p4-cb-heartbeat"
+  구현일: 2026-08-01
+  검증예정일: 2026-08-03
+  가설: "하트비트를 메시지 핸들러에서 분리하면 updated_at이 장마감까지 300초마다 갱신된다"
+  근거: "07-31 실측 — H0UNMKO0은 세션 전이 시에만 오고(하루 2건) updated_at이 09:00:05에 멈췄다"
+  예측:
+    - metric: db.market_halt.updated_at
+      expect: "15:4x (수기 확인)"
+  주의: "last_message_at은 09:00 부근에서 멈춰 있어도 정상이다 — 여기에 임계를 두면 상시 오경보."
+  상태: pending
+
+- id: "2026-08-01-p5-wall-clock-phase"
+  구현일: 2026-08-01
+  검증예정일: 2026-08-03
+  가설: "폴러 위상을 벽시계 자정 격자에 앵커하면 설계 표대로 실현된다"
+  근거: "07-31 실측 — 설계 35/155/275초가 실측 95/198/305초로 어긋나 있었다(기동 시각 앵커)"
+  예측:
+    - metric: poller_phase.만기유동성.mode_second
+      expect: "13 ~ 17"
+    - metric: poller_phase.투자자수급.mode_second
+      expect: "38 ~ 42"
+    - metric: poller_phase.매크로.mode_second
+      expect: "46 ~ 50"
+    - metric: poller_phase.계좌잔고.mode_second
+      expect: "46 ~ 50"
+  상태: pending
+
+- id: "2026-08-01-overall"
+  구현일: 2026-08-01
+  검증예정일: 2026-08-03
+  가설: "Fix 5종 합산으로 밀림과 결손이 함께 줄고 총수요는 예산 안에 머문다"
+  예측:
+    - metric: overrun.count
+      expect: "<= 30"
+    - metric: cycles.missing.unrecovered_count
+      expect: "<= 25"
+    - metric: rest.capacity_pct
+      expect: "<= 50"
+  상태: pending

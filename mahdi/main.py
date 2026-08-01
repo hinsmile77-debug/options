@@ -16,6 +16,7 @@ import logging
 import math
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -164,6 +165,23 @@ MARKET_HALT_REFERENCE_SYMBOL = "005930"
 MARKET_HALT_HEARTBEAT_SECONDS = 300.0  # 메시지와 무관하게 이 간격마다 현재 상태를 DB에 갱신
 MARKET_HALT_MESSAGE_TOUCH_SECONDS = 60.0  # 수신 시각(last_message_at) DB 갱신 스로틀
 MARKET_HALT_RECEIVE_LOG_EVERY = 20  # 수신 N건마다 INFO 1줄(첫 수신은 항상 남김)
+
+# 2026-08-01(§5-4): WS 생존 신호도 같은 원칙 — 메시지와 독립한 타이머가 낸다(마이그레이션 020).
+WS_HEARTBEAT_SECONDS = 300.0
+
+
+@dataclass
+class WsLiveness:
+    """WS 연결/재연결 감지의 생존 상태 — 관측 루프가 갱신하고 독립 하트비트가 DB에 남긴다.
+
+    2026-08-01(운영점검보고서 2026-07-31 §5-4). 07-31 재연결 0회 — 좋은 일이지만 **재연결 로직이
+    살아있는지는 증명되지 않았다**. WS 수신 자체는 `market_raw_1m` 적재로 간접 증명되지만 그건
+    "재연결 감지"가 아니다. CB 감지와 같은 패턴(독립 타이머 + 상태 객체 공유)으로 해결한다.
+    """
+
+    connected_since: datetime | None = None
+    last_message_at: datetime | None = None
+    reconnect_count: int = 0
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
@@ -532,6 +550,7 @@ async def run_observation_loop(
     futures_symbol: str,
     regime_state_machine: RegimeStateMachine,
     market_halt_monitor: MarketHaltMonitor,
+    ws_liveness: WsLiveness | None = None,
 ) -> None:
     """
     입력: 이미 연결된 WS 클라이언트, 구독 롤링 매니저 목록(2026-07-06부터 리스트 — 먼슬리/위클리
@@ -670,6 +689,11 @@ async def run_observation_loop(
         if raw is None:
             return  # JSON 제어 메시지(구독 응답/PINGPONG)는 무시
 
+        # 2026-08-01(§5-4): 수신 시각은 메모리에만 남기고 DB 쓰기는 하트비트가 맡는다 —
+        # 초당 수십 건 들어오는 경로라 여기서 DB를 만지면 안 된다.
+        if ws_liveness is not None:
+            ws_liveness.last_message_at = db.local_now()
+
         # H0UNMKO0(장운영정보)는 종목코드가 아니라 헤더의 TR_ID로 구분해야 한다 — 응답 바디에
         # 종목코드 필드 자체가 없다(_parse_market_operation 주석 참고).
         header_parts = raw.split("|", 3)
@@ -762,6 +786,7 @@ async def run_observation_loop_forever(
     market_halt_monitor: MarketHaltMonitor,
     approval_key: str,
     connect=websockets.connect,
+    ws_liveness: WsLiveness | None = None,
 ) -> None:
     """
     입력: run_observation_loop과 동일 + 이미 연결된 첫 WS 클라이언트(호출측이 최초 1회 연결해
@@ -793,11 +818,13 @@ async def run_observation_loop_forever(
     backoff = WS_RECONNECT_INITIAL_BACKOFF_SECONDS
     currently_connected = True
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
+    if ws_liveness is not None:
+        ws_liveness.connected_since = db.local_now()
     try:
         await run_observation_loop(
             ws_client, subscription_managers, rest_client,
             futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
-            market_halt_monitor=market_halt_monitor,
+            market_halt_monitor=market_halt_monitor, ws_liveness=ws_liveness,
         )
         return
     except _WS_DISCONNECT_ERRORS:
@@ -817,10 +844,15 @@ async def run_observation_loop_forever(
                 if not currently_connected:
                     notify.notify("WS 재연결 성공 — 관측 재개.", "INFO")
                     currently_connected = True
+                # 2026-08-01(§5-4): 재연결이 실제로 일어났다는 사실을 남긴다 — 07-31처럼 0회인
+                # 날에도 "감지기가 붙어 있다"는 것은 독립 하트비트가 따로 증명한다.
+                if ws_liveness is not None:
+                    ws_liveness.connected_since = db.local_now()
+                    ws_liveness.reconnect_count += 1
                 await run_observation_loop(
                     new_client, subscription_managers, rest_client,
                     futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
-                    market_halt_monitor=market_halt_monitor,
+                    market_halt_monitor=market_halt_monitor, ws_liveness=ws_liveness,
                 )
                 return
         except _WS_DISCONNECT_ERRORS:
@@ -1135,6 +1167,31 @@ def _update_atm_iv(regime_state_machine: RegimeStateMachine | None, rows: list[d
         regime_state_machine.update_iv(sum(ivs) / len(ivs))
 
 
+async def poll_ws_heartbeat(
+    ws_liveness: WsLiveness,
+    interval_seconds: float = WS_HEARTBEAT_SECONDS,
+) -> None:
+    """
+    계산: 메시지 수신과 무관하게 interval_seconds마다 `ws_status`를 upsert한다 —
+         `updated_at`이 "관측 루프의 WS 파트가 살아있다"를 뜻하게 만든다.
+    해석: §5-4 원칙("생존 신호는 감시 대상과 독립한 타이머에서")의 세 번째 적용이다.
+         `last_message_at`은 **장중에만** 의미가 있다 — 장외에는 체결이 없어 비어 있는 게 정상이라
+         COCKPIT이 장중에만 임계를 건다(CB 감지에서 배운 대로, 정상을 이상으로 표시하지 않는다).
+    실패 조건: DB 기록 실패는 로그만 남기고 다음 주기를 기다린다 — 하트비트가 죽어도 WS 수신과
+              재연결 자체는 계속 동작해야 한다.
+    """
+    while True:
+        try:
+            with db.get_connection() as conn:
+                db.upsert_ws_status(
+                    conn, db.local_now(), ws_liveness.connected_since,
+                    ws_liveness.last_message_at, ws_liveness.reconnect_count,
+                )
+        except Exception:
+            logger.warning("WS 하트비트 기록 실패 — 관측 자체에는 영향 없음", exc_info=True)
+        await asyncio.sleep(interval_seconds)
+
+
 async def poll_market_halt_heartbeat(
     market_halt_monitor: MarketHaltMonitor,
     interval_seconds: float = MARKET_HALT_HEARTBEAT_SECONDS,
@@ -1418,14 +1475,19 @@ async def poll_option_chain(
                 # db.local_now()를 다시 부르지 않고 이번 사이클의 poll_time을 그대로 쓴다 — 일부
                 # 테스트가 db.local_now()를 정해진 시각 시퀀스로 모킹해두는데, 여기서 한 번 더
                 # 부르면 그 시퀀스를 예상보다 빨리 소진시켜 poll_time 자체가 어긋난다.
+                # 2026-08-01(§5-5): 누적 호출 수를 함께 남긴다 — 두 행의 차이로 "총 REST 수요
+                # (건/초)"가 나와 COCKPIT이 다음날 로그 집계를 기다리지 않고 바로 볼 수 있다.
+                # 속성이 없는 테스트 더블에서도 죽지 않게 getattr 기본값 None을 쓴다.
                 db.record_rate_limiter_status(
                     conn, poll_time, rest_client.rate_limit_backoff_multiplier, overrun_seconds,
+                    getattr(rest_client, "rate_limit_total_calls", None),
                 )
                 # 2026-07-29(운영점검보고서 §2-5/Fix#3): 위 싱글턴 기록은 "지금 상태"만 보존해
                 # 시계열 조회가 불가능하다 — 같은 값을 append-only 테이블에도 남겨 언제부터
                 # 배율이 오르기 시작했는지 등을 사후에 되짚어볼 수 있게 한다.
                 db.append_rate_limiter_status_history(
                     conn, poll_time, rest_client.rate_limit_backoff_multiplier, overrun_seconds,
+                    getattr(rest_client, "rate_limit_total_calls", None),
                 )
         except Exception:
             logger.warning("레이트리밋 근접도 기록 실패", exc_info=True)
@@ -2192,6 +2254,8 @@ def _record_risk_snapshot(
     market_halted: bool,
     decision_label: str,
     risk_engine_state: object,
+    risk_gate_invocations: int = 0,
+    risk_gate_last_invoked_at: datetime | None = None,
 ) -> None:
     """
     입력: 이번 사이클의 신호 원재료/계좌 상태/RiskEngine 인스턴스/거래정지 상태/판단 라벨.
@@ -2203,9 +2267,12 @@ def _record_risk_snapshot(
          `greeks`에 담는 건 **포트폴리오 그릭스가 아니라 시장 감마 구조**다 — 포지션 생애주기
          추적이 아직 없어(ExecutionEngine 미배선) 보유 그릭스라는 개념 자체가 없으므로, 지어내지
          않고 `scope`/`portfolio` 필드로 그 사실을 명시한다.
-         `circuit_breaker_state`는 "마지막으로 evaluate()가 불린 시점"의 값이다 — 진입 후보가
-         아닌 사이클에서는 CircuitBreaker.evaluate()를 부르지 않는다(일간 래치 설계라 매분
-         호출하면 의도치 않게 HALTED로 고착될 수 있어 의도적으로 부르지 않음).
+         2026-08-01(§5-4 "안전장치의 생존 신호"): 종전에는 `circuit_breaker_state`가 "마지막으로
+         evaluate()가 불린 시점"의 값이었다 — 일간 래치 설계라 매분 호출하면 HALTED로 고착될 수
+         있어 의도적으로 안 불렀고, 그 결과 07-31 기준 **하루 0회 평가**였다. 즉 킬스위치가
+         살아있는지 아무도 몰랐다. 이제 상태를 바꾸지 않는 `evaluate_readonly()`로 **매 사이클
+         조건을 실제로 평가**해 남긴다(래치는 여전히 실주문 경로의 `evaluate()`에서만 일어난다).
+         계좌 상태가 없으면 평가 자체가 불가능하므로 `latched_state`만 남기고 그 사실을 명시한다.
     실패 조건: 기록 실패가 폴링 루프를 막으면 안 되므로 로그만 남기고 넘어간다.
     """
     daily_loss_limit = (get_risk_limits().get("limits") or {}).get("daily_loss_pct")
@@ -2223,14 +2290,29 @@ def _record_risk_snapshot(
         "spot": signal_inputs.spot,
     }
     cb_state = {
-        "circuit_breaker_state": risk_engine.circuit_breaker.state.value,
-        "circuit_breaker_state_is_last_evaluated": True,
+        # 래치된 상태(하루 안에서 한 번 HALTED면 유지) — 실주문 경로가 실제로 보는 값.
+        "circuit_breaker_latched_state": risk_engine.circuit_breaker.state.value,
         "market_halted": market_halted,
         "market_halt_label": (halt_status or {}).get("label"),
         "decision": decision_label,
         "risk_engine": risk_engine_state,
         "account_tracker_ready": account_state is not None,
+        # 2026-08-01(§5-4): 진입 게이트 생존 계측. 0회는 "진입 후보가 없었다"는 정상 상태다 —
+        # 경고 대상이 아니라 정보다(임계를 두면 상시 오경보가 된다).
+        "risk_gate_invocations_today": risk_gate_invocations,
+        "risk_gate_last_invoked_at": (
+            risk_gate_last_invoked_at.strftime("%H:%M") if risk_gate_last_invoked_at else None
+        ),
     }
+    if account_state is None:
+        cb_state["circuit_breaker_evaluated"] = False
+        cb_state["circuit_breaker_note"] = "계좌 상태 없음 — 조건 평가 불가(잔고 폴러 대기 중)"
+    else:
+        # 상태를 바꾸지 않는 평가 — 이 값이 있다는 것 자체가 "킬스위치가 살아있다"의 증거다.
+        readonly = risk_engine.circuit_breaker.evaluate_readonly(account_state, MarketConditions())
+        cb_state["circuit_breaker_evaluated"] = True
+        cb_state["circuit_breaker_now"] = readonly.state.value
+        cb_state["circuit_breaker_triggered_now"] = readonly.triggered_conditions
     try:
         db.insert_risk_snapshot(conn, poll_time, greeks, loss_buffer, cb_state)
     except Exception:
@@ -2267,6 +2349,12 @@ async def poll_signal_fusion_cycle(
 
     fusion_engine = SignalFusionEngine()
     risk_engine = RiskEngine()
+    # 2026-08-01(§5-4): RiskEngine의 진입 게이트는 **진입 후보가 있을 때만** 불린다(07-31 하루
+    # 0회). 그 자체는 정상이지만, 0회라는 사실이 어디에도 안 남으면 "게이트가 죽었는지"와
+    # "진입 후보가 없었는지"를 구분할 수 없다. 호출 횟수/마지막 호출 시각을 남긴다 —
+    # **0회에 경고를 걸지는 않는다**(그러면 CB 하트비트와 같은 실수: 정상을 이상으로 표시).
+    risk_gate_invocations = 0
+    risk_gate_last_invoked_at: datetime | None = None
     next_tick: float | None = None
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
@@ -2327,6 +2415,8 @@ async def poll_signal_fusion_cycle(
                             sizing_input, account_state, entry_candidates[0], MarketConditions(),
                             market_halted=market_halted,
                         )
+                        risk_gate_invocations += 1
+                        risk_gate_last_invoked_at = poll_time
                         risk_gate_state["risk_engine"] = {
                             "approved": risk_decision.approved,
                             "approved_size": risk_decision.approved_size,
@@ -2347,6 +2437,8 @@ async def poll_signal_fusion_cycle(
                     halt_status=halt_status, market_halted=market_halted,
                     decision_label="ENTER" if is_entry else "REJECT",
                     risk_engine_state=risk_gate_state.get("risk_engine"),
+                    risk_gate_invocations=risk_gate_invocations,
+                    risk_gate_last_invoked_at=risk_gate_last_invoked_at,
                 )
         except Exception:
             logger.warning("Signal Fusion 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
@@ -2486,6 +2578,7 @@ async def main() -> None:
     approval_key = ApprovalKeyIssuer(kis_settings).issue()
     regime_state_machine = RegimeStateMachine(underlying=UNDERLYING, futures_symbol=futures_symbol)
     market_halt_monitor = MarketHaltMonitor()
+    ws_liveness = WsLiveness()
 
     # 시세(H0IOCNT0/H0IOASP0)는 계좌 무관 공개 데이터라 모의투자 전용 도메인이 없다 —
     # is_mock 여부와 상관없이 MARKET_DATA_WS_DOMAIN(실전 도메인) 하나로 접속한다.
@@ -2535,6 +2628,7 @@ async def main() -> None:
                 regime_state_machine=regime_state_machine,
                 market_halt_monitor=market_halt_monitor,
                 approval_key=approval_key,
+                ws_liveness=ws_liveness,
             ),
             poll_option_chain(rest_client, books, master, regime_state_machine=regime_state_machine),
             poll_expiry_liquidity(
@@ -2547,8 +2641,10 @@ async def main() -> None:
             poll_account_balance_cycle(
                 rest_client, phase_offset_seconds=ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS
             ),
-            # 2026-07-31 §4 우선순위 4 — CB 감지 생존 신호를 메시지 수신과 독립시킨다.
+            # 2026-07-31 §4 우선순위 4 / 2026-08-01 §5-4 — 안전장치 생존 신호는 감시 대상과
+            # 독립한 타이머에서 낸다(CB 감지 / WS 연결).
             poll_market_halt_heartbeat(market_halt_monitor),
+            poll_ws_heartbeat(ws_liveness),
         ]
         if overseas_future_master is not None:
             tasks.append(

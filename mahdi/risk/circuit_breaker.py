@@ -56,6 +56,27 @@ class CircuitBreaker:
         self._state = CircuitBreakerState.NORMAL
         self._halt_reasons = []
 
+    def evaluate_readonly(
+        self,
+        account_state: AccountState,
+        market_conditions: MarketConditions,
+    ) -> CircuitBreakerDecision:
+        """
+        입력: `evaluate()`와 동일.
+        계산: 조건을 **전부 평가하되 내부 상태(`_state`/`_halt_reasons`)를 바꾸지 않는다.**
+             반환하는 `state`는 "지금 이 입력만으로 판단하면 어떤 상태인가"이고, 래치된 과거
+             HALT는 반영하지 않는다(그건 `self.state`가 따로 들고 있다).
+        해석: 2026-08-01(운영점검보고서 2026-07-31 §5-4). 이 킬스위치는 **일간 래치**라 매분
+             `evaluate()`를 부르면 의도치 않게 HALTED로 고착될 수 있어 라이브 루프에서 일부러
+             호출하지 않았다 — 그 결과 07-31 기준 **하루 0회 평가**였고, `risk_snapshots`의
+             `circuit_breaker_state_is_last_evaluated` 플래그가 "이 값은 지금 상태가 아니다"라고
+             정직하게 표시하고 있었다. 즉 **킬스위치가 살아있는지 아무도 모르는 상태**였고,
+             이는 CB 감지 하트비트와 정확히 같은 문제다(§5-4 "생존 신호는 감시 대상과 독립한
+             타이머에서"). 상태를 바꾸지 않는 평가 경로를 두면 매분 안전하게 계측할 수 있다.
+        실패 조건: 없음 — 순수 계산이다.
+        """
+        return self._assess(account_state, market_conditions)[0]
+
     def evaluate(
         self,
         account_state: AccountState,
@@ -82,6 +103,34 @@ class CircuitBreaker:
               반복 신호를 보내는 것이 안전하며, 조건이 해소된 뒤에도 계속
               True를 반환하면 호출측이 "지금도 위급 상황"과 "예전에 위급했던
               적 있음"을 구분할 수 없게 된다.
+        """
+        _decision, triggered_now, emergency = self._assess(account_state, market_conditions)
+
+        if triggered_now:
+            self._state = CircuitBreakerState.HALTED
+            for reason in triggered_now:
+                if reason not in self._halt_reasons:
+                    self._halt_reasons.append(reason)
+
+        halted = self._state == CircuitBreakerState.HALTED
+        return CircuitBreakerDecision(
+            state=self._state,
+            triggered_conditions=list(self._halt_reasons) if halted else [],
+            requires_gradual_delever=halted,
+            requires_emergency_flatten=emergency,
+        )
+
+    def _assess(
+        self,
+        account_state: AccountState,
+        market_conditions: MarketConditions,
+    ) -> tuple[CircuitBreakerDecision, list[str], bool]:
+        """
+        계산: v6 §12.3 HALT_CONDITIONS를 순서대로 대조한다. **상태를 바꾸지 않는 유일한 평가
+             지점**이고, `evaluate()`와 `evaluate_readonly()`가 둘 다 이걸 쓴다.
+        해석: 2026-08-01 — 두 경로가 조건 로직을 따로 들고 있으면 "계측된 것과 실제 동작이
+             다르다"는, 계측이 없는 지금보다 나쁜 상태가 된다. 로직을 한 곳에만 둔다.
+        반환: (이번 입력만으로 본 결정, 이번에 발동한 조건 목록, 긴급청산 필요 여부)
         """
         risk_limits = self._risk_limits if self._risk_limits is not None else get_risk_limits()
         cb_cfg = risk_limits.get("circuit_breaker", {})
@@ -118,16 +167,11 @@ class CircuitBreaker:
         if cb_cfg.get("model_drift") and market_conditions.model_drift_detected:
             triggered_now.append("model_drift")
 
-        if triggered_now:
-            self._state = CircuitBreakerState.HALTED
-            for reason in triggered_now:
-                if reason not in self._halt_reasons:
-                    self._halt_reasons.append(reason)
-
-        halted = self._state == CircuitBreakerState.HALTED
-        return CircuitBreakerDecision(
-            state=self._state,
-            triggered_conditions=list(self._halt_reasons) if halted else [],
-            requires_gradual_delever=halted,
+        state = CircuitBreakerState.HALTED if triggered_now else CircuitBreakerState.NORMAL
+        decision = CircuitBreakerDecision(
+            state=state,
+            triggered_conditions=list(triggered_now),
+            requires_gradual_delever=bool(triggered_now),
             requires_emergency_flatten=emergency,
         )
+        return decision, triggered_now, emergency
