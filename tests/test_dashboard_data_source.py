@@ -860,18 +860,74 @@ def test_market_halt_check_warns_when_detector_never_recorded_anything(monkeypat
 
 def test_market_halt_check_ok_with_heartbeat_when_no_transition_yet(monkeypatch):
     # 하트비트만 갱신된 정상 상태(전이 이력 없음 → mkop_cls_code=None) — "직전: ... 해제됨"이
-    # 아니라 "감지기 갱신 시각"을 보여줘야 한다.
+    # 아니라 "관측 루프 갱신 시각"과 "최근 장운영정보 수신 시각"을 **나눠서** 보여줘야 한다
+    # (2026-07-31 §2-2: 07-30 설계는 둘을 한 값에 섞어 표시했다).
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 7, 31, 9, 6, 0))
     monkeypatch.setattr(
         "mahdi.dashboard.data_source.db.latest_market_halt_state",
         lambda conn: {
             "updated_at": datetime(2026, 7, 31, 9, 5, 0), "is_halted": False,
             "mkop_cls_code": None, "label": "정상", "halted_since": None,
+            "last_message_at": datetime(2026, 7, 31, 9, 0, 5),
         },
     )
     check = _market_halt_check(object())
     assert check.status == "ok"
     assert "발동 이력 없음" in check.detail
-    assert "09:05:00" in check.detail
+    assert "09:05:00" in check.detail  # 관측 루프 하트비트
+    assert "09:00:05" in check.detail  # 최근 장운영정보 수신
+
+
+def test_market_halt_check_handles_tz_aware_timestamps_from_postgres(monkeypatch):
+    # 2026-07-31 라이브 왕복에서 잡은 결함(단위테스트로는 절대 못 잡는 유형): psycopg는 TIMESTAMPTZ
+    # 컬럼을 tz-aware로 돌려주는데 db.local_now()는 naive라, 그대로 빼면 TypeError로 헬스체크
+    # 전체가 죽는다. 2026-07-20 `_freshness_check`에서 겪은 것과 정확히 같은 유형이다.
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 7, 31, 15, 44, 0))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 31, 15, 43, 0, tzinfo=timezone.utc), "is_halted": False,
+            "mkop_cls_code": None, "label": "정상", "halted_since": None,
+            "last_message_at": datetime(2026, 7, 31, 9, 0, 5, tzinfo=timezone.utc),
+        },
+    )
+    check = _market_halt_check(object())
+    assert check.status == "ok"
+    assert "15:43:00" in check.detail
+
+
+def test_market_halt_check_warns_when_heartbeat_is_stale(monkeypatch):
+    # 핵심 회귀 방지(§2-2): 이제 updated_at은 메시지와 무관한 독립 하트비트(300초)가 갱신하므로,
+    # 오래됐다는 건 **관측 루프가 멈췄다**는 뜻이다. 07-30 설계에서는 정상일에도 6시간 45분씩
+    # 묵어 있어 이 임계를 걸 수 없었다.
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 7, 31, 15, 0, 0))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 31, 9, 0, 5), "is_halted": False,
+            "mkop_cls_code": None, "label": "정상", "halted_since": None,
+            "last_message_at": datetime(2026, 7, 31, 9, 0, 5),
+        },
+    )
+    check = _market_halt_check(object())
+    assert check.status == "warning"
+    assert "하트비트" in check.detail
+
+
+def test_market_halt_check_does_not_warn_on_long_message_silence(monkeypatch):
+    # 반대 방향 회귀 방지: last_message_at은 정상일에도 수 시간 비어 있는 게 정상이므로
+    # (07-31 실측: 09:00 이후 6시간 45분 무수신) 여기에 임계를 걸면 상시 오경보가 된다.
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 7, 31, 15, 44, 0))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 7, 31, 15, 43, 0), "is_halted": False,
+            "mkop_cls_code": None, "label": "정상", "halted_since": None,
+            "last_message_at": datetime(2026, 7, 31, 9, 0, 5),
+        },
+    )
+    check = _market_halt_check(object())
+    assert check.status == "ok"
 
 
 def test_market_halt_check_warns_when_currently_halted(monkeypatch):
@@ -889,11 +945,13 @@ def test_market_halt_check_warns_when_currently_halted(monkeypatch):
 
 
 def test_market_halt_check_ok_when_resumed(monkeypatch):
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 7, 29, 9, 26, 0))
     monkeypatch.setattr(
         "mahdi.dashboard.data_source.db.latest_market_halt_state",
         lambda conn: {
             "updated_at": datetime(2026, 7, 29, 9, 25, 0), "is_halted": False,
             "mkop_cls_code": "175", "label": "서킷브레이크 해제", "halted_since": None,
+            "last_message_at": datetime(2026, 7, 29, 9, 25, 0),
         },
     )
     check = _market_halt_check(object())

@@ -1,6 +1,6 @@
 import asyncio
+import itertools
 import logging
-import math
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -884,6 +884,16 @@ class _FakeLoop:
         return next(self._times)
 
 
+# 위상 0초·주기 60초 격자 위에 정확히 앉은 시각(초=0). 2026-07-31 §4 우선순위 5로 폴러 스케줄이
+# 벽시계 격자에 앵커되면서, 고정 틱 테스트는 이벤트 루프 시계(_FakeLoop)뿐 아니라 **벽시계도**
+# 고정해야 결정론적이 된다 — 그러지 않으면 실행 시각에 따라 첫 대기가 0~60초로 흔들린다.
+_GRID_ALIGNED_NOW = datetime(2026, 7, 31, 10, 30, 0)
+
+
+def _pin_wall_clock(monkeypatch, now: datetime = _GRID_ALIGNED_NOW) -> None:
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: now)
+
+
 def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeypatch):
     # 2026-07-09: "작업 후 interval만큼 sleep"이면 사이클 소요시간만큼 실제 주기가 매번 밀려
     # poll_time(분 단위)이 분 경계를 건너뛰는 유실이 발생했다 — 절대시각 고정 틱(next_tick)으로
@@ -898,6 +908,7 @@ def test_poll_option_chain_uses_fixed_tick_schedule_not_sleep_after_work(monkeyp
     monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: None)
     monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
 
+    _pin_wall_clock(monkeypatch)
     # 1번째 사이클 종료 시각=1000.0 -> next_tick=1000+60=1060(정상 60초 대기 예상).
     # 2번째 사이클 종료 시각=1200.0(가상으로 사이클이 오래 걸려 예정 틱 1120을 80초 지나침)
     # -> 2026-07-30(운영점검 §4 Fix#3)부터는 현재 시각으로 재기준(delay=0)하지 않고 **원래 위상
@@ -950,6 +961,7 @@ def test_poll_option_chain_records_rate_limiter_status_each_cycle(monkeypatch):
     )
     monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
 
+    _pin_wall_clock(monkeypatch)
     # 1번째 사이클 종료 시각=1000.0 -> next_tick=1000+60=1060, 정상 60초 대기(overrun=0).
     # 2번째 사이클 종료 시각=1200.0 -> next_tick=1060+60=1120을 이미 지나쳐 80초 밀림.
     fake_loop = _FakeLoop([1000.0, 1200.0])
@@ -1468,58 +1480,6 @@ def test_poll_investor_flow_retries_once_when_all_segments_fail(monkeypatch):
     assert 5.0 in sleep_calls  # 재시도 backoff가 실제로 대기했다
 
 
-def test_poll_investor_flow_waits_startup_offset_before_first_cycle(monkeypatch):
-    # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사 후속): poll_investor_flow는
-    # poll_option_chain과 동일하게 60초 주기라, poll_expiry_liquidity(2026-07-09)와 달리
-    # 오프셋이 없어 매 사이클 공유 _RateLimiter에서 계속 겹쳤다 — 라이브 계측(타폴러동시호출
-    # 추정)으로 이게 정상 상태 기준선 콜 3건 오염의 주범임을 확인해 동일한 오프셋 패턴을
-    # 적용한다. 최초 사이클 진입 전에 정확히 한 번, startup_offset_seconds만큼 대기하는지 검증.
-    rest_client = _FakeInvestorFlowRestClient({})
-
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleep_calls.append(seconds)
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_investor_flow(rest_client, interval_seconds=1, startup_offset_seconds=15.0))
-
-    assert sleep_calls == [15.0]
-    assert rest_client.calls == []  # 오프셋 대기 중이라 아직 사이클에 진입하지 않음
-
-
-def test_poll_investor_flow_default_offset_is_zero_and_skips_wait(monkeypatch):
-    # startup_offset_seconds 기본값(0.0)일 때는 기존 동작(오프셋 없이 바로 사이클 진입)을 그대로
-    # 유지해야 한다 — main() 밖 호출부(테스트 등)의 하위호환 보장.
-    rest_client = _FakeInvestorFlowRestClient(
-        {
-            "F001": _investor_flow_response(-100.0, 200.0, -50.0),
-            "OC01": _investor_flow_response(-30.0, 40.0, -5.0),
-            "OP01": _investor_flow_response(-20.0, 10.0, 15.0),
-        }
-    )
-
-    @contextmanager
-    def fake_get_connection(settings=None):
-        yield object()
-
-    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
-    monkeypatch.setattr("mahdi.main.db.insert_investor_flow", lambda *a, **k: None)
-
-    async def fake_sleep(seconds):
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_investor_flow(rest_client, interval_seconds=1))
-
-    assert len(rest_client.calls) == 3  # 오프셋 없이 바로 사이클에 진입해 3세그먼트 전부 시도됨
-
-
 def test_run_observation_loop_computes_vpin_for_futures_symbol(monkeypatch):
     # VPIN은 옵션이 아니라 선물(기초자산)에만 적용한다(2026-07-06 결정) — 등거래량 버킷 2개가
     # 닫힌 뒤 선물 1분봉이 flush될 때 market_raw_1m.vpin에 실제 계산값이 실리는지 확인.
@@ -1728,7 +1688,9 @@ class _FakeRestClientForLiquidity:
         return self._asking_resp
 
 
-def test_poll_expiry_liquidity_aggregates_one_row_per_book(monkeypatch):
+def test_poll_expiry_liquidity_aggregates_one_row_per_book_across_its_slots(monkeypatch):
+    # 2026-07-31(§4 우선순위 1): 3북 33콜을 한 사이클에 몰아 쏘던 것을 **북 하나씩 홀수분 슬롯**으로
+    # 흩었다. 그래서 "한 사이클에 북 전부"가 아니라 "10분 창을 돌면 북마다 정확히 1행"이 계약이다.
     rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
     written_rows: list[dict] = []
 
@@ -1750,8 +1712,11 @@ def test_poll_expiry_liquidity_aggregates_one_row_per_book(monkeypatch):
         (_FakeSubscriptionManagerForLiquidity(strikes), "weekly"),
     ]
 
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+    # 두 북의 슬롯 분(minute % 10 == 1, 3)에서 각각 한 사이클씩 돌린다.
+    for slot_minute in mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES[: len(books)]:
+        _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 10, 20 + slot_minute, 0))
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
 
     assert len(written_rows) == 2  # 북(regular, weekly)당 1행
     series_seen = {row["series"] for row in written_rows}
@@ -1765,6 +1730,63 @@ def test_poll_expiry_liquidity_aggregates_one_row_per_book(monkeypatch):
     # 만기 확인용 get_quote는 북당 1건만 호출돼야 함(ATM 앵커 1건, 레그마다 반복 호출 아님)
     assert len(rest_client.quote_calls) == 2
     assert len(rest_client.asking_calls) == 5 * 2 * 2  # 2북 x ATM±2(5) x (C,P)
+
+
+def test_poll_expiry_liquidity_does_nothing_outside_its_book_slots(monkeypatch):
+    # 핵심 회귀 방지(§2-1 원인 a): 슬롯이 아닌 분에는 REST를 단 한 건도 쏘지 않아야 하고,
+    # "구독 없음 → 2초 재확인" 경로로 새서 위상 격자를 리셋해서도 안 된다.
+    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: None)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0})
+    books = [(_FakeSubscriptionManagerForLiquidity(strikes), "regular")]
+
+    _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 10, 22, 0))  # minute % 10 == 2 → 슬롯 아님
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=60))
+
+    assert rest_client.quote_calls == []
+    assert rest_client.asking_calls == []
+    assert sleep_calls != [2.0]  # 워밍업 재확인 경로가 아니라 정상 스케줄 대기여야 한다
+
+
+def test_expiry_liquidity_slots_assign_exactly_one_book_per_minute_and_cover_all_books():
+    # 슬롯 튜플과 북 목록이 어긋나면(북 추가 시 슬롯을 안 늘리면) 그 북은 영영 조회되지 않는다.
+    books = [(object(), "regular"), (object(), "weekly_mon"), (object(), "weekly_thu")]
+    assert len(mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES) >= len(books), (
+        "북이 슬롯보다 많다 — 초과분은 영영 조회되지 않는다"
+    )
+    assert len(set(mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES)) == len(
+        mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES
+    ), "두 북이 같은 분에 배정됐다 — 버스트를 나눈 의미가 없다"
+
+    seen: list[str] = []
+    for minute in range(mahdi_main.EXPIRY_LIQUIDITY_WINDOW_MINUTES):
+        due = mahdi_main._expiry_liquidity_books_due(books, datetime(2026, 7, 31, 10, minute, 0))
+        assert len(due) <= 1, f"minute={minute}에 북 2개 이상이 동시에 발사된다: {due}"
+        seen.extend(series for _manager, series in due)
+    assert seen == ["regular", "weekly_mon", "weekly_thu"]  # 10분 창 한 바퀴에 북마다 정확히 1회
+
+
+def test_expiry_liquidity_slots_are_all_odd_minutes():
+    # 짝수분은 옵션체인이 3북 30레그를 쓰고(공칭 0~30초), 홀수분은 먼슬리 10레그(0~10초)뿐이라
+    # 47초가 빈다 — 축소안 (a)가 만든 그 여유에 이 폴러를 넣는 것이 §4 우선순위 1의 핵심이다.
+    for slot in mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES:
+        assert slot % 2 == 1, f"슬롯 {slot}분이 짝수 — 옵션체인 30레그 사이클과 겹친다"
 
 
 def test_poll_expiry_liquidity_skips_book_with_no_strikes(monkeypatch):
@@ -1786,6 +1808,7 @@ def test_poll_expiry_liquidity_skips_book_with_no_strikes(monkeypatch):
 
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
+    _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 10, 21, 0))  # minute % 10 == 1 → "regular" 슬롯
     books = [(_FakeSubscriptionManagerForLiquidity(frozenset()), "regular")]
 
     with pytest.raises(RuntimeError, match="stop-loop"):
@@ -1826,8 +1849,11 @@ def test_poll_expiry_liquidity_skips_bad_book_and_continues_after_db_error(monke
         (_FakeSubscriptionManagerForLiquidity(strikes), "weekly"),
     ]
 
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
+    # 2026-07-31: 북마다 슬롯이 다른 분이므로 "첫 북 실패 → 둘째 북 정상"은 두 사이클에 걸쳐 일어난다.
+    for slot_minute in mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES[: len(books)]:
+        _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 10, 20 + slot_minute, 0))
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
 
     assert call_count["n"] == 2  # 북 2개 각각 1행씩 시도됨
     assert len(written_rows) == 1  # 첫 북만 실패, 둘째 북은 정상 적재됨(루프가 안 죽음)
@@ -1868,6 +1894,7 @@ def test_poll_expiry_liquidity_leg_fetch_failure_logs_kis_response_body_and_is_t
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
     strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0})  # ATM±2, 5개 행사가
+    _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 10, 21, 0))  # minute % 10 == 1 → "regular" 슬롯
     books = [(_FakeSubscriptionManagerForLiquidity(strikes), "regular")]
 
     with caplog.at_level(logging.WARNING, logger="mahdi.main"):
@@ -1919,6 +1946,7 @@ def test_poll_expiry_liquidity_anchor_fetch_failure_is_logged_with_response_body
     monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
 
     strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0})
+    _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 10, 21, 0))  # minute % 10 == 1 → "regular" 슬롯
     books = [(_FakeSubscriptionManagerForLiquidity(strikes), "regular")]
 
     with caplog.at_level(logging.WARNING, logger="mahdi.main"):
@@ -1931,69 +1959,6 @@ def test_poll_expiry_liquidity_anchor_fetch_failure_is_logged_with_response_body
     failure_records = [r for r in caplog.records if "만기 유동성 만기확인 조회 실패" in r.getMessage()]
     assert len(failure_records) == 1
     assert "EGW00201" in failure_records[0].getMessage()
-
-
-def test_poll_expiry_liquidity_waits_startup_offset_before_first_cycle(monkeypatch):
-    # 2026-07-09: poll_option_chain과 동시에 기동하면 두 폴러의 정규 사이클이 같은 순간에 겹쳐
-    # 공유 레이트리미터 큐가 길어지는 것을 완화하기 위해 최초 사이클을 startup_offset_seconds만큼
-    # 지연시킨다 — 지연이 정확히 한 번, 사이클 진입보다 먼저 일어나는지 검증한다.
-    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
-
-    @contextmanager
-    def fake_get_connection(settings=None):
-        yield object()
-
-    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
-    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: None)
-
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleep_calls.append(seconds)
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-
-    books = [(_FakeSubscriptionManagerForLiquidity(frozenset()), "regular")]
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(
-            poll_expiry_liquidity(
-                rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1, startup_offset_seconds=30.0
-            )
-        )
-
-    # 오프셋 대기가 먼저 일어나고(30.0), 그 뒤에야 사이클 진입 -> 구독 행사가 없어 2초 재확인 경로.
-    # fake_sleep이 첫 호출에서 바로 예외를 던지므로 오프셋 대기만 기록되고 루프에 도달하지 못한다.
-    assert sleep_calls == [30.0]
-
-
-def test_poll_expiry_liquidity_default_offset_is_zero_and_skips_wait(monkeypatch):
-    # startup_offset_seconds 기본값(main.py 시그니처 기준 0.0)일 때는 기존 동작(오프셋 없이 바로
-    # 사이클 진입)을 그대로 유지해야 한다 — main() 밖 호출부(테스트 등)의 하위호환 보장.
-    rest_client = _FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE)
-
-    @contextmanager
-    def fake_get_connection(settings=None):
-        yield object()
-
-    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
-    monkeypatch.setattr("mahdi.main.db.insert_expiry_liquidity_1m", lambda conn, row: None)
-
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleep_calls.append(seconds)
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-
-    books = [(_FakeSubscriptionManagerForLiquidity(frozenset()), "regular")]
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_expiry_liquidity(rest_client, books, _FakeMasterForLiquidity(), interval_seconds=1))
-
-    assert sleep_calls == [2.0]  # 오프셋 없이 바로 "구독 없음 -> 2초 재확인" 경로
 
 
 def test_parse_overseas_future_last_price_strips_padding():
@@ -2076,63 +2041,6 @@ def _fallback_stub(zn=None, es=None, move=None):
         return responses.get(symbol)
 
     return _fetch
-
-
-def test_poll_macro_snapshot_waits_startup_offset_before_first_cycle(monkeypatch):
-    # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사 후속): poll_macro_snapshot(300초
-    # 주기)도 poll_expiry_liquidity(2026-07-09)와 동일하게 오프셋 없이는 5분마다
-    # poll_option_chain과 같은 순간에 겹친다 — 라이브 계측(타폴러동시호출추정)으로 실제 영향을
-    # 확인해 동일한 오프셋 패턴을 적용한다. 최초 사이클 진입 전에 정확히 한 번,
-    # startup_offset_seconds만큼 대기하는지 검증.
-    master = _FakeOverseasFutureMaster({})
-    rest_client = _FakeOverseasRestClient(future_prices={})
-
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleep_calls.append(seconds)
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1, startup_offset_seconds=45.0))
-
-    assert sleep_calls == [45.0]
-    assert rest_client.future_calls == []  # 오프셋 대기 중이라 아직 사이클에 진입하지 않음
-
-
-def test_poll_macro_snapshot_default_offset_is_zero_and_skips_wait(monkeypatch):
-    # startup_offset_seconds 기본값(0.0)일 때는 기존 동작(오프셋 없이 바로 사이클 진입)을 그대로
-    # 유지해야 한다 — main() 밖 호출부(테스트 등)의 하위호환 보장.
-    master = _FakeOverseasFutureMaster({"VX": ("VXN26", "VXQ26"), "CNH": ("CNHN26", "CNHU26")})
-    rest_client = _FakeOverseasRestClient(
-        future_prices={
-            "VXN26": _future_price_response(17.50),
-            "VXQ26": _future_price_response(17.80),
-            "CNHN26": _future_price_response(6.7803),
-        },
-        daily_chart=_daily_chart_response(4.54),
-    )
-
-    @contextmanager
-    def fake_get_connection(settings=None):
-        yield object()
-
-    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
-    monkeypatch.setattr("mahdi.main.db.insert_macro_snapshot_5m", lambda conn, row: None)
-    monkeypatch.setattr("mahdi.main.yfinance_fallback.fetch_last_close", _fallback_stub())
-
-    async def fake_sleep(seconds):
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_macro_snapshot(rest_client, master, interval_seconds=1))
-
-    # 오프셋 없이 바로 사이클에 진입했다는 뜻 — VX/CNH 선물 호출이 시도됨
-    assert set(rest_client.future_calls) == {"VXN26", "VXQ26", "CNHN26"}
 
 
 def test_poll_macro_snapshot_computes_term_structure_and_writes_row(monkeypatch):
@@ -3160,22 +3068,6 @@ def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeyp
     assert risk_gate_state["direction"] > 0
 
 
-def test_poll_signal_fusion_cycle_waits_startup_offset_before_first_cycle(monkeypatch):
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleep_calls.append(seconds)
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-    regime_state_machine = _FakeRegimeStateMachineWithLastState(None)
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_signal_fusion_cycle(regime_state_machine, interval_seconds=1, startup_offset_seconds=10.0))
-
-    assert sleep_calls == [10.0]
-
-
 def test_poll_signal_fusion_cycle_continues_after_cycle_failure(monkeypatch):
     @contextmanager
     def fake_get_connection(settings=None):
@@ -3428,23 +3320,6 @@ def test_poll_account_balance_cycle_records_snapshot_each_cycle(monkeypatch):
     assert rest_client.calls == 2
 
 
-def test_poll_account_balance_cycle_waits_startup_offset(monkeypatch):
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds):
-        sleep_calls.append(seconds)
-        raise RuntimeError("stop-loop")
-
-    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
-    rest_client = _FakeBalanceRestClient(_SAMPLE_BALANCE_RESPONSE)
-
-    with pytest.raises(RuntimeError, match="stop-loop"):
-        _run(poll_account_balance_cycle(rest_client, interval_seconds=1, startup_offset_seconds=20.0))
-
-    assert sleep_calls == [20.0]
-    assert rest_client.calls == 0
-
-
 def test_poll_account_balance_cycle_continues_after_failure(monkeypatch):
     class _FailingRestClient:
         def get_balance(self):
@@ -3468,8 +3343,123 @@ def test_poll_account_balance_cycle_continues_after_failure(monkeypatch):
 
 
 def test_advance_fixed_tick_first_cycle_schedules_one_full_interval():
-    next_tick, delay, overrun = _advance_fixed_tick(None, 60.0, 1000.0)
+    # 2026-07-31 §4 우선순위 5: 첫 틱은 "지금 + 주기"가 아니라 **벽시계 격자의 다음 지점**이다.
+    # 정확히 격자 위(09:00:00, 위상 0초·주기 60초)면 이중 실행을 피해 한 주기 뒤를 잡는다.
+    next_tick, delay, overrun = _advance_fixed_tick(
+        None, 60.0, 1000.0, 0.0, wall_now=datetime(2026, 7, 31, 9, 0, 0)
+    )
     assert (next_tick, delay, overrun) == (1060.0, 60.0, 0.0)
+
+
+def test_advance_fixed_tick_first_cycle_anchors_to_wall_clock_grid_not_now():
+    # 09:00:20에 첫 사이클이 끝났으면 다음 틱은 "지금+60초"(09:01:20)가 아니라 격자 위의 09:01:00.
+    # 이 성질이 없으면 구독 워밍업으로 next_tick이 리셋될 때마다 위상이 임의로 옮겨간다
+    # (2026-07-31 §2-3에서 실측된 설계 오프셋 35/155/275초 → 실측 95/198/305초의 원인).
+    next_tick, delay, overrun = _advance_fixed_tick(
+        None, 60.0, 1000.0, 0.0, wall_now=datetime(2026, 7, 31, 9, 0, 20)
+    )
+    assert (next_tick, delay, overrun) == (1040.0, 40.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    "wall, interval, phase, expected",
+    [
+        # 위상 15초·주기 60초 → 격자는 매 분 15초
+        (datetime(2026, 7, 31, 9, 0, 0), 60.0, 15.0, 15.0),
+        (datetime(2026, 7, 31, 9, 0, 20), 60.0, 15.0, 55.0),
+        # 매크로: 위상 168초(2분 48초)·주기 300초 → 09:02:48, 09:07:48, ...
+        (datetime(2026, 7, 31, 9, 0, 0), 300.0, 168.0, 168.0),
+        (datetime(2026, 7, 31, 9, 2, 48), 300.0, 168.0, 300.0),
+        (datetime(2026, 7, 31, 9, 3, 48), 300.0, 168.0, 240.0),
+        # 계좌잔고: 위상 288초(4분 48초)·주기 300초 → 09:04:48, 09:09:48, ...
+        (datetime(2026, 7, 31, 9, 5, 0), 300.0, 288.0, 288.0),
+    ],
+)
+def test_seconds_until_next_wall_tick_is_anchored_to_midnight(wall, interval, phase, expected):
+    assert mahdi_main._seconds_until_next_wall_tick(interval, phase, wall) == pytest.approx(expected)
+
+
+def test_seconds_until_next_wall_tick_is_always_positive_and_within_one_interval():
+    # 어떤 시각에서 출발하든 (0, interval] 안에 들어와야 한다 — 0이면 방금 끝난 사이클과 같은 분에
+    # 곧바로 한 번 더 도는 이중 실행이 되고, interval을 넘으면 격자를 건너뛴다.
+    for second in range(0, 3600, 7):
+        wall = datetime(2026, 7, 31, 9, 0, 0) + timedelta(seconds=second)
+        for interval, phase in ((60.0, 0.0), (60.0, 15.0), (300.0, 168.0), (300.0, 288.0)):
+            wait = mahdi_main._seconds_until_next_wall_tick(interval, phase, wall)
+            assert 0 < wait <= interval
+
+
+def _poller_for_wall_slot_test(name, rest_client_holder):
+    """벽시계 정렬 테스트용 폴러 팩토리 — 폴러마다 필요한 가짜 의존성이 달라 여기서 묶는다."""
+    strikes = frozenset({1330.0, 1332.5, 1335.0, 1337.5, 1340.0})
+    if name == "option_chain":
+        rest_client_holder.append(_FakeRestClientChain(_SAMPLE_OPTION_QUOTE))
+        return poll_option_chain(
+            rest_client_holder[0], [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+            _FakeMaster(), interval_seconds=60, phase_offset_seconds=0.0,
+        )
+    if name == "expiry_liquidity":
+        rest_client_holder.append(_FakeRestClientForLiquidity(_SAMPLE_OPTION_QUOTE, _SAMPLE_ASKING_PRICE))
+        return poll_expiry_liquidity(
+            rest_client_holder[0], [(_FakeSubscriptionManagerForLiquidity(strikes), "regular")],
+            _FakeMasterForLiquidity(), interval_seconds=60, phase_offset_seconds=15.0,
+        )
+    if name == "investor_flow":
+        rest_client_holder.append(_FakeInvestorFlowRestClient({}))
+        return poll_investor_flow(rest_client_holder[0], interval_seconds=60, phase_offset_seconds=40.0)
+    if name == "macro_snapshot":
+        rest_client_holder.append(_FakeOverseasRestClient(future_prices={}))
+        return poll_macro_snapshot(
+            rest_client_holder[0], _FakeOverseasFutureMaster({}),
+            interval_seconds=300, phase_offset_seconds=168.0,
+        )
+    if name == "account_balance":
+        rest_client_holder.append(_FakeBalanceRestClient(_SAMPLE_BALANCE_RESPONSE))
+        return poll_account_balance_cycle(
+            rest_client_holder[0], interval_seconds=300, phase_offset_seconds=288.0
+        )
+    if name == "signal_fusion":
+        rest_client_holder.append(None)
+        return poll_signal_fusion_cycle(
+            _FakeRegimeStateMachineWithLastState(None), interval_seconds=60, phase_offset_seconds=10.0
+        )
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize(
+    "poller, interval, phase, expected_wait",
+    [
+        # 벽시계를 09:00:00으로 고정했을 때, 각 폴러가 자기 격자의 첫 지점까지 기다려야 하는 초.
+        ("option_chain", 60.0, 0.0, 60.0),  # 정확히 격자 위 → 이중 실행 회피로 한 주기 뒤
+        ("expiry_liquidity", 60.0, 15.0, 15.0),
+        ("investor_flow", 60.0, 40.0, 40.0),
+        ("macro_snapshot", 300.0, 168.0, 168.0),
+        ("account_balance", 300.0, 288.0, 288.0),
+        ("signal_fusion", 60.0, 10.0, 10.0),
+    ],
+)
+def test_every_poller_waits_for_its_wall_clock_slot_before_first_cycle(
+    monkeypatch, wall_tick_alignment_enabled, poller, interval, phase, expected_wait
+):
+    # 2026-07-31(§2-3/§4 우선순위 5): 종전 `sleep(startup_offset_seconds)`는 격자 원점을 **기동
+    # 시각**에 못박아, 설계 오프셋 35/155/275초가 실측 95/198/305초로 어긋나 있었다(매일 다름).
+    # 이제 모든 폴러는 벽시계 자정 기준 격자의 첫 지점까지 기다린 뒤 첫 사이클에 들어간다.
+    # (이 테스트만 conftest의 정렬 무력화를 opt-out 한다 — `wall_tick_alignment_enabled` 픽스처)
+    _pin_wall_clock(monkeypatch, datetime(2026, 7, 31, 9, 0, 0))
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    holder: list = []
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(_poller_for_wall_slot_test(poller, holder))
+
+    assert sleep_calls == [expected_wait]  # 첫 대기가 곧 격자 정렬 대기 — 사이클 진입 전이다
 
 
 def test_advance_fixed_tick_normal_cycle_keeps_absolute_grid():
@@ -3680,20 +3670,29 @@ def test_run_observation_loop_records_market_halt_baseline_row_on_subscribe(monk
     assert label == "정상"
 
 
-def test_market_operation_heartbeat_updates_state_without_transition(monkeypatch):
-    # 차단 여부가 안 바뀌는 코드(정상 세션 전환/VI 등)에도 "방금 수신했다"는 사실은 남아야 한다.
-    # 하트비트 간격 기본값(300초)이면 첫 수신은 곧바로 기록된다(마지막 기록 시각 초기값 0.0).
+def test_market_operation_message_without_transition_only_touches_last_message_at(monkeypatch):
+    # 2026-07-31(§2-2/§4 우선순위 4): 차단 여부가 안 바뀌는 코드(정상 세션 전환/VI 등)는
+    # **상태 행을 건드리지 않고** "방금 수신했다"는 사실(last_message_at)만 남긴다 —
+    # updated_at은 이제 독립 하트비트(poll_market_halt_heartbeat)의 몫이라, 여기서 같이 갱신하면
+    # "감지기 생존"과 "메시지 수신"이 다시 한 값으로 뭉개진다.
+    seen_calls: list[datetime] = []
+    monkeypatch.setattr("mahdi.main.db.mark_market_halt_message_seen", lambda conn, at: seen_calls.append(at))
+
     halt_writes = _run_observation_loop_with_market_operation_messages(
         monkeypatch, [_make_h0unmko0("11", with_ws_envelope=True)]
     )
 
-    assert len(halt_writes) == 2  # 구독 직후 기준행 + 하트비트 1건
-    assert halt_writes[1] == (False, None, "정상")
+    assert len(halt_writes) == 1  # 구독 직후 기준행뿐 — 전이가 없으므로 상태 행 갱신 없음
+    assert len(seen_calls) == 1  # 수신 시각만 기록
 
 
-def test_market_operation_heartbeat_is_throttled_between_messages(monkeypatch):
-    # 매 수신마다 DB에 쓰면 안 된다 — 하트비트 간격 안에 연달아 온 메시지는 한 번만 기록한다.
-    halt_writes = _run_observation_loop_with_market_operation_messages(
+def test_market_operation_message_seen_write_is_throttled(monkeypatch):
+    # 매 수신마다 DB에 쓰면 안 된다 — 스로틀 창(MARKET_HALT_MESSAGE_TOUCH_SECONDS) 안에
+    # 연달아 온 메시지는 한 번만 기록한다.
+    seen_calls: list[datetime] = []
+    monkeypatch.setattr("mahdi.main.db.mark_market_halt_message_seen", lambda conn, at: seen_calls.append(at))
+
+    _run_observation_loop_with_market_operation_messages(
         monkeypatch,
         [
             _make_h0unmko0("11", with_ws_envelope=True),
@@ -3702,7 +3701,61 @@ def test_market_operation_heartbeat_is_throttled_between_messages(monkeypatch):
         ],
     )
 
-    assert len(halt_writes) == 2  # 기준행 1 + 하트비트 1(나머지 2건은 간격 미달로 생략)
+    assert len(seen_calls) == 1  # 나머지 2건은 스로틀 창 안이라 생략
+
+
+def test_market_halt_heartbeat_writes_state_without_any_message(monkeypatch):
+    # 핵심 회귀 방지(§2-2): H0UNMKO0은 세션 전이 시에만 온다(07-31 실측 하루 2건). 메시지가
+    # 한 건도 없어도 하트비트는 계속 돌아야 하며, 그 값이 "관측 루프가 살아있다"의 유일한 증거다.
+    writes: list[tuple] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr(
+        "mahdi.main.db.upsert_market_halt_state",
+        lambda conn, at, is_halted, code, label, since: writes.append((is_halted, code, label)),
+    )
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(mahdi_main.poll_market_halt_heartbeat(MarketHaltMonitor(), interval_seconds=300.0))
+
+    assert writes == [(False, None, "정상"), (False, None, "정상")]
+    assert sleep_calls == [300.0, 300.0]
+
+
+def test_market_halt_heartbeat_survives_db_failure(monkeypatch):
+    # 하트비트가 죽어도 CB 감지 자체(WS 핸들러)는 계속 동작해야 하므로, DB 실패는 삼키고 다음 주기로.
+    @contextmanager
+    def fake_get_connection(settings=None):
+        raise RuntimeError("DB 연결 실패")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(mahdi_main.poll_market_halt_heartbeat(MarketHaltMonitor(), interval_seconds=300.0))
+
+    assert sleep_calls == [300.0]  # 예외가 위로 새지 않고 다음 주기를 기다린다
 
 
 def test_market_operation_halt_transition_still_records_and_wins_over_heartbeat(monkeypatch):
@@ -3720,47 +3773,178 @@ def test_market_operation_halt_transition_still_records_and_wins_over_heartbeat(
     assert halt_writes[2] == (False, "175", "서킷브레이크 해제")
 
 
-# ===== 2026-07-30 운영점검 Fix#2: 5분 그룹 재스태거링 =====
+# ===== 2026-07-31 운영점검 §4 우선순위 2: 밀린 분 먼슬리 전용 캐치업 =====
 
 
-def test_five_minute_pollers_are_spread_across_the_window_not_clustered():
-    import mahdi.main as mahdi_main
+def _catchup_harness(monkeypatch, *, loop_times, overran_at, now_at, inserted):
+    """밀림 1회를 재현하는 공통 배선 — 반환값은 sleep 호출 목록."""
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
 
-    # 07-29 fix가 계좌잔고를 60초 그룹에서 빼냈지만 만기유동성(30초)·매크로(45초) 바로 옆
-    # (60초)에 놓아, 매 5분마다 REST 41건이 30초 폭에 몰렸다(07-30 실측: 분%5=3 구간만
-    # 타폴러동시호출 평균 22.9건).
-    # 2026-07-31: 축소안 (c)로 만기유동성 주기가 600초가 되어 세 폴러의 주기가 더 이상 같지
-    # 않다 — "오프셋 간 간격"만 보면 부족하고, **공통 주기(LCM) 안의 실제 발사 시각**을 전부
-    # 펼쳐서 겹치는지 확인해야 한다. 상수에서 직접 재계산하므로 앞으로 주기/오프셋을 어떻게
-    # 바꾸든 충돌이 생기면 이 테스트가 잡는다.
-    schedules = [
-        (mahdi_main.EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS, mahdi_main.EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS),
-        (mahdi_main.MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS, mahdi_main.MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS),
-        (mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS, mahdi_main.ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS),
-    ]
-    horizon = math.lcm(*(int(interval) for _offset, interval in schedules))
-    firings = sorted(
-        offset + interval * k
-        for offset, interval in schedules
-        for k in range(int(horizon // interval))
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_option_analysis_1m", lambda conn, row: inserted.append(row)
     )
-    assert len(firings) == len(set(firings)), f"두 폴러가 정확히 같은 시각에 발사된다: {firings}"
-    # 창 끝에서 다음 창 시작으로 넘어가는 구간(wrap)도 함께 본다.
-    gaps = [b - a for a, b in zip(firings, firings[1:])] + [firings[0] + horizon - firings[-1]]
-    assert min(gaps) >= 60.0, f"5/10분 폴러가 다시 뭉쳤다: 발사시각={firings}, 최소간격={min(gaps)}초"
+    monkeypatch.setattr("mahdi.main.db.insert_underlying_spot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.record_rate_limiter_status", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.append_rate_limiter_status_history", lambda *a, **k: None)
+
+    # db.local_now() 호출 순서: ①사이클1 poll_time ②사이클1 _advance_fixed_tick의 첫 틱 앵커
+    # ③사이클2(밀리는 사이클) poll_time ④캐치업의 "지금 몇 분인가" 판정 — ④부터 다음 분이다.
+    now_values = itertools.chain([overran_at] * 3, itertools.repeat(now_at))
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: next(now_values))
+    fake_loop = _FakeLoop(loop_times)  # 인스턴스 1개를 공유해야 시각 시퀀스가 소비된다
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:  # 사이클 1의 정상 대기는 통과시키고 밀린 사이클까지 돌린다
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    books = [
+        (_FakeSubscriptionManagerWithStrikes(), "regular"),
+        (_FakeSubscriptionManagerWithStrikes(), "weekly_mon"),
+    ]
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_option_chain(rest_client, books, _FakeMaster(), interval_seconds=60))
+    return sleep_calls
 
 
-def test_sixty_second_pollers_do_not_collide_with_five_minute_group_phase():
-    import mahdi.main as mahdi_main
+def test_option_chain_catches_up_the_skipped_minute_with_monthly_book_only(monkeypatch):
+    # 2026-07-30 Fix#3(위상 격자 스냅)은 위상 고착을 해결한 대신 **밀림 1회 = 결손 1분**을
+    # 확정시켰다(07-31 실측: 밀림 46건 → 결손 47분, 먼슬리 커버리지 95.0% → 90.5%).
+    # 격자를 되돌리지 않고, 다음 틱까지의 대기 시간 안에서 건너뛴 분을 먼슬리만으로 메운다.
+    inserted: list[dict] = []
+    # 1번째 사이클 종료 1000.0 → next_tick 1060 / 2번째 종료 1200.0 → 1120을 80초 지나쳐 밀림.
+    sleep_calls = _catchup_harness(
+        monkeypatch,
+        loop_times=[1000.0, 1200.0],
+        overran_at=datetime(2026, 7, 31, 10, 30, 0),
+        now_at=datetime(2026, 7, 31, 10, 31, 0),  # 밀린 사이에 벽시계는 다음 분으로 넘어갔다
+        inserted=inserted,
+    )
 
-    # 60초 그룹(옵션체인 0초 + 투자자수급 15초)은 매 분 t=0~30초 구간을 쓴다 —
-    # 5분 폴러들은 그 뒤(35초 이후)에 놓여야 한다.
-    for offset in (
-        mahdi_main.EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS,
-        mahdi_main.MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS,
-        mahdi_main.ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS,
-    ):
-        assert offset % 60.0 >= 30.0, f"오프셋 {offset}이 옵션체인 수집 구간(t=0~30초)과 겹친다"
+    catchup_rows = [row for row in inserted if row["timestamp"] == datetime(2026, 7, 31, 10, 31, 0)]
+    assert catchup_rows, "건너뛴 분이 회수되지 않았다"
+    # 먼슬리 1북만 회수한다 — 위클리는 축소안 (a)가 이미 격분 해상도를 선택했으므로 일관.
+    assert {row["option_type"] for row in catchup_rows} == {"C", "P"}
+    assert len(catchup_rows) == len(_FakeSubscriptionManagerWithStrikes().desired_strikes) * 2
+    assert sleep_calls[-1] <= 40.0  # 회수에 쓴 시간만큼 남은 대기가 줄어든다
+
+
+def test_option_chain_does_not_catch_up_when_remaining_delay_is_too_short(monkeypatch):
+    # 회수 사이클까지 밀려 연쇄되는 것을 막는다 — 남은 대기가 임계 미만이면 시도하지 않는다.
+    inserted: list[dict] = []
+    # 2번째 종료 1175.0 → 1120을 55초 지나침 → 스냅 1180 → delay 5.0초(임계 25초 미만).
+    _catchup_harness(
+        monkeypatch,
+        loop_times=[1000.0, 1175.0],
+        overran_at=datetime(2026, 7, 31, 10, 30, 0),
+        now_at=datetime(2026, 7, 31, 10, 31, 0),
+        inserted=inserted,
+    )
+
+    assert not [row for row in inserted if row["timestamp"] == datetime(2026, 7, 31, 10, 31, 0)]
+
+
+def test_option_chain_does_not_catch_up_when_no_minute_was_actually_skipped(monkeypatch):
+    # 밀렸어도 벽시계 분이 그대로면(=실제로는 안 건너뛰었으면) 같은 분을 두 번 쓰지 않는다.
+    inserted: list[dict] = []
+    _catchup_harness(
+        monkeypatch,
+        loop_times=[1000.0, 1200.0],
+        overran_at=datetime(2026, 7, 31, 10, 30, 0),
+        now_at=datetime(2026, 7, 31, 10, 30, 0),  # 분이 안 바뀜
+        inserted=inserted,
+    )
+
+    assert len(inserted) == len([r for r in inserted if r["timestamp"] == datetime(2026, 7, 31, 10, 30, 0)])
+    # 회수분이 없으므로 30레그(짝수분 3북)와 10레그(홀수분)만 존재해야 한다 — 중복 적재 없음
+    assert all(row["timestamp"] == datetime(2026, 7, 31, 10, 30, 0) for row in inserted)
+
+
+# ===== 2026-07-31 운영점검 §4 우선순위 5: 폴러 "점유 구간" 충돌 검사 =====
+#
+# 종전 두 테스트(test_five_minute_pollers_are_spread.../test_sixty_second_pollers_do_not_collide...)는
+# 폴러를 **점(발사 시각)** 으로만 모델링했고, 그래서 07-31에 실제로 일어난 충돌을 못 잡았다:
+#   - 만기유동성은 30콜을 쏘느라 중앙 55.5초(최대 109초)를 점유하는데 그 길이를 아무도 모델링하지
+#     않았다 → 1:35에 시작해 2분대 옵션체인 사이클을 통째로 덮었다(밀림 17건).
+#   - `offset % 60 >= 30` 규칙의 전제("옵션체인은 매 분 t=0~30초를 쓴다")도 틀렸다 —
+#     짝수분 옵션체인은 실측 중앙 39.2초·p90 59.0초를 쓴다.
+# 그래서 점이 아니라 **구간**으로 바꾸고, 구간 길이를 상수(북 수·행사가 폭·기준 페이서 간격)에서
+# 직접 계산한다. 앞으로 행사가 폭이나 북 구성을 바꾸면 이 테스트가 따라온다.
+
+
+def _nominal_poller_occupancy(minute: int) -> list[tuple[str, float, float]]:
+    """이 분(0~9, minute % 10)에 발사되는 폴러들의 (이름, 시작초, 종료초) 목록.
+
+    점유 길이는 **백오프가 없을 때**(기준 페이서 1.0초/콜)의 공칭값이다 — 실측은 백오프 배율에
+    비례해 늘어나며, 그래서 총 REST 수요 예산(07-31 실측 43.6%)을 함께 관리해야 한다.
+    """
+    from mahdi.broker.rest_client import DEFAULT_MIN_REQUEST_INTERVAL_SECONDS as PACE
+
+    strikes_per_book = mahdi_main.STRIKES_EACH_SIDE * 2 + 1
+    legs_per_book = strikes_per_book * 2  # 콜/풋
+    weekly_books = len(mahdi_main.OPTION_CHAIN_SLOW_SERIES)
+    liquidity_legs = (mahdi_main.LIQUIDITY_ATM_EACH_SIDE * 2 + 1) * 2 + 1  # 호가 + 만기확인 앵커 1건
+
+    occupancy: list[tuple[str, float, float]] = []
+
+    def add(name: str, phase: float, calls: int) -> None:
+        start = phase % 60.0
+        occupancy.append((name, start, start + calls * PACE))
+
+    # 옵션체인: 매 분. 위클리 2북은 짝수분에만(축소안 (a)).
+    due_books = 1 + (weekly_books if minute % mahdi_main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == 0 else 0)
+    add("option_chain", mahdi_main.OPTION_CHAIN_PHASE_OFFSET_SECONDS, due_books * legs_per_book)
+    # 투자자수급: 매 분 3세그먼트(선물/콜/풋).
+    add("investor_flow", mahdi_main.INVESTOR_FLOW_PHASE_OFFSET_SECONDS, 3)
+    # 만기유동성: 북별 홀수분 슬롯에서 1북씩.
+    if minute in mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES:
+        add("expiry_liquidity", mahdi_main.EXPIRY_LIQUIDITY_PHASE_OFFSET_SECONDS, liquidity_legs)
+    # 매크로/계좌잔고: 300초 주기라 10분 창에서 두 번(minute, minute+5) 발사된다.
+    macro_minute = int(mahdi_main.MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS // 60)
+    if minute % 5 == macro_minute % 5:
+        # 최대 7콜(VIX 근월/차근월 + USDCNH + ZN + ES + US10Y + USDKRW) — 저빈도 항목이 다 겹치는 날.
+        add("macro_snapshot", mahdi_main.MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS, 7)
+    balance_minute = int(mahdi_main.ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS // 60)
+    if minute % 5 == balance_minute % 5:
+        add("account_balance", mahdi_main.ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS, 1)
+    return occupancy
+
+
+def test_poller_occupancy_windows_do_not_overlap():
+    # 공통 주기(LCM)는 10분 — 그 창의 모든 분에 대해 폴러 점유 구간이 겹치지 않아야 한다.
+    for minute in range(10):
+        windows = sorted(_nominal_poller_occupancy(minute), key=lambda w: w[1])
+        for (a_name, _a_start, a_end), (b_name, b_start, _b_end) in zip(windows, windows[1:]):
+            assert a_end <= b_start, (
+                f"minute%10={minute}: {a_name}({_a_start:.0f}~{a_end:.0f}초)와 "
+                f"{b_name}({b_start:.0f}초~)의 점유 구간이 겹친다"
+            )
+
+
+def test_poller_occupancy_fits_inside_the_minute():
+    # 마지막 폴러가 분 경계를 넘기면 다음 분 옵션체인(위상 0초)과 겹친다.
+    for minute in range(10):
+        windows = _nominal_poller_occupancy(minute)
+        last_end = max(end for _name, _start, end in windows)
+        assert last_end <= 60.0, f"minute%10={minute}: 점유가 {last_end:.0f}초로 분을 넘긴다"
+
+
+def test_expiry_liquidity_is_never_scheduled_on_option_chain_heavy_minutes():
+    # §4 우선순위 1의 핵심 계약: 만기유동성 슬롯은 옵션체인이 3북 전부를 도는 분과 겹치면 안 된다.
+    heavy_minutes = {
+        m for m in range(10) if m % mahdi_main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == 0
+    }
+    assert not (set(mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES) & heavy_minutes)
 
 
 # ===== 2026-07-31 총 REST 수요 축소안 (a): 위클리 2북 격분 폴링 =====

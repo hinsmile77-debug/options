@@ -1,6 +1,7 @@
 # CURRENT_STATE — 마흐디(options) 현재 개발 상태
 
-_최종 갱신: 2026-07-10_
+_최종 갱신: 2026-08-01 (그 전 갱신은 2026-07-10 — 아래 "2026-08-01 현재 스냅샷"이 그 사이
+3주치를 요약한다. 07-11 이후 내용은 이 문서 나머지 부분보다 이 절이 우선한다.)_
 
 ---
 
@@ -9,6 +10,65 @@ _최종 갱신: 2026-07-10_
 - Python: 3.12 (uv 관리 가상환경, `.python-version`)
 - DB: TimescaleDB(`mahdi_timescaledb`) + Redis(`mahdi_redis`), `docker-compose.yml`
 - KIS 계좌: 모의투자(VPS), `.env`에 앱키/시크릿/계좌번호 보관(gitignore, 커밋 안 됨)
+
+---
+
+## 2026-08-01 현재 스냅샷 (07-11 ~ 08-01 요약)
+
+### 실행 모드
+**ADVISORY 전용** — 판단은 매분 수행되고 `signal_decisions`/`risk_snapshots`에 기록되지만
+**실주문 경로는 배선돼 있지 않다**. `ExecutionEngine`은 구현만 돼 있고 관측 루프에 연결되지 않았다.
+
+### Phase 2 모듈 배선 상태
+
+| 모듈 | 구현 | 라이브 배선 | 비고 |
+|---|---|---|---|
+| `mahdi/risk/engine.py` (Core Engine 7) | ✅ | ✅ 조건부 | 진입 후보가 있을 때만 `evaluate_entry()` — 07-31 기준 호출 0회 |
+| `mahdi/risk/market_halt.py` (KRX CB 감지) | ✅ | ✅ | H0UNMKO0 구독 + 독립 하트비트(08-01) |
+| `mahdi/risk/circuit_breaker.py` | ✅ | ❌ | 일간 래치 설계라 매분 `evaluate()`를 **일부러 안 부른다** |
+| `mahdi/fusion/*` (Signal Fusion) | ✅ | ✅ | `poll_signal_fusion_cycle`, ADVISORY |
+| `mahdi/execution/*` (Execution Engine) | ✅ | ❌ | **재진입 방지 로직 부재** — 배선 전 선행 해결 필요 |
+| `mahdi/execution/account_tracker.py` | ✅ | ✅ | `poll_account_balance_cycle`(300초) |
+| `mahdi/backtest/*` | ✅ | ❌ | 오프라인 전용 |
+| `mahdi/engines/regime.py` (HMM) | ✅ | ⚠️ **폴백 중** | `data/models/regime_engine.pkl` 부재 → `warmup_fallback()` 자기참조. **19영업일 100% RANGE_BALANCED** |
+
+### 폴러 6개 — 주기·벽시계 위상 (2026-08-01 확정, `mahdi/main.py` "폴러 위상 계획" 주석 참고)
+
+| 폴러 | 주기 | 위상 | 발사 분(mod 10) | 콜/사이클 |
+|---|---|---|---|---|
+| `poll_option_chain` | 60초 | 0초 | 매 분 | 30(짝)/10(홀) — 위클리 2북은 격분만 |
+| `poll_expiry_liquidity` | 60초 확인 | 15초 | 1, 3, 5 (북별 1개) | 11 |
+| `poll_investor_flow` | 60초 | 40초 | 매 분 | 3 |
+| `poll_macro_snapshot` | 300초 | 168초(2:48) | 2, 7 | ≤7(항목별 주기 분리) |
+| `poll_account_balance_cycle` | 300초 | 288초(4:48) | 4, 9 | 1 |
+| `poll_signal_fusion_cycle` | 60초 | 10초 | 매 분 | 0 (DB만) |
+| `poll_market_halt_heartbeat` | 300초 | — | — | 0 (DB만) |
+
+- 위상은 **벽시계 자정 기준**이다(`_seconds_until_next_wall_tick`). 2026-07-31까지는 기동 시각
+  기준이라 매일 달라졌고, 그게 스태거링 설계가 실현되지 않던 원인이었다.
+- 밀렸을 때는 **원래 격자로 스냅**하고(`_advance_fixed_tick`), 건너뛴 분은 **먼슬리 10레그로 회수**한다.
+
+### 총 REST 수요 예산 (공유 `_RateLimiter` 1.0건/초 = 용량 100%)
+
+| | 07-30 | 07-31 실측 | 08-01 구현 반영 후(예상) |
+|---|---|---|---|
+| 총 호출/일 | 19,606 | **12,947** | ~13,400 |
+| 초당 수요 | 0.663 (66.3%) | **0.436 (43.6%)** | ~0.452 (45.2%) |
+| 적자 시작 백오프 배율 | 1.51배 | **2.28배** | ~2.21배 |
+
+**폴러를 추가할 때는 이 예산부터 확인할 것.** 목표는 50% 이하 유지.
+
+### 알려진 미해결 항목
+- **판단 무반응**: 레짐 1종류·확신도 1값·전략 1개(`wait_and_see`)로 19영업일째 고정.
+  해소 예정 — `rv_ratio` 2026-08-04경, HMM 학습 2026-08-10경.
+- **mod10=0 구간의 "호출 1건당 8~9초" 정체**(07-31 7건) — 원인 미규명, 08-01에 계측만 투입.
+- **Slack 알림 비활성**(`slack_alert_settings.enabled=false`, 07-28부터) — 사용자 결정 대기.
+- **COCKPIT 브라우저 육안 검증**이 07-06부터 이월 중(로그에는 기동 라인만 남는다).
+
+### 운영 점검 리듬
+매 거래일 종료 후 `docs/동작점검/YYYY-MM-DD_마흐디_운영점검보고서.md` 작성.
+**구현 시점에 "가설 → 예측치 → 판정 기준"을 `NEXT_TODO`에 남기고 다음 보고서 §2-0에서 대조**하는
+방식이 07-31에 처음 작동했다(예측 0.438건/초 vs 실측 0.436 — 오차 0.5%).
 
 ---
 

@@ -93,6 +93,9 @@ MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS = 300
 US10Y_LOOKBACK_DAYS = 10
 UNDERLYING = "KOSPI200"
 OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범위와 동일한 종목을 REST로 주기 조회
+# 옵션체인은 다른 폴러들이 비켜서는 기준점이라 벽시계 매 분 00초에 고정한다(2026-07-31 §2-3,
+# 상세는 MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS 위 "폴러 위상 계획" 표).
+OPTION_CHAIN_PHASE_OFFSET_SECONDS = 0.0
 
 # 2026-07-31(운영점검보고서 2026-07-30 §5-2 "총 REST 수요 축소안" (a), 사용자 승인) — 위클리 2북만
 # 격분(2분) 주기로 늦춘다.
@@ -124,6 +127,12 @@ OPTION_CHAIN_POLL_INTERVAL_SECONDS = 60  # WS 구독(ATM±STRIKES_EACH_SIDE) 범
 OPTION_CHAIN_SLOW_SERIES = frozenset({"weekly_mon", "weekly_thu"})
 OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
 
+# 2026-07-31(운영점검보고서 2026-07-31 §4 우선순위 2) — 밀림으로 건너뛴 분을 먼슬리 10레그로
+# 회수할지 결정하는 임계. 다음 격자 틱까지 남은 대기 시간이 이보다 짧으면 회수를 시도하지 않는다
+# (회수 사이클까지 밀려 연쇄되는 것을 막는다). 먼슬리 10콜 × 기준 1.0초에 백오프 여유를 더해
+# 잡았다 — 07-31 실측 밀림 46건 중 대기 25초 미만은 4건뿐이라 대부분 회수 가능하다.
+OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS = 25.0
+
 # 2026-07-29 신규 — 서킷브레이커/거래정지 감지(mahdi/risk/market_halt.py)용 H0UNMKO0(국내주식
 # 장운영정보) 구독 대상. CB/시장임시정지는 시장 전체 이벤트라 아무 종목이나 구독해도 그 순간의
 # MKOP_CLS_CODE로 시장 전체 상태를 알 수 있다 — KOSPI 최대형주(삼성전자)라 세션 상태 변화를
@@ -137,14 +146,30 @@ MARKET_HALT_REFERENCE_SYMBOL = "005930"
 # 조치는 둘: (1) 구독 직후 현재 상태("정상")를 한 번 upsert해 COCKPIT이 "데이터 없음"이 아니라
 # "정상"을 표시하게 하고, (2) 메시지를 실제로 받을 때마다 카운트해서 주기적으로 INFO 로그를
 # 남기고 최신 수신 시각을 DB에 반영한다(전이 시에만 알림/이력을 남기는 절제 원칙은 그대로).
-MARKET_HALT_HEARTBEAT_SECONDS = 300.0  # 전이가 없어도 이 간격마다 최신 수신 시각을 DB에 갱신
+#
+# 2026-07-31 실측으로 위 (2)의 설계 전제가 반증됐다(운영점검보고서 2026-07-31 §2-2). 하트비트를
+# **메시지 핸들러 안에** 두면 "메시지가 오지 않으면 하트비트도 멈춘다" — 그런데 H0UNMKO0은
+# 실제로 **세션 전이 시점에만** 발신된다(07-31 하루 총 2건: 08:00 장전세션, 09:00 정규장 개시).
+# 그 결과 `market_halt_status.updated_at`이 09:00:05에 멈춘 채 6시간 45분간 갱신되지 않았고,
+# 이는 "감지기가 죽었을 때"와 정확히 같은 모습이다 — 즉 생존 증명이 되지 못했다.
+#
+# 조치(§4 우선순위 4): **생존 신호를 감시 대상과 독립한 타이머에서 낸다.**
+#   - `poll_market_halt_heartbeat()`가 메시지 유무와 무관하게 300초마다 현재 상태를 upsert →
+#     `updated_at`은 이제 "관측 루프가 살아있다"를 뜻한다(임계 감시 가능).
+#   - 메시지를 실제로 받은 시각은 별도 컬럼 `last_message_at`에 남긴다(마이그레이션 018) →
+#     "감지기가 최근 무언가를 봤다"를 뜻하며, **정상일에도 6시간 공백이 정상**이므로 임계를 두지
+#     않는다(임계를 두면 그 자체가 상시 오경보다 — 07-31 실측이 근거).
+# 남는 한계(정직하게): "WS는 살아있는데 H0UNMKO0 구독만 조용히 끊긴 경우"는 KIS가 주기적
+# 하트비트를 주지 않는 이상 원리적으로 관측 불가다.
+MARKET_HALT_HEARTBEAT_SECONDS = 300.0  # 메시지와 무관하게 이 간격마다 현재 상태를 DB에 갱신
+MARKET_HALT_MESSAGE_TOUCH_SECONDS = 60.0  # 수신 시각(last_message_at) DB 갱신 스로틀
 MARKET_HALT_RECEIVE_LOG_EVERY = 20  # 수신 N건마다 INFO 1줄(첫 수신은 항상 남김)
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
 # 아니라 오프셋은 순전히 기동 로그 가독성을 위한 것.
 SIGNAL_FUSION_POLL_INTERVAL_SECONDS = 60.0
-SIGNAL_FUSION_STARTUP_OFFSET_SECONDS = 10.0
+SIGNAL_FUSION_PHASE_OFFSET_SECONDS = 10.0
 _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason VARCHAR(50)
 
 # 2026-07-28 8차 — 계좌 손익/포지션 상태 추적기 라이브 배선(get_balance() 실측 필드 매핑은
@@ -163,9 +188,10 @@ _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason
 # 2026-07-30(운영점검보고서 §2-1/§4 Fix#2): 위 07-29 조치의 "300초 그룹과 겹치지 않는 60초"는
 # 60초 그룹 기준으로는 맞았지만 300초 그룹 기준으로는 틀렸다 — 만기유동성(30초)·매크로(45초)와
 # 같은 5분 창의 첫 60초 안에 셋이 모여 41건 버스트를 만들었다. 60 → 275초로 옮겨 5분 창의
-# 끝자락(4분대)에 단독 배치한다(상세 근거는 MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS 주석).
+# 끝자락(4분대)에 단독 배치한다(상세 근거는 MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS 주석).
+# 2026-07-31(§4 우선순위 5): 275 → 288초(4분 48초 지점) — 아래 "폴러 위상 계획" 표 참고.
 ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS = 300.0
-ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS = 275.0
+ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS = 288.0
 
 # 2026-07-08 실측: 레이트리밋 버스트 등으로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
@@ -263,7 +289,32 @@ LIQUIDITY_ATM_EACH_SIDE = 2
 # **합계 0.663 → 약 0.456건/초(용량의 46%, 백오프 2.19배까지 여유)** 를 목표로 한다.
 # COCKPIT 신선도 배지(`_STALE_DATA_THRESHOLD_SECONDS`=300초)는 `option_analysis_1m`/선물만
 # 대상이라 이 변경으로 경고가 뜨지 않는다(확인함).
-EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 600
+#
+# 2026-07-31(운영점검보고서 2026-07-31 §2-1 원인 a / §4 우선순위 1) — **버스트 분할**.
+# 위 (c)안은 주기를 600초로 늦춰 호출 "총량"을 절반으로 줄였지만, 한 사이클이 여전히 33콜을
+# **한 번에** 쏘는 구조는 그대로였다. 07-31 하루치 실측으로 그 대가가 처음 계량됐다:
+#   버스트 50회 / 점유 시간 중앙 55.5초 · 평균 58.0초 · **최대 109.3초**
+#   시작 위치는 10분 창의 1분 35초(50회 중 47회) → 2분대 짝수분 옵션체인 사이클(0~39초 필요)을
+#   통째로 덮는다. 그 결과 시작분 mod10=2 구간만 창 안 만기유동성 호출 평균 13.4건 ·
+#   REST수집 53.0초 · 밀림 17건(전체 46건의 37%)으로 튀었다.
+# 즉 **총량이 아니라 버스트 형태가 남은 병목**이었다(총수요는 이미 용량의 43.6%로 여유가 있다).
+#
+# 조치: "600초마다 3북 33콜 일괄" → "**60초마다 확인하되 북 하나씩 홀수분 슬롯에서만 조회**".
+#   - 홀수분은 축소안 (a) 덕에 옵션체인이 먼슬리 10레그만 돌아 0~13초만 쓰고 **47초가 비어 있다**
+#     (07-31 실측 중앙값). 북 1개는 11콜(만기확인 1 + 호가 10) ≈ 13초라 그 안에 여유롭게 들어간다.
+#   - 총 호출량은 완전히 동일하다(33콜/10분). 바뀌는 것은 "한 번에 33콜"이 "세 번에 11콜씩"이 된 것뿐.
+#   - 북별 조회 시각이 1/3/5분으로 갈리지만 `db.latest_expiry_liquidity()`가 원래부터
+#     `DISTINCT ON (series) ORDER BY series, timestamp DESC`로 **북별 최신값**을 취하므로
+#     COCKPIT 표시에 영향이 없다(그 함수 docstring이 "북마다 조회 시각이 조금씩 어긋날 수 있어"라고
+#     이미 명시하고 있다).
+#   - 슬롯 판정을 벽시계 `poll_time.minute % 10`으로 하는 이유는 축소안 (a)와 동일하다 —
+#     재시작해도 위상이 같고 로그/DB만으로 검증할 수 있다.
+EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 60
+EXPIRY_LIQUIDITY_WINDOW_MINUTES = 10  # 한 바퀴(북 전체를 한 번씩)를 도는 논리 주기
+# books 순서(regular / weekly_mon / weekly_thu)대로 배정되는 `minute % 10` 슬롯 — 전부 홀수분이고
+# 서로 2분씩 떨어져 있다. 북이 늘어나면 이 튜플만 늘리면 되고, 길이가 모자라면 초과분은 조회되지
+# 않으므로 회귀 테스트(test_expiry_liquidity_slots_cover_every_book)가 이를 잡는다.
+EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES = (1, 3, 5)
 
 # 2026-07-09 실측: poll_option_chain(60초, ~28콜)과 poll_expiry_liquidity(300초, ~11콜)가 같은
 # 순간에 공유 _RateLimiter 큐에 들어가면 그 사이클만 대기시간이 늘어나 poll_option_chain의
@@ -273,7 +324,10 @@ EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS = 600
 # (근본 수정은 poll_option_chain/poll_investor_flow의 고정 틱 스케줄링, 이건 보조 완화).
 # 2026-07-30(운영점검보고서 §2-1/§4 Fix#2): 아래 "5분 그룹 재스태거링" 주석 참고 — 30.0 →
 # 35.0. 옵션체인이 매 분 t=0~30초 구간을 쓰므로(30콜×1.0초) 그 뒤로 5초 물린다.
-EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS = 35.0
+# 2026-07-31(§4 우선순위 5): 35 → 15초. 슬롯이 홀수분으로 옮겨가면서 그 분의 옵션체인은
+# 먼슬리 10레그(0~13초)뿐이라 15초부터 바로 시작해도 겹치지 않는다 — 오히려 늦게 시작하면
+# 투자자수급(40초)과 부딪힌다. 상세 배치는 아래 "폴러 위상 계획" 표 참고.
+EXPIRY_LIQUIDITY_PHASE_OFFSET_SECONDS = 15.0
 
 # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사, 스케줄 밀림 근본원인 확정 후속): 07-09에
 # poll_expiry_liquidity에만 오프셋을 준 뒤로 poll_investor_flow와 poll_macro_snapshot은 여전히
@@ -291,7 +345,9 @@ EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS = 35.0
 # (그 위험 때문에 애초에 단일 공유 리미터로 합쳤던 것, 위 2026-07-08 이력 참고) 이번엔 손대지
 # 않는다 — 위상 분산은 총 호출량이나 페이싱 정책을 바꾸지 않고 "언제 겹치는지"만 조정하는
 # 저위험 완화책이다.
-INVESTOR_FLOW_STARTUP_OFFSET_SECONDS = 15.0
+# 2026-07-31(§4 우선순위 5): 15 → 40초. 15초 자리는 만기유동성 슬롯이 가져갔고, 투자자수급은
+# 3콜(≈4초)뿐이라 **짝수분 옵션체인(0~30초 공칭)이 끝난 뒤**에 두는 것이 자연스럽다.
+INVESTOR_FLOW_PHASE_OFFSET_SECONDS = 40.0
 
 # 2026-07-30(운영점검보고서 §2-1/§4 Fix#2) — "5분 그룹 재스태거링".
 #
@@ -316,15 +372,108 @@ INVESTOR_FLOW_STARTUP_OFFSET_SECONDS = 15.0
 # 오프셋 값 자체는 바꾸지 않았다 — 주기만 늘어나 만기유동성 발사 횟수가 절반이 됐을 뿐이다.
 # (이 성질은 `test_five_minute_pollers_are_spread_across_the_window_not_clustered`가 상수에서
 #  직접 재계산해 검증하므로, 앞으로 주기/오프셋을 바꾸면 테스트가 충돌을 잡아준다.)
-MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS = 155.0
+#
+# ==========================================================================================
+# 2026-07-31(운영점검보고서 2026-07-31 §2-3 / §4 우선순위 5) — **폴러 위상 계획**
+#
+# 위 07-30 계산("0:35 / 2:35 / 4:35에 흩었다")은 **한 번도 그대로 실현된 적이 없었다.** 07-31
+# 하루치 로그에서 엔드포인트별 호출 시각을 역산한 결과:
+#   폴러        설계 오프셋   실측 벽시계 위상        차이
+#   투자자수급     15초        매 분 47~50초         +32초
+#   만기유동성     35초        10분 창의 1:35(=95초)  +60초
+#   매크로        155초       5분 창의 3:18~3:25     +43~50초
+#   계좌잔고      275초       5분 창의 0:05~0:08     +30초(랩)
+# 원인은 `*_STARTUP_OFFSET_SECONDS`가 이름 그대로 **프로세스 기동 시각 기준**이었다는 것이다 —
+# `await asyncio.sleep(offset)` 후 첫 사이클이 도는 시점을 `_advance_fixed_tick`이 격자 원점으로
+# 고정하므로, 기동 시각과 첫 사이클 소요시간에 따라 벽시계 위상이 **매일 달라진다**. 즉 §2-1(a)의
+# 만기유동성 충돌은 "오프셋 값이 나빴다"가 아니라 "오프셋 앵커가 없었다"는 문제였고, 값만 다시
+# 튜닝해봐야 내일 기동 시각이 몇 초 달라지면 또 다른 자리로 옮겨간다.
+#
+# 조치: 모든 폴러를 **벽시계 자정 기준 격자**(`phase_offset + k*interval`)에 앵커한다
+# (`_advance_fixed_tick` / `_seconds_until_next_wall_tick`). 이제 상수는 이름 그대로
+# "벽시계 위상"이고, 아래 표가 실제로 실현되는 배치다(공통 주기 LCM = 600초):
+#
+#   폴러          주기    위상            발사 분(mod 10)   콜수   공칭 점유(콜×1.0초)
+#   ------------  ------  --------------  ----------------  -----  -------------------
+#   옵션체인       60초    0초             매 분             30/10  0~30초(짝) / 0~10초(홀)
+#   만기유동성     60초    15초            1, 3, 5 (북별)    11     15~26초
+#   투자자수급     60초    40초            매 분             3      40~43초
+#   매크로        300초   168초(2:48)     2, 7              ≤7     48~55초
+#   계좌잔고      300초   288초(4:48)     4, 9              1      48~49초
+#   SignalFusion   60초    10초            매 분             0      (REST 없음)
+#
+# 겹치는 구간이 하나도 없고, 최소 간격은 30→40초(10초)와 43→48초(5초)다. 짝수분에 만기유동성을
+# 두지 않는 것이 이 배치의 핵심이다 — 짝수분은 옵션체인이 30레그를 쓰고, 홀수분은 10레그만 써서
+# 47초가 비기 때문이다(축소안 (a)가 만든 여유를 처음으로 실제로 활용한다).
+#
+# **공칭 점유는 백오프가 없을 때(페이서 1.0초/콜)의 값**이다. 실측 짝수분 옵션체인은 백오프
+# 1.3배가 걸려 39.2초를 썼다 — 즉 이 배치의 여유는 백오프 배율에 비례해 줄어들며, 그래서 총
+# REST 수요 예산(07-31 실측 43.6%)을 함께 관리해야 한다. 이 성질은
+# `test_poller_occupancy_windows_do_not_overlap`이 상수에서 직접 재계산해 검증한다.
+# ==========================================================================================
+MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS = 168.0
 
 
-def _advance_fixed_tick(next_tick: float | None, interval_seconds: float, loop_now: float) -> tuple[float, float, float]:
+def _seconds_until_next_wall_tick(
+    interval_seconds: float, phase_offset_seconds: float, wall_now: datetime
+) -> float:
     """
-    입력: 직전 예약 시각(첫 사이클이면 None), 폴링 주기, 현재 이벤트 루프 시각.
+    입력: 폴링 주기, 벽시계 위상(자정 기준 초), 현재 벽시계 시각.
+    계산: 자정 기준 격자 `phase_offset + k*interval` 위의 **다음 지점까지 남은 초**를 돌려준다.
+         반환값은 항상 (0, interval] 범위다 — 정확히 격자 위에 있으면 "지금"이 아니라 **한 주기
+         뒤**를 돌려준다. `_advance_fixed_tick`이 사이클 종료 직후 이 함수를 부르기 때문인데,
+         0을 돌려주면 방금 끝난 사이클과 같은 분에 곧바로 한 번 더 도는 이중 실행이 된다.
+    해석: 2026-07-31 §2-3 — 종전에는 폴러 위상이 프로세스 기동 시각에 앵커돼 매일 달라졌고,
+         그래서 스태거링 설계값(35/155/275초)이 실측(95/198/305초)과 어긋나 있었다. 벽시계
+         자정을 원점으로 삼으면 위상이 **기동 시각·재시작과 무관하게 항상 같다** — 설계 표
+         (MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS 위 "폴러 위상 계획")가 그대로 실현되고,
+         로그 타임스탬프만 보고도 "이 폴러가 제 자리에서 돌았는가"를 검증할 수 있다.
+    실패 조건: interval_seconds <= 0이면 격자를 정의할 수 없으므로 0.0(대기 없음).
+    """
+    if interval_seconds <= 0:
+        return 0.0
+    since_midnight = (
+        wall_now.hour * 3600 + wall_now.minute * 60 + wall_now.second + wall_now.microsecond / 1_000_000
+    )
+    elapsed_in_cycle = (since_midnight - phase_offset_seconds) % interval_seconds
+    if elapsed_in_cycle == 0:
+        return interval_seconds
+    return interval_seconds - elapsed_in_cycle
+
+
+async def _sleep_until_first_wall_tick(interval_seconds: float, phase_offset_seconds: float) -> None:
+    """
+    계산: 폴러 기동 직후 벽시계 격자의 첫 지점까지 대기한다.
+    해석: 종전 `await asyncio.sleep(startup_offset_seconds)`의 대체다. 그 방식은 (1) 콜드스타트
+         버스트를 막는 효과는 있었지만 (2) 격자 원점을 기동 시각에 못박아 벽시계 위상이 매일
+         달라지게 만든 원인이기도 했다(2026-07-31 §2-3). 여기서 격자에 맞춰 기다리면 두 목적이
+         한 번에 해결된다 — 폴러마다 위상이 다르므로 콜드스타트에도 서로 흩어지고, 첫 사이클부터
+         이미 설계 위상 위에 앉는다.
+         최대 대기 시간은 주기와 같다(옵션체인/만기유동성/투자자수급 ≤60초, 매크로/계좌잔고
+         ≤300초). 장중 수동 재시작 시 매크로가 최대 5분 늦게 시작할 수 있으나, 원래 5분봉이라
+         해상도 손실이 없다.
+    """
+    wait = _seconds_until_next_wall_tick(interval_seconds, phase_offset_seconds, db.local_now())
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+def _advance_fixed_tick(
+    next_tick: float | None,
+    interval_seconds: float,
+    loop_now: float,
+    phase_offset_seconds: float = 0.0,
+    wall_now: datetime | None = None,
+) -> tuple[float, float, float]:
+    """
+    입력: 직전 예약 시각(첫 사이클이면 None), 폴링 주기, 현재 이벤트 루프 시각, 벽시계 위상,
+         현재 벽시계 시각(주입 안 하면 `db.local_now()` — 테스트 이음새).
     계산: 다음 틱을 **원래 위상 격자 위에서만** 예약한다 — 사이클이 주기를 넘겨 예약 시각을
          이미 지나쳤으면, 지나친 틱들을 통째로 건너뛰되 격자에서 벗어나지 않도록 주기의 정수배만
-         더한다. 반환값은 (다음 예약 시각, 대기 시간, 밀린 시간).
+         더한다. 첫 틱(next_tick=None)은 `_seconds_until_next_wall_tick`으로 **벽시계 격자**에
+         앵커한다(2026-07-31 §2-3) — 종전에는 `loop_now + interval`이라 격자 원점이 "지금"이었고,
+         그래서 구독 워밍업으로 next_tick이 한 번 리셋될 때마다 위상이 임의로 옮겨갔다.
+         반환값은 (다음 예약 시각, 대기 시간, 밀린 시간).
     해석: 2026-07-30 운영점검 §2-1 원인(b). 종전에는 밀리면 `next_tick = loop_now`로 **현재 시각에
          위상을 다시 못박았다**. 이러면 한 번 밀릴 때마다 그 폴러의 위상이 조금씩 이동하고,
          이동한 자리가 5분 폴러 버스트 구간이면 계속 겹쳐 또 밀리는 식으로 위상이 끌려다닌다 —
@@ -338,7 +487,12 @@ def _advance_fixed_tick(next_tick: float | None, interval_seconds: float, loop_n
     실패 조건: interval_seconds <= 0이면 격자를 정의할 수 없으므로 현재 시각 기준으로 예약한다.
     """
     if next_tick is None:
-        return loop_now + interval_seconds, interval_seconds, 0.0
+        if interval_seconds <= 0:
+            return loop_now, 0.0, 0.0
+        wait = _seconds_until_next_wall_tick(
+            interval_seconds, phase_offset_seconds, wall_now if wall_now is not None else db.local_now()
+        )
+        return loop_now + wait, wait, 0.0
 
     scheduled = next_tick + interval_seconds
     delay = scheduled - loop_now
@@ -434,7 +588,7 @@ async def run_observation_loop(
     vpin_volumes: dict[str, list[float]] = {}
 
     market_operation_message_count = 0
-    market_halt_heartbeat_at = 0.0
+    market_halt_message_touched_at = 0.0
 
     async def handle_market_operation_message(raw: str) -> None:
         """
@@ -445,12 +599,15 @@ async def run_observation_loop(
              구독종목(005930)의 개별 VI 발동/해제 때도 메시지가 오므로(문서: "연결종목의 VI
              발동 시와 VI 해제 시에 데이터 수신") MKOP_CLS_CODE가 HALT_TRIGGER/CLEAR 밖이면
              MarketHaltMonitor가 알아서 무시한다 — 매 수신마다 DB에 쓰면 안 되는 이유이기도 하다.
-        생존 계측(2026-07-30 Fix#4): 전이가 없어도 (a) 수신 건수를 세어 첫 수신과 이후
-             MARKET_HALT_RECEIVE_LOG_EVERY건마다 INFO를 남기고, (b) 최소
-             MARKET_HALT_HEARTBEAT_SECONDS 간격으로 현재 상태를 다시 upsert해 "마지막으로 장운영
-             정보를 받은 시각"이 DB에 남게 한다. 알림(Slack)/이력 테이블은 종전대로 전이 시에만.
+        생존 계측(2026-07-30 Fix#4 → 2026-07-31 재설계): 전이가 없어도 (a) 수신 건수를 세어 첫
+             수신과 이후 MARKET_HALT_RECEIVE_LOG_EVERY건마다 INFO를 남기고, (b) 마지막 수신 시각을
+             `market_halt_status.last_message_at`에 남긴다(MARKET_HALT_MESSAGE_TOUCH_SECONDS
+             스로틀). **"관측 루프가 살아있다"는 신호는 여기가 아니라 독립 타이머
+             `poll_market_halt_heartbeat()`가 낸다** — H0UNMKO0이 세션 전이 시에만 오기 때문에
+             (07-31 실측 하루 2건) 메시지 핸들러 안의 하트비트는 감지기가 죽은 것과 구분되지
+             않았다(2026-07-31 §2-2). 알림(Slack)/이력 테이블은 종전대로 전이 시에만.
         """
-        nonlocal market_operation_message_count, market_halt_heartbeat_at
+        nonlocal market_operation_message_count, market_halt_message_touched_at
 
         status = _parse_market_operation(raw)
         if status is None:
@@ -468,6 +625,17 @@ async def run_observation_loop(
                 market_halt_monitor.is_halted,
             )
 
+        # 사이드카/VI 등 어떤 코드든 "받았다"는 사실 자체는 감지기 생존의 증거이므로, 아래 분기
+        # 전에 기록한다(사이드카 분기는 곧바로 return한다).
+        now_monotonic = time.monotonic()
+        if now_monotonic - market_halt_message_touched_at >= MARKET_HALT_MESSAGE_TOUCH_SECONDS:
+            market_halt_message_touched_at = now_monotonic
+            try:
+                with db.get_connection() as conn:
+                    db.mark_market_halt_message_seen(conn, db.local_now())
+            except Exception:
+                logger.warning("장운영정보 수신 시각 기록 실패 — 감지 자체에는 영향 없음", exc_info=True)
+
         code = status.mkop_cls_code
         if code in SIDECAR_CODES:
             notify.notify(
@@ -477,20 +645,8 @@ async def run_observation_loop(
             return
         transition = market_halt_monitor.update(status, db.local_now())
         if not transition.changed:
-            # 전이는 없지만 "방금 수신했다"는 사실 자체는 남겨야 한다 — 매 메시지마다 쓰면 DB
-            # 부하가 되므로 하트비트 간격으로만 갱신한다(값은 현재 상태 그대로라 덮어써도 안전).
-            now_monotonic = time.monotonic()
-            if now_monotonic - market_halt_heartbeat_at >= MARKET_HALT_HEARTBEAT_SECONDS:
-                market_halt_heartbeat_at = now_monotonic
-                try:
-                    with db.get_connection() as conn:
-                        db.upsert_market_halt_state(
-                            conn, db.local_now(), market_halt_monitor.is_halted,
-                            market_halt_monitor.current_code, market_halt_monitor.label,
-                            market_halt_monitor.halted_since,
-                        )
-                except Exception:
-                    logger.warning("장운영정보 하트비트 기록 실패 — 감지 자체에는 영향 없음", exc_info=True)
+            # 전이가 없으면 상태 행은 건드리지 않는다 — 위에서 last_message_at만 갱신했고,
+            # updated_at은 독립 하트비트(poll_market_halt_heartbeat)의 몫이다.
             return
         with db.get_connection() as conn:
             db.upsert_market_halt_state(
@@ -979,6 +1135,107 @@ def _update_atm_iv(regime_state_machine: RegimeStateMachine | None, rows: list[d
         regime_state_machine.update_iv(sum(ivs) / len(ivs))
 
 
+async def poll_market_halt_heartbeat(
+    market_halt_monitor: MarketHaltMonitor,
+    interval_seconds: float = MARKET_HALT_HEARTBEAT_SECONDS,
+) -> None:
+    """
+    입력: 관측 루프가 WS 메시지로 갱신하는 서킷브레이커/거래정지 상태머신.
+    계산: **메시지 수신과 무관하게** interval_seconds마다 현재 상태를 `market_halt_status`에
+         upsert한다 — `updated_at`이 "관측 루프가 이 시각까지 살아 있었다"를 뜻하게 만든다.
+    해석: 2026-07-31 §2-2 / §4 우선순위 4. 07-30에 넣은 하트비트는 메시지 핸들러 안에 있어
+         "메시지가 안 오면 하트비트도 멈추는" 구조였고, H0UNMKO0이 실제로는 세션 전이 시에만
+         오기 때문에(07-31 하루 총 2건: 08:00·09:00) `updated_at`이 09:00:05에서 6시간 45분간
+         멈춰 있었다 — 감지기가 죽은 모습과 구분되지 않았다. **생존 신호는 감시 대상과 독립한
+         타이머에서 나와야 한다**는 원칙(보고서 §5-4)을 여기서 처음 적용한다.
+         "감지기가 최근 실제로 무언가를 봤는가"는 별도 컬럼 `last_message_at`이 답하며, 정상일에도
+         6시간 공백이 정상이므로 거기엔 임계를 두지 않는다.
+    실패 조건: DB 기록 실패는 로그만 남기고 다음 주기를 기다린다 — 하트비트가 죽어도 CB 감지
+              자체(WS 핸들러)는 계속 동작해야 한다.
+    """
+    while True:
+        try:
+            with db.get_connection() as conn:
+                db.upsert_market_halt_state(
+                    conn, db.local_now(), market_halt_monitor.is_halted,
+                    market_halt_monitor.current_code, market_halt_monitor.label,
+                    market_halt_monitor.halted_since,
+                )
+        except Exception:
+            logger.warning("장운영정보 하트비트 기록 실패 — 감지 자체에는 영향 없음", exc_info=True)
+        await asyncio.sleep(interval_seconds)
+
+
+async def _catch_up_missed_option_chain_minute(
+    rest_client: KISRestClient,
+    books: list[tuple[RollingSubscriptionManager, str]],
+    master: IndexDerivativesMaster,
+    underlying: str,
+    overran_poll_time: datetime,
+    warning_throttle: WarningThrottle,
+) -> bool:
+    """
+    입력: 방금 주기를 초과한 사이클의 poll_time, 그리고 그 사이클이 쓴 것과 같은 인자들.
+    계산: 밀림으로 **통째로 건너뛴 분**을 먼슬리 북만으로 한 번 회수한다. 회수 대상 분은 "지금
+         이 순간의 벽시계 분"이다 — 격자 스냅으로 다음 틱까지 대기 중이므로, 지금 분이 곧 마지막
+         으로 건너뛴 분이다(예: 14:30:00 시작 사이클이 14:32:36에 끝나고 다음 틱이 14:33:00이면
+         지금은 14:32분 → 14:31·14:32 중 최신인 14:32를 채운다). 반환값은 실제로 회수했는지 여부.
+    해석: 2026-07-31 §2-1 / §4 우선순위 2. 07-30 Fix#3(위상 격자 스냅)은 위상 고착을 해결한
+         대신 **밀림 1회 = 결손 1분을 확정**시켰다 — 종전의 즉시 재시작(`next_tick = loop_now`)은
+         다음 분을 앞당겨 채우는 회수 효과가 있었는데 그 경로가 사라졌기 때문이다. 07-31 실측에서
+         밀림 46건 → 결손 47분(먼슬리 커버리지 95.0% → 90.5%)으로 나타났다. 격자를 되돌리지 않고
+         (되돌리면 위상 고착이 재발한다) 대기 시간 안에서 결손만 메운다.
+    비용: 먼슬리 10레그뿐이다. 07-31 밀림 46건 기준 하루 +460건(총수요 0.436 → 약 0.452건/초,
+         용량의 45.2%) — 목표 50% 이내를 유지한다. 위클리는 회수하지 않는다(축소안 (a)가 이미
+         격분 해상도를 선택했으므로 일관).
+    실패 조건: 회수 사이클이 또 밀리는 것을 막기 위해 **재귀하지 않는다**(호출측이 남은 대기
+              시간이 충분할 때만 부른다). 회수할 분이 원래 사이클과 같으면(=실은 안 건너뛰었으면)
+              아무 것도 하지 않는다. 조회/적재 실패는 정규 사이클과 동일하게 격리한다.
+    """
+    catchup_time = db.local_now().replace(second=0, microsecond=0)
+    if catchup_time <= overran_poll_time:
+        return False
+    fast_books = [book for book in books if book[1] not in OPTION_CHAIN_SLOW_SERIES]
+    if not fast_books:
+        return False
+
+    rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
+        rest_client, fast_books, master, underlying, catchup_time, warning_throttle
+    )
+    if not any_strikes or not rows:
+        return False
+
+    try:
+        with db.get_connection() as conn:
+            for row in rows:
+                try:
+                    db.insert_option_analysis_1m(conn, row)
+                except Exception:
+                    warning_throttle.warning(
+                        "option_chain_leg_insert_failure",
+                        "옵션 체인 적재 실패(값 이상 등): strike=%s type=%s raw_kis_output1=%s",
+                        row.get("strike"), row.get("option_type"), row.get("_raw_kis_output1"),
+                        exc_info=True,
+                    )
+                    conn.rollback()
+                    continue
+            if latest_spot is not None:
+                try:
+                    db.insert_underlying_spot(conn, catchup_time, underlying, latest_spot)
+                except Exception:
+                    logger.warning("기초자산 스팟 적재 실패(결손 회수)", exc_info=True)
+                    conn.rollback()
+    except Exception:
+        logger.warning("옵션체인 결손 회수 적재 실패 — 회수만 건너뜀", exc_info=True)
+        return False
+
+    logger.info(
+        "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로 채움(밀린 사이클 %s)",
+        catchup_time.strftime("%H:%M"), len(rows), overran_poll_time.strftime("%H:%M"),
+    )
+    return True
+
+
 async def poll_option_chain(
     rest_client: KISRestClient,
     books: list[tuple[RollingSubscriptionManager, str]],
@@ -987,6 +1244,7 @@ async def poll_option_chain(
     interval_seconds: float = OPTION_CHAIN_POLL_INTERVAL_SECONDS,
     retry_backoff_seconds: float = CYCLE_RETRY_BACKOFF_SECONDS,
     regime_state_machine: RegimeStateMachine | None = None,
+    phase_offset_seconds: float = OPTION_CHAIN_PHASE_OFFSET_SECONDS,
 ) -> None:
     """
     입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(2026-07-06부터 리스트 — 먼슬리
@@ -1019,6 +1277,8 @@ async def poll_option_chain(
               실제로 로깅해 105MB까지 로테이션 없이 누적됐던 로그가 이 반복으로 다시 파묻히지
               않게 한다.
     """
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
+
     next_tick: float | None = None
     last_success_time: datetime | None = None
     gap_alerted = False
@@ -1130,7 +1390,9 @@ async def poll_option_chain(
         )
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
         if overrun_seconds > 0:
             logger.warning(
                 "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기 "
@@ -1191,6 +1453,15 @@ async def poll_option_chain(
             collect_seconds, insert_seconds, db_write_seconds, other_seconds,
             len(rows), overrun_seconds, ", 재시도함" if retried else "", other_poller_calls_text,
         )
+        if overrun_seconds > 0 and delay >= OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS:
+            # 회수에 쓴 시간만큼 남은 대기를 줄인다. 이벤트 루프 시계가 아니라 time.monotonic()을
+            # 쓰는 이유는 위 db_write_seconds 계측과 같다 — 기존 스케줄링 테스트들이
+            # asyncio.get_running_loop()를 정해진 시각 시퀀스로 모킹해둬 한 번 더 부르면 어긋난다.
+            catchup_started = time.monotonic()
+            await _catch_up_missed_option_chain_minute(
+                rest_client, books, master, underlying, poll_time, warning_throttle
+            )
+            delay = max(delay - (time.monotonic() - catchup_started), 0.0)
         await asyncio.sleep(delay)
 
 
@@ -1254,43 +1525,72 @@ def _parse_asking_price_leg(resp: dict) -> dict | None:
     return {"spread_pct": spread_pct, "depth": depth, "volume": volume}
 
 
+def _expiry_liquidity_books_due(
+    books: list[tuple[RollingSubscriptionManager, str]], poll_time: datetime
+) -> list[tuple[RollingSubscriptionManager, str]]:
+    """
+    입력: (구독 매니저, series) 튜플 목록, 이번 사이클의 폴링 시각.
+    계산: `EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES`가 books 인덱스별로 지정한 `minute % 10` 슬롯과
+         일치하는 북만 돌려준다 — 슬롯이 아닌 분에는 빈 리스트(이번 분은 조회 안 함).
+    해석: 2026-07-31 §2-1 원인(a) — 3북 33콜을 한 번에 쏘던 것을 북 하나씩 홀수분에 흩는다.
+         상세 근거는 `EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES` 주석 참고. 슬롯 배정을 벽시계 분으로
+         하므로 재시작해도 위상이 같다(축소안 (a)의 `_books_due_this_cycle`과 동일 원칙).
+    실패 조건: 슬롯 튜플보다 북이 많으면 초과분은 영영 조회되지 않는다 —
+              `test_expiry_liquidity_slots_cover_every_book`이 이 불일치를 잡는다.
+    """
+    slot = poll_time.minute % EXPIRY_LIQUIDITY_WINDOW_MINUTES
+    return [
+        book
+        for index, book in enumerate(books)
+        if index < len(EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES)
+        and EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES[index] == slot
+    ]
+
+
 async def poll_expiry_liquidity(
     rest_client: KISRestClient,
     books: list[tuple[RollingSubscriptionManager, str]],
     master: IndexDerivativesMaster,
     underlying: str = UNDERLYING,
     interval_seconds: float = EXPIRY_LIQUIDITY_POLL_INTERVAL_SECONDS,
-    startup_offset_seconds: float = 0.0,
+    phase_offset_seconds: float = 0.0,
 ) -> None:
     """
     입력: REST 클라이언트, (구독 매니저, series) 튜플 목록(먼슬리 "regular" + 위클리(월)
          "weekly_mon" + 위클리(목) "weekly_thu", 2026-07-10 위클리 분리),
-         종목코드 마스터, 기동 시 최초 사이클을 지연시킬 초(startup_offset_seconds — 2026-07-09
-         추가: poll_option_chain과 동시에 기동하면 두 폴러의 정규 사이클이 계속 같은 순간에
-         겹쳐 공유 레이트리미터 큐가 길어지므로, 오프셋으로 사이클 시작 시각을 어긋나게 둔다).
-    계산: 북마다 ATM±2(_atm_liquidity_window) 구간의 콜/풋 각각에 get_asking_price()를 호출해
+         종목코드 마스터, 벽시계 위상(phase_offset_seconds — 2026-07-09 추가: poll_option_chain과
+         동시에 기동하면 두 폴러의 정규 사이클이 계속 같은 순간에 겹쳐 공유 레이트리미터 큐가
+         길어지므로 사이클 시작 시각을 어긋나게 둔다. 2026-07-31부터 이 값은 기동 시각이 아니라
+         **벽시계 자정 기준 위상**이다 — `_seconds_until_next_wall_tick` 참고).
+    계산: **2026-07-31부터 이 폴러는 매 분 돌되 그 분의 슬롯에 배정된 북 하나만 조회한다**
+         (`_expiry_liquidity_books_due` — 홀수분 1/3/5, 한 바퀴 = 10분). 종전에는 600초마다
+         3북 33콜을 한 번에 쏴서 중앙 55.5초(최대 109초)를 점유했고, 그게 2분대 짝수분 옵션체인
+         사이클을 통째로 덮어 밀림 17건(전체의 37%)을 만들었다. 총 호출량은 완전히 동일하다.
+         북마다 ATM±2(_atm_liquidity_window) 구간의 콜/풋 각각에 get_asking_price()를 호출해
          %스프레드·깊이·거래량을 집계하고, 만기일은 ATM 종목 1건만 get_quote()로 별도 확인해
          (_parse_option_quote 재사용) expiry_liquidity_1m에 적재한다. 만기 확인용 get_quote()는
          북당 사이클당 1건뿐이라 REST 부하에 미치는 영향은 무시할 만하다. poll_option_chain과
          동일하게 절대시각 고정 틱(next_tick)으로 다음 사이클을 예약해 사이클 소요시간에 따라
          실제 주기가 매번 밀리지 않게 한다.
+         북별 적재 시각이 1/3/5분으로 갈리지만, `db.latest_expiry_liquidity()`가 원래부터
+         `DISTINCT ON (series)`로 북별 최신값을 취하므로 COCKPIT 표시에는 영향이 없다.
     실패 조건: 개별 레그 조회/파싱 실패는 건너뛰고 나머지로 계속 집계한다. 유효한 레그가 하나도
-              없거나 만기를 확인하지 못하면 그 북은 이번 사이클을 건너뛴다. 모든 북에 구독 행사가가
-              없으면(기동 초입) 2초 뒤 재확인.
+              없거나 만기를 확인하지 못하면 그 북은 이번 사이클을 건너뛴다. 슬롯 북에 아직 구독
+              행사가가 없으면(기동 초입) 2초 뒤 재확인.
     로그(2026-07-20): REST 조회 실패는 poll_option_chain과 동일하게 `_log_kis_call_failure`로
               응답 바디를 남기고 `warning_throttle`로 반복을 억제한다 — 만기확인용 get_quote()
               실패는 이전엔 아예 로그도 안 남기고 조용히 삼켰다(원인 추적 불가능한 사각지대였음).
     """
-    if startup_offset_seconds > 0:
-        await asyncio.sleep(startup_offset_seconds)
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
 
     next_tick: float | None = None
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
+        due_books = _expiry_liquidity_books_due(books, poll_time)
         any_strikes = False
         rows: list[dict] = []
-        for subscription_manager, series in books:
+        for subscription_manager, series in due_books:
             window = _atm_liquidity_window(subscription_manager.desired_strikes, LIQUIDITY_ATM_EACH_SIDE)
             if not window:
                 continue
@@ -1356,7 +1656,9 @@ async def poll_expiry_liquidity(
                 }
             )
 
-        if not any_strikes:
+        # 슬롯이 아닌 분(due_books 비어 있음)은 "구독 전"이 아니라 정상적인 무작업 사이클이므로
+        # 워밍업 재확인 경로로 새면 안 된다 — 그러면 위상 격자가 매 분 리셋된다(2026-07-31).
+        if due_books and not any_strikes:
             next_tick = None  # 구독 전이므로 아직 고정 스케줄을 시작하지 않음
             await asyncio.sleep(2.0)
             continue
@@ -1372,7 +1674,9 @@ async def poll_expiry_liquidity(
                         continue
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
         if overrun_seconds > 0:
             logger.warning(
                 "만기 유동성 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
@@ -1604,7 +1908,7 @@ async def poll_macro_snapshot(
     rest_client: KISRestClient,
     overseas_master: OverseasFutureMaster,
     interval_seconds: float = MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS,
-    startup_offset_seconds: float = 0.0,
+    phase_offset_seconds: float = 0.0,
     item_refresh_seconds: dict[str, float] | None = None,
 ) -> None:
     """
@@ -1636,8 +1940,7 @@ async def poll_macro_snapshot(
               한 번이라도 성공하면 복구 알림을 보내고 스트릭/알림 상태를 리셋 — gap_alerted
               (poll_option_chain)와 동일한 "지속되면 알리고, 회복되면 알린다" 패턴.
     """
-    if startup_offset_seconds > 0:
-        await asyncio.sleep(startup_offset_seconds)
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
 
     next_tick: float | None = None
     cbot_alert_sent = False
@@ -1699,7 +2002,9 @@ async def poll_macro_snapshot(
                 )
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
         if overrun_seconds > 0:
             logger.warning(
                 "매크로 스냅샷 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
@@ -1756,7 +2061,7 @@ async def poll_investor_flow(
     underlying: str = UNDERLYING,
     interval_seconds: float = OPTION_CHAIN_POLL_INTERVAL_SECONDS,
     retry_backoff_seconds: float = CYCLE_RETRY_BACKOFF_SECONDS,
-    startup_offset_seconds: float = 0.0,
+    phase_offset_seconds: float = 0.0,
 ) -> None:
     """
     입력: REST 클라이언트, 기초자산 라벨, 기동 시 최초 사이클을 지연시킬 초(startup_offset_seconds
@@ -1775,8 +2080,7 @@ async def poll_investor_flow(
     스케줄: poll_option_chain과 동일하게 절대시각 고정 틱(next_tick)으로 다음 사이클을 예약한다
            (2026-07-09 — "작업 후 sleep" 누적 드리프트로 poll_time이 분 경계를 건너뛰는 것을 방지).
     """
-    if startup_offset_seconds > 0:
-        await asyncio.sleep(startup_offset_seconds)
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
 
     next_tick: float | None = None
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
@@ -1803,7 +2107,9 @@ async def poll_investor_flow(
                 )
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
         if overrun_seconds > 0:
             logger.warning(
                 "투자자 수급 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
@@ -1935,7 +2241,7 @@ async def poll_signal_fusion_cycle(
     regime_state_machine: RegimeStateMachine,
     underlying: str = UNDERLYING,
     interval_seconds: float = SIGNAL_FUSION_POLL_INTERVAL_SECONDS,
-    startup_offset_seconds: float = 0.0,
+    phase_offset_seconds: float = 0.0,
 ) -> None:
     """
     입력: 다른 폴러가 매 선물봉마다 갱신하는 RegimeStateMachine(최신 레짐은 last_state로 읽음 —
@@ -1957,8 +2263,7 @@ async def poll_signal_fusion_cycle(
     실패 조건: 이번 사이클 조회/계산/적재가 실패하면 로그만 남기고 다음 사이클을 기다린다(다른
               폴러와 동일한 장애 격리 원칙).
     """
-    if startup_offset_seconds > 0:
-        await asyncio.sleep(startup_offset_seconds)
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
 
     fusion_engine = SignalFusionEngine()
     risk_engine = RiskEngine()
@@ -2047,7 +2352,9 @@ async def poll_signal_fusion_cycle(
             logger.warning("Signal Fusion 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
         if overrun_seconds > 0:
             logger.warning(
                 "Signal Fusion 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
@@ -2059,7 +2366,7 @@ async def poll_signal_fusion_cycle(
 async def poll_account_balance_cycle(
     rest_client: KISRestClient,
     interval_seconds: float = ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS,
-    startup_offset_seconds: float = 0.0,
+    phase_offset_seconds: float = 0.0,
 ) -> None:
     """
     입력: REST 클라이언트, 기동 시 최초 사이클을 지연시킬 초(다른 REST 폴러와 겹치지 않게 —
@@ -2072,8 +2379,7 @@ async def poll_account_balance_cycle(
     실패 조건: 이번 사이클 조회/파싱/적재가 실패하면 로그만 남기고 다음 사이클을 기다린다(다른
               폴러와 동일한 장애 격리 원칙 — 계좌 조회 실패가 관측 루프 전체를 막으면 안 됨).
     """
-    if startup_offset_seconds > 0:
-        await asyncio.sleep(startup_offset_seconds)
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
 
     next_tick: float | None = None
     while True:
@@ -2087,7 +2393,9 @@ async def poll_account_balance_cycle(
             logger.warning("계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
 
         loop_now = asyncio.get_running_loop().time()
-        next_tick, delay, overrun_seconds = _advance_fixed_tick(next_tick, interval_seconds, loop_now)
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
         if overrun_seconds > 0:
             logger.warning(
                 "계좌 잔고 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기",
@@ -2230,21 +2538,23 @@ async def main() -> None:
             ),
             poll_option_chain(rest_client, books, master, regime_state_machine=regime_state_machine),
             poll_expiry_liquidity(
-                rest_client, books, master, startup_offset_seconds=EXPIRY_LIQUIDITY_STARTUP_OFFSET_SECONDS
+                rest_client, books, master, phase_offset_seconds=EXPIRY_LIQUIDITY_PHASE_OFFSET_SECONDS
             ),
-            poll_investor_flow(rest_client, startup_offset_seconds=INVESTOR_FLOW_STARTUP_OFFSET_SECONDS),
+            poll_investor_flow(rest_client, phase_offset_seconds=INVESTOR_FLOW_PHASE_OFFSET_SECONDS),
             poll_signal_fusion_cycle(
-                regime_state_machine, startup_offset_seconds=SIGNAL_FUSION_STARTUP_OFFSET_SECONDS
+                regime_state_machine, phase_offset_seconds=SIGNAL_FUSION_PHASE_OFFSET_SECONDS
             ),
             poll_account_balance_cycle(
-                rest_client, startup_offset_seconds=ACCOUNT_BALANCE_STARTUP_OFFSET_SECONDS
+                rest_client, phase_offset_seconds=ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS
             ),
+            # 2026-07-31 §4 우선순위 4 — CB 감지 생존 신호를 메시지 수신과 독립시킨다.
+            poll_market_halt_heartbeat(market_halt_monitor),
         ]
         if overseas_future_master is not None:
             tasks.append(
                 poll_macro_snapshot(
                     rest_client, overseas_future_master,
-                    startup_offset_seconds=MACRO_SNAPSHOT_STARTUP_OFFSET_SECONDS,
+                    phase_offset_seconds=MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS,
                 )
             )
         # 2026-07-19(§5-4) — .env에 토큰/채널이 설정된 경우에만 워커를 띄운다. notify.notify()가

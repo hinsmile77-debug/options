@@ -130,6 +130,16 @@ def _is_trading_hours(now: datetime) -> bool:
     return now.weekday() < 5 and _TRADING_DAY_START <= now.time() <= _TRADING_DAY_END
 
 
+def _as_naive(ts: datetime) -> datetime:
+    """TIMESTAMPTZ 컬럼에서 읽은 tz-aware 값을 db.local_now()와 같은 좌표계(naive KST)로 맞춘다.
+
+    2026-07-20 `_freshness_check`, 2026-07-31 `_market_halt_check`에서 각각 같은 유형의
+    TypeError를 실측했다 — 저장 정책상 라벨만 UTC일 뿐 값은 이미 KST 벽시계라 변환이 아니라
+    tzinfo 제거가 맞다(db.local_now() docstring 참고).
+    """
+    return ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
+
+
 def _freshness_check(label: str, latest_ts: datetime | None, now: datetime) -> HealthCheck:
     """장중이 아니면(주말/장외시간) 데이터가 안 들어와도 정상이므로 판단하지 않는다 — 장중에만
     §5-4와 동일한 5분 기준으로 결손 여부를 판단한다.
@@ -146,9 +156,7 @@ def _freshness_check(label: str, latest_ts: datetime | None, now: datetime) -> H
         return HealthCheck(label, "info", "장중 아님(평일 09:00~15:45 외)")
     if latest_ts is None:
         return HealthCheck(label, "warning", "장중인데 데이터가 아직 한 건도 없음")
-    if latest_ts.tzinfo is not None:
-        latest_ts = latest_ts.replace(tzinfo=None)
-    age_seconds = max((now - latest_ts).total_seconds(), 0.0)
+    age_seconds = max((now - _as_naive(latest_ts)).total_seconds(), 0.0)
     if age_seconds >= _STALE_DATA_THRESHOLD_SECONDS:
         return HealthCheck(label, "warning", f"{age_seconds / 60:.0f}분째 결손")
     return HealthCheck(label, "ok", f"{age_seconds:.0f}초 전 갱신")
@@ -421,6 +429,11 @@ def _shutdown_reliability_check(conn) -> HealthCheck:
 # 2026-07-23(운영점검보고서 §2-1/§4 Fix#4) — 배율이 이 값 이하면 "백오프 없음(정상)"으로 본다.
 # 부동소수 계산 잔차를 허용하기 위해 정확히 1.0이 아니라 살짝 여유를 둔다.
 _RATE_LIMITER_OK_MULTIPLIER = 1.01
+# CB 감지 하트비트(mahdi.main.MARKET_HALT_HEARTBEAT_SECONDS=300초)의 2배 — 한 번 걸렀는데도
+# 갱신이 없으면 관측 루프 쪽 이상으로 본다. 이 임계는 `updated_at`(독립 하트비트)에만 걸고,
+# `last_message_at`(H0UNMKO0 수신)에는 걸지 않는다 — 정상일에도 수 시간 공백이 정상이기 때문이다
+# (2026-07-31 실측: 하루 총 2건, 09:00 이후 6시간 45분 무수신이 정상 상태였다).
+_MARKET_HALT_HEARTBEAT_STALE_SECONDS = 600.0
 
 
 def _rate_limiter_health_check(conn) -> HealthCheck:
@@ -474,11 +487,32 @@ def _market_halt_check(conn) -> HealthCheck:
             label, "warning",
             f"🚨 {status['label']}({status['mkop_cls_code']}) — {status['halted_since']:%H:%M:%S}부터 신규진입 차단 중",
         )
+    # 2026-07-31(운영점검 §2-2/§4 우선순위 4): 이 배지는 서로 다른 세 가지를 구분해야 한다 —
+    # (A) 감시 대상(시장)이 정상인가 (B) 감시자(관측 루프)가 살아있는가 (C) 감시자가 최근 실제로
+    # 무언가를 봤는가. 07-30 설계는 A와 B를 `updated_at` 하나에 섞어 표시했는데, H0UNMKO0이
+    # 세션 전이 시에만 오는 탓에 정상일에도 그 값이 6시간 45분 묵어 있었다.
+    # 이제 `updated_at`은 독립 하트비트(300초)가 갱신하므로 **오래되면 진짜로 이상**이고,
+    # `last_message_at`은 정상일에도 수 시간 공백이 정상이라 임계를 두지 않고 참고 표시만 한다.
+    # 2026-07-31 라이브 왕복에서 잡은 결함: TIMESTAMPTZ 컬럼을 psycopg가 tz-aware로 돌려주는데
+    # db.local_now()는 naive라 그대로 빼면 TypeError로 헬스체크 전체가 죽는다 — 2026-07-20에
+    # `_freshness_check`에서 똑같이 겪었던 유형이다(그 docstring 참고). local_now()의 "naive-KST가
+    # UTC 라벨로 저장된다"는 정책상 tzinfo만 떼면 벽시계 숫자는 이미 같은 좌표계다.
+    heartbeat_age = (db.local_now() - _as_naive(status["updated_at"])).total_seconds()
+    seen = status.get("last_message_at")
+    seen_text = f" · 최근 장운영정보 {seen:%H:%M:%S}" if seen is not None else " · 장운영정보 수신 이력 없음"
+    if heartbeat_age > _MARKET_HALT_HEARTBEAT_STALE_SECONDS:
+        return HealthCheck(
+            label, "warning",
+            f"감지기 하트비트 {heartbeat_age / 60:.0f}분째 정지({status['updated_at']:%H:%M:%S}) — "
+            f"관측 루프 생존 확인 필요{seen_text}",
+        )
     if status["mkop_cls_code"] is None:
-        # 전이가 한 번도 없었던 정상 상태 — 하트비트가 갱신한 "마지막 갱신 시각"을 함께 보여줘
-        # 감지기가 살아있음을 눈으로 확인할 수 있게 한다.
-        return HealthCheck(label, "ok", f"정상(발동 이력 없음) — 감지기 갱신 {status['updated_at']:%H:%M:%S}")
-    return HealthCheck(label, "ok", f"정상 — 직전: {status['label']}({status['updated_at']:%H:%M:%S} 해제됨)")
+        return HealthCheck(
+            label, "ok", f"정상(발동 이력 없음) — 관측루프 {status['updated_at']:%H:%M:%S}{seen_text}"
+        )
+    return HealthCheck(
+        label, "ok", f"정상 — 직전: {status['label']}({status['updated_at']:%H:%M:%S} 해제됨){seen_text}"
+    )
 
 
 def get_market_halt_status() -> dict | None:

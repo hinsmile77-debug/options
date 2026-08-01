@@ -739,3 +739,46 @@ def test_insert_risk_snapshot_accepts_null_loss_buffer():
     conn = FakeConnection()
     db.insert_risk_snapshot(conn, datetime(2026, 7, 31, 9, 30), greeks={}, loss_buffer=None, cb_state={})
     assert conn.store["params"][2] is None
+
+
+# ===== 2026-07-31 운영점검 §2-2/§4 우선순위 4: CB 감지 생존 신호와 수신 사실의 분리 =====
+
+
+def test_upsert_market_halt_state_does_not_touch_last_message_at():
+    # 하트비트(300초)가 상태 행을 덮어쓸 때 last_message_at까지 NULL로 밀면 "감지기가 최근
+    # 무언가를 봤는가"라는 별개 신호가 사라진다 — 컬럼 목록에 없어야 ON CONFLICT가 보존한다.
+    conn = FakeConnection()
+    db.upsert_market_halt_state(conn, datetime(2026, 7, 31, 9, 5), False, None, "정상", None)
+
+    assert "last_message_at" not in conn.store["query"]
+    assert "ON CONFLICT (id) DO UPDATE" in conn.store["query"]
+
+
+def test_mark_market_halt_message_seen_updates_only_the_timestamp():
+    # 반대로 수신 기록은 상태 값(is_halted/mkop_cls_code/label)을 건드리면 안 된다 —
+    # 진행 중인 차단을 덮어쓸 위험이 있기 때문이다.
+    conn = FakeConnection()
+    seen_at = datetime(2026, 7, 31, 9, 0, 5)
+    db.mark_market_halt_message_seen(conn, seen_at)
+
+    query = conn.store["query"]
+    assert query.startswith("UPDATE market_halt_status SET last_message_at=")
+    assert "is_halted" not in query and "mkop_cls_code" not in query
+    assert conn.store["params"] == (seen_at,)
+
+
+def test_latest_market_halt_state_returns_both_liveness_signals():
+    # COCKPIT은 updated_at("관측 루프가 살아있다")과 last_message_at("감지기가 최근 뭔가를 봤다")을
+    # 나눠 표시해야 한다 — 07-30 설계는 둘을 한 값에 섞어 정상일에도 6시간 45분 묵은 값을 보여줬다.
+    conn = FakeReadConnection(
+        [(datetime(2026, 7, 31, 15, 43), False, None, "정상", None, datetime(2026, 7, 31, 9, 0, 5))]
+    )
+    state = db.latest_market_halt_state(conn)
+
+    assert state["updated_at"] == datetime(2026, 7, 31, 15, 43)
+    assert state["last_message_at"] == datetime(2026, 7, 31, 9, 0, 5)
+    assert state["is_halted"] is False
+
+
+def test_latest_market_halt_state_returns_none_when_detector_never_recorded():
+    assert db.latest_market_halt_state(FakeReadConnection([])) is None

@@ -1,5 +1,7 @@
+import logging
 import threading
 import time
+from unittest import mock
 
 import httpx
 import pytest
@@ -495,3 +497,96 @@ def test_get_does_not_widen_rate_limiter_on_unrelated_500():
     with pytest.raises(httpx.HTTPStatusError):
         client.get_balance()
     assert client._rate_limiter._current_interval == pytest.approx(1.0)
+
+
+# ===== 2026-07-31 운영점검 §2-1(b)/§4 우선순위 3: 느린 호출의 페이서/HTTP 구간 분리 계측 =====
+
+
+def test_slow_call_log_splits_pacer_wait_from_http_time(caplog):
+    # 07-31에 "호출 1건당 8~9초" 정체 7건이 나왔는데, httpx가 남기는 건 응답 완료 시점 한 줄뿐이라
+    # 페이서 대기와 서버 응답을 구분할 수 없어 원인을 좁히지 못했다. 두 구간을 나눠 남긴다.
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.05)
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+        # 임계를 낮춰 이번 호출이 반드시 걸리게 한다(운영 기본값 3.0초는 정상 호출을 안 남긴다).
+        with mock.patch("mahdi.broker.rest_client.SLOW_CALL_LOG_THRESHOLD_SECONDS", 0.01):
+            client.get_balance()
+
+    records = [r for r in caplog.records if "느린 REST 호출" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "페이서대기" in message and "HTTP" in message
+
+
+def test_normal_call_is_not_logged_at_default_threshold(caplog):
+    # 하루 12,947건을 전부 남기면 07-31에 되찾은 로그 가독성(사람이 읽는 줄 6,161 → 2,963)을
+    # 다시 잃는다 — 정상 호출은 남지 않아야 한다.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+        client.get_balance()
+
+    assert not [r for r in caplog.records if "느린 REST 호출" in r.getMessage()]
+
+
+def test_slow_call_is_logged_even_when_the_request_raises(caplog):
+    # 타임아웃으로 끝난 호출이야말로 계측이 필요하다(07-31 실측 9.5초 간격은 httpx timeout=10.0초
+    # 직전까지 간 요청일 가능성이 있다) — finally에서 재고 넘긴다.
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.05)
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+        with mock.patch("mahdi.broker.rest_client.SLOW_CALL_LOG_THRESHOLD_SECONDS", 0.01):
+            with pytest.raises(httpx.ReadTimeout):
+                client.get_balance()
+
+    assert [r for r in caplog.records if "느린 REST 호출" in r.getMessage()]
+
+
+def test_slow_call_log_attributes_pacer_wait_when_the_limiter_is_backed_off(caplog):
+    # 페이서대기가 크면 "다른 폴러와의 예약 큐 경합", HTTP가 크면 "서버/커넥션 풀"이 범인이다 —
+    # 이 구분이 §2-1(b)를 다음 거래일에 판정하기 위한 계측의 핵심이다.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"output": {}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.05,
+    )
+    client._rate_limiter.wait()  # 다음 호출이 반드시 페이서에서 대기하도록 슬롯을 미리 예약
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+        with mock.patch("mahdi.broker.rest_client.SLOW_CALL_LOG_THRESHOLD_SECONDS", 0.01):
+            client.get_balance()
+
+    message = [r for r in caplog.records if "느린 REST 호출" in r.getMessage()][0].getMessage()
+    pacer = float(message.split("페이서대기 ")[1].split("초")[0])
+    http = float(message.split("+ HTTP ")[1].split("초")[0])
+    assert pacer > http  # 이 시나리오의 지연은 전적으로 페이서 대기다

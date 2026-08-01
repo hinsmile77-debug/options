@@ -31,6 +31,24 @@ logger = logging.getLogger("mahdi.broker.rest_client")
 # 사이클당 필요한 최대 호출(옵션체인 ~30 + 수급 3 = 33)도 33초면 끝나 60초 주기 안에 들어간다.
 DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 
+# 2026-07-31(운영점검보고서 2026-07-31 §2-1 원인 b / §4 우선순위 3) — 느린 호출 계측 임계.
+#
+# 07-31 하루치 로그에서 "호출 1건당 8~9초"가 연속되는 정체 구간 7건이 관측됐다(전부 10분 창의
+# 0분대, 계좌잔고 호출 직후 시작). 그런데 원인을 좁힐 수가 없었다:
+#   - 공유 _RateLimiter의 당시 배율은 1.22~1.82배(= 최대 1.82초)라 9초를 설명하지 못한다.
+#   - 같은 시각 투자자수급(1.2초 간격)·만기유동성 호가(3.8초)는 정상 속도로 응답했으므로
+#     KIS 서버 전체 지연도 아니다.
+# httpx가 남기는 로그는 **응답 완료 시점 한 줄**뿐이라 "페이서에서 기다린 시간"과 "서버가 응답을
+# 준 시간"이 합쳐져 구분되지 않는 것이 문제였다. 두 구간을 따로 재서 남기면 세 가설이 갈린다:
+#   페이서대기가 크다 → 예약 큐 경합(_next_allowed 누적, 즉 다른 폴러와의 충돌)
+#   HTTP가 크다      → KIS 서버 또는 커넥션 풀(httpx.Client 단일 인스턴스 공유)
+#   둘 다 작다       → 이벤트 루프/스레드풀 블로킹(asyncio.to_thread 기본 풀 포화 등)
+#
+# 임계를 둔 이유: 하루 12,947건을 전부 남기면 07-31에 어렵게 되찾은 로그 가독성
+# (사람이 읽는 줄 6,161 → 2,963줄)을 다시 잃는다. 정상 호출은 페이서대기 포함 ~1.2초라
+# 3.0초면 정상 구간은 거의 걸리지 않고 §2-1(b)의 5~9초 구간만 남는다.
+SLOW_CALL_LOG_THRESHOLD_SECONDS = 3.0
+
 
 class _RateLimiter:
     """여러 스레드(asyncio.to_thread)가 공유하는 최소 호출 간격 페이서.
@@ -208,11 +226,30 @@ class KISRestClient:
             "custtype": "P",
         }
 
+    def _log_if_slow(self, method: str, url: str, pacer_seconds: float, http_seconds: float) -> None:
+        """계산: 페이서 대기 + HTTP 응답이 임계를 넘으면 두 구간을 **나눠서** 남긴다
+        (2026-07-31 §4 우선순위 3 — 상세 근거는 SLOW_CALL_LOG_THRESHOLD_SECONDS 주석)."""
+        total = pacer_seconds + http_seconds
+        if total < SLOW_CALL_LOG_THRESHOLD_SECONDS:
+            return
+        logger.warning(
+            "느린 REST 호출 %.2f초 = 페이서대기 %.2f초 + HTTP %.2f초 (배율 %.2f배, %s %s)",
+            total, pacer_seconds, http_seconds, self._rate_limiter.current_multiplier,
+            method, url.split("?", 1)[0].rsplit("/", 1)[-1],
+        )
+
     def _get(self, url: str, **kwargs) -> dict:
         """모든 REST GET 호출의 단일 진입점 — 실제 전송 직전에 _rate_limiter로 페이싱하고,
-        결과에 따라 적응형 백오프 상태를 갱신한다(2026-07-20, _RateLimiter 참고)."""
+        결과에 따라 적응형 백오프 상태를 갱신한다(2026-07-20, _RateLimiter 참고).
+        2026-07-31: 페이서 대기와 HTTP 응답 시간을 따로 재서 느릴 때만 남긴다(§4 우선순위 3)."""
+        pacer_started = time.monotonic()
         self._rate_limiter.wait()
-        response = self._client.get(url, **kwargs)
+        http_started = time.monotonic()
+        try:
+            response = self._client.get(url, **kwargs)
+        finally:
+            # 예외(타임아웃 등)로 끝난 호출이야말로 계측이 필요하다 — finally에서 재고 넘긴다.
+            self._log_if_slow("GET", url, http_started - pacer_started, time.monotonic() - http_started)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -224,8 +261,13 @@ class KISRestClient:
 
     def _post(self, url: str, **kwargs) -> dict:
         """모든 REST POST 호출의 단일 진입점 — GET과 동일한 공유 레이트리미터를 통과시킨다."""
+        pacer_started = time.monotonic()
         self._rate_limiter.wait()
-        response = self._client.post(url, **kwargs)
+        http_started = time.monotonic()
+        try:
+            response = self._client.post(url, **kwargs)
+        finally:
+            self._log_if_slow("POST", url, http_started - pacer_started, time.monotonic() - http_started)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

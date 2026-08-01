@@ -504,8 +504,11 @@ def upsert_market_halt_state(
     입력: 서킷브레이커/거래정지 실시간 감지(mahdi.risk.market_halt.MarketHaltMonitor)의 상태
          전이 시점 값.
     계산: 싱글턴 행(id=TRUE 고정) upsert — `rate_limiter_status_log`와 동일한 패턴. main.py의
-         WS 핸들러가 MarketHaltMonitor.update()의 `changed=True`일 때만 호출한다(2026-07-29
-         신규) — 매 WS 메시지가 아니라 실제로 차단 여부가 바뀐 시점에만 갱신된다.
+         WS 핸들러가 MarketHaltMonitor.update()의 `changed=True`일 때, 그리고
+         `poll_market_halt_heartbeat()`가 300초마다 호출한다.
+         2026-07-31: `last_message_at`은 여기서 건드리지 않는다 — 컬럼 목록에 없으므로 ON CONFLICT
+         DO UPDATE가 그 값을 보존한다. 수신 시각은 `mark_market_halt_message_seen()` 전담이다
+         (두 신호를 분리한 이유는 마이그레이션 018 주석 참고).
     """
     row = {
         "id": True, "updated_at": updated_at, "is_halted": is_halted,
@@ -514,24 +517,43 @@ def upsert_market_halt_state(
     _upsert(conn, "market_halt_status", _MARKET_HALT_STATUS_COLUMNS, ("id",), row)
 
 
+def mark_market_halt_message_seen(conn: ConnectionLike, seen_at: datetime) -> None:
+    """
+    입력: H0UNMKO0 장운영정보를 실제로 수신한 시각.
+    계산: 싱글턴 행의 `last_message_at`만 갱신한다 — 상태 값(is_halted/mkop_cls_code/label)은
+         건드리지 않으므로 진행 중인 차단을 덮어쓸 위험이 없다.
+    해석: 2026-07-31 §2-2 — `updated_at`("관측 루프가 살아있다", 독립 하트비트가 갱신)과
+         `last_message_at`("감지기가 최근 무언가를 봤다")을 분리한다. 이 TR은 세션 전이 시에만
+         오므로 정상일에도 수 시간 공백이 정상이며, 그래서 이 컬럼에는 임계 경보를 두지 않는다.
+    실패 조건: 아직 행이 없으면(구독 직후 기준행 upsert 전) UPDATE가 0행을 건드리고 조용히 끝난다 —
+              기준행은 구독 직후 반드시 생기므로 실사용에서는 발생하지 않는다.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE market_halt_status SET last_message_at=%s WHERE id IS TRUE", (seen_at,))
+
+
 def latest_market_halt_state(conn: ConnectionLike) -> dict | None:
     """
-    계산: 가장 최근 upsert_market_halt_state() 기록을 반환한다.
+    계산: 가장 최근 upsert_market_halt_state() 기록을 반환한다. 2026-07-31부터 `last_message_at`
+         (마지막 H0UNMKO0 수신 시각)을 함께 돌려주며, 이는 `updated_at`(관측 루프 생존 하트비트)과
+         **의미가 다르다** — COCKPIT은 둘을 나눠 표시해야 한다(마이그레이션 018 주석 참고).
     실패 조건: 아직 CB/거래정지 이벤트가 한 번도 없었으면(정상적인 대부분의 거래일) None —
               호출측(RiskEngine 게이팅, COCKPIT)이 "정상"으로 취급해야 한다(지어내지 않음 —
               is_halted=False로 만든 가짜 행을 반환하지 않는다).
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT updated_at, is_halted, mkop_cls_code, label, halted_since FROM market_halt_status LIMIT 1"
+            "SELECT updated_at, is_halted, mkop_cls_code, label, halted_since, last_message_at "
+            "FROM market_halt_status LIMIT 1"
         )
         row = cur.fetchone()
     if row is None:
         return None
-    updated_at, is_halted, mkop_cls_code, label, halted_since = row
+    updated_at, is_halted, mkop_cls_code, label, halted_since, last_message_at = row
     return {
         "updated_at": updated_at, "is_halted": bool(is_halted),
         "mkop_cls_code": mkop_cls_code, "label": label, "halted_since": halted_since,
+        "last_message_at": last_message_at,
     }
 
 
