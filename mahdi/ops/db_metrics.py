@@ -63,7 +63,9 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
     for key, fn in (
         ("tables", _tables),
         ("book_coverage", _book_coverage),
+        ("book_gamma_map", book_gamma_map),
         ("signal_decisions", _signal_decisions),
+        ("signal_reach", signal_reach),
         ("risk_gate_distinct", _risk_gate_distinct),
         ("regime", _regime),
         ("feature_store", _feature_store),
@@ -194,6 +196,59 @@ def _book_coverage(conn: ConnectionLike, target: date) -> list[dict]:
     return out
 
 
+def book_gamma_map(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> list[dict]:
+    """
+    입력: DB 커넥션, 대상 날짜, 기초자산 라벨.
+    계산: 그날 **장 마지막 스냅샷**을 만기별로 나눠 북마다 GEX / 감마플립 / 핀 리스크를 낸다.
+    해석: 2026-08-03 §5-5 — 세 북을 합산하면 만기별 정보가 서로를 덮는다. 특히 **만기 당일 북은
+         잔존만기가 0이라 감마플립이 정의되지 않는 반면 핀 리스크(v6 §A3)는 그 북에서만** 나온다.
+         2026-08-03이 실제로 weekly_mon 만기일이었는데 그날 GEX는 세 북 합산 하나뿐이었다.
+    실패 조건: 그날 체인/스팟이 없으면 빈 목록 — 지어내지 않는다.
+    """
+    from mahdi.features.options_intel import calculate_gex, find_gamma_flip, legs_by_expiry, pin_risk
+
+    spot_row = _fetchone(
+        conn,
+        "SELECT spot FROM underlying_spot_1m WHERE underlying=%s AND timestamp::date=%s "
+        "ORDER BY timestamp DESC LIMIT 1",
+        (underlying, target),
+    )
+    if not spot_row or spot_row[0] is None:
+        return []
+    spot = float(spot_row[0])
+
+    rows = _fetchall(
+        conn,
+        "SELECT DISTINCT ON (expiry, strike, option_type) expiry, strike, option_type, oi, iv, gamma "
+        "FROM option_analysis_1m WHERE underlying=%s AND timestamp::date=%s AND expiry >= %s "
+        "ORDER BY expiry, strike, option_type, timestamp DESC",
+        (underlying, target, target),
+    )
+    chain_rows = [
+        {
+            "expiry": expiry, "strike": float(strike), "option_type": option_type,
+            "oi": float(oi or 0.0), "iv": float(iv or 0.0), "gamma": float(gamma or 0.0),
+        }
+        for expiry, strike, option_type, oi, iv, gamma in rows
+    ]
+
+    out = []
+    for expiry, legs in legs_by_expiry(chain_rows, target).items():
+        pin = pin_risk(legs, spot)
+        out.append(
+            {
+                "expiry": expiry,
+                "legs": len(legs),
+                "gex": calculate_gex(legs, spot),
+                "gamma_flip": find_gamma_flip(legs, spot),
+                "pin_strike": pin["strike"] if pin else None,
+                "pin_concentration_pct": round(pin["concentration"] * 100, 1) if pin else None,
+                "expiry_today": expiry == target,
+            }
+        )
+    return out
+
+
 def _signal_decisions(conn: ConnectionLike, target: date) -> list[dict]:
     rows = _fetchall(
         conn,
@@ -204,6 +259,88 @@ def _signal_decisions(conn: ConnectionLike, target: date) -> list[dict]:
     return [
         {"decision": d, "conviction": c, "reject_reason": r, "count": int(n)} for d, c, r, n in rows
     ]
+
+
+# ===== 2026-08-03 §5-1 — "신호 도달률" =====
+#
+# 07-31 §5-5는 옳은 원칙을 세웠다: *"인프라 지표가 좋아져도 판단 입력은 나빠질 수 있으므로 반드시
+# 나란히 읽는다."* 그래서 `먼슬리 분 커버리지`를 만들었고, 08-03에 그 값은 98.8%로 훌륭했다.
+# **그런데 같은 날 감마플립 산출률은 0%였다.** 커버리지는 *"데이터가 DB에 있는가"* 만 재고
+# *"그 데이터가 신호까지 도달했는가"* 는 재지 않는다 — 한 칸이 비어 있었다.
+#
+# 아래 임계는 08-03 실측을 기준선으로 잡았다(전부 그날 경고를 냈을 값들이다).
+SIGNAL_REACH_WARNINGS = {
+    # 앙상블 6멤버 중 2개는 미학습(xgboost/lstm), orderflow는 파이프라인 미구현이라 이론상
+    # 최대는 3이다. 최대 가용 멤버가 3 미만이면 옵션 신호(options_flow)가 죽어 있다는 뜻이다.
+    "member_count_max_min": 3,
+    # 탐색 범위 밖이라 정상적으로 못 구하는 분이 있으므로 100%를 요구하지 않는다.
+    "gamma_flip_pct_min": 80.0,
+    # db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES(10분)에 여유를 더한 값 — 넘으면 경계가 깨진 것이다.
+    "chain_age_seconds_max": 900.0,
+}
+
+
+def signal_reach(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 그날의 판단 행에서 **신호가 실제로 도달했는지**를 센다 — 앙상블 최대 가용 멤버 수,
+         감마플립 산출률, 체인 스냅샷의 레그 수/최고령 나이(중앙값·최대).
+    해석: 상세 근거는 위 `SIGNAL_REACH_WARNINGS` 주석. `warnings` 키에 담긴 문자열이 비어 있지
+         않으면 그날 사람이 반드시 읽어야 할 항목이다.
+    실패 조건: 마이그레이션 022 적용 전(컬럼 없음)이면 `{"available": False}`만 돌려준다 —
+              0%로 표시해 "오늘 신호가 죽었다"는 거짓 신호를 만들지 않는다.
+    """
+    try:
+        row = _fetchone(
+            conn,
+            "SELECT count(*), "
+            "       max((risk_gate_state->>'available_member_count')::int), "
+            "       count(gamma_flip), "
+            "       percentile_cont(0.5) WITHIN GROUP (ORDER BY chain_leg_count), "
+            "       max(chain_leg_count), "
+            "       percentile_cont(0.5) WITHIN GROUP (ORDER BY chain_oldest_leg_age_seconds), "
+            "       max(chain_oldest_leg_age_seconds) "
+            "FROM signal_decisions WHERE timestamp::date=%s",
+            (target,),
+        )
+    except Exception:
+        conn.rollback()
+        logger.warning("신호 도달률 집계 실패 — 마이그레이션 022 적용 전일 수 있다", exc_info=True)
+        return {"available": False}
+
+    decisions = int(row[0]) if row else 0
+    if not decisions:
+        return {"available": False}
+
+    member_max = int(row[1]) if row[1] is not None else 0
+    flip_count = int(row[2])
+    flip_pct = round(flip_count / decisions * 100, 1)
+    out = {
+        "available": True,
+        "decisions": decisions,
+        "member_count_max": member_max,
+        "gamma_flip_count": flip_count,
+        "gamma_flip_pct": flip_pct,
+        "chain_leg_median": float(row[3]) if row[3] is not None else None,
+        "chain_leg_max": int(row[4]) if row[4] is not None else None,
+        "chain_age_seconds_median": float(row[5]) if row[5] is not None else None,
+        "chain_age_seconds_max": float(row[6]) if row[6] is not None else None,
+    }
+
+    warnings: list[str] = []
+    if member_max < SIGNAL_REACH_WARNINGS["member_count_max_min"]:
+        warnings.append(
+            f"앙상블 최대 가용 멤버 {member_max}개 — options_flow가 한 번도 활성화되지 않았다"
+        )
+    if flip_pct < SIGNAL_REACH_WARNINGS["gamma_flip_pct_min"]:
+        warnings.append(f"감마플립 산출률 {flip_pct}% — 행사가 창이 스팟을 따라가고 있는지 확인")
+    age_max = out["chain_age_seconds_max"]
+    if age_max is not None and age_max > SIGNAL_REACH_WARNINGS["chain_age_seconds_max"]:
+        warnings.append(
+            f"체인 스냅샷 최고령 레그 {age_max / 60:.0f}분 — 신선도 경계가 깨졌다"
+        )
+    out["warnings"] = warnings
+    return out
 
 
 def _risk_gate_distinct(conn: ConnectionLike, target: date) -> int:

@@ -8,6 +8,7 @@ mahdi.data.subscription_manager가 담당하고 이 클래스는 순수 WS 송�
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
 
@@ -15,6 +16,13 @@ import httpx
 
 from mahdi.broker import tr_codes
 from mahdi.config.settings import KISSettings
+
+# 2026-08-03(운영점검보고서 §2-8-3 / §4 우선순위 4) — 이 모듈에는 **로거 자체가 없었다.**
+# 08-03 하루 전체에서 로그를 낸 것은 httpx / mahdi.main / mahdi.broker.rest_client 셋뿐이고,
+# WS 연결·구독·해제는 단 한 줄도 남지 않았다. 그래서 "WS는 붙어 있는데 특정 구독만 조용히
+# 실패/해제된" 상태를 로그만으로는 절대 알 수 없었다(§2-4의 H0UNMKO0 수신 0건이 그 사례).
+# 볼륨은 하루 수십 줄 수준이다 — 구독은 ATM 롤링 때만 움직인다.
+logger = logging.getLogger("mahdi.broker.ws_client")
 
 
 class WSConnection(Protocol):
@@ -27,6 +35,26 @@ class WSConnection(Protocol):
 class Subscription:
     tr_id: str
     tr_key: str  # 종목코드 등
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionAck:
+    """KIS가 구독 등록/해제 요청에 되돌려주는 제어 메시지(JSON) 1건.
+
+    2026-08-03(§4 우선순위 4). 실시간 데이터는 파이프(|) 구분 텍스트로 오고, 구독 응답은 JSON으로
+    같은 소켓에 온다 — 종전에는 `mahdi.main`의 핸들러가 *"JSON 제어 메시지(구독 응답/PINGPONG)는
+    무시"* 하고 버렸다. 그런데 **이 응답이야말로 "구독이 실제로 성립했다"는 유일한 증거**다.
+    """
+
+    tr_id: str
+    tr_key: str
+    rt_cd: str      # "0"=성공
+    msg_code: str
+    message: str
+
+    @property
+    def succeeded(self) -> bool:
+        return self.rt_cd == "0"
 
 
 class ApprovalKeyIssuer:
@@ -101,6 +129,9 @@ class KISWebSocketClient:
             raise ValueError(f"구독 슬롯 한도({self.MAX_SUBSCRIPTIONS}) 초과 — 롤링 해제 필요")
         await self._conn.send(self._envelope("1", sub))
         self._active.add(key)
+        logger.info(
+            "WS 구독 요청: %s %s (활성 %d/%d)", sub.tr_id, sub.tr_key, len(self._active), self.MAX_SUBSCRIPTIONS
+        )
 
     async def unsubscribe(self, sub: Subscription) -> None:
         """활성 구독이 아니면 아무 것도 하지 않는다(멱등)."""
@@ -109,6 +140,33 @@ class KISWebSocketClient:
             return
         await self._conn.send(self._envelope("2", sub))
         self._active.discard(key)
+        logger.info(
+            "WS 구독 해제: %s %s (활성 %d/%d)", sub.tr_id, sub.tr_key, len(self._active), self.MAX_SUBSCRIPTIONS
+        )
+
+    @staticmethod
+    def parse_subscription_ack(message: dict) -> SubscriptionAck | None:
+        """
+        입력: `listen()`이 넘긴 JSON 제어 메시지(파이프 텍스트가 아닌 것).
+        계산: KIS 구독 응답 형태(`header.tr_id`/`header.tr_key` + `body.rt_cd`/`msg_cd`/`msg1`)면
+             `SubscriptionAck`으로 만든다.
+        해석: 2026-08-03(§4 우선순위 4). **구독 성립 여부를 아는 유일한 경로**다 —
+             `market_halt_status.last_message_at`(H0UNMKO0 데이터 수신)에는 임계를 걸 수 없다
+             (정상일에도 하루 0~2건이라 상시 오경보가 된다. 08-03은 0건, 07-31은 1건이었다).
+             "데이터가 안 온다"와 "구독이 안 걸렸다"를 구분하려면 구독 쪽을 따로 봐야 한다.
+        실패 조건: PINGPONG 등 body가 없는 제어 메시지면 None(호출측이 조용히 무시한다).
+        """
+        body = message.get("body")
+        if not isinstance(body, dict) or "rt_cd" not in body:
+            return None
+        header = message.get("header") or {}
+        return SubscriptionAck(
+            tr_id=str(header.get("tr_id", "")),
+            tr_key=str(header.get("tr_key", "")),
+            rt_cd=str(body.get("rt_cd", "")),
+            msg_code=str(body.get("msg_cd", "")),
+            message=str(body.get("msg1", "")),
+        )
 
     async def listen(self, handler: MessageHandler) -> None:
         """

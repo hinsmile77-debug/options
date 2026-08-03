@@ -1,5 +1,5 @@
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from mahdi.data import db
 
@@ -524,6 +524,43 @@ def test_option_chain_as_of_matches_latest_option_chain_shape():
     assert "timestamp <= %s" in conn.store["query"]
 
 
+def test_chain_snapshot_bounds_freshness_and_expiry():
+    """2026-08-03 §2-2 회귀 — 체인 스냅샷에 신선도 창과 만기 경계가 반드시 걸려야 한다.
+
+    수정 전에는 `DISTINCT ON (strike, option_type)`만 있고 시각/만기 조건이 없어, ATM 창 밖으로
+    빠진 행사가가 그때의 값 그대로 영원히 남았다 — 라이브 실측 246레그 중 오늘 수집분은 10개,
+    156레그(63%)가 이미 만기가 지난 것이었고 최고령은 4주 전이었다. GEX 부호까지 뒤집혔다.
+    """
+    conn = FakeReadConnection([])
+    as_of = datetime(2026, 8, 3, 13, 0)
+
+    db.option_chain_as_of(conn, "KOSPI200", as_of)
+
+    query, params = conn.store["query"], conn.store["params"]
+    # 만기가 다른 3개 북(regular/weekly_mon/weekly_thu)이 같은 행사가에서 서로를 덮어쓰지 않도록
+    # DISTINCT ON에 expiry가 들어가야 한다.
+    assert "DISTINCT ON (expiry, strike, option_type)" in query
+    assert "timestamp >= %s" in query and "expiry >= %s" in query
+    assert params == (
+        "KOSPI200",
+        as_of,
+        as_of - timedelta(minutes=db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES),
+        as_of.date(),
+    )
+
+
+def test_latest_option_chain_uses_same_bounds_as_backtest_path(monkeypatch):
+    # 라이브와 백테스트가 다른 체인을 보면 백테스트 결과를 라이브에 적용할 수 없다.
+    now = datetime(2026, 8, 3, 13, 0)
+    monkeypatch.setattr(db, "local_now", lambda: now)
+    live, replay = FakeReadConnection([]), FakeReadConnection([])
+
+    db.latest_option_chain(live, "KOSPI200")
+    db.option_chain_as_of(replay, "KOSPI200", now)
+
+    assert live.store == replay.store
+
+
 def test_investor_flow_as_of_returns_tuple():
     conn = FakeReadConnection([(500.0, -200.0, -300.0)])
     result = db.investor_flow_as_of(conn, "KOSPI200", datetime(2026, 7, 6, 9, 31))
@@ -797,9 +834,12 @@ def test_upsert_ws_status_writes_the_singleton_row():
     assert conn.store["params"][0] is True  # id
 
 
-def test_latest_ws_status_returns_all_four_signals():
+def test_latest_ws_status_returns_all_five_signals():
     conn = FakeReadConnection(
-        [(datetime(2026, 8, 3, 15, 43), datetime(2026, 8, 3, 7, 31), datetime(2026, 8, 3, 15, 33), 0)]
+        [(
+            datetime(2026, 8, 3, 15, 43), datetime(2026, 8, 3, 7, 31), datetime(2026, 8, 3, 15, 33), 0,
+            datetime(2026, 8, 3, 7, 31, 4),
+        )]
     )
     state = db.latest_ws_status(conn)
 
@@ -807,6 +847,8 @@ def test_latest_ws_status_returns_all_four_signals():
     assert state["connected_since"] == datetime(2026, 8, 3, 7, 31)
     assert state["last_message_at"] == datetime(2026, 8, 3, 15, 33)
     assert state["reconnect_count_today"] == 0
+    # 2026-08-03 §4 우선순위 4 — "구독이 성립했는가"는 "데이터가 왔는가"와 별개 신호다.
+    assert state["market_op_subscribed_at"] == datetime(2026, 8, 3, 7, 31, 4)
 
 
 def test_latest_ws_status_returns_none_when_observation_loop_never_ran():

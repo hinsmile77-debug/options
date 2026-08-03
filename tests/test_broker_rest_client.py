@@ -516,7 +516,7 @@ def test_slow_call_log_splits_pacer_wait_from_http_time(caplog):
         min_request_interval=0.0,
     )
 
-    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
         # 임계를 낮춰 이번 호출이 반드시 걸리게 한다(운영 기본값 3.0초는 정상 호출을 안 남긴다).
         with mock.patch("mahdi.broker.rest_client.SLOW_CALL_LOG_THRESHOLD_SECONDS", 0.01):
             client.get_balance()
@@ -540,7 +540,8 @@ def test_normal_call_is_not_logged_at_default_threshold(caplog):
         min_request_interval=0.0,
     )
 
-    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+    # 계측이 INFO로 내려갔으므로(2026-08-03 §2-8) 캡처도 INFO로 해야 "안 남는다"를 실제로 검증한다.
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
         client.get_balance()
 
     assert not [r for r in caplog.records if "느린 REST 호출" in r.getMessage()]
@@ -560,7 +561,7 @@ def test_slow_call_is_logged_even_when_the_request_raises(caplog):
         min_request_interval=0.0,
     )
 
-    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
         with mock.patch("mahdi.broker.rest_client.SLOW_CALL_LOG_THRESHOLD_SECONDS", 0.01):
             with pytest.raises(httpx.ReadTimeout):
                 client.get_balance()
@@ -582,7 +583,7 @@ def test_slow_call_log_attributes_pacer_wait_when_the_limiter_is_backed_off(capl
     )
     client._rate_limiter.wait()  # 다음 호출이 반드시 페이서에서 대기하도록 슬롯을 미리 예약
 
-    with caplog.at_level(logging.WARNING, logger="mahdi.broker.rest_client"):
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
         with mock.patch("mahdi.broker.rest_client.SLOW_CALL_LOG_THRESHOLD_SECONDS", 0.01):
             client.get_balance()
 
@@ -590,3 +591,105 @@ def test_slow_call_log_attributes_pacer_wait_when_the_limiter_is_backed_off(capl
     pacer = float(message.split("페이서대기 ")[1].split("초")[0])
     http = float(message.split("+ HTTP ")[1].split("초")[0])
     assert pacer > http  # 이 시나리오의 지연은 전적으로 페이서 대기다
+
+
+# ===== 2026-08-03 §4 우선순위 3: 커넥션 풀 재사용 실패 대응 =====
+
+
+def test_get_retries_once_on_remote_protocol_error():
+    """KIS가 먼저 닫은 keep-alive 커넥션을 재사용하면 RemoteProtocolError가 난다(08-03/07-31 각 8건).
+
+    요청이 서버에 도달하지 않았고 GET이라 부작용이 없으므로 재시도가 안전하다.
+    """
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        if len(attempts) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+        return httpx.Response(200, json={"output1": {"ok": True}})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+
+    assert client.get_quote("201S03", market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES) == {"output1": {"ok": True}}
+    assert len(attempts) == 2
+
+
+def test_get_retry_still_goes_through_the_pacer():
+    # 재시도가 페이서를 건너뛰면 EGW00201(초당 거래건수 초과)을 우리 손으로 유발하게 된다.
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.RemoteProtocolError("boom", request=request)
+        return httpx.Response(200, json={})
+
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.001,
+    )
+    before = client.rate_limit_total_calls
+    client.get_quote("201S03", market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
+
+    assert client.rate_limit_total_calls - before == 2, "재시도도 페이서 카운터를 통과해야 한다"
+
+
+def test_get_propagates_remote_protocol_error_when_retry_also_fails():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("boom", request=request)
+
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get_quote("201S03", market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
+
+
+def test_default_client_bounds_pool_and_keepalive():
+    # 호출이 페이서로 직렬화되므로 커넥션이 여러 개 필요 없다 — 좁은 풀 + 긴 keep-alive가
+    # RemoteProtocolError를 줄인다(08-03 §4 우선순위 3).
+    from mahdi.broker.rest_client import _HTTP_LIMITS, _HTTP_TIMEOUT
+
+    assert _HTTP_LIMITS.max_connections == 4
+    assert _HTTP_LIMITS.keepalive_expiry == 15.0
+    assert _HTTP_TIMEOUT.connect == 3.0
+    assert _HTTP_TIMEOUT.read == 10.0
+
+
+def test_slow_call_log_is_info_not_warning(caplog):
+    # 진단 목적이 끝났다 — 하루 933건의 WARNING은 진짜 경고를 파묻는다(§2-8).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
+        client._log_if_slow("GET", "https://x/uapi/inquire-price?a=1", pacer_seconds=1.0, http_seconds=9.0)
+
+    records = [r for r in caplog.records if "느린 REST 호출" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+
+
+def test_slow_call_threshold_ignores_calls_under_five_seconds(caplog):
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+        min_request_interval=0.0,
+    )
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
+        client._log_if_slow("GET", "https://x/uapi/inquire-price", pacer_seconds=2.0, http_seconds=2.5)
+
+    assert not [r for r in caplog.records if "느린 REST 호출" in r.message]

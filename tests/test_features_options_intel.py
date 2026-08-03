@@ -11,9 +11,38 @@ from mahdi.features.options_intel import (
     calculate_vrp,
     find_gamma_flip,
     gamma_walls,
+    legs_by_expiry,
     legs_from_chain_rows,
+    pin_risk,
+    usable_for_black_scholes,
     vanna_charm_drift,
 )
+
+
+def _leg(strike: float, opt: str, oi: float, *, iv: float = 0.18, t_years: float = 0.05) -> OptionLeg:
+    return OptionLeg(strike=strike, option_type=opt, oi=oi, iv=iv, t_years=t_years, gamma=0.0)
+
+
+def _flip_legs() -> list[OptionLeg]:
+    """스팟 350 기준 338~341 사이에서 GEX 부호가 바뀌는, 실제 체인 모양(행사가 3개 x C/P)의 구성.
+
+    순 익스포저(콜OI - 풋OI)는 340에서 -500, 350에서 0, 360에서 +1500 — 낮은 쪽이 풋 우세,
+    높은 쪽이 콜 우세인 전형적인 배치다. GAMMA_FLIP_MIN_LEGS(6)를 만족하는 최소 크기이기도 하다.
+    """
+    return [
+        _leg(340, "c", 100), _leg(340, "p", 600),
+        _leg(350, "c", 300), _leg(350, "p", 300),
+        _leg(360, "c", 1600), _leg(360, "p", 100),
+    ]
+
+
+def _no_flip_legs() -> list[OptionLeg]:
+    """전 구간에서 콜 우세라 부호가 바뀌지 않는 구성 — flip이 탐색 범위 밖인 정상 케이스."""
+    return [
+        _leg(340, "c", 100), _leg(340, "p", 0),
+        _leg(350, "c", 100), _leg(350, "p", 0),
+        _leg(360, "c", 100), _leg(360, "p", 0),
+    ]
 
 
 def test_calculate_gex_empty_is_zero():
@@ -45,9 +74,21 @@ def test_legs_from_chain_rows_empty_input_is_empty():
     assert legs_from_chain_rows([], today=date(2026, 7, 28)) == []
 
 
-def test_legs_from_chain_rows_clamps_expired_rows_to_zero_t_years():
+def test_legs_from_chain_rows_excludes_already_expired_rows():
+    # 2026-08-03 §2-2: docstring은 처음부터 "만기가 지난 레그는 제외한다"고 적혀 있었는데 코드는
+    # max(..., 0)으로 t_years만 0으로 clamp해 조용히 통과시켰다 — 라이브 실측 246레그 중 156개가
+    # 이미 만기가 지난 레그였다. 문서 쪽이 옳으므로 코드를 문서에 맞췄다.
     rows = [{"strike": 350.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01, "expiry": date(2026, 7, 1)}]
+    assert legs_from_chain_rows(rows, today=date(2026, 7, 28)) == []
+
+
+def test_legs_from_chain_rows_keeps_same_day_expiry():
+    # 만기 당일 북(위클리 월/목)은 핀 리스크의 주 무대라 GEX에는 반드시 들어가야 한다.
+    # t_years=0이라 BS 감마는 못 구하지만 calculate_gex()는 저장된 gamma를 쓰므로 문제 없고,
+    # find_gamma_flip()은 usable_for_black_scholes()가 따로 걸러낸다.
+    rows = [{"strike": 350.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01, "expiry": date(2026, 7, 28)}]
     legs = legs_from_chain_rows(rows, today=date(2026, 7, 28))
+    assert len(legs) == 1
     assert legs[0].t_years == 0.0
 
 
@@ -62,40 +103,64 @@ def test_calculate_gex_call_positive_put_negative():
 
 def test_find_gamma_flip_none_when_calls_only_always_positive():
     # 콜만 있으면 감마·OI·S^2 항이 전 구간에서 양수 → 부호 전환 없음
-    legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.18, t_years=0.05, gamma=0.01)]
-    assert find_gamma_flip(legs, spot=350) is None
+    assert find_gamma_flip(_no_flip_legs(), spot=350) is None
 
 
 def test_find_gamma_flip_detects_sign_change():
     # put OI가 낮은 스팟 쪽에, call OI가 높은 스팟 쪽에 몰려있는 실제 시장과 유사한 구성.
     # 사전에 그리드를 스캔해 338~341 사이에서 부호가 바뀌는 것을 확인한 파라미터.
-    legs = [
-        OptionLeg(strike=340, option_type="p", oi=500, iv=0.18, t_years=0.05, gamma=0.0),
-        OptionLeg(strike=360, option_type="c", oi=1500, iv=0.18, t_years=0.05, gamma=0.0),
-    ]
-    flip = find_gamma_flip(legs, spot=350)
+    flip = find_gamma_flip(_flip_legs(), spot=350)
     assert flip is not None
     assert 335 < flip < 345
 
 
 def test_find_gamma_flip_does_not_leak_vollib_print_to_stdout():
-    # 2026-07-08 실측: vollib.ref_python(C 확장 미설치 폴백)의 d1()이 sigma*sqrt(t)==0일 때
-    # (iv=0 또는 t_years=0 — 얇거나 만기 임박 레그에서 실제로 발생) print('')을 실행해 COCKPIT
-    # 하루 로그(667,663줄)의 99% 이상이 이 빈 줄이었다. iv=0.18/t_years=0.05처럼 정상적인 레그로는
-    # 이 조건이 아예 트리거되지 않으므로(회귀를 못 잡는 거짓 통과), 경계 조건 레그를 써야 한다.
-    legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.0, t_years=0.0, gamma=0.0)]
+    # 2026-07-08 실측: vollib.ref_python(C 확장 미설치 폴백)의 d1()에 디버그용 print('')이 남아
+    # 있어 COCKPIT 하루 로그(667,663줄)의 99% 이상이 이 빈 줄이었다. 실제로 vollib를 호출하는
+    # 경로여야 회귀를 잡으므로 **계산 가능한 레그**를 쓴다(iv=0/t_years=0 레그는 2026-08-03
+    # §2-1 이후 계산 전에 배제돼 vollib에 닿지도 않는다 — 그걸로 테스트하면 거짓 통과다).
+    legs = _flip_legs()
     captured = io.StringIO()
     with contextlib.redirect_stdout(captured):
         find_gamma_flip(legs, spot=350)
     assert captured.getvalue() == ""
 
 
-def test_find_gamma_flip_handles_zero_time_to_expiry_without_warning_noise(recwarn):
-    # 그리드 경계에서 t_years/iv가 0에 가까우면 vollib 내부에서 0-나눗셈이 발생한다 — 계산 자체는
-    # 그대로 두되(nan/inf가 부호 비교에 들어가도 flip 로직은 안전) RuntimeWarning만 억제한다.
+def test_find_gamma_flip_excludes_zero_iv_legs_instead_of_poisoning_the_sum(caplog):
+    """2026-08-03 §2-1 회귀 — iv=0 레그 하나가 전체 곡선을 NaN으로 만들어선 안 된다.
+
+    수정 전 코드는 `gex_at()`에서 레그별 감마를 **합산**했기 때문에, iv=0인 레그가 하나만 섞여도
+    그 그리드 포인트의 합계 전체가 NaN이 됐다. 그리고 NaN은 `values[i-1]*values[i] < 0`을 항상
+    False로 만들어 함수가 예외도 경고도 없이 None으로 떨어졌다 — 라이브 실측에서 41개 그리드가
+    전부 NaN이었고, `signal_decisions` 전 이력에서 `available_member_count >= 3`인 행이 0건
+    (앙상블 멤버 options_flow가 한 번도 활성화된 적 없음)이었던 직접적 원인이다.
+    """
+    legs = [*_flip_legs(), _leg(350, "c", 100, iv=0.0)]
+    flip = find_gamma_flip(legs, spot=350)
+    assert flip is not None, "iv=0 레그 하나 때문에 flip이 사라지면 안 된다"
+    assert 335 < flip < 345
+    assert not caplog.records, "정상 산출 경로에서는 경고를 남기지 않는다"
+
+
+def test_find_gamma_flip_warns_when_too_few_usable_legs(caplog):
+    # 조용한 실패가 §2-1 버그를 넉 달간 가렸다 — 산출 불가는 반드시 로그에 남는다.
     legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.0, t_years=0.0, gamma=0.0)]
-    find_gamma_flip(legs, spot=350)
-    assert not any(issubclass(w.category, RuntimeWarning) for w in recwarn.list)
+    assert find_gamma_flip(legs, spot=350) is None
+    assert any("감마플립 산출 불가" in r.message for r in caplog.records)
+
+
+def test_find_gamma_flip_out_of_range_is_silent(caplog):
+    # 반대로 "탐색 범위 안에 flip이 없다"는 정상적인 결과이므로 로그를 남기지 않는다
+    # (매분 경고가 나오면 진짜 경고가 파묻힌다).
+    assert find_gamma_flip(_no_flip_legs(), spot=350) is None
+    assert not caplog.records
+
+
+def test_usable_for_black_scholes_requires_positive_iv_time_strike():
+    assert usable_for_black_scholes(OptionLeg(strike=350, option_type="c", oi=1, iv=0.18, t_years=0.05, gamma=0.0))
+    assert not usable_for_black_scholes(OptionLeg(strike=350, option_type="c", oi=1, iv=0.0, t_years=0.05, gamma=0.0))
+    assert not usable_for_black_scholes(OptionLeg(strike=350, option_type="c", oi=1, iv=0.18, t_years=0.0, gamma=0.0))
+    assert not usable_for_black_scholes(OptionLeg(strike=0, option_type="c", oi=1, iv=0.18, t_years=0.05, gamma=0.0))
 
 
 def test_gamma_walls_ranks_by_exposure():
@@ -138,3 +203,55 @@ def test_gamma_map_engine_delegates_to_functions():
     legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.18, t_years=0.05, gamma=0.01)]
     assert engine.calculate_gex(legs, spot=350) == calculate_gex(legs, spot=350)
     assert engine.gamma_walls(legs, spot=350) == gamma_walls(legs, spot=350)
+
+
+# ===== 2026-08-03 §5-5: 북별 체인 스냅샷 =====
+
+
+def test_legs_by_expiry_separates_books_instead_of_merging_them():
+    """3개 북을 합산하면 만기별 정보가 서로를 덮는다 — 특히 만기 당일 북이 묻힌다."""
+    rows = [
+        {"strike": 350.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "expiry": date(2026, 8, 13)},
+        {"strike": 350.0, "option_type": "C", "oi": 50.0, "iv": 0.30, "gamma": 0.05,
+         "expiry": date(2026, 8, 6)},
+        {"strike": 350.0, "option_type": "P", "oi": 70.0, "iv": 0.40, "gamma": 0.08,
+         "expiry": date(2026, 8, 6)},
+    ]
+    grouped = legs_by_expiry(rows, today=date(2026, 8, 3))
+
+    assert list(grouped) == [date(2026, 8, 6), date(2026, 8, 13)]  # 만기 오름차순
+    assert len(grouped[date(2026, 8, 6)]) == 2
+    assert len(grouped[date(2026, 8, 13)]) == 1
+
+
+def test_legs_by_expiry_keeps_the_same_exclusion_rules_as_the_flat_conversion():
+    rows = [
+        {"strike": 350.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01, "expiry": None},
+        {"strike": 350.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01,
+         "expiry": date(2026, 7, 1)},  # 이미 만기
+    ]
+    assert legs_by_expiry(rows, today=date(2026, 8, 3)) == {}
+
+
+def test_pin_risk_is_computable_on_expiry_day_when_gamma_flip_is_not():
+    # 만기 당일은 t_years=0이라 BS 감마가 정의되지 않는다 — 그런데 핀 리스크는 바로 그 북의 것이다.
+    legs = [
+        _leg(350, "c", 1000, t_years=0.0), _leg(350, "p", 1000, t_years=0.0),
+        _leg(355, "c", 10, t_years=0.0), _leg(345, "p", 10, t_years=0.0),
+    ]
+    legs = [OptionLeg(l.strike, l.option_type, l.oi, l.iv, l.t_years, gamma=0.05) for l in legs]
+
+    assert find_gamma_flip(legs, spot=350.0) is None  # BS 경로는 못 쓴다
+    risk = pin_risk(legs, spot=350.0)
+    assert risk is not None
+    assert risk["strike"] == 350.0
+    assert risk["concentration"] > 0.9  # 노출이 한 행사가에 몰려 있다
+    assert risk["distance_pct"] == pytest.approx(0.0)
+
+
+def test_pin_risk_returns_none_when_there_is_no_exposure():
+    # OI가 전부 0이면(08-03 weekly_thu가 91% 그랬다) 지어내지 않는다.
+    legs = [OptionLeg(350, "c", oi=0.0, iv=0.2, t_years=0.01, gamma=0.05)]
+    assert pin_risk(legs, spot=350.0) is None
+    assert pin_risk([], spot=350.0) is None

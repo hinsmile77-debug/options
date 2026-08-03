@@ -31,6 +31,13 @@ REM docs\동작점검\auto\에 마크다운 + JSON 사이드카로 남긴다. �
 REM 위 taskkill로 관측 루프가 이미 종료돼 **로그가 완결**돼 있고, DB/Redis는 의도적으로 계속
 REM 실행 중이라 SQL 집계가 가능하다. 스크립트가 최상위에서 예외를 삼키므로(exit 0) 실패해도
 REM 아래 종료 로그까지 정상적으로 진행된다.
+REM
+REM 2026-08-03(운영점검보고서 §3-1): 이 줄만 출력이 파일로 리다이렉트되는데, **Python이
+REM 리다이렉트된 파일에 쓰는 인코딩은 콘솔 코드페이지(위 chcp 65001)가 아니라 OS 시스템
+REM 로캘(ANSI=cp949)을 따른다** — 그래서 08-03 로그에 리포트 경로의 한글이 전부 깨져 남았다
+REM ("docs\??????\auto\2026-08-03_??.md"). start_mahdi_premarket.bat 상단이 이미 같은 함정을
+REM 문서화해 뒀는데 stop 쪽에는 그 대책이 빠져 있었다. 프로세스 단위로 UTF-8을 강제한다.
+set PYTHONIOENCODING=utf-8
 uv run python scripts\daily_ops_report.py >> "%LOG_FILE%" 2>&1
 
 echo [%date% %time%] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"

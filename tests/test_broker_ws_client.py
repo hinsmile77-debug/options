@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -114,3 +115,48 @@ def test_approval_key_issuer_returns_key_from_response():
     issuer = ApprovalKeyIssuer(settings, client=httpx.Client(transport=httpx.MockTransport(handler)))
 
     assert issuer.issue() == "APV-123"
+
+
+# ===== 2026-08-03 §4 우선순위 4: 구독 ACK =====
+
+
+def test_parse_subscription_ack_reads_success_response():
+    ack = KISWebSocketClient.parse_subscription_ack(
+        {
+            "header": {"tr_id": "H0UNMKO0", "tr_key": "005930"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }
+    )
+    assert ack is not None
+    assert ack.tr_id == "H0UNMKO0"
+    assert ack.tr_key == "005930"
+    assert ack.succeeded is True
+
+
+def test_parse_subscription_ack_reads_failure_response():
+    ack = KISWebSocketClient.parse_subscription_ack(
+        {
+            "header": {"tr_id": "H0UNMKO0", "tr_key": "005930"},
+            "body": {"rt_cd": "1", "msg_cd": "OPSP0009", "msg1": "ALREADY IN SUBSCRIBE"},
+        }
+    )
+    assert ack is not None and ack.succeeded is False
+    assert ack.msg_code == "OPSP0009"
+
+
+def test_parse_subscription_ack_ignores_pingpong_and_data():
+    # PINGPONG 등 body가 없는 제어 메시지는 구독 응답이 아니다.
+    assert KISWebSocketClient.parse_subscription_ack({"header": {"tr_id": "PINGPONG"}}) is None
+    assert KISWebSocketClient.parse_subscription_ack({"raw": "0|H0IFCNT0|001|101S03^090000^350"}) is None
+
+
+def test_subscribe_and_unsubscribe_are_logged(caplog):
+    # 2026-08-03 §2-8-3: 이 모듈에는 로거 자체가 없어 구독 상태 변화가 로그에 전혀 안 남았다.
+    ws = KISWebSocketClient(approval_key="APV", connection=FakeConnection())
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.ws_client"):
+        asyncio.run(ws.subscribe(Subscription("H0IOCNT0", "201S03C325")))
+        asyncio.run(ws.unsubscribe(Subscription("H0IOCNT0", "201S03C325")))
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("WS 구독 요청" in m for m in messages)
+    assert any("WS 구독 해제" in m for m in messages)

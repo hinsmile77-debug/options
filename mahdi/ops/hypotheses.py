@@ -86,7 +86,8 @@ def evaluate(
     입력: 가설 목록, 대상 날짜, 로그 지표, (선택) DB 지표.
     계산: `검증예정일`이 대상 날짜 **이하**이고 `상태`가 `pending`인 가설만 골라 예측과 실측을
          나란히 낸다 — 예정일이 지났는데 아직 확정 안 된 항목이 계속 보이는 편이, 하루 놓치면
-         영영 사라지는 것보다 낫다.
+         영영 사라지는 것보다 낫다. 예정일이 **지난** 항목에는 `overdue=True`를 달아 리포트가
+         표 위로 따로 띄운다(2026-08-03 §5-4).
     실패 조건: 항목 형식이 어긋나면 그 항목만 건너뛴다(로그만 남긴다).
     """
     out: list[dict] = []
@@ -111,6 +112,11 @@ def evaluate(
                         "actual": actual,
                         "expect": expect,
                         "verdict": _verdict(actual, expect),
+                        # 2026-08-03 §5-4: 예정일이 **지난** 채로 아직 pending인 항목.
+                        # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에
+                        # 섞여 들어가면 놓치기 쉽고 그러면 규약 자체가 무력해진다.
+                        "overdue": due is not None and due < target,
+                        "검증예정일": due.isoformat() if due is not None else None,
                     }
                 )
         except Exception:

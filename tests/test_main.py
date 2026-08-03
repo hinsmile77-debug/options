@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 import logging
 import time
 from contextlib import contextmanager
@@ -416,6 +417,8 @@ def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconne
     notify_calls: list[tuple[str, str]] = []
     monkeypatch.setattr("mahdi.main.notify.notify", lambda message, level="INFO": notify_calls.append((message, level)))
 
+    liveness = mahdi_main.WsLiveness(market_op_subscribed_at=datetime(2026, 8, 4, 7, 31))
+
     with pytest.raises(RuntimeError, match="세 번째 연결 시도는 테스트 범위 밖"):
         _run(
             run_observation_loop_forever(
@@ -423,10 +426,16 @@ def test_run_observation_loop_forever_reconnects_and_resubscribes_after_disconne
                 regime_state_machine=_FakeRegimeStateMachine(),
                 market_halt_monitor=MarketHaltMonitor(),
                 approval_key="APV1", connect=fake_connect,
+                ws_liveness=liveness,
             )
         )
 
     assert fake_connect.call_count == 2  # 재연결 성공 1회 + 그다음 재연결 시도(실패로 테스트 종료)
+    # 2026-08-03 §4 우선순위 4: 새 연결은 KIS 쪽 구독 상태가 전부 초기화된 상태다 — 재구독 ACK이
+    # 다시 올 때까지는 "구독 성립"이 아니다. 직전 연결의 시각을 그대로 두면 끊긴 구독이 살아 있는
+    # 것처럼 보인다(이 테스트의 second_conn은 ACK을 돌려주지 않는다).
+    assert liveness.market_op_subscribed_at is None
+    assert liveness.reconnect_count == 1
     # 연결에 성공하면 backoff가 초기값으로 리셋된다 — 두 번의 끊김 모두 "첫 끊김"이라 둘 다 5초.
     assert sleep_calls == [5.0, 5.0]
 
@@ -2947,7 +2956,9 @@ def test_build_signal_inputs_computes_gex_and_gamma_flip_from_chain_and_spot(mon
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, -100.0, -200.0))
 
     regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=(1.0,) + (0.0,) * 7)
-    inputs = _build_signal_inputs(conn=object(), regime_state=regime_state, underlying="KOSPI200")
+    inputs, chain_inputs = _build_signal_inputs(
+        conn=object(), regime_state=regime_state, underlying="KOSPI200"
+    )
 
     assert inputs.regime_state is regime_state
     assert inputs.spot == 350.5
@@ -2955,6 +2966,10 @@ def test_build_signal_inputs_computes_gex_and_gamma_flip_from_chain_and_spot(mon
     assert inputs.foreign_net_flow == 500.0
     assert inputs.ofi is None  # 라이브 OFI 집계 파이프라인 없음 — 항상 None
     assert inputs.queue_imbalance is None
+    # 2026-08-03 §5-1: 판단 행에 남길 체인 입력 관측치를 함께 돌려준다(마이그레이션 022).
+    assert chain_inputs["gex"] == inputs.gex
+    assert chain_inputs["gamma_flip"] == inputs.gamma_flip
+    assert chain_inputs["chain_leg_count"] == 2
 
 
 def test_build_signal_inputs_handles_missing_chain_and_flow_gracefully(monkeypatch):
@@ -2962,13 +2977,17 @@ def test_build_signal_inputs_handles_missing_chain_and_flow_gracefully(monkeypat
     monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
 
-    inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+    inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
 
     assert inputs.regime_state is None
     assert inputs.gex is None
     assert inputs.gamma_flip is None
     assert inputs.spot is None
     assert inputs.foreign_net_flow is None
+    # 체인이 비면 레그 수는 0이고 나이는 None이다 — 없는 값을 0으로 채우면 "계산했는데 0"과
+    # 구분되지 않는다.
+    assert chain_inputs["chain_leg_count"] == 0
+    assert chain_inputs["chain_oldest_leg_age_seconds"] is None
 
 
 class _FakeRegimeStateMachineWithLastState:
@@ -2999,7 +3018,7 @@ def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
             (ts, conviction, decision, reject_reason, risk_gate_state, exec_mode)
         ),
     )
@@ -3047,7 +3066,7 @@ def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeyp
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
             (ts, conviction, decision, reject_reason, risk_gate_state, exec_mode)
         ),
     )
@@ -3155,7 +3174,7 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
             (decision, risk_gate_state)
         ),
     )
@@ -3209,7 +3228,7 @@ def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
             (decision, risk_gate_state)
         ),
     )
@@ -3254,7 +3273,7 @@ def test_poll_signal_fusion_cycle_marks_account_tracker_not_ready(monkeypatch):
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
             (decision, risk_gate_state)
         ),
     )
@@ -3519,7 +3538,7 @@ def test_poll_signal_fusion_cycle_rejects_when_palette_only_says_wait(monkeypatc
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
             (decision, reject_reason, risk_gate_state)
         ),
     )
@@ -3896,7 +3915,6 @@ def _nominal_poller_occupancy(minute: int) -> list[tuple[str, float, float]]:
 
     strikes_per_book = mahdi_main.STRIKES_EACH_SIDE * 2 + 1
     legs_per_book = strikes_per_book * 2  # 콜/풋
-    weekly_books = len(mahdi_main.OPTION_CHAIN_SLOW_SERIES)
     liquidity_legs = (mahdi_main.LIQUIDITY_ATM_EACH_SIDE * 2 + 1) * 2 + 1  # 호가 + 만기확인 앵커 1건
 
     occupancy: list[tuple[str, float, float]] = []
@@ -3905,8 +3923,12 @@ def _nominal_poller_occupancy(minute: int) -> list[tuple[str, float, float]]:
         start = phase % 60.0
         occupancy.append((name, start, start + calls * PACE))
 
-    # 옵션체인: 매 분. 위클리 2북은 짝수분에만(축소안 (a)).
-    due_books = 1 + (weekly_books if minute % mahdi_main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == 0 else 0)
+    # 옵션체인: 먼슬리는 매 분, 위클리는 각자 배정된 분 패리티에만(2026-08-03 §4 우선순위 2).
+    due_books = 1 + sum(
+        1
+        for phase in mahdi_main.OPTION_CHAIN_SLOW_SERIES_PHASE.values()
+        if minute % mahdi_main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == phase
+    )
     add("option_chain", mahdi_main.OPTION_CHAIN_PHASE_OFFSET_SECONDS, due_books * legs_per_book)
     # 투자자수급: 매 분 3세그먼트(선물/콜/풋).
     add("investor_flow", mahdi_main.INVESTOR_FLOW_PHASE_OFFSET_SECONDS, 3)
@@ -3943,12 +3965,36 @@ def test_poller_occupancy_fits_inside_the_minute():
         assert last_end <= 60.0, f"minute%10={minute}: 점유가 {last_end:.0f}초로 분을 넘긴다"
 
 
-def test_expiry_liquidity_is_never_scheduled_on_option_chain_heavy_minutes():
-    # §4 우선순위 1의 핵심 계약: 만기유동성 슬롯은 옵션체인이 3북 전부를 도는 분과 겹치면 안 된다.
-    heavy_minutes = {
-        m for m in range(10) if m % mahdi_main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == 0
-    }
-    assert not (set(mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES) & heavy_minutes)
+def test_option_chain_load_is_flat_across_every_minute():
+    """2026-08-03 §4 우선순위 2의 핵심 계약 — 어느 분에도 옵션체인 부하가 몰리지 않아야 한다.
+
+    종전에는 위클리 2북이 모두 짝수분에 실려 짝수분 30레그 / 홀수분 10레그였고, 밀림 39건의
+    100%가 짝수 mod10, 결손 41분 중 39분이 홀수분이었다(짝수분 초과분이 다음 분을 스킵시킨다).
+    """
+    per_minute = []
+    for minute in range(10):
+        chain = [w for w in _nominal_poller_occupancy(minute) if w[0] == "option_chain"]
+        assert len(chain) == 1
+        per_minute.append(chain[0][2] - chain[0][1])
+    assert len(set(per_minute)) == 1, f"분마다 옵션체인 점유가 다르다: {per_minute}"
+
+
+def test_weekly_books_split_across_minute_parities():
+    # 두 위클리 북이 같은 패리티를 쓰면 평탄화가 무너진다 — 상수 수준에서 못 박는다.
+    phases = list(mahdi_main.OPTION_CHAIN_SLOW_SERIES_PHASE.values())
+    assert sorted(phases) == list(range(mahdi_main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES))
+
+
+def test_low_frequency_pollers_share_a_phase_on_disjoint_minutes():
+    # 만기유동성/매크로/계좌잔고는 같은 30초 위상을 공유한다 — 발사 분 집합이 서로소라 안전하다.
+    # (겹치면 test_poller_occupancy_windows_do_not_overlap이 잡지만, 의도를 여기에 남긴다.)
+    expiry = set(mahdi_main.EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES)
+    macro = {m for m in range(10) if m % 5 == int(mahdi_main.MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS // 60) % 5}
+    balance = {m for m in range(10) if m % 5 == int(mahdi_main.ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS // 60) % 5}
+
+    assert expiry & macro == set()
+    assert expiry & balance == set()
+    assert macro & balance == set()
 
 
 # ===== 2026-07-31 총 REST 수요 축소안 (a): 위클리 2북 격분 폴링 =====
@@ -3962,14 +4008,15 @@ def _books_for_cadence_test():
     ]
 
 
-def test_books_due_includes_all_three_on_even_minutes():
+def test_books_due_pairs_monthly_with_weekly_mon_on_even_minutes():
+    # 2026-08-03 §4 우선순위 2: 매 분 먼슬리 1북 + 위클리 1북 = 20레그로 평탄해진다.
     due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 30))
-    assert [series for _m, series in due] == ["regular", "weekly_mon", "weekly_thu"]
+    assert [series for _m, series in due] == ["regular", "weekly_mon"]
 
 
-def test_books_due_drops_weeklies_on_odd_minutes():
+def test_books_due_pairs_monthly_with_weekly_thu_on_odd_minutes():
     due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 31))
-    assert [series for _m, series in due] == ["regular"]  # 먼슬리는 언제나 매분
+    assert [series for _m, series in due] == ["regular", "weekly_thu"]  # 먼슬리는 언제나 매분
 
 
 def test_books_due_halves_weekly_call_volume_over_an_hour():
@@ -3996,7 +4043,7 @@ def test_books_due_preserves_input_order_so_monthly_is_polled_first():
     assert due[0][1] == "regular"
 
 
-def test_poll_option_chain_skips_weekly_books_on_odd_minutes(monkeypatch):
+def test_poll_option_chain_uses_weekly_thu_on_odd_minutes(monkeypatch):
     # 실제 폴러 경로에서도 위클리 심볼이 조회되지 않는지 확인한다(헬퍼 단위테스트만으로는
     # 호출측이 due_books를 실제로 쓰는지 보장되지 않는다).
     rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
@@ -4027,10 +4074,10 @@ def test_poll_option_chain_skips_weekly_books_on_odd_minutes(monkeypatch):
     with pytest.raises(RuntimeError, match="stop-loop"):
         _run(poll_option_chain(rest_client, _books_for_cadence_test(), _SeriesRecordingMaster(), interval_seconds=60))
 
-    assert set(requested_series) == {"regular"}
+    assert set(requested_series) == {"regular", "weekly_thu"}
 
 
-def test_poll_option_chain_polls_all_books_on_even_minutes(monkeypatch):
+def test_poll_option_chain_uses_weekly_mon_on_even_minutes(monkeypatch):
     rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
 
     requested_series: list[str] = []
@@ -4059,7 +4106,7 @@ def test_poll_option_chain_polls_all_books_on_even_minutes(monkeypatch):
     with pytest.raises(RuntimeError, match="stop-loop"):
         _run(poll_option_chain(rest_client, _books_for_cadence_test(), _SeriesRecordingMaster(), interval_seconds=60))
 
-    assert set(requested_series) == {"regular", "weekly_mon", "weekly_thu"}
+    assert set(requested_series) == {"regular", "weekly_mon"}
 
 
 # ===== 2026-07-31 매크로 항목별 갱신 주기 분리 =====
@@ -4227,3 +4274,178 @@ def test_poll_macro_snapshot_does_not_count_unfetched_zn_cycles_as_failures(monk
 
     assert [row["zn_front"] for row in written] == [_FALLBACK_PRICE, None, None, None, None]
     assert notify_calls == []  # 미조회 NULL 4건이 이중실패로 오인되지 않아야 한다
+
+
+def test_run_observation_loop_rerolls_atm_when_futures_bar_completes(monkeypatch):
+    """2026-08-03 §2-2 후속 회귀 — ATM은 스팟을 따라 **계속** 이동해야 한다.
+
+    수정 전에는 `roll_to_spot()`이 WS 연결당 단 한 번(진입부)만 호출됐다. 그 결과 2026-08-03
+    실측에서 07:31 장전 호가 1046.81로 잡힌 행사가 1042.50~1052.50 5개가 하루 종일 고정됐고,
+    정작 시장은 983~1015에서 움직여 **하루치 옵션 체인 전체가 약 5.5% 외가격에서 수집**됐다.
+    §2-1(NaN 오염)을 걷어낸 뒤에도 감마플립 산출률이 0%로 남은 이유가 이것이다.
+    """
+    futures_symbol = "101S03"
+    incoming = [
+        _make_h0ifcnt0("090000", 350.0, 10, 350.05, 349.95, 100, 100, symbol=futures_symbol),
+        # 스팟이 5포인트 올라 ATM이 350.0 → 355.0으로 두 칸 이동하는 봉
+        _make_h0ifcnt0("090030", 355.0, 10, 355.05, 354.95, 100, 100, symbol=futures_symbol),
+        _make_h0ifcnt0("090100", 355.0, 5, 355.05, 354.95, 100, 100, symbol=futures_symbol),  # 09:00봉 flush
+    ]
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection(incoming))
+    subscription_manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1
+    )
+    rest_client = FakeRestClient(spot=350.0)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_regime_state", lambda conn, **kwargs: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda conn, underlying, symbol, updated_at: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [subscription_manager], rest_client, futures_symbol=futures_symbol,
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+            )
+        )
+
+    # 진입부 초기 롤링은 REST 스팟 350.0 → {347.5, 350.0, 352.5}.
+    # 09:00봉 종가 355.0으로 재롤링되면 {352.5, 355.0, 357.5}이어야 한다.
+    assert subscription_manager.desired_strikes == frozenset({352.5, 355.0, 357.5})
+    # 슬롯 수는 그대로 — 롤링은 범위를 벗어난 구독을 먼저 해제한 뒤 새 행사가를 구독한다
+    # (선물/장운영정보 구독은 옵션 슬롯과 무관하므로 옵션 TR만 센다).
+    option_subs = {key for key in ws_client.active_subscriptions if key[0] == "H0IOCNT0"}
+    assert len(option_subs) == 6
+
+
+def test_reroll_books_to_spot_logs_only_when_window_actually_moves(monkeypatch, caplog):
+    # roll_to_spot()은 diff 기반이라 변화가 없으면 무동작이지만, "언제 어디로 옮겼는가"는
+    # 로그에 남아야 한다 — 매분 호출되므로 변화 없을 때 조용한 것도 똑같이 중요하다.
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([]))
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+
+    with caplog.at_level("INFO", logger="mahdi.main"):
+        _run(mahdi_main._reroll_books_to_spot([manager], 350.0))
+        first = [r for r in caplog.records if "ATM 롤링" in r.message]
+        _run(mahdi_main._reroll_books_to_spot([manager], 350.4))  # 같은 ATM 격자 → 변화 없음
+        second = [r for r in caplog.records if "ATM 롤링" in r.message]
+        _run(mahdi_main._reroll_books_to_spot([manager], 356.0))  # ATM 355.0 → 이동
+        third = [r for r in caplog.records if "ATM 롤링" in r.message]
+
+    assert len(first) == 1
+    assert len(second) == 1, "ATM이 그대로면 로그를 남기지 않는다"
+    assert len(third) == 2
+
+
+# ===== 2026-08-03 §2-8 / §4 우선순위 3: 로그 위생 =====
+
+
+def test_kis_call_failure_keeps_response_body_but_drops_traceback(caplog):
+    """HTTPStatusError는 원인이 응답 바디에 전부 있고 스택은 항상 같은 세 프레임이라 정보가 0이다.
+
+    08-03 실측: 이 트레이스백만 하루 약 1,700줄이었고, 그중 306줄이 "CBOT/CME SUB거래소 신청
+    계좌가 아닙니다"(계정 권한 문제 — 코드로는 절대 해결 안 되는 항상 실패) 18건이었다.
+    """
+    request = httpx.Request("GET", "https://openapivts.koreainvestment.com/uapi/x?SRS_CD=ZNU26")
+    response = httpx.Response(
+        500, request=request,
+        json={"rt_cd": "1", "msg_cd": "EGW00552", "msg1": "CBOT SUB거래소 신청 계좌가 아닙니다."},
+    )
+    exc = httpx.HTTPStatusError("Server error '500'", request=request, response=response)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        mahdi_main._log_kis_call_failure("ZN(10년 국채선물) 근월물 조회 실패: ZNU26", exc)
+
+    record = caplog.records[-1]
+    assert "EGW00552" in record.getMessage(), "KIS 원인 코드는 반드시 남아야 한다"
+    assert not record.exc_info, "HTTPStatusError에는 트레이스백을 붙이지 않는다"
+
+
+def test_kis_call_failure_keeps_traceback_for_unexpected_errors(caplog):
+    # 반대로 HTTPStatusError가 아닌 예외는 "어디서 났는가"가 곧 원인이므로 스택을 남긴다.
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        mahdi_main._log_kis_call_failure("응답 파싱 실패", ValueError("bad payload"))
+
+    assert caplog.records[-1].exc_info is not None
+
+
+# ===== 2026-08-03 §2-4 / §4 우선순위 4: 구독 성립 신호 =====
+
+
+def test_observation_loop_records_market_op_subscription_ack(monkeypatch):
+    """08-03에 장운영정보 데이터가 하루 0건이었는데 하트비트는 정상이라 배지가 초록이었다.
+
+    `last_message_at`에는 임계를 걸 수 없으므로(정상일에도 0~2건) **구독이 성립했는가**를
+    따로 기록해 "구독이 안 걸린 것"과 "이벤트가 없었던 것"을 구분한다.
+    """
+    ack = json.dumps(
+        {
+            "header": {"tr_id": tr_codes.WS_TR_MARKET_OPERATION_INFO, "tr_key": "005930"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }
+    )
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([ack]))
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+    liveness = mahdi_main.WsLiveness()
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 4, 7, 31, 4))
+
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [manager], FakeRestClient(spot=350.0), futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+                ws_liveness=liveness,
+            )
+        )
+
+    assert liveness.market_op_subscribed_at == datetime(2026, 8, 4, 7, 31, 4)
+    # 구독 응답은 데이터가 아니다 — last_message_at을 건드리면 "감지기가 뭔가를 봤다"가 거짓이 된다.
+    assert liveness.last_message_at is None
+
+
+def test_observation_loop_ignores_ack_for_other_tr_ids(monkeypatch):
+    ack = json.dumps(
+        {
+            "header": {"tr_id": "H0IFCNT0", "tr_key": "101S03"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }
+    )
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([ack]))
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+    liveness = mahdi_main.WsLiveness()
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [manager], FakeRestClient(spot=350.0), futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+                ws_liveness=liveness,
+            )
+        )
+
+    assert liveness.market_op_subscribed_at is None

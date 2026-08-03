@@ -131,3 +131,57 @@ def test_metric_paths_used_by_the_repository_file_exist_in_a_real_parse(path):
     )
     # 값 자체는 픽스처에 따라 없을 수 있으나, 최상위 절은 반드시 존재해야 한다.
     assert report.dig(parsed, path.split(".")[0]) is not None
+
+
+# ===== 2026-08-03 §5-4: 확정 대기(overdue) 표시 =====
+
+
+def test_evaluate_marks_overdue_pending_entries(tmp_path):
+    """예정일이 지났는데 아직 pending이면 표에 섞이지 않고 따로 드러나야 한다.
+
+    규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 쌓이면 규약 자체가 무력해진다.
+    """
+    entries = [
+        {"id": "due-today", "검증예정일": date(2026, 8, 4), "상태": "pending",
+         "예측": [{"metric": "overrun.count", "expect": "<= 30"}]},
+        {"id": "overdue", "검증예정일": date(2026, 8, 3), "상태": "pending",
+         "예측": [{"metric": "overrun.count", "expect": "<= 30"}]},
+    ]
+    results = hypotheses.evaluate(entries, date(2026, 8, 4), {"overrun": {"count": 12}})
+
+    by_id = {r["id"]: r for r in results}
+    assert by_id["due-today"]["overdue"] is False  # 오늘이 예정일 — 아직 늦지 않았다
+    assert by_id["overdue"]["overdue"] is True
+    assert by_id["overdue"]["검증예정일"] == "2026-08-03"
+
+
+def test_report_surfaces_overdue_entries_above_the_table():
+    from mahdi.ops import report
+
+    out = report.render(
+        {"date": "2026-08-04"},
+        hypotheses=[{
+            "id": "2026-08-01-p1", "가설": "버스트 분할", "metric": "overrun.count",
+            "actual": 12, "expect": "<= 20", "verdict": "확인",
+            "overdue": True, "검증예정일": "2026-08-03",
+        }],
+    )
+    section = out.split("## 0. 가설 검정", 1)[1].split("\n## ", 1)[0]
+    callout, table = section.split("| id |", 1)
+    assert "확정 대기 1건" in callout
+    assert "2026-08-01-p1" in callout
+    assert "2026-08-03" in callout
+    assert table  # 표 자체는 그대로 나온다
+
+
+def test_report_omits_the_callout_when_nothing_is_overdue():
+    from mahdi.ops import report
+
+    out = report.render(
+        {"date": "2026-08-04"},
+        hypotheses=[{
+            "id": "h1", "가설": "x", "metric": "overrun.count",
+            "actual": 12, "expect": "<= 20", "verdict": "확인", "overdue": False,
+        }],
+    )
+    assert "확정 대기" not in out

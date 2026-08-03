@@ -115,3 +115,94 @@ def test_dig_returns_none_for_missing_paths_instead_of_raising():
     assert report.dig(_TODAY, "rest.total_calls") == 13000
     assert report.dig(_TODAY, "rest.없는키") is None
     assert report.dig(_TODAY, "없는절.a.b") is None
+
+
+# ===== 2026-08-03 §5-1: 신호 도달률 =====
+
+
+def _reach(**overrides) -> dict:
+    base = {
+        "available": True, "decisions": 494, "member_count_max": 3,
+        "gamma_flip_count": 450, "gamma_flip_pct": 91.1,
+        "chain_leg_median": 30.0, "chain_leg_max": 30,
+        "chain_age_seconds_median": 60.0, "chain_age_seconds_max": 120.0,
+        "warnings": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_signal_reach_section_reports_values_and_no_warning_when_healthy():
+    out = report.render(_TODAY, db_metrics={"signal_reach": _reach()})
+    assert "## 14. 신호 도달률" in out
+    assert "91.1%" in out
+    assert "경고 없음" in out
+
+
+def test_signal_reach_section_surfaces_warnings():
+    # 08-03 실측 재현: 감마플립 0%, 앙상블 최대 2멤버, 체인 최고령 4주.
+    out = report.render(
+        _TODAY,
+        db_metrics={"signal_reach": _reach(
+            member_count_max=2, gamma_flip_count=0, gamma_flip_pct=0.0,
+            chain_leg_max=246, chain_age_seconds_max=2_400_000.0,
+            warnings=["앙상블 최대 가용 멤버 2개 — options_flow가 한 번도 활성화되지 않았다"],
+        )},
+    )
+    assert "⚠ 앙상블 최대 가용 멤버 2개" in out
+    assert "경고 없음" not in out
+
+
+def test_signal_reach_section_says_so_when_migration_not_applied():
+    # 0%로 표시하면 "오늘 신호가 죽었다"는 거짓 신호가 된다.
+    out = report.render(_TODAY, db_metrics={"signal_reach": {"available": False}})
+    section = out.split("## 14. 신호 도달률", 1)[1].split("\n## ", 1)[0]
+    assert "마이그레이션 022" in section
+    assert "감마플립 산출률" not in section
+
+
+def test_signal_reach_section_quotes_thresholds_from_the_single_source():
+    # 배지와 리포트가 다른 임계를 쓰면 어느 쪽을 믿을지 알 수 없다(README 규약).
+    from mahdi.ops.db_metrics import SIGNAL_REACH_WARNINGS
+
+    out = report.render(_TODAY, db_metrics={"signal_reach": _reach()})
+    assert f"< {SIGNAL_REACH_WARNINGS['gamma_flip_pct_min']}%" in out
+
+
+def test_signal_reach_renders_missing_chain_columns_as_dashes():
+    # 마이그레이션 022 이전 판단 행은 체인 컬럼이 NULL이다 — "None"이 그대로 찍히면 안 된다.
+    out = report.render(
+        _TODAY,
+        db_metrics={"signal_reach": _reach(
+            chain_leg_median=None, chain_leg_max=None,
+            chain_age_seconds_median=None, chain_age_seconds_max=None,
+        )},
+    )
+    section = out.split("## 14. 신호 도달률", 1)[1].split("\n## ", 1)[0]
+    assert "None" not in section
+
+
+# ===== 2026-08-03 §5-5: 북별 감마 지형 =====
+
+
+def test_book_gamma_map_separates_expiries_and_marks_expiry_day():
+    out = report.render(
+        _TODAY,
+        db_metrics={"book_gamma_map": [
+            {"expiry": "2026-08-03", "legs": 10, "gex": 2_874_115_490, "gamma_flip": None,
+             "pin_strike": 1050.0, "pin_concentration_pct": 54.3, "expiry_today": True},
+            {"expiry": "2026-08-13", "legs": 10, "gex": -4_761_470_801, "gamma_flip": 987.5,
+             "pin_strike": 1050.0, "pin_concentration_pct": 83.6, "expiry_today": False},
+        ]},
+    )
+    section = out.split("## 15. 북별 감마 지형", 1)[1].split("\n## ", 1)[0]
+    assert "2026-08-03" in section and "2026-08-13" in section
+    assert "**만기 당일**" in section
+    # 만기 당일 북의 감마플립이 비는 것은 정상이라는 설명이 함께 나와야 한다.
+    assert "감마플립이 정의되지 않는다" in section
+
+
+def test_book_gamma_map_section_survives_empty_input():
+    out = report.render(_TODAY, db_metrics={"book_gamma_map": []})
+    assert "## 15. 북별 감마 지형" in out
+    assert "데이터 없음" in out.split("## 15. 북별 감마 지형", 1)[1]

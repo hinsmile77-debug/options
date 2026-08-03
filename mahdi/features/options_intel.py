@@ -8,14 +8,23 @@ from __future__ import annotations
 
 import contextlib
 import io
-import warnings
+import logging
+import math
 from dataclasses import dataclass
 from datetime import date, time
 from typing import Sequence
 
 from vollib.black_scholes.greeks.analytical import gamma as _bs_gamma
 
+logger = logging.getLogger("mahdi.features.options_intel")
+
 _CALL_PUT_SIGN = {"c": 1.0, "p": -1.0}
+
+# 2026-08-03(운영점검보고서 §2-1) — Gamma Flip 탐색에 쓸 수 있는 최소 레그 수. 행사가 3개 x
+# 콜/풋 = 6이 하한이다(그보다 적으면 GEX(S) 곡선이 몇 개의 점으로만 결정돼 부호 전환 위치가
+# 사실상 임의값이 된다). 이 아래로 떨어지면 값을 지어내지 않고 None을 돌려주되 **로그를 남긴다** —
+# 지금까지 산출 실패가 조용했던 것이 §2-1 버그가 넉 달간 안 보인 직접적 원인이다.
+GAMMA_FLIP_MIN_LEGS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,9 +48,15 @@ def legs_from_chain_rows(chain_rows: Sequence[dict], today: date) -> list[Option
     계산: `mahdi/dashboard/data_source.py`의 체인 dict -> `OptionLeg` 변환과 동일한 규칙 —
          option_type을 소문자로, t_years=max((expiry-today).days, 0)/365. vanna/charm은 이
          조회 결과에 없어 기본값(0.0)을 그대로 둔다(있는 값을 억지로 채우지 않음).
-    해석: 만기가 지난(또는 없는) 레그는 제외한다 — expiry가 None인 행, 또는 today 이후 값이
-         없는 비정상 행은 만들지 않는다.
+    해석: 만기가 지난(또는 없는) 레그는 제외한다 — expiry가 None인 행, 또는 today 이전에 이미
+         만기가 끝난 행은 만들지 않는다.
     실패 조건: chain_rows가 비어있으면 빈 목록.
+
+    2026-08-03(운영점검보고서 §2-1/§2-2): 위 "해석"은 원래부터 이렇게 적혀 있었는데 **코드는
+    `expiry is not None`만 걸고 있었다** — 문서와 코드가 어긋나 있었고, 그 결과 라이브 체인
+    246레그 중 156레그(63%)가 이미 만기가 지난 것이었다(`max(..., 0)`이 t_years를 0으로 clamp해
+    조용히 통과시킨다). t_years=0 레그는 Black-Scholes 감마가 정의되지 않아 `find_gamma_flip()`의
+    합계를 NaN으로 오염시킨다. 문서 쪽이 옳았으므로 코드를 문서에 맞춘다.
     """
     return [
         OptionLeg(
@@ -49,12 +64,41 @@ def legs_from_chain_rows(chain_rows: Sequence[dict], today: date) -> list[Option
             option_type=row["option_type"].lower(),
             oi=row["oi"],
             iv=row["iv"],
-            t_years=max((row["expiry"] - today).days, 0) / 365.0,
+            t_years=(row["expiry"] - today).days / 365.0,
             gamma=row["gamma"],
         )
         for row in chain_rows
-        if row.get("expiry") is not None
+        if row.get("expiry") is not None and row["expiry"] >= today
     ]
+
+
+def legs_by_expiry(chain_rows: Sequence[dict], today: date) -> dict[date, list[OptionLeg]]:
+    """
+    입력: `legs_from_chain_rows()`와 같은 형태의 dict 목록, 잔존만기 계산 기준일.
+    계산: 만기별로 레그를 나눠 돌려준다(만기 오름차순). 각 그룹의 변환 규칙은
+         `legs_from_chain_rows()`와 완전히 동일하다 — 같은 함수를 재사용한다.
+    해석: 2026-08-03(운영점검보고서 §5-5). 3개 북(먼슬리 regular / 위클리 월·목)을 **합산하면
+         만기별 정보가 서로를 덮는다.** 특히 만기 당일 북은 잔존만기가 0이라 Black-Scholes
+         감마가 정의되지 않는 반면, v6 §A3가 말하는 **만기 Pinning은 바로 그 북에서만** 나온다 —
+         합산 GEX 하나로는 그 신호를 볼 수 없다.
+         용도 분리:
+           - 먼슬리(최근월) → GEX/감마플립/감마월의 **주 입력**(v6 §11.4 게이트).
+           - 위클리 → **핀 리스크 전용** 지표(만기일 당일 ATM 집중도).
+         2026-08-03은 실제로 weekly_mon 만기일이었고, 그날 하루 GEX는 세 북 합산이었다.
+    실패 조건: chain_rows가 비어있으면 빈 dict. 만기가 지난/없는 레그는
+              `legs_from_chain_rows()`와 동일하게 제외된다.
+    """
+    grouped: dict[date, list[dict]] = {}
+    for row in chain_rows:
+        expiry = row.get("expiry")
+        if expiry is None:
+            continue
+        grouped.setdefault(expiry, []).append(row)
+    return {
+        expiry: legs
+        for expiry in sorted(grouped)
+        if (legs := legs_from_chain_rows(grouped[expiry], today))
+    }
 
 
 def calculate_gex(legs: Sequence[OptionLeg], spot: float, multiplier: float = 250_000) -> float:
@@ -71,6 +115,27 @@ def calculate_gex(legs: Sequence[OptionLeg], spot: float, multiplier: float = 25
     return sum(_CALL_PUT_SIGN[leg.option_type] * leg.gamma * leg.oi * multiplier * s_term for leg in legs)
 
 
+def usable_for_black_scholes(leg: OptionLeg) -> bool:
+    """
+    입력: 옵션 체인 레그 1개.
+    계산: Black-Scholes 감마를 **정의된 값으로** 계산할 수 있는 레그인지 판정한다 —
+         iv/t_years/strike가 전부 양수여야 한다(셋 중 하나라도 0이면 d1의 분모가 0이 된다).
+    해석: 2026-08-03(운영점검보고서 §2-1) — `find_gamma_flip()`의 `gex_at()`은 레그별 감마를
+         **합산**한다. 따라서 `iv=0`인 레그가 **하나만** 섞여도 그 레그의 감마가 NaN이 되고,
+         NaN이 더해진 순간 그 그리드 포인트의 합계 전체가 NaN이 된다. 그리고 NaN은
+         `values[i-1] * values[i] < 0`을 **항상 False**로 만들기 때문에, 함수는 예외도 경고도
+         없이 루프를 끝까지 돌고 None을 반환한다.
+         라이브 DB 실측(2026-08-03 15:45): 41개 그리드 포인트가 **전부 NaN**이었고, 부분집합
+         (먼슬리만/미만기만/당일만기만) 어느 쪽을 넣어도 같았다. `signal_decisions` 전 이력에서
+         `available_member_count >= 3`인 행이 0건인 것이 그 결과다 — 앙상블 멤버
+         `options_flow`(v6 §11.3 base_w 0.20)가 **한 번도 활성화된 적이 없다.**
+         오늘 실측 결측률: `option_analysis_1m` 기준 iv가 0/NULL인 행이 먼슬리 4.4%,
+         weekly_mon 9.7%. 즉 "가끔"이 아니라 매 스냅샷마다 확실히 섞인다.
+    실패 조건: 없음 — 순수 판정 함수.
+    """
+    return leg.iv > 0 and leg.t_years > 0 and leg.strike > 0
+
+
 def find_gamma_flip(
     legs: Sequence[OptionLeg],
     spot: float,
@@ -83,19 +148,32 @@ def find_gamma_flip(
     GEX 부호가 바뀌는 기초자산 레벨(Gamma Flip) — 이탈 시 urgency 모드.
 
     입력: 옵션 체인 레그(행사가·IV·잔존만기 포함), 현재 스팟, 계약승수.
-    계산: 스팟 ±search_pct 구간을 steps개 그리드로 나눠 각 지점에서 Black-Scholes 감마를
-         재계산(행사가·IV·잔존만기는 고정, 스팟만 이동)해 GEX(S)를 구성한 뒤, 부호가 바뀌는
-         구간을 선형보간해 flip 레벨을 추정한다. steps x legs번 vollib.gamma()를 호출하는데,
-         vollib.ref_python(C 확장 미설치 시 폴백되는 순수 파이썬 구현)의 d1()에 디버그용
-         print('')이 남아 있어(2026-07-08 실측: COCKPIT 하루 로그의 99%가 이 빈 줄이었음)
-         stdout을 로컬로 흡수한다 — 그리드 경계(t_years/iv≈0)에서 나는 0-나눗셈 RuntimeWarning도
-         같은 이유로 억제(값 계산 자체는 정상, numpy가 nan/inf를 반환할 뿐이고 그 지점은 그대로
-         GEX 부호 비교에 들어가 flip 계산에 영향 없음).
+    계산: **먼저 `usable_for_black_scholes()`로 계산 불가 레그를 걸러낸 뒤**, 스팟 ±search_pct
+         구간을 steps개 그리드로 나눠 각 지점에서 Black-Scholes 감마를 재계산(행사가·IV·
+         잔존만기는 고정, 스팟만 이동)해 GEX(S)를 구성하고, 부호가 바뀌는 구간을 선형보간해
+         flip 레벨을 추정한다. steps x legs번 vollib.gamma()를 호출하는데, vollib.ref_python
+         (C 확장 미설치 시 폴백되는 순수 파이썬 구현)의 d1()에 디버그용 print('')이 남아 있어
+         (2026-07-08 실측: COCKPIT 하루 로그의 99%가 이 빈 줄이었음) stdout을 로컬로 흡수한다.
     해석: 이 레벨을 이탈하면 딜러 헤지가 안정화<->증폭으로 전환 — 변동성 폭발 준비 신호.
-    실패 조건: legs가 비어있으면 None. 그리드 전 구간에서 부호가 바뀌지 않으면 None
-              (flip 레벨이 탐색 범위 밖에 있음을 의미).
+    실패 조건: 사용 가능한 레그가 GAMMA_FLIP_MIN_LEGS 미만이면 None + WARNING. 그리드 전 구간에서
+              부호가 바뀌지 않으면 None(flip 레벨이 탐색 범위 밖 — 정상적인 결과이므로 로그 없음).
+              그리드 값에 NaN이 남아 있으면(방어) 그 구간은 건너뛰고, 전 구간이 NaN이면 None + WARNING.
+
+    2026-08-03(§2-1) 이전 버전은 RuntimeWarning을 억제하면서 주석에 *"값 계산 자체는 정상,
+    numpy가 nan/inf를 반환할 뿐이고 그 지점은 그대로 GEX 부호 비교에 들어가 flip 계산에 영향
+    없음"* 이라고 적어 두었는데 **이것이 사실과 정반대였다** — NaN은 "그 지점"이 아니라 합계를
+    거쳐 전 구간을 오염시키고, 부호 비교를 조용히 무력화한다. 경고 억제가 그 사실을 덮었다.
+    이제 억제하지 않고 **입력 단계에서 배제한다**(억제는 계산 결과를 못 믿게 만든다).
     """
-    if not legs:
+    usable = [leg for leg in legs if usable_for_black_scholes(leg)]
+    if len(usable) < GAMMA_FLIP_MIN_LEGS:
+        logger.warning(
+            "감마플립 산출 불가 — BS 계산 가능 레그 %d개(전체 %d개, 최소 %d 필요). "
+            "iv=0 %d개 / 잔존만기<=0 %d개",
+            len(usable), len(legs), GAMMA_FLIP_MIN_LEGS,
+            sum(1 for leg in legs if leg.iv <= 0),
+            sum(1 for leg in legs if leg.t_years <= 0),
+        )
         return None
 
     step_size = (spot * 2 * search_pct) / (steps - 1)
@@ -104,20 +182,30 @@ def find_gamma_flip(
     def gex_at(s: float) -> float:
         s_term = s**2 / 100
         total = 0.0
-        for leg in legs:
+        for leg in usable:
             g = _bs_gamma(leg.option_type, s, leg.strike, leg.t_years, risk_free_rate, leg.iv)
             total += _CALL_PUT_SIGN[leg.option_type] * g * leg.oi * multiplier * s_term
         return total
 
-    with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
+    with contextlib.redirect_stdout(io.StringIO()):
         values = [gex_at(s) for s in grid]
-    for i in range(1, len(grid)):
-        if values[i - 1] == 0:
-            return grid[i - 1]
-        if values[i - 1] * values[i] < 0:
-            frac = values[i - 1] / (values[i - 1] - values[i])
-            return grid[i - 1] + frac * (grid[i] - grid[i - 1])
+
+    finite = [(i, v) for i, v in enumerate(values) if math.isfinite(v)]
+    if not finite:
+        logger.warning(
+            "감마플립 산출 불가 — 그리드 %d개 전 구간이 NaN/inf다(레그 %d개). "
+            "usable_for_black_scholes()를 통과한 입력에서 이 경로가 나오면 vollib 쪽 문제다.",
+            len(grid), len(usable),
+        )
+        return None
+
+    for prev, cur in zip(finite, finite[1:]):
+        (i_prev, v_prev), (i_cur, v_cur) = prev, cur
+        if v_prev == 0:
+            return grid[i_prev]
+        if v_prev * v_cur < 0:
+            frac = v_prev / (v_prev - v_cur)
+            return grid[i_prev] + frac * (grid[i_cur] - grid[i_prev])
     return None
 
 
@@ -137,6 +225,33 @@ def gamma_walls(
         exposure = abs(leg.gamma * leg.oi * multiplier * s_term)
         by_strike[leg.strike] = by_strike.get(leg.strike, 0.0) + exposure
     return sorted(by_strike.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+
+
+def pin_risk(legs: Sequence[OptionLeg], spot: float, multiplier: float = 250_000) -> dict | None:
+    """
+    입력: **하나의 만기**에 속한 레그들(`legs_by_expiry()`의 한 그룹), 현재 스팟, 계약승수.
+    계산: 감마 노출이 가장 큰 행사가(자석 후보)와, 그 행사가가 전체 노출에서 차지하는 비중,
+         그리고 스팟이 그 행사가에서 얼마나 떨어져 있는지를 낸다.
+    해석: 2026-08-03 §5-5 — v6 §A3 "만기 Pinning". 만기 당일에는 잔존만기가 0이라 Black-Scholes
+         감마·감마플립이 정의되지 않지만, **핀 리스크는 바로 그 북에서만 의미가 있다.** 그래서
+         이 지표는 저장된 감마(`OptionLeg.gamma`)만 쓰고 BS를 재계산하지 않는다 — 만기 당일에도
+         계산된다는 것이 이 함수의 존재 이유다.
+         `concentration`이 높고(한 행사가에 노출이 몰림) `distance_pct`가 작으면(스팟이 그 위)
+         만기 근접 시 가격이 그 행사가에 붙들릴 가능성이 크다.
+    실패 조건: legs가 비어있거나 전체 노출이 0이면(OI가 전부 0 등) None — 지어내지 않는다.
+    """
+    walls = gamma_walls(legs, spot, multiplier, top_n=1)
+    if not walls:
+        return None
+    total = sum(abs(leg.gamma * leg.oi * multiplier * (spot**2 / 100)) for leg in legs)
+    if total <= 0:
+        return None
+    strike, exposure = walls[0]
+    return {
+        "strike": strike,
+        "concentration": exposure / total,
+        "distance_pct": (spot - strike) / spot * 100 if spot else None,
+    }
 
 
 def vanna_charm_drift(legs: Sequence[OptionLeg], now: time, charm_active_after: time = time(14, 0)) -> dict:

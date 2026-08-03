@@ -47,7 +47,36 @@ DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 # 임계를 둔 이유: 하루 12,947건을 전부 남기면 07-31에 어렵게 되찾은 로그 가독성
 # (사람이 읽는 줄 6,161 → 2,963줄)을 다시 잃는다. 정상 호출은 페이서대기 포함 ~1.2초라
 # 3.0초면 정상 구간은 거의 걸리지 않고 §2-1(b)의 5~9초 구간만 남는다.
-SLOW_CALL_LOG_THRESHOLD_SECONDS = 3.0
+#
+# 2026-08-03(운영점검보고서 §2-0 p3 / §2-8 / §4 우선순위 3) — **진단 목적이 달성됐다.**
+# 08-03 실측 933건으로 원인이 갈렸다: 페이서대기 450건 / HTTP 483건으로 우세 분류는 반반이지만
+# **극단값은 전부 HTTP 쪽**이고(상위 5건 중 4건이 페이서대기 0.00~0.78초에 HTTP 8.4~10.0초),
+# 최대값이 정확히 10.00초인 것은 `httpx.Client(timeout=10.0)` 천장에 닿은 것이다. 같은 날
+# `RemoteProtocolError` 8건(07-31도 8건)이 함께 나온 것까지 합치면 결론은 **커넥션 풀 재사용
+# 실패 + KIS 응답 지연**이다.
+#
+# 임계를 3.0 → 5.0초로 올리고 레벨을 WARNING → INFO로 내린다. 하루 933건의 WARNING은 진짜
+# 경고를 파묻는다(08-03 사람이 읽는 줄 4,629줄의 20%가 이 한 줄이었다). 계측을 없애지 않는 이유는
+# 커넥션 풀 조치(아래 `_HTTP_LIMITS`)의 효과를 같은 지표로 재야 하기 때문이다 — **고치기 위해
+# 만든 계측을 고친 뒤에 끄면 회귀를 못 잡는다.**
+SLOW_CALL_LOG_THRESHOLD_SECONDS = 5.0
+
+# 2026-08-03(§4 우선순위 3) — 커넥션 풀/타임아웃.
+#
+# 종전에는 `httpx.Client(timeout=10.0)` 하나로 기본 풀(max_connections=100,
+# max_keepalive_connections=20, keepalive_expiry=5.0)을 그대로 썼다. 그런데 이 클라이언트의
+# 호출은 전부 공유 `_RateLimiter`가 1건/초로 **직렬화**하므로 커넥션이 동시에 여러 개 필요한
+# 상황 자체가 없다 — 풀을 좁히면 같은 커넥션을 계속 재사용해 TLS 핸드셰이크가 줄고, 무엇보다
+# keep-alive 유효기간을 우리가 통제할 수 있게 된다.
+#
+# `keepalive_expiry`를 5.0 → 15.0초로 늘리는 이유: 우리 호출 간격(1초)에서는 5초 만료가 오히려
+# 잦은 재연결을 만들고, 재연결 순간과 KIS 쪽이 커넥션을 닫는 타이밍이 겹치면 `RemoteProtocolError`
+# ("server disconnected without sending a response")가 난다 — 08-03/07-31 각 8건.
+#
+# `connect=3.0`: 종전 timeout=10.0은 연결·읽기·쓰기 전부에 10초였다. 연결 자체가 3초를 넘으면
+# 재시도가 더 빠르고, 읽기 10초는 그대로 둔다(KIS 응답이 실제로 느린 경우가 있다).
+_HTTP_LIMITS = httpx.Limits(max_connections=4, max_keepalive_connections=2, keepalive_expiry=15.0)
+_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 
 
 class _RateLimiter:
@@ -196,7 +225,7 @@ class KISRestClient:
     ) -> None:
         self._settings = settings
         self._token_daemon = token_daemon
-        self._client = client or httpx.Client(timeout=10.0)
+        self._client = client or httpx.Client(timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS)
         self._rate_limiter = _RateLimiter(min_request_interval)
 
     @property
@@ -228,28 +257,45 @@ class KISRestClient:
 
     def _log_if_slow(self, method: str, url: str, pacer_seconds: float, http_seconds: float) -> None:
         """계산: 페이서 대기 + HTTP 응답이 임계를 넘으면 두 구간을 **나눠서** 남긴다
-        (2026-07-31 §4 우선순위 3 — 상세 근거는 SLOW_CALL_LOG_THRESHOLD_SECONDS 주석)."""
+        (2026-07-31 §4 우선순위 3 — 상세 근거는 SLOW_CALL_LOG_THRESHOLD_SECONDS 주석).
+        2026-08-03(§2-8): 진단이 끝나 WARNING → INFO. 지표 집계는 계속 이 줄을 읽는다."""
         total = pacer_seconds + http_seconds
         if total < SLOW_CALL_LOG_THRESHOLD_SECONDS:
             return
-        logger.warning(
+        logger.info(
             "느린 REST 호출 %.2f초 = 페이서대기 %.2f초 + HTTP %.2f초 (배율 %.2f배, %s %s)",
             total, pacer_seconds, http_seconds, self._rate_limiter.current_multiplier,
             method, url.split("?", 1)[0].rsplit("/", 1)[-1],
         )
 
-    def _get(self, url: str, **kwargs) -> dict:
-        """모든 REST GET 호출의 단일 진입점 — 실제 전송 직전에 _rate_limiter로 페이싱하고,
-        결과에 따라 적응형 백오프 상태를 갱신한다(2026-07-20, _RateLimiter 참고).
-        2026-07-31: 페이서 대기와 HTTP 응답 시간을 따로 재서 느릴 때만 남긴다(§4 우선순위 3)."""
+    def _send_get(self, url: str, **kwargs) -> httpx.Response:
+        """계산: 페이싱 → GET 1회. 소요시간을 페이서/HTTP로 나눠 재고 느리면 남긴다."""
         pacer_started = time.monotonic()
         self._rate_limiter.wait()
         http_started = time.monotonic()
         try:
-            response = self._client.get(url, **kwargs)
+            return self._client.get(url, **kwargs)
         finally:
             # 예외(타임아웃 등)로 끝난 호출이야말로 계측이 필요하다 — finally에서 재고 넘긴다.
             self._log_if_slow("GET", url, http_started - pacer_started, time.monotonic() - http_started)
+
+    def _get(self, url: str, **kwargs) -> dict:
+        """모든 REST GET 호출의 단일 진입점 — 실제 전송 직전에 _rate_limiter로 페이싱하고,
+        결과에 따라 적응형 백오프 상태를 갱신한다(2026-07-20, _RateLimiter 참고).
+        2026-07-31: 페이서 대기와 HTTP 응답 시간을 따로 재서 느릴 때만 남긴다(§4 우선순위 3).
+
+        2026-08-03(§4 우선순위 3): `RemoteProtocolError`는 **1회만** 재시도한다. 이 예외는 KIS가
+        먼저 닫은 keep-alive 커넥션을 httpx가 재사용하려 할 때 나며(08-03/07-31 각 8건), 요청이
+        서버에 도달하지 않았으므로 재시도가 안전하다(중복 주문 같은 부작용이 없는 GET이기도 하다).
+        재시도도 **반드시 `_send_get`을 거쳐 페이서를 통과**한다 — 여기서 페이서를 건너뛰면
+        EGW00201(초당 거래건수 초과)을 우리 손으로 유발하게 된다. 두 번째도 실패하면 그대로
+        전파해 호출측의 기존 부분 실패 처리(레그 건너뛰기 등)에 맡긴다.
+        """
+        try:
+            response = self._send_get(url, **kwargs)
+        except httpx.RemoteProtocolError:
+            logger.info("커넥션 재사용 실패(RemoteProtocolError) — 1회 재시도: %s", url.split("?", 1)[0])
+            response = self._send_get(url, **kwargs)
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

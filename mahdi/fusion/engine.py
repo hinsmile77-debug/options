@@ -9,6 +9,7 @@ Palette를 하나의 evaluate() 호출로 통과시킨다. `RiskEngine`과 같�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from mahdi.config.settings import get_strategy_params
@@ -16,8 +17,21 @@ from mahdi.engines.regime import RegimeLabel
 from mahdi.fusion.conflict_resolution import resolve_conflicts
 from mahdi.fusion.ensemble import weighted_consensus
 from mahdi.fusion.meta_label import MetaLabelInputs, TradePermission, classify
-from mahdi.fusion.signal_layer import SignalInputs, build_member_scores
+from mahdi.fusion.signal_layer import MEMBER_FIELDS, MemberScores, SignalInputs, build_member_scores
 from mahdi.fusion.strategy_palette import enforce_daily_strategy_cap, select_strategies
+
+# 2026-08-03(운영점검보고서 §5-2) — 이 모듈에는 로그가 하나도 없었다.
+#
+# 08-03 하루 전체에서 로그를 낸 것은 httpx / mahdi.main / mahdi.broker.rest_client 셋뿐이고,
+# fusion·engines·risk·features·execution·learning은 전부 무음이었다. §2-1의 버그(감마플립이
+# 전 이력에서 한 번도 산출된 적 없음 → options_flow 멤버 영구 미가용)가 넉 달간 안 보인 이유가
+# 정확히 이것이다 — **판단 축에는 관측이 없었다.**
+#
+# 다만 볼륨을 다시 늘리면 07-31에 어렵게 되찾은 가독성을 또 잃는다(08-03 §2-8: 사람이 읽는 줄이
+# 4,629줄로 두 배가 됐다). 그래서 **전이(transition)에만 반응한다** — 매 분 찍지 않고, 멤버
+# 가용 조합이나 판정 형태가 **바뀔 때만** 한 줄. 정상적인 하루라면 수 건에 그친다.
+# (2026-07-19 §5-5의 WarningThrottle, 07-30 Fix#4의 "상태 전이가 있을 때만 기록"과 같은 계열.)
+logger = logging.getLogger("mahdi.fusion.engine")
 
 
 def _sign(value: float) -> float:
@@ -52,6 +66,8 @@ class FusionDecision:
 class SignalFusionEngine:
     def __init__(self, strategy_params: dict | None = None) -> None:
         self._params = strategy_params if strategy_params is not None else get_strategy_params()
+        # 직전 사이클의 "판단 형태" — 바뀔 때만 로그를 낸다(위 logger 주석 참고).
+        self._last_shape: tuple | None = None
 
     def evaluate(
         self,
@@ -116,7 +132,7 @@ class SignalFusionEngine:
             cap = strategy_gates.get("max_priority_strategies_per_regime_day", 2)
             allowed = enforce_daily_strategy_cap(palette.allowed_strategies, already_used_strategies_today, cap)
 
-        return FusionDecision(
+        decision = FusionDecision(
             direction=ensemble_result.direction,
             conviction_score=meta_result.conviction_score,
             trade_permission=meta_result.trade_permission,
@@ -124,4 +140,33 @@ class SignalFusionEngine:
             signal_agreement_count=conflict.agreement_count,
             available_member_count=conflict.available_member_count,
             reject_reasons=reject_reasons,
+        )
+        self._log_shape_transition(decision, member_scores)
+        return decision
+
+    def _log_shape_transition(self, decision: FusionDecision, member_scores: MemberScores) -> None:
+        """
+        입력: 이번 사이클의 판단과 멤버 점수.
+        계산: "어떤 멤버가 살아 있고 / 어떤 허가와 사유가 나왔는가"를 형태(shape)로 압축해,
+             직전 사이클과 다를 때만 INFO 한 줄을 남긴다.
+        해석: 2026-08-03 §5-2. 매 분 찍으면 하루 495줄이 되어 가독성을 잃고, 아무것도 안 찍으면
+             **멤버 하나가 조용히 죽어도 로그만으로는 영영 모른다**(08-03에 실제로 그랬다).
+             전이만 남기면 정상일에는 수 건, 무언가 바뀐 날에는 그 시각이 정확히 남는다.
+        실패 조건: 없음 — 로깅 실패는 판단에 영향을 주지 않는다.
+        """
+        available = tuple(
+            name for name in MEMBER_FIELDS if getattr(member_scores, name) is not None
+        )
+        shape = (available, decision.trade_permission, tuple(decision.reject_reasons),
+                 tuple(decision.allowed_strategies))
+        if shape == self._last_shape:
+            return
+        previous, self._last_shape = self._last_shape, shape
+        logger.info(
+            "판단 형태 전이: 가용멤버 %s(%d/%d) · %s · 사유 %s · 전략 %s%s",
+            list(available), len(available), len(MEMBER_FIELDS),
+            decision.trade_permission.value,
+            list(decision.reject_reasons) or "없음",
+            list(decision.allowed_strategies) or "없음",
+            "" if previous is None else f" (직전 가용멤버 {list(previous[0])})",
         )

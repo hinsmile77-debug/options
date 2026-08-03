@@ -1014,12 +1014,14 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
     monkeypatch.setattr("mahdi.dashboard.data_source._shutdown_reliability_check", make_check("shutdown"))
     monkeypatch.setattr("mahdi.dashboard.data_source._rate_limiter_health_check", make_check("rate_limiter"))
-    # 2026-08-01(§5-5) 관측 품질 4종
+    # 2026-08-01(§5-5) 관측 품질 5종
     monkeypatch.setattr("mahdi.dashboard.data_source._rest_demand_check", make_check("rest_demand"))
     monkeypatch.setattr("mahdi.dashboard.data_source._backoff_headroom_check", make_check("backoff_headroom"))
     monkeypatch.setattr("mahdi.dashboard.data_source._monthly_coverage_check", make_check("monthly_coverage"))
     monkeypatch.setattr("mahdi.dashboard.data_source._overrun_count_check", make_check("overrun_count"))
     monkeypatch.setattr("mahdi.dashboard.data_source._ws_liveness_check", make_check("ws_liveness"))
+    # 2026-08-03(§5-1) 신호 도달률 — 커버리지가 답하지 못하는 "판단까지 갔는가"
+    monkeypatch.setattr("mahdi.dashboard.data_source._signal_reach_check", make_check("signal_reach"))
 
     result = get_health_summary()
 
@@ -1027,6 +1029,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
         "market_halt", "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
         "regime", "regime_fit_progress", "shutdown", "rate_limiter",
         "rest_demand", "backoff_headroom", "monthly_coverage", "overrun_count", "ws_liveness",
+        "signal_reach",
     ]
     assert [c.label for c in result] == calls
 

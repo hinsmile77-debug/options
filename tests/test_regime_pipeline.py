@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 
 import numpy as np
@@ -257,3 +258,52 @@ def test_compute_gap_zscore_uses_prev_close_and_atm_iv():
 def test_compute_gap_zscore_no_prior_day_returns_zero():
     conn = _FakeConnection([None, (355.0,)])
     assert regime_pipeline.compute_gap_zscore(conn, "KOSPI200") == 0.0
+
+
+# ===== 2026-08-03 §5-2: 피처 활성화/레짐 전이 로깅 =====
+
+
+def _machine_for_logging(monkeypatch) -> RegimeStateMachine:
+    machine = RegimeStateMachine(underlying="KOSPI200", futures_symbol="101S03")
+    machine.engine = None  # warmup_fallback 경로 — 모델 파일 유무와 무관하게 결정론적
+    monkeypatch.setattr(db, "underlying_daily_closes", lambda conn, underlying, days: [])
+    monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
+    monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
+    monkeypatch.setattr(db, "recent_us10y_daily_series", lambda conn, days: [])
+    monkeypatch.setattr(db, "insert_feature_store", lambda *a, **k: None)
+    monkeypatch.setattr(db, "insert_regime_state", lambda *a, **k: None)
+    monkeypatch.setattr(db, "latest_investor_flow", lambda conn, underlying: None)
+    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn: None)
+    monkeypatch.setattr(db, "recent_es_front_series", lambda conn, limit: [])
+    return machine
+
+
+def test_feature_activation_is_logged_once_when_it_first_leaves_neutral(monkeypatch, caplog):
+    """rv_ratio가 실제로 살아나는 시점이 로그 한 줄로 남아야 한다.
+
+    07-30에는 그 사실을 알아내려고 `feature_store` 전체 5,394행을 뒤져야 했다. 그리고
+    **예상일(08-04)이 지나도 이 줄이 안 나오면 그 자체가 이상 신호**다(2026-08-03 §2-6).
+    """
+    machine = _machine_for_logging(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.engines.regime_pipeline"):
+        machine._log_neutral_escapes({"rv_ratio": 1.0, "book_thinning": 0.0})
+        assert not [r for r in caplog.records if "피처 활성화" in r.getMessage()]
+
+        machine._log_neutral_escapes({"rv_ratio": 1.34, "book_thinning": 0.0})
+        first = [r for r in caplog.records if "피처 활성화" in r.getMessage()]
+        machine._log_neutral_escapes({"rv_ratio": 1.41, "book_thinning": 0.0})
+        second = [r for r in caplog.records if "피처 활성화" in r.getMessage()]
+
+    assert len(first) == 1
+    assert "rv_ratio" in first[0].getMessage()
+    assert len(second) == 1, "피처당 평생 1건이라 두 번째부터는 남기지 않는다"
+
+
+def test_feature_activation_uses_the_same_neutral_values_as_the_ops_report():
+    # 리포트 지표와 로그가 다른 기준을 쓰면 어느 쪽을 믿을지 알 수 없다(README 규약).
+    from mahdi.engines.regime_pipeline import _FEATURE_NEUTRAL_VALUES
+    from mahdi.ops.db_metrics import _FEATURE_NEUTRAL
+
+    for name, neutral in _FEATURE_NEUTRAL.items():
+        assert _FEATURE_NEUTRAL_VALUES[name] == neutral

@@ -125,7 +125,24 @@ OPTION_CHAIN_PHASE_OFFSET_SECONDS = 0.0
 # 대신 `poll_time.minute`을 쓰면 재시작해도 위상이 같고, 로그/DB만 보고도 "이 분에 위클리를 봤어야
 # 하는가"를 바로 검증할 수 있다. 사이클이 밀려 분을 건너뛰면 짝수 분이 연달아 나올 수 있는데,
 # 그건 벽시계 기준으로는 여전히 2분에 1회 이하라 부하가 늘지 않는다.
-OPTION_CHAIN_SLOW_SERIES = frozenset({"weekly_mon", "weekly_thu"})
+# 2026-08-03(운영점검보고서 §2-3 / §4 우선순위 2) — 위클리 2북을 **같은 분에 몰지 않고 서로 다른
+# 분 패리티에 나눠 태운다.** 위 축소안 (a)는 "위클리는 2분에 1회"라는 총량만 정했고, 두 북을 모두
+# `minute % 2 == 0`(짝수분)에 실었다. 그래서:
+#
+#   짝수분 = 먼슬리 10 + 위클리 20 = 30레그 → 실측 REST평균 40~51초, 60초 초과 39건
+#   홀수분 = 먼슬리 10레그          → 실측 REST평균 12~19초, 60초 초과 0건
+#
+# 2026-08-03 실측: **밀림 39건의 100%가 짝수 mod10 버킷**이고, 짝수분 사이클이 60초를 넘기면 그
+# 다음(홀수) 분이 통째로 스킵되므로 **결손 41분 중 39분이 홀수분**이었다. 분당 호출 수가 14~36으로
+# 3:1 쏠려 있는 것이 원인이고, 총량을 줄이는 문제가 아니라 **분산의 문제**다.
+#
+# 위클리 월을 짝수분, 목을 홀수분에 두면 매 분 20레그로 평탄해진다 — **총 REST 수요는 1건도 늘지
+# 않고**(위클리 각 북의 2분 주기도 그대로), 분당 최대-최소가 34/23으로 좁혀진다. 잃는 것이 없다.
+#
+# 값은 `poll_time.minute % 2`와 비교할 나머지다. 벽시계 분을 쓰는 이유는 축소안 (a) 때와 같다 —
+# 프로세스 기동 시각에 좌우되는 내부 카운터 대신 `poll_time.minute`을 쓰면 재시작해도 위상이
+# 같고, 로그/DB만 보고도 "이 분에 이 북을 봤어야 하는가"를 바로 검증할 수 있다.
+OPTION_CHAIN_SLOW_SERIES_PHASE = {"weekly_mon": 0, "weekly_thu": 1}
 OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
 
 # 2026-07-31(운영점검보고서 2026-07-31 §4 우선순위 2) — 밀림으로 건너뛴 분을 먼슬리 10레그로
@@ -182,6 +199,10 @@ class WsLiveness:
     connected_since: datetime | None = None
     last_message_at: datetime | None = None
     reconnect_count: int = 0
+    # 2026-08-03(§4 우선순위 4): H0UNMKO0 구독이 마지막으로 **성립**한 시각(KIS SUBSCRIBE 응답
+    # rt_cd=0 수신 시점). `last_message_at`(데이터 수신)과는 전혀 다른 신호다 — 08-03에 장운영정보
+    # 데이터가 0건이었는데도 하트비트는 정상이라 "구독이 살아 있는가"를 판별할 방법이 없었다.
+    market_op_subscribed_at: datetime | None = None
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
@@ -208,8 +229,10 @@ _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason
 # 같은 5분 창의 첫 60초 안에 셋이 모여 41건 버스트를 만들었다. 60 → 275초로 옮겨 5분 창의
 # 끝자락(4분대)에 단독 배치한다(상세 근거는 MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS 주석).
 # 2026-07-31(§4 우선순위 5): 275 → 288초(4분 48초 지점) — 아래 "폴러 위상 계획" 표 참고.
+# 2026-08-03(§4 우선순위 2): 288 → 270초(4분 30초 지점). 만기유동성/매크로와 같은 30초 위상을
+# 공유한다 — 셋의 발사 분 집합 {1,3,5}/{2,7}/{4,9}가 서로소라 같은 분에 만나지 않는다.
 ACCOUNT_BALANCE_POLL_INTERVAL_SECONDS = 300.0
-ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS = 288.0
+ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS = 270.0
 
 # 2026-07-08 실측: 레이트리밋 버스트 등으로 사이클 내 모든 종목 조회가 한꺼번에 실패하는 경우
 # (정규장 405분 중 203분치 옵션체인 데이터가 통째로 유실됨을 DB로 확인)가 있었다 — 60초 다음
@@ -345,7 +368,10 @@ EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES = (1, 3, 5)
 # 2026-07-31(§4 우선순위 5): 35 → 15초. 슬롯이 홀수분으로 옮겨가면서 그 분의 옵션체인은
 # 먼슬리 10레그(0~13초)뿐이라 15초부터 바로 시작해도 겹치지 않는다 — 오히려 늦게 시작하면
 # 투자자수급(40초)과 부딪힌다. 상세 배치는 아래 "폴러 위상 계획" 표 참고.
-EXPIRY_LIQUIDITY_PHASE_OFFSET_SECONDS = 15.0
+# 2026-08-03(§4 우선순위 2): 15 → 30초. 위클리 월/목을 짝/홀로 나누면서 **홀수분 옵션체인도
+# 20레그(0~20초)**가 됐다 — 15초에 시작하면 이제 겹친다. 옵션체인 공칭 20초에 백오프 여유
+# (실측 시간가중 평균 1.25배 → 25초)를 더해 30초로 물린다.
+EXPIRY_LIQUIDITY_PHASE_OFFSET_SECONDS = 30.0
 
 # 2026-07-28(운영점검보고서 2026-07-27 §4 Fix#1 재수사, 스케줄 밀림 근본원인 확정 후속): 07-09에
 # poll_expiry_liquidity에만 오프셋을 준 뒤로 poll_investor_flow와 poll_macro_snapshot은 여전히
@@ -365,7 +391,11 @@ EXPIRY_LIQUIDITY_PHASE_OFFSET_SECONDS = 15.0
 # 저위험 완화책이다.
 # 2026-07-31(§4 우선순위 5): 15 → 40초. 15초 자리는 만기유동성 슬롯이 가져갔고, 투자자수급은
 # 3콜(≈4초)뿐이라 **짝수분 옵션체인(0~30초 공칭)이 끝난 뒤**에 두는 것이 자연스럽다.
-INVESTOR_FLOW_PHASE_OFFSET_SECONDS = 40.0
+# 2026-08-03(§4 우선순위 2): 40 → 50초. 만기유동성이 30초로 물러나며 30~41초를 쓰게 됐고,
+# 40초는 그 한가운데다. 2026-08-03 실측에서 투자자수급(당시 42초)은 **짝수분 옵션체인 창 안에
+# 들어간 최대 기여자**(mod10=0에서 창 안 1.6건)였다 — 매 분 3콜뿐이라 가장 늦은 자리로 미루는
+# 것이 비용이 가장 싸다. 50~53초로 분 끝에 2콜분(≈7초) 여유를 남긴다.
+INVESTOR_FLOW_PHASE_OFFSET_SECONDS = 50.0
 
 # 2026-07-30(운영점검보고서 §2-1/§4 Fix#2) — "5분 그룹 재스태거링".
 #
@@ -424,12 +454,42 @@ INVESTOR_FLOW_PHASE_OFFSET_SECONDS = 40.0
 # 두지 않는 것이 이 배치의 핵심이다 — 짝수분은 옵션체인이 30레그를 쓰고, 홀수분은 10레그만 써서
 # 47초가 비기 때문이다(축소안 (a)가 만든 여유를 처음으로 실제로 활용한다).
 #
+# ------------------------------------------------------------------------------------------
+# 2026-08-03(운영점검보고서 §2-3 / §4 우선순위 2) — **위 배치의 전제가 틀렸다.**
+#
+# 위 표는 "짝수분은 30레그, 홀수분은 10레그"라는 **비대칭 자체를 주어진 것으로 놓고** 그 사이의
+# 빈 자리를 찾는 방식이었다. 그런데 08-03 실측에서 그 비대칭이 곧 밀림의 원인이었다:
+#   밀림 39건의 **100%가 짝수 mod10** / 결손 41분 중 **39분이 홀수분**(짝수분 초과분이 다음
+#   분을 통째로 스킵시킨다) / 분당 호출 수 14~36으로 3:1 쏠림.
+# 그래서 빈 자리를 찾는 대신 **부하 자체를 평탄하게** 만든다(`OPTION_CHAIN_SLOW_SERIES_PHASE`) —
+# 위클리 월/목을 짝/홀로 나누면 총 REST 수요는 그대로인 채 매 분 20레그가 된다.
+#
+# 옵션체인이 매 분 0~20초(공칭)를 쓰게 되므로 나머지 폴러를 그 뒤로 다시 배치한다:
+#
+#   폴러          주기    위상            발사 분(mod 10)   콜수   공칭 점유(콜×1.0초)
+#   ------------  ------  --------------  ----------------  -----  -------------------
+#   옵션체인       60초    0초             매 분             20     0~20초 (전 분 동일)
+#   만기유동성     60초    30초            1, 3, 5 (북별)    11     30~41초
+#   매크로        300초   150초(2:30)     2, 7              ≤7     30~37초
+#   계좌잔고      300초   270초(4:30)     4, 9              1      30~31초
+#   투자자수급     60초    50초            매 분             3      50~53초
+#   SignalFusion   60초    10초            매 분             0      (REST 없음)
+#
+# **만기유동성·매크로·계좌잔고가 같은 위상(30초)을 공유하는 것이 이 배치의 핵심이다.** 셋의 발사
+# 분 집합 {1,3,5} / {2,7} / {4,9}는 서로소라 같은 분에 절대 만나지 않는다 — 서로 다른 위상을
+# 억지로 찾아 분 뒤쪽으로 밀어낼 이유가 없고, 오히려 한 자리에 모으면 그 뒤의 투자자수급까지
+# 여유가 커진다. 결과적으로 **모든 분이 동일한 구조**(0~20 옵션체인 / 30~41 저빈도 / 50~53
+# 투자자수급)를 갖고, 최소 간격은 20→30초(10초)와 41→50초(9초)다.
+#
+# 분당 호출 수: mod10 {0,6,8}=23 / {4,9}=24 / {2,7}=30 / {1,3,5}=34 — 최대 34, 최소 23
+# (종전 최대 36, 최소 14). 총량과 평균(26.8건/분)은 바뀌지 않는다.
+#
 # **공칭 점유는 백오프가 없을 때(페이서 1.0초/콜)의 값**이다. 실측 짝수분 옵션체인은 백오프
 # 1.3배가 걸려 39.2초를 썼다 — 즉 이 배치의 여유는 백오프 배율에 비례해 줄어들며, 그래서 총
-# REST 수요 예산(07-31 실측 43.6%)을 함께 관리해야 한다. 이 성질은
+# REST 수요 예산(08-03 실측 45.1%)을 함께 관리해야 한다. 이 성질은
 # `test_poller_occupancy_windows_do_not_overlap`이 상수에서 직접 재계산해 검증한다.
 # ==========================================================================================
-MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS = 168.0
+MACRO_SNAPSHOT_PHASE_OFFSET_SECONDS = 150.0
 
 
 def _seconds_until_next_wall_tick(
@@ -541,6 +601,51 @@ class _WebsocketsAdapter(WSConnection):
 
     async def close(self) -> None:
         await self._ws.close()
+
+
+async def _reroll_books_to_spot(
+    subscription_managers: list[RollingSubscriptionManager], spot: float
+) -> None:
+    """
+    입력: 구독 롤링 매니저 목록, 방금 완성된 선물 1분봉의 종가.
+    계산: ATM이 실제로 이동한 매니저만 roll_to_spot()으로 재롤링하고, 이동했을 때만 INFO 1줄을
+         남긴다(`roll_to_spot()` 자체가 diff 기반이라 변화가 없으면 무동작이지만, "언제 어디서
+         어디로 옮겼는가"는 로그에 남아야 한다).
+    해석: 2026-08-03(운영점검보고서 §2-2 후속 조사) — `RollingSubscriptionManager`의 모듈
+         docstring은 *"현재가가 바뀌어 ATM이 이동하면 범위를 벗어난 행사가 구독을 해제하고 새로
+         진입한 행사가를 구독한다"* 고 선언하지만, **`roll_to_spot()`은 WS 연결당 단 한 번**
+         (`run_observation_loop` 진입부 main.py:584)만 호출되고 있었다. 그 결과:
+
+           2026-08-03 실측 — 07:31:03 장전 기동 시점의 지수 호가 1046.81로 ATM이 1047.5에 고정됐고,
+           **하루 종일 행사가 1042.50~1052.50 5개가 한 번도 바뀌지 않았다.** 정작 그날 선물
+           A01609는 983.15~1015.05, 지수는 982.02~1015 구간에서 움직였다 — 즉 **하루치 옵션
+           체인 전체가 스팟에서 약 5.5% 떨어진 외가격(OTM)에서 수집됐다**(수집된 옵션 체결가가
+           0.01~5.00에 몰려 있는 것이 그 증거).
+
+         이것이 §2-1의 NaN 오염을 걷어낸 뒤에도 감마플립 산출률이 0%로 남은 이유다: GEX(S)가
+         탐색 구간(±5%) 어디에서도 부호를 바꾸지 않는데, 5개 행사가가 전부 한쪽(외가격)에
+         몰려 있으면 콜-풋 OI 불균형의 부호가 뒤집힐 자리가 없기 때문이다.
+
+         **선물 종가로 롤링하는 이유**: 이 함수는 WS 수신 태스크 위에서 돈다 — 구독 송신
+         (`ws_client.subscribe`)을 REST 폴러 태스크에서 부르면 같은 소켓에 두 태스크가 동시에
+         쓰게 된다. 선물↔지수 베이시스는 통상 행사가 간격(2.5p)의 절반 미만이라 ATM 선택이
+         한 칸 어긋날 여지가 작고, 무엇보다 **REST 폴링 대상은 매니저의 `desired_strikes`에서
+         나오므로 WS 구독과 체인 수집이 항상 같은 행사가 집합을 본다**(어느 쪽을 기준으로 삼든
+         둘이 어긋나지 않는 것이 더 중요하다).
+    실패 조건: 개별 매니저의 롤링 실패(구독 슬롯 한도 등)는 그대로 전파한다 — 구독 상태가
+              불명확해진 채로 관측을 이어가면 안 된다.
+    """
+    for subscription_manager in subscription_managers:
+        before = subscription_manager.desired_strikes
+        await subscription_manager.roll_to_spot(spot)
+        after = subscription_manager.desired_strikes
+        if before != after:
+            logger.info(
+                "ATM 롤링: 스팟 %.2f — 행사가 %s → %s",
+                spot,
+                f"{min(before):.1f}~{max(before):.1f}" if before else "(없음)",
+                f"{min(after):.1f}~{max(after):.1f}" if after else "(없음)",
+            )
 
 
 async def run_observation_loop(
@@ -684,10 +789,35 @@ async def run_observation_loop(
         else:
             notify.notify(f"✅ {transition.label} — 거래 재개, 신규 진입 차단 해제", "INFO")
 
+    def handle_subscription_ack(message: dict) -> None:
+        """
+        입력: 파이프 텍스트가 아닌 JSON 제어 메시지.
+        계산: 구독 응답(SUBSCRIBE ACK)이면 결과를 로그로 남기고, H0UNMKO0 구독이 성립한 경우
+             `WsLiveness.market_op_subscribed_at`을 갱신한다(DB 기록은 하트비트가 맡는다).
+        해석: 2026-08-03(§2-4 / §4 우선순위 4). 종전에는 이 메시지를 통째로 버렸는데, 08-03에
+             장운영정보 데이터가 하루 0건이었을 때 **"구독이 안 걸린 것"과 "이벤트가 없었던 것"을
+             구분할 방법이 없었다.** `last_message_at`에 임계를 걸 수는 없으므로(정상일에도
+             0~2건) 구독 성립 쪽을 따로 본다.
+        실패 조건: PINGPONG 등 구독 응답이 아닌 제어 메시지면 아무 것도 하지 않는다.
+        """
+        ack = KISWebSocketClient.parse_subscription_ack(message)
+        if ack is None:
+            return
+        if ack.succeeded:
+            logger.info("WS 구독 확립: %s %s — %s", ack.tr_id, ack.tr_key, ack.message)
+        else:
+            logger.warning(
+                "WS 구독 실패: %s %s — rt_cd=%s %s %s", ack.tr_id, ack.tr_key,
+                ack.rt_cd, ack.msg_code, ack.message,
+            )
+        if ack.tr_id == tr_codes.WS_TR_MARKET_OPERATION_INFO and ack.succeeded and ws_liveness is not None:
+            ws_liveness.market_op_subscribed_at = db.local_now()
+
     async def handle_message(message: dict) -> None:
         raw = message.get("raw")
         if raw is None:
-            return  # JSON 제어 메시지(구독 응답/PINGPONG)는 무시
+            handle_subscription_ack(message)  # 구독 응답 — PINGPONG 등 나머지는 조용히 무시
+            return
 
         # 2026-08-01(§5-4): 수신 시각은 메모리에만 남기고 DB 쓰기는 하트비트가 맡는다 —
         # 초당 수십 건 들어오는 경로라 여기서 DB를 만지면 안 된다.
@@ -749,6 +879,7 @@ async def run_observation_loop(
                 },
             )
             if tick_symbol == futures_symbol:
+                await _reroll_books_to_spot(subscription_managers, bar.close)
                 regime_state_machine.update_bar(bar)
                 state = regime_state_machine.step(conn, bar.minute)
                 db.insert_regime_state(
@@ -849,6 +980,10 @@ async def run_observation_loop_forever(
                 if ws_liveness is not None:
                     ws_liveness.connected_since = db.local_now()
                     ws_liveness.reconnect_count += 1
+                    # 새 연결은 KIS 쪽 구독 상태가 전부 초기화된 상태다 — 재구독 ACK이 올
+                    # 때까지는 "구독 성립"이 아니다(2026-08-03 §4 우선순위 4). 직전 연결의
+                    # 시각을 그대로 두면 끊긴 구독이 살아 있는 것처럼 보인다.
+                    ws_liveness.market_op_subscribed_at = None
                 await run_observation_loop(
                     new_client, subscription_managers, rest_client,
                     futures_symbol=futures_symbol, regime_state_machine=regime_state_machine,
@@ -1135,10 +1270,11 @@ def _books_due_this_cycle(
 ) -> list[tuple[RollingSubscriptionManager, str]]:
     """
     입력: 전체 (구독 매니저, series) 목록, 이번 사이클의 분 단위 시각.
-    계산: `OPTION_CHAIN_SLOW_SERIES`(위클리 2북)는 `poll_time.minute`이
-         `OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES`의 배수인 사이클에만 포함하고, 나머지 북
-         (먼슬리)은 항상 포함한다.
-    해석: 2026-07-31 총 REST 수요 축소안 (a) — 상세 근거는 `OPTION_CHAIN_SLOW_SERIES` 주석 참고.
+    계산: `OPTION_CHAIN_SLOW_SERIES_PHASE`에 등록된 북(위클리 2북)은 `poll_time.minute`을
+         `OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES`로 나눈 나머지가 **그 북에 배정된 값과 같은**
+         사이클에만 포함하고, 나머지 북(먼슬리)은 항상 포함한다.
+    해석: 2026-07-31 총 REST 수요 축소안 (a)의 총량(위클리 2분 주기)은 그대로 두고, 2026-08-03
+         §4 우선순위 2로 **분산**만 고친다 — 상세 근거는 `OPTION_CHAIN_SLOW_SERIES_PHASE` 주석 참고.
          반환 순서는 입력 순서를 유지한다(먼슬리를 먼저 조회해 스팟/ATM IV가 항상 주력 북 기준으로
          잡히도록 — 호출측 `_update_atm_iv`가 rows 기준으로 ATM을 고르기 때문).
     실패 조건: 없음 — 알 수 없는 series는 "느린 북이 아니다"로 보아 매 사이클 포함한다(새 북을
@@ -1147,8 +1283,9 @@ def _books_due_this_cycle(
     return [
         (manager, series)
         for manager, series in books
-        if series not in OPTION_CHAIN_SLOW_SERIES
-        or poll_time.minute % OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES == 0
+        if series not in OPTION_CHAIN_SLOW_SERIES_PHASE
+        or poll_time.minute % OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES
+        == OPTION_CHAIN_SLOW_SERIES_PHASE[series]
     ]
 
 
@@ -1186,6 +1323,7 @@ async def poll_ws_heartbeat(
                 db.upsert_ws_status(
                     conn, db.local_now(), ws_liveness.connected_since,
                     ws_liveness.last_message_at, ws_liveness.reconnect_count,
+                    ws_liveness.market_op_subscribed_at,
                 )
         except Exception:
             logger.warning("WS 하트비트 기록 실패 — 관측 자체에는 영향 없음", exc_info=True)
@@ -1252,7 +1390,7 @@ async def _catch_up_missed_option_chain_minute(
     catchup_time = db.local_now().replace(second=0, microsecond=0)
     if catchup_time <= overran_poll_time:
         return False
-    fast_books = [book for book in books if book[1] not in OPTION_CHAIN_SLOW_SERIES]
+    fast_books = [book for book in books if book[1] not in OPTION_CHAIN_SLOW_SERIES_PHASE]
     if not fast_books:
         return False
 
@@ -1310,8 +1448,9 @@ async def poll_option_chain(
          집합을 공유), 종목코드 마스터.
     계산: 북마다 WS 구독 중인 행사가×콜/풋 각각에 대해 주기적으로 get_quote()를 호출해
          그릭스/IV/OI를 option_analysis_1m에, 기초자산 스팟을 underlying_spot_1m에 적재한다.
-         **2026-07-31부터 위클리 2북은 격분(2분)에만 조회한다**(총 REST 수요 축소안 (a) —
-         `_books_due_this_cycle`/`OPTION_CHAIN_SLOW_SERIES` 주석 참고). 먼슬리는 매분 그대로다.
+         **2026-07-31부터 위클리 2북은 격분(2분)에만 조회하고, 2026-08-03부터는 월/목이 서로 다른
+         분 패리티를 쓴다**(`_books_due_this_cycle`/`OPTION_CHAIN_SLOW_SERIES_PHASE` 주석 참고 —
+         매 분 먼슬리 1북 + 위클리 1북 = 20레그로 평탄해진다). 먼슬리는 매분 그대로다.
          get_quote()는 동기(블로킹) httpx 호출이라 asyncio.to_thread로 실행해 WS 수신 루프를
          막지 않는다. 구독 종목이 있는데 한 건도 성공하지 못했다면(레이트리밋 버스트 등으로
          사이클 전체가 실패) retry_backoff_seconds 뒤 그 사이클을 한 번만 재시도한다.
@@ -1784,16 +1923,23 @@ def _log_kis_call_failure(
          (최대 수십 건) 반복 재발할 수 있는 호출측은 throttle/category를 함께 넘기면 §5-5와 동일한
          패턴(WarningThrottle)으로 억제된다. 매크로 스냅샷처럼 사이클당 호출이 1건뿐이라 반복
          스팸 우려가 없는 호출측은 throttle을 안 넘기면 기존처럼 즉시 로깅된다.
+         2026-08-03(운영점검보고서 §2-8 / §4 우선순위 3): **HTTPStatusError에는 트레이스백을
+         붙이지 않는다.** 이 경우 원인은 이미 응답 바디에 전부 실려 있고(rt_cd/msg_cd/msg1),
+         스택은 항상 같은 세 프레임(`_collect_*_cycle` → `to_thread` → `_get`)이라 정보가 0이다.
+         08-03 실측: 이 트레이스백만 하루 약 1,700줄이었고 그중 306줄이 ZN/ES 해외시세 18건인데,
+         그건 "CBOT/CME SUB거래소 신청 계좌가 아닙니다"라는 **계정 권한 문제라 코드로는 절대
+         해결되지 않는 항상 실패**다. 반대로 HTTPStatusError가 **아닌** 예외(파싱 오류, 예상 못 한
+         런타임 오류 등)는 어디서 났는지가 곧 원인이므로 트레이스백을 그대로 남긴다.
     실패 조건: 없음 — 로깅 자체는 항상 성공한다고 가정.
     """
     if isinstance(exc, httpx.HTTPStatusError):
-        fmt, args = "%s — %s", (message, exc.response.text)
+        fmt, args, exc_info = "%s — %s", (message, exc.response.text), False
     else:
-        fmt, args = "%s", (message,)
+        fmt, args, exc_info = "%s", (message,), True
     if throttle is not None and category is not None:
-        throttle.warning(category, fmt, *args, exc_info=True)
+        throttle.warning(category, fmt, *args, exc_info=exc_info)
     else:
-        logger.warning(fmt, *args, exc_info=True)
+        logger.warning(fmt, *args, exc_info=exc_info)
 
 
 async def _collect_macro_snapshot_cycle(
@@ -2180,30 +2326,48 @@ async def poll_investor_flow(
         await asyncio.sleep(delay)
 
 
-def _build_signal_inputs(conn, regime_state: RegimeState | None, underlying: str = UNDERLYING) -> SignalInputs:
+def _build_signal_inputs(
+    conn, regime_state: RegimeState | None, underlying: str = UNDERLYING
+) -> tuple[SignalInputs, dict]:
     """
     입력: DB 커넥션, 이번 사이클의 최신 레짐 상태(RegimeStateMachine.last_state), underlying 라벨.
     계산: option_analysis_1m 체인 스냅샷(legs_from_chain_rows) + underlying_spot_1m 스팟으로
          GEX/Gamma Flip을, investor_flow_1m 최신값으로 외국인 순매수 부호를 구성한다. OFI/큐
          임밸런스는 아직 라이브 집계 파이프라인이 없어(체결 틱 기반 실시간 호가 집계 미구현)
          None으로 둔다 — orderflow_ofi_vpin 멤버는 이번 증분에서 항상 미가용.
+         **함께 반환하는 dict는 판단 행에 그대로 남길 체인 입력 관측치**다(마이그레이션 022).
     해석: 체인/스팟 조회가 비어있거나 실패하면 그 부분만 None으로 남기고 계속 진행한다(다른
          폴러들의 "부분 실패 허용" 원칙과 동일 — Signal Fusion 자체가 None을 안전하게 처리하도록
          설계돼 있음).
+         2026-08-03 §5-1: 두 번째 반환값이 있는 이유는 **"그 데이터가 신호까지 도달했는가"를
+         사후에 셀 수 있어야 하기 때문**이다. 08-03에 먼슬리 커버리지는 98.8%였는데 감마플립
+         산출률은 0%였고, 그 사실을 알아낼 지표가 하나도 없었다.
     실패 조건: 없음 — 개별 조회 결과 부재는 SignalInputs 필드의 None으로 흡수된다.
     """
     chain_rows = db.latest_option_chain(conn, underlying)
     spot = db.latest_underlying_spot(conn, underlying)
     flow = db.latest_investor_flow(conn, underlying)
 
+    now = db.local_now()
     gex = gamma_flip = None
     if chain_rows and spot is not None:
-        legs = legs_from_chain_rows(chain_rows, today=db.local_now().date())
+        legs = legs_from_chain_rows(chain_rows, today=now.date())
         if legs:
             gex = calculate_gex(legs, spot)
             gamma_flip = find_gamma_flip(legs, spot)
 
-    return SignalInputs(
+    # timestamp는 `_chain_snapshot()`이 항상 채우지만, 나이는 어디까지나 부가 관측치라 없으면
+    # 그 항목만 비운다 — 이것 때문에 판단 자체가 죽으면 안 된다.
+    oldest = min((row["timestamp"] for row in chain_rows if row.get("timestamp") is not None), default=None)
+    chain_inputs = {
+        "gamma_flip": gamma_flip,
+        "gex": gex,
+        "chain_leg_count": len(chain_rows),
+        "chain_oldest_leg_age_seconds": (
+            (now - oldest.replace(tzinfo=None)).total_seconds() if oldest is not None else None
+        ),
+    }
+    signal_inputs = SignalInputs(
         regime_state=regime_state,
         gex=gex,
         gamma_flip=gamma_flip,
@@ -2212,6 +2376,7 @@ def _build_signal_inputs(conn, regime_state: RegimeState | None, underlying: str
         queue_imbalance=None,
         foreign_net_flow=flow[0] if flow is not None else None,
     )
+    return signal_inputs, chain_inputs
 
 
 def _account_state_snapshot_from_row(row: dict | None) -> BalanceSnapshot | None:
@@ -2360,7 +2525,9 @@ async def poll_signal_fusion_cycle(
         poll_time = db.local_now().replace(second=0, microsecond=0)
         try:
             with db.get_connection() as conn:
-                signal_inputs = _build_signal_inputs(conn, regime_state_machine.last_state, underlying)
+                signal_inputs, chain_inputs = _build_signal_inputs(
+                    conn, regime_state_machine.last_state, underlying
+                )
                 decision = fusion_engine.evaluate(signal_inputs, MetaLabelContext())
 
                 # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)
@@ -2431,6 +2598,9 @@ async def poll_signal_fusion_cycle(
                     reject_reason=reject_reason,
                     risk_gate_state=risk_gate_state,
                     exec_mode="ADVISORY",
+                    # 2026-08-03 §5-1: 판단 시점의 체인 입력을 함께 남겨야 "신호 도달률"을 사후에
+                    # 셀 수 있다(마이그레이션 022).
+                    chain_inputs=chain_inputs,
                 )
                 _record_risk_snapshot(
                     conn, poll_time, signal_inputs, account_state, risk_engine,

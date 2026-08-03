@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from mahdi.features import regime_features
+
 from mahdi.features.regime_features import (
     adx,
     book_thinning,
@@ -121,3 +123,43 @@ def test_cross_asset_stress_averages_across_available_series():
     only_usdcnh = cross_asset_stress([], usdcnh_spike, [])
     all_three_same_spike = cross_asset_stress(usdcnh_spike, usdcnh_spike, usdcnh_spike)
     assert only_usdcnh == pytest.approx(all_three_same_spike / 3)
+
+
+# ===== 2026-08-03 §4 우선순위 6(HMM 드라이런에서 발견): z-score 폭발 =====
+
+
+def test_series_zscore_treats_float_noise_variance_as_no_variance():
+    """거의 상수인 계열에서 z-score가 폭발하면 안 된다.
+
+    `std <= 0` 가드는 "완전히 불변"만 걸렀는데, 실제 데이터는 부동소수 잡음 때문에 std가 정확히
+    0이 아니라 1e-13 같은 값이 된다 — 그러면 (x-mean)/1e-13 = 1e12가 그대로 통과했다.
+    08-03 실측: `feature_store` 6,213행 중 13행의 cross_asset_stress가 1e11~1e12였고,
+    대각 공분산 가우시안 HMM이 그 이상치 하나로 발산했다(6회 재시작 전부 비수렴, 로그우도 -2.2e22).
+    us10y_yield/usdkrw는 KIS 일봉이라 하루 1~2개 값뿐이라 이 조건이 정상 운영에서 재현된다.
+    """
+    nearly_constant = [4.54, 4.54, 4.54 + 1e-13, 4.55]
+    assert regime_features._series_zscore(nearly_constant) == 0.0
+
+
+def test_series_zscore_is_clamped_to_a_sane_range():
+    # z가 10을 넘는 순간 "얼마나 더 큰가"는 추가 정보가 아니라 잡음이다.
+    exploding = [1.0, 1.0, 1.0000001, 500.0]
+    z = regime_features._series_zscore(exploding)
+    assert abs(z) <= regime_features._MAX_ABS_ZSCORE
+
+
+def test_series_zscore_keeps_ordinary_values_untouched():
+    # 클램프가 정상 범위 값까지 건드리면 피처가 뭉개진다.
+    ordinary = [10.0, 12.0, 8.0, 11.0, 14.0]
+    z = regime_features._series_zscore(ordinary)
+    assert 0.0 < abs(z) < regime_features._MAX_ABS_ZSCORE
+
+
+def test_cross_asset_stress_stays_bounded_for_near_constant_series():
+    # 08-03 실측 최대 1.05e12 → 클램프 이후 상한은 _MAX_ABS_ZSCORE.
+    stress = regime_features.cross_asset_stress(
+        usdkrw_daily_series=[1352.3, 1352.3, 1352.3 + 1e-12, 1360.0],
+        usdcnh_recent_series=[6.78, 6.78, 6.78, 6.79],
+        us10y_daily_series=[4.54, 4.54, 4.54, 4.60],
+    )
+    assert 0.0 <= stress <= regime_features._MAX_ABS_ZSCORE

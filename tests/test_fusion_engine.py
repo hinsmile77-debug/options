@@ -1,3 +1,5 @@
+import logging
+
 from mahdi.engines.regime import RegimeLabel, RegimeState
 from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
 from mahdi.fusion.meta_label import TradePermission
@@ -87,3 +89,38 @@ def test_daily_strategy_cap_is_applied_via_already_used_set():
     )
     decision = engine.evaluate(inputs, MetaLabelContext(), vrp=-0.05)
     assert decision.allowed_strategies == []
+
+
+# ===== 2026-08-03 §5-2: 판단 축 전이 로깅 =====
+
+
+def test_engine_logs_shape_transition_once_not_every_cycle(caplog):
+    """매 분 찍으면 하루 495줄, 아무것도 안 찍으면 멤버가 조용히 죽어도 영영 모른다.
+
+    08-03에 실제로 후자였다 — `options_flow`가 전 이력에서 한 번도 활성화된 적 없었는데
+    로그에 흔적이 0줄이었다.
+    """
+    engine = SignalFusionEngine()
+    inputs = SignalInputs(regime_state=None, foreign_net_flow=500.0)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.fusion.engine"):
+        engine.evaluate(inputs, MetaLabelContext())
+        first = [r for r in caplog.records if "판단 형태 전이" in r.getMessage()]
+        engine.evaluate(inputs, MetaLabelContext())  # 같은 형태 — 로그 없음
+        second = [r for r in caplog.records if "판단 형태 전이" in r.getMessage()]
+
+    assert len(first) == 1
+    assert len(second) == 1, "형태가 그대로면 다시 남기지 않는다"
+    assert "flow_position" in first[0].getMessage()
+
+
+def test_engine_logs_again_when_member_availability_changes(caplog):
+    engine = SignalFusionEngine()
+
+    with caplog.at_level(logging.INFO, logger="mahdi.fusion.engine"):
+        engine.evaluate(SignalInputs(foreign_net_flow=500.0), MetaLabelContext())
+        engine.evaluate(SignalInputs(foreign_net_flow=None), MetaLabelContext())  # 멤버 하나 사라짐
+
+    records = [r for r in caplog.records if "판단 형태 전이" in r.getMessage()]
+    assert len(records) == 2
+    assert "직전 가용멤버" in records[1].getMessage()

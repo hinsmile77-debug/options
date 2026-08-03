@@ -10,6 +10,7 @@ main.py는 매 선물봉마다 RegimeStateMachine.step()만 호출하면 된다.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from datetime import datetime, time as dtime
@@ -21,6 +22,19 @@ import numpy as np
 from mahdi.data import db
 from mahdi.engines.regime import FEATURE_NAMES, RegimeEngine, RegimeLabel, RegimeState, warmup_fallback
 from mahdi.features.regime_features import adx, book_thinning, cross_asset_stress, hurst_exponent, iv_change_rate, rv_ratio
+
+# 2026-08-03(운영점검보고서 §5-2) — 판단 축의 관측. 상세 근거는 `mahdi/fusion/engine.py`의 logger
+# 주석 참고. 여기서는 **피처가 중립값을 처음 벗어나는 순간**만 남긴다(피처당 평생 1건).
+#
+# 왜 이 순간인가: `rv_ratio`는 유효 종가가 21일 미만이면 중립값 1.0을 반환하는데(정상 동작),
+# 07-30에 그 사실을 알아내는 데 `feature_store` 전체 5,394행을 뒤져야 했다. 실제로 살아나는
+# 시점이 로그에 한 줄 남으면 그 조사 자체가 필요 없다 — 그리고 **예상일이 지나도 그 줄이 안
+# 나오면 그게 곧 이상 신호**다(08-04 예상, 2026-08-03 §2-6).
+logger = logging.getLogger("mahdi.engines.regime_pipeline")
+
+# 피처별 "아직 살아있지 않다"를 뜻하는 값 — `mahdi/ops/db_metrics.py`의 `_FEATURE_NEUTRAL`과
+# 같은 정의다(리포트 지표와 로그가 다른 기준을 쓰면 안 된다).
+_FEATURE_NEUTRAL_VALUES = {"rv_ratio": 1.0, "book_thinning": 0.0, "cross_asset_stress": 0.0}
 
 if TYPE_CHECKING:
     from mahdi.data.collector import MinuteBar
@@ -230,6 +244,9 @@ class RegimeStateMachine:
         self._bar_count = 0
         self._gap_zscore: float | None = None  # 세션 첫 계산값을 캐싱(갭은 장중 재계산 대상이 아님)
         self.last_state: RegimeState | None = None  # 다른 폴러(Signal Fusion)가 재계산 없이 참조
+        # 이번 프로세스에서 이미 "중립값 탈출"을 알린 피처 — 피처당 한 번만 남긴다(§5-2).
+        self._escaped_neutral: set[str] = set()
+        self._last_regime: RegimeLabel | None = None
         try:
             self.engine: RegimeEngine | None = RegimeEngine.load(model_path)
         except FileNotFoundError:
@@ -260,7 +277,9 @@ class RegimeStateMachine:
         features = self.feature_builder.build(
             daily_closes, usdkrw_daily_series, usdcnh_recent_series, us10y_daily_series
         )
-        db.insert_feature_store(conn, timestamp, self.underlying, dict(zip(FEATURE_NAMES, features)), FEATURE_VERSION)
+        named_features = dict(zip(FEATURE_NAMES, features))
+        self._log_neutral_escapes(named_features)
+        db.insert_feature_store(conn, timestamp, self.underlying, named_features, FEATURE_VERSION)
 
         if self.engine is not None and self._bar_count >= _MIN_WARMUP_BARS:
             state = self.engine.predict(np.array([features]))
@@ -271,5 +290,31 @@ class RegimeStateMachine:
             prior_regime = latest_prior_close_regime(conn)
             state = warmup_fallback(prior_regime, macro_score=macro_score, gap_zscore=self._gap_zscore)
 
+        if self._last_regime != state.regime:
+            logger.info(
+                "레짐 전이: %s → %s (안정=%s, 모델=%s)",
+                self._last_regime.name if self._last_regime is not None else "(최초)",
+                state.regime.name, state.stability_flag,
+                "predict" if self.engine is not None and self._bar_count >= _MIN_WARMUP_BARS else "warmup_fallback",
+            )
+            self._last_regime = state.regime
+
         self.last_state = state
         return state
+
+    def _log_neutral_escapes(self, named_features: dict[str, float]) -> None:
+        """
+        입력: 이번 봉의 피처 이름→값.
+        계산: `_FEATURE_NEUTRAL_VALUES`에 등록된 피처가 **처음** 중립값을 벗어나면 INFO 한 줄.
+        해석: 2026-08-03 §5-2 — 피처당 평생 1건이라 로그 볼륨 부담이 없고, **예상일이 지나도
+             줄이 안 나오면 그 자체가 이상 신호**다(rv_ratio는 유효 종가 21일째인 08-04 예상).
+        실패 조건: 없음.
+        """
+        for name, neutral in _FEATURE_NEUTRAL_VALUES.items():
+            if name in self._escaped_neutral:
+                continue
+            value = named_features.get(name)
+            if value is None or value == neutral:
+                continue
+            self._escaped_neutral.add(name)
+            logger.info("피처 활성화: %s가 중립값(%s)을 처음 벗어났다 — 현재 %.6g", name, neutral, value)

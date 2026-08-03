@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from mahdi.ops import db_metrics as db_metrics_module  # 임계를 리포트에 그대로 인용하기 위함
+
 # 전일 대비 델타를 붙일 핵심 지표. (라벨, 지표 경로, 포맷, 개선 방향)
 # 개선 방향: "down"이면 감소가 개선, "up"이면 증가가 개선, None이면 판정하지 않는다.
 HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
@@ -115,7 +117,11 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     if db_metrics:
         lines += _section("12. DB 적재", lambda: _render_db_tables(db_metrics))
         lines += _section("13. 판단/레짐/피처", lambda: _render_db_judgement(db_metrics))
-        lines += _section("14. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
+        lines += _section("14. 신호 도달률 — 데이터가 판단까지 갔는가",
+                          lambda: _render_signal_reach(db_metrics))
+        lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
+                          lambda: _render_book_gamma_map(db_metrics))
+        lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -379,6 +385,59 @@ def _render_db_judgement(db: dict) -> list[str]:
     return out
 
 
+def _render_signal_reach(db: dict) -> list[str]:
+    """2026-08-03 §5-1 — "데이터가 DB에 있는가"가 아니라 "판단까지 도달했는가"를 낸다."""
+    reach = db.get("signal_reach") or {}
+    if not reach.get("available"):
+        return [
+            "> 이 지표는 마이그레이션 022(`signal_decisions`의 체인 입력 컬럼) 적용 이후부터 나온다.",
+            "",
+        ]
+    out = _table(
+        ["지표", "값", "경고 임계"],
+        [
+            [
+                "앙상블 최대 가용 멤버",
+                f"{reach['member_count_max']}개 / 이론 최대 3개",
+                f"< {db_metrics_module.SIGNAL_REACH_WARNINGS['member_count_max_min']}",
+            ],
+            [
+                "감마플립 산출률",
+                f"{reach['gamma_flip_pct']}% ({reach['gamma_flip_count']:,}/{reach['decisions']:,}분)",
+                f"< {db_metrics_module.SIGNAL_REACH_WARNINGS['gamma_flip_pct_min']}%",
+            ],
+            [
+                "체인 스냅샷 레그 수",
+                f"중앙 {_fmt(reach.get('chain_leg_median'), '{:.0f}')} / "
+                f"최대 {_fmt(reach.get('chain_leg_max'), '{:,.0f}')}",
+                "북수 x (ATM±N)x2 에서 크게 벗어나면",
+            ],
+            [
+                "체인 스냅샷 최고령 레그",
+                f"중앙 {_fmt(_minutes(reach.get('chain_age_seconds_median')), '{:.1f}분')} / "
+                f"최대 {_fmt(_minutes(reach.get('chain_age_seconds_max')), '{:.1f}분')}",
+                f"> {db_metrics_module.SIGNAL_REACH_WARNINGS['chain_age_seconds_max'] / 60:.0f}분",
+            ],
+        ],
+    )
+    for warning in reach.get("warnings") or []:
+        out.append(f"- ⚠ {warning}")
+    if not reach.get("warnings"):
+        out.append("- 경고 없음")
+    out += [
+        "",
+        "> **커버리지(§12)와 반드시 나란히 읽는다.** 2026-08-03에 먼슬리 커버리지는 98.8%였는데 "
+        "감마플립 산출률은 **0%**였다 — 커버리지는 *데이터가 DB에 있는가*만 재고 *그 데이터가 "
+        "신호까지 도달했는가*는 재지 않기 때문이다.",
+        "",
+    ]
+    return out
+
+
+def _minutes(seconds: float | None) -> float | None:
+    return None if seconds is None else seconds / 60.0
+
+
 def _render_db_misc(db: dict) -> list[str]:
     macro = db.get("macro") or {}
     out = _table(
@@ -402,14 +461,55 @@ def _render_db_misc(db: dict) -> list[str]:
 
 
 def _render_hypotheses(results: list[dict]) -> list[str]:
+    out: list[str] = []
+    # 2026-08-03 §5-4 — 예정일이 지났는데 아직 `상태: pending`인 항목을 **표 위로** 띄운다.
+    # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에 섞여 들어가면 놓치기
+    # 쉽고 그렇게 쌓이면 "예측 → 실측 검정" 규약 자체가 무력해진다.
+    overdue = sorted({(r["id"], r.get("검증예정일")) for r in results if r.get("overdue")})
+    if overdue:
+        out += [
+            f"> ⚠ **확정 대기 {len(overdue)}건** — 검증예정일이 지났는데 `hypotheses.yaml`의 "
+            "`상태`가 아직 `pending`이다. 오늘 보고서를 쓰면서 손으로 확정할 것:",
+            "",
+        ]
+        out += [f"> - `{hid}` (예정일 {due or '미지정'})" for hid, due in overdue]
+        out.append("")
+
     rows = [
         [r["id"], r["가설"], r["metric"], _fmt(r.get("actual"), "{}"), r["expect"], r["verdict"]]
         for r in results
     ]
-    out = _table(["id", "가설", "지표", "실측", "예측", "판정"], rows)
+    out += _table(["id", "가설", "지표", "실측", "예측", "판정"], rows)
     out += [
         "> 판정은 참고값이다 — **`hypotheses.yaml`의 `상태`는 자동으로 바뀌지 않는다.** "
         "사람이 보고서를 쓰면서 손으로 확정한다(자동 판정이 틀렸을 때 조용히 덮이는 것을 막는다).",
+        "",
+    ]
+    return out
+
+
+def _render_book_gamma_map(db: dict) -> list[str]:
+    """2026-08-03 §5-5 — 합산하면 만기별 정보가 서로를 덮는다. 북마다 나눠 본다."""
+    books = db.get("book_gamma_map") or []
+    out = _table(
+        ["만기", "레그", "GEX", "감마플립", "핀 행사가", "핀 집중도", "비고"],
+        [
+            [
+                str(b["expiry"]),
+                str(b["legs"]),
+                _fmt(b.get("gex"), "{:,.0f}"),
+                _fmt(b.get("gamma_flip"), "{:.2f}"),
+                _fmt(b.get("pin_strike"), "{:.1f}"),
+                _fmt(b.get("pin_concentration_pct"), "{:.1f}%"),
+                "**만기 당일**" if b.get("expiry_today") else "",
+            ]
+            for b in books
+        ],
+    )
+    out += [
+        "> 만기 당일 북은 잔존만기 0이라 **감마플립이 정의되지 않는다**(`—`가 정상) — 대신 "
+        "핀 리스크(v6 §A3 만기 Pinning)가 그 북에서만 의미를 갖는다. 먼슬리(최근월)가 "
+        "GEX/감마플립의 주 입력이고(v6 §11.4 게이트), 위클리는 핀 리스크 전용으로 읽는다.",
         "",
     ]
     return out

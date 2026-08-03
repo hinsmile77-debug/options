@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Iterator, Protocol
 
 import psycopg
@@ -565,7 +565,10 @@ def latest_market_halt_state(conn: ConnectionLike) -> dict | None:
     }
 
 
-_WS_STATUS_COLUMNS = ("id", "updated_at", "connected_since", "last_message_at", "reconnect_count_today")
+_WS_STATUS_COLUMNS = (
+    "id", "updated_at", "connected_since", "last_message_at", "reconnect_count_today",
+    "market_op_subscribed_at",
+)
 
 
 def upsert_ws_status(
@@ -574,6 +577,7 @@ def upsert_ws_status(
     connected_since: datetime | None,
     last_message_at: datetime | None,
     reconnect_count_today: int,
+    market_op_subscribed_at: datetime | None = None,
 ) -> None:
     """
     입력: 하트비트 시각과 `mahdi.main.WsLiveness`의 현재 값.
@@ -585,6 +589,7 @@ def upsert_ws_status(
     row = {
         "id": True, "updated_at": updated_at, "connected_since": connected_since,
         "last_message_at": last_message_at, "reconnect_count_today": reconnect_count_today,
+        "market_op_subscribed_at": market_op_subscribed_at,
     }
     _upsert(conn, "ws_status", _WS_STATUS_COLUMNS, ("id",), row)
 
@@ -597,7 +602,8 @@ def latest_ws_status(conn: ConnectionLike) -> dict | None:
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT updated_at, connected_since, last_message_at, reconnect_count_today FROM ws_status LIMIT 1"
+            "SELECT updated_at, connected_since, last_message_at, reconnect_count_today, "
+            "market_op_subscribed_at FROM ws_status LIMIT 1"
         )
         row = cur.fetchone()
     if row is None:
@@ -605,6 +611,7 @@ def latest_ws_status(conn: ConnectionLike) -> dict | None:
     return {
         "updated_at": row[0], "connected_since": row[1],
         "last_message_at": row[2], "reconnect_count_today": int(row[3]),
+        "market_op_subscribed_at": row[4],
     }
 
 
@@ -654,23 +661,52 @@ def get_active_futures_symbol(conn: ConnectionLike, underlying: str) -> str | No
     return row[0] if row else None
 
 
-def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
+# 2026-08-03(운영점검보고서 §2-2) — 체인 스냅샷이 인정하는 레그의 최대 나이(분).
+#
+# **배경**: 종전 `latest_option_chain()`은 `DISTINCT ON (strike, option_type)`만 걸고 시각 조건도
+# 만기 조건도 없었다. ATM±2 창은 스팟을 따라 움직이므로 한때 창 안에 있다가 빠져나간 행사가가
+# **그때의 값 그대로 영원히 스냅샷에 남는다.** 2026-08-03 15:45 라이브 실측: 반환 246레그 중
+# 오늘 수집분은 10개뿐이고, 156레그(63%)가 이미 만기가 지난 것이며, 최고령 레그는 4주 전
+# (2026-07-06 10:45)이었다. GEX가 전체 -563억 / 오늘 수집분만 +28억으로 **부호가 뒤집혔다** —
+# GEX 부호는 v6 §7의 회귀/증폭 판정과 §11.4 프리미엄 매도 게이트(positive GEX 요구)의 입력이다.
+#
+# **왜 10분인가**: `main.py:120` 주석이 위클리 격분(2분) 전환 근거로 "안 조회한 분에는 직전 값이
+# 이월돼 구멍이 안 생긴다"고 적었는데, 그 의도는 **1~2분 이월**이었다. 여기에 밀림·결손이 겹쳐
+# 최대 몇 분 더 벌어질 수 있는 여유를 더해 10분으로 잡는다(2026-08-03 실측 최대 밀림 48.2초,
+# 미회수 결손 6분). 이보다 오래된 값은 "이월"이 아니라 "유령"이다.
+CHAIN_SNAPSHOT_MAX_AGE_MINUTES = 10
+
+_CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", "expiry", "timestamp")
+
+# `DISTINCT ON`에 **expiry를 포함한다**(2026-08-03 §2-2). 종전에는 (strike, option_type)으로만 묶어
+# 만기가 다른 3개 북(regular/weekly_mon/weekly_thu)이 같은 행사가에서 서로를 덮어썼다 — 마지막으로
+# 폴링된 북 하나만 남아, 반환된 감마가 어느 만기의 것인지 알 수 없었고 북별 GEX도 볼 수 없었다.
+_CHAIN_SNAPSHOT_SQL = """
+    SELECT DISTINCT ON (expiry, strike, option_type)
+        strike, option_type, oi, iv, gamma, gex, expiry, timestamp
+    FROM option_analysis_1m
+    WHERE underlying=%s
+      AND timestamp <= %s
+      AND timestamp >= %s
+      AND expiry >= %s
+    ORDER BY expiry, strike, option_type, timestamp DESC
+"""
+
+
+def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> list[dict]:
     """
-    계산: (strike, option_type) 레그별로 가장 최근 timestamp 1건씩만 골라 체인 스냅샷을 구성한다
-         (폴링 주기 중 레그마다 조회 시각이 조금씩 어긋날 수 있어 레그별 최신값을 취함).
-    해석: 반환된 dict는 mahdi.features.options_intel.OptionLeg 생성에 바로 쓸 수 있는 키를 가진다.
+    입력: DB 커넥션, 기초자산 라벨, 스냅샷 기준 시각.
+    계산: `as_of` 이전 `CHAIN_SNAPSHOT_MAX_AGE_MINUTES`분 이내에 수집됐고 `as_of` 시점에 아직
+         만기가 남은(당일 만기 포함) 레그만 모아, (expiry, strike, option_type)별 최신 1건으로
+         체인 스냅샷을 구성한다.
+    해석: 반환 dict는 `mahdi.features.options_intel.OptionLeg` 생성에 바로 쓸 수 있는 키를 가진다.
+         `latest_option_chain()`(라이브)과 `option_chain_as_of()`(백테스트 리플레이)가 **이 함수를
+         공유한다** — 두 경로가 다른 체인을 보면 백테스트 결과를 라이브에 적용할 수 없다.
+    실패 조건: 조건을 만족하는 행이 없으면 빈 목록(호출측이 GEX/flip을 건너뛴다).
     """
+    oldest = as_of - timedelta(minutes=CHAIN_SNAPSHOT_MAX_AGE_MINUTES)
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT ON (strike, option_type)
-                strike, option_type, oi, iv, gamma, gex, expiry, timestamp
-            FROM option_analysis_1m
-            WHERE underlying=%s
-            ORDER BY strike, option_type, timestamp DESC
-            """,
-            (underlying,),
-        )
+        cur.execute(_CHAIN_SNAPSHOT_SQL, (underlying, as_of, oldest, as_of.date()))
         rows = cur.fetchall()
     return [
         {
@@ -685,6 +721,14 @@ def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
         }
         for strike, option_type, oi, iv, gamma, gex, expiry, timestamp in rows
     ]
+
+
+def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
+    """
+    계산: 지금(`local_now()`) 기준 체인 스냅샷 — 상세 규칙은 `_chain_snapshot()` 참고.
+    해석: 반환된 dict는 mahdi.features.options_intel.OptionLeg 생성에 바로 쓸 수 있는 키를 가진다.
+    """
+    return _chain_snapshot(conn, underlying, local_now())
 
 
 # 현재 코드가 실제로 기록하는 series 값만 조회한다 — 과거 버전이 쓰던 이름(예: 2026-07-10
@@ -888,21 +932,33 @@ def insert_signal_decision(
     reject_reason: str | None,
     risk_gate_state: dict,
     exec_mode: str,
+    chain_inputs: dict | None = None,
 ) -> None:
     """
     입력: 시각, conviction(v6 §11.1 4단계 문자열), decision("ENTER"/"HOLD"/"REJECT"),
          거절 사유(있으면), 리스크/신호 게이트 상태 요약(JSONB 직렬화), 실행 모드
-         ("ADVISORY"/"CONFIRM"/"AUTO").
+         ("ADVISORY"/"CONFIRM"/"AUTO"), (선택) 판단 시점의 옵션 체인 입력
+         (`gamma_flip`/`gex`/`chain_leg_count`/`chain_oldest_leg_age_seconds` 키, 마이그레이션 022).
     계산: `signal_decisions`는 `decision_id`가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이
          새 행을 남기는 append-only 로그(§18.2 "거절된 신호도 기록한다")라 단순 INSERT만 한다.
+    해석: 2026-08-03 §5-1 — 체인 입력을 판단 행에 함께 남겨야 "신호 도달률"을 사후 집계할 수
+         있다. 08-03에 먼슬리 커버리지는 98.8%인데 감마플립 산출률은 0%였고, 그것을 알아낼
+         지표가 하나도 없었다. `chain_inputs`가 None이면 네 컬럼은 NULL로 남는다 — 없는 값을
+         0으로 채우면 "계산했는데 0"과 구분되지 않는다.
     실패 조건: reject_reason이 50자를 넘으면 DB가 자르지 않고 에러를 낼 수 있다 — 호출측이
               미리 축약해서 넘겨야 한다.
     """
+    chain = chain_inputs or {}
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
-            "risk_gate_state, exec_mode) VALUES (%s, %s, %s, %s, %s, %s)",
-            (timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode),
+            "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
+            "chain_oldest_leg_age_seconds) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
+                chain.get("gamma_flip"), chain.get("gex"),
+                chain.get("chain_leg_count"), chain.get("chain_oldest_leg_age_seconds"),
+            ),
         )
     conn.commit()
 
@@ -985,35 +1041,14 @@ def market_bars_between(conn: ConnectionLike, symbol: str, start: datetime, end:
 
 def option_chain_as_of(conn: ConnectionLike, underlying: str, as_of: datetime) -> list[dict]:
     """
-    `latest_option_chain()`과 완전히 같은 형태를 반환하되, "지금 기준 최신"이 아니라 `as_of`
-    시각 기준 각 레그(strike, option_type)의 최신값을 취한다 — 백테스트 과거 리플레이 전용
-    (`latest_option_chain()`은 실시간 대시보드 전용으로 그대로 둔다).
+    `latest_option_chain()`과 완전히 같은 형태·같은 규칙(신선도 창 + 만기 경계)을 `as_of` 시각
+    기준으로 적용한다 — 백테스트 과거 리플레이 전용.
+
+    2026-08-03(§4 우선순위 1): 종전에는 이 함수만 `timestamp <= as_of`를 걸고 신선도/만기
+    경계가 없었다. 라이브와 백테스트가 다른 체인을 보면 백테스트 결과를 라이브에 적용할 수
+    없으므로 `_chain_snapshot()`으로 통일한다.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT ON (strike, option_type)
-                strike, option_type, oi, iv, gamma, gex, expiry, timestamp
-            FROM option_analysis_1m
-            WHERE underlying=%s AND timestamp <= %s
-            ORDER BY strike, option_type, timestamp DESC
-            """,
-            (underlying, as_of),
-        )
-        rows = cur.fetchall()
-    return [
-        {
-            "strike": float(strike),
-            "option_type": option_type,
-            "oi": float(oi) if oi is not None else 0.0,
-            "iv": float(iv) if iv is not None else 0.0,
-            "gamma": float(gamma) if gamma is not None else 0.0,
-            "gex": float(gex) if gex is not None else 0.0,
-            "expiry": expiry,
-            "timestamp": timestamp,
-        }
-        for strike, option_type, oi, iv, gamma, gex, expiry, timestamp in rows
-    ]
+    return _chain_snapshot(conn, underlying, as_of)
 
 
 def investor_flow_as_of(conn: ConnectionLike, underlying: str, as_of: datetime) -> tuple[float, float, float] | None:

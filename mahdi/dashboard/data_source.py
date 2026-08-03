@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta
@@ -516,19 +517,53 @@ def _market_halt_check(conn) -> HealthCheck:
     heartbeat_age = (db.local_now() - _as_naive(status["updated_at"])).total_seconds()
     seen = status.get("last_message_at")
     seen_text = f" · 최근 장운영정보 {seen:%H:%M:%S}" if seen is not None else " · 장운영정보 수신 이력 없음"
+    # 2026-08-03(운영점검 §2-4/§4 우선순위 4): (C)에 네 번째 질문을 더한다 — **감시자가 실제로
+    # 감시 대상에 붙어 있는가**. 08-03에는 장운영정보 데이터가 하루 0건이었는데도 하트비트가
+    # 정상이라 배지가 초록이었다. 데이터 수신에는 임계를 걸 수 없지만(정상일에도 0~2건) 구독
+    # 성립 여부는 확정적으로 판정할 수 있다.
+    ws_status_known, subscribed_at = _market_op_subscription(conn)
+    subscribed_text = f" · 구독확립 {subscribed_at:%H:%M:%S}" if subscribed_at is not None else ""
     if heartbeat_age > _MARKET_HALT_HEARTBEAT_STALE_SECONDS:
         return HealthCheck(
             label, "warning",
             f"감지기 하트비트 {heartbeat_age / 60:.0f}분째 정지({status['updated_at']:%H:%M:%S}) — "
-            f"관측 루프 생존 확인 필요{seen_text}",
+            f"관측 루프 생존 확인 필요{subscribed_text}{seen_text}",
+        )
+    if ws_status_known and subscribed_at is None:
+        return HealthCheck(
+            label, "warning",
+            f"H0UNMKO0 구독 미성립 — 하트비트는 정상({status['updated_at']:%H:%M:%S})이지만 감지기가 "
+            f"장운영정보에 붙어 있지 않다{seen_text}",
         )
     if status["mkop_cls_code"] is None:
         return HealthCheck(
-            label, "ok", f"정상(발동 이력 없음) — 관측루프 {status['updated_at']:%H:%M:%S}{seen_text}"
+            label, "ok",
+            f"정상(발동 이력 없음) — 관측루프 {status['updated_at']:%H:%M:%S}{subscribed_text}{seen_text}",
         )
     return HealthCheck(
-        label, "ok", f"정상 — 직전: {status['label']}({status['updated_at']:%H:%M:%S} 해제됨){seen_text}"
+        label, "ok",
+        f"정상 — 직전: {status['label']}({status['updated_at']:%H:%M:%S} 해제됨){subscribed_text}{seen_text}",
     )
+
+
+def _market_op_subscription(conn) -> tuple[bool, datetime | None]:
+    """
+    계산: `ws_status`에서 (행이 있는가, H0UNMKO0 구독 성립 시각)을 읽는다.
+    해석: 2026-08-03 §4 우선순위 4. 두 값을 함께 돌려주는 이유는 **"행이 없다"와 "행은 있는데
+         구독만 안 걸렸다"가 전혀 다른 신호**이기 때문이다 — 전자는 마이그레이션 021 적용 전이거나
+         관측 루프 미기동(그 판정은 `_ws_liveness_check`의 몫)이고, 후자만 이 배지가 경고할 일이다.
+    실패 조건: 조회 실패는 (False, None) — CB 배지는 이 정보 없이도 나머지 판정을 계속해야 한다.
+    """
+    try:
+        status = db.latest_ws_status(conn)
+    except Exception:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        logger.warning("WS 구독 성립 시각 조회 실패 — CB 배지의 나머지 판정은 계속한다", exc_info=True)
+        return False, None
+    if not status:
+        return False, None
+    return True, status.get("market_op_subscribed_at")
 
 
 def get_market_halt_status() -> dict | None:
@@ -615,6 +650,39 @@ def _monthly_coverage_check(conn, underlying: str, now: datetime) -> HealthCheck
     detail = f"{coverage['minutes']}분 / 경과 {elapsed}분 = {pct:.1f}% (만기 {coverage['expiry']})"
     status = "warning" if pct < _MONTHLY_COVERAGE_WARNING_PCT else "ok"
     return HealthCheck(label, status, detail, group="관측 품질")
+
+
+def _signal_reach_check(conn, now: datetime) -> HealthCheck:
+    """
+    해석: 2026-08-03 §5-1 — **커버리지(§12)가 답하지 못하는 한 칸.** 커버리지는 "데이터가 DB에
+         있는가"만 재고, 이 배지는 "그 데이터가 판단까지 도달했는가"를 잰다. 08-03에 먼슬리
+         커버리지 98.8%인 날 감마플립 산출률은 0%였고, 그 사실을 볼 수 있는 지표가 없었다.
+         **리포트(`mahdi/ops/report.py` §14)와 같은 함수·같은 임계를 쓴다** — 배지와 리포트가
+         다른 답을 내면 어느 쪽을 믿을지 알 수 없다(README 규약).
+    실패 조건: 마이그레이션 022 적용 전이거나 아직 판단 이력이 없으면 "집계 전"(info).
+    """
+    label = "신호 도달률(체인 → 판단)"
+    try:
+        reach = db_metrics.signal_reach(conn, now.date())
+    except Exception:
+        conn.rollback()
+        logger.warning("신호 도달률 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    if not reach.get("available"):
+        return HealthCheck(
+            label, "info", "집계 전(마이그레이션 022 적용 전이거나 판단 이력 없음)", group="관측 품질"
+        )
+    detail = (
+        f"감마플립 {reach['gamma_flip_pct']}% ({reach['gamma_flip_count']:,}/{reach['decisions']:,}분) · "
+        f"앙상블 최대 {reach['member_count_max']}멤버"
+    )
+    age_max = reach.get("chain_age_seconds_max")
+    if age_max is not None:
+        detail += f" · 체인 최고령 {age_max / 60:.0f}분"
+    warnings = reach.get("warnings") or []
+    if warnings:
+        return HealthCheck(label, "warning", f"{detail} — {warnings[0]}", group="관측 품질")
+    return HealthCheck(label, "ok", detail, group="관측 품질")
 
 
 def _overrun_count_check(conn, now: datetime) -> HealthCheck:
@@ -708,6 +776,9 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _monthly_coverage_check(conn, underlying, now),
                 _overrun_count_check(conn, now),
                 _ws_liveness_check(conn, now),
+                # 2026-08-03(§5-1) — 커버리지 바로 아래 칸. 08-03에 커버리지 98.8%인 날
+                # 감마플립 산출률은 0%였다(데이터는 DB에 있었지만 판단까지 가지 않았다).
+                _signal_reach_check(conn, now),
             ]
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)

@@ -207,20 +207,46 @@ def iv_change_rate(iv_series: Sequence[float]) -> float:
     return (iv_series[-1] - iv_series[0]) / iv_series[0]
 
 
+# 2026-08-03(운영점검보고서 §4 우선순위 6 — HMM 드라이런에서 발견) — z-score의 실효 상한.
+#
+# **발견 경위**: 08-10 임계 도달 전에 `fit_regime_engine.py --dry-run`을 미리 돌렸더니
+# `fit()`은 예외 없이 끝나는데 **6회 재시작 전부 "Model is not converging"**(로그우도 -2.2e22)
+# 이었다. 원인은 `feature_store` 6,213행 중 13행의 `cross_asset_stress`가 **1e11~1e12**
+# (9행의 `book_thinning`은 |z|>10)였던 것 — 대각 공분산 가우시안 HMM은 이런 이상치 한 개로
+# 그 차원의 분산이 폭발해 EM이 통째로 발산한다.
+#
+# **왜 생겼나**: 아래 `std <= 0` 가드는 "값이 완전히 불변인 계열"만 걸러낸다. 그런데 실제
+# 데이터는 부동소수 잡음 때문에 std가 정확히 0이 아니라 1e-13 같은 값이 된다 — 그러면
+# (x - mean)/1e-13 = 1e12가 그대로 통과한다. us10y_yield/usdkrw는 KIS 일봉이라 하루 1~2개
+# 값뿐이고(08-03 실측 non-null 2건) 거의 상수라, 이 조건이 **정상 운영에서 재현된다.**
+#
+# 조치 두 가지:
+#   (1) 0 판정을 **상대 오차**로 바꾼다 — 계열 규모(|mean|) 대비 무시할 만큼 작은 표준편차는
+#       "변동 없음"으로 본다. 절대 임계만 쓰면 1e-13 수준에서 또 뚫린다.
+#   (2) 그래도 남는 큰 값은 ±_MAX_ABS_ZSCORE로 **자른다**. z가 10을 넘는 순간 "얼마나 더 큰가"는
+#       추가 정보가 아니라 잡음이며(정규분포에서 |z|>10은 사실상 발생하지 않는다), 모델에는
+#       "극단적으로 이례적"이라는 사실만 전달되면 충분하다.
+_ZSCORE_RELATIVE_STD_EPSILON = 1e-9
+_MAX_ABS_ZSCORE = 10.0
+
+
 def _series_zscore(series: Sequence[float]) -> float:
     """
     계산: 시퀀스 마지막 값이 그 앞(직전 구간) 평균 대비 몇 표준편차 위/아래인지(부호 있는 z-score).
-    실패 조건: 데이터 3개 미만이거나 표준편차가 0(값 불변)이면 중립값 0.0 — book_thinning·
-              cross_asset_stress가 공유하는 핵심 계산.
+         결과는 ±_MAX_ABS_ZSCORE로 클램프한다.
+    실패 조건: 데이터 3개 미만이거나 표준편차가 계열 규모 대비 무시할 수준이면(사실상 값 불변)
+              중립값 0.0 — book_thinning·cross_asset_stress가 공유하는 핵심 계산.
+              상세 근거는 위 `_ZSCORE_RELATIVE_STD_EPSILON` 주석 참고.
     """
     if len(series) < 3:
         return 0.0
     baseline = series[:-1]
     mean = sum(baseline) / len(baseline)
     std = _stdev(baseline)
-    if std <= 0:
+    if std <= abs(mean) * _ZSCORE_RELATIVE_STD_EPSILON or std <= 0:
         return 0.0
-    return (series[-1] - mean) / std
+    z = (series[-1] - mean) / std
+    return max(-_MAX_ABS_ZSCORE, min(_MAX_ABS_ZSCORE, z))
 
 
 def book_thinning(spread_series: Sequence[float]) -> float:
