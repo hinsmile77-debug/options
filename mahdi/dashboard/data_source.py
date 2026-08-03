@@ -130,6 +130,18 @@ _TRADING_DAY_START = dtime(9, 0)
 _TRADING_DAY_END = dtime(15, 45)
 _STALE_DATA_THRESHOLD_SECONDS = 300.0
 
+# 2026-08-03(COCKPIT 육안 점검) — KOSPI200 선물·옵션 **장 마감 동시호가(종가 단일가)** 시작 시각.
+#
+# 이 구간(15:35~15:45)에는 연속 체결이 없어 WS 체결 메시지가 끊기고 1분봉도 안 만들어진다.
+# 그런데 `_is_trading_hours()`는 15:45까지 True이고 결손 임계는 5분이라, **매 거래일 15:40부터
+# 15:45까지 "선물 시세 N분째 결손" 노란불이 반드시 뜬다.** 08-03 15:44:53 화면이 정확히 그
+# 순간을 잡았다("12분째 결손", WS 마지막 수신 15:34:55).
+#
+# 이것은 2026-07-31 §2-2에서 CB 하트비트로 배운 것과 같은 실수다 — **정상을 이상으로 표시하면
+# 진짜 이상을 못 알아본다.** 단일가 구간에서는 결손 나이를 `now`가 아니라 이 시각 기준으로 재서,
+# "단일가 진입 전부터 이미 끊겨 있었나"만 판정한다(14:00에 멈춘 경우는 여전히 경고).
+_CLOSING_AUCTION_START = dtime(15, 35)
+
 
 def _is_trading_hours(now: datetime) -> bool:
     return now.weekday() < 5 and _TRADING_DAY_START <= now.time() <= _TRADING_DAY_END
@@ -145,9 +157,15 @@ def _as_naive(ts: datetime) -> datetime:
     return ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
 
 
-def _freshness_check(label: str, latest_ts: datetime | None, now: datetime) -> HealthCheck:
+def _freshness_check(
+    label: str, latest_ts: datetime | None, now: datetime, *, continuous_trading_only: bool = False
+) -> HealthCheck:
     """장중이 아니면(주말/장외시간) 데이터가 안 들어와도 정상이므로 판단하지 않는다 — 장중에만
     §5-4와 동일한 5분 기준으로 결손 여부를 판단한다.
+
+    `continuous_trading_only=True`는 **연속 체결에만 의존하는 데이터**(WS 체결 기반)에 쓴다 —
+    종가 단일가 구간(15:35~15:45)에는 체결이 없는 것이 정상이므로 그 구간 시작 시각을 기준으로
+    나이를 잰다. REST 폴링 기반(옵션체인)은 단일가 구간에도 계속 들어오므로 False(기본)다.
 
     2026-07-20(버그 수정): latest_ts는 TIMESTAMPTZ 컬럼(MAX(timestamp))에서 psycopg가 읽어온
     값이라 tzinfo가 붙어 있는데, now(db.local_now())는 naive다 — 장외시간에는 이 함수가 그 값을
@@ -161,7 +179,12 @@ def _freshness_check(label: str, latest_ts: datetime | None, now: datetime) -> H
         return HealthCheck(label, "info", "장중 아님(평일 09:00~15:45 외)")
     if latest_ts is None:
         return HealthCheck(label, "warning", "장중인데 데이터가 아직 한 건도 없음")
-    age_seconds = max((now - _as_naive(latest_ts)).total_seconds(), 0.0)
+    # 2026-08-03: 연속 체결이 없는 구간(종가 단일가)에서는 `now`가 아니라 그 구간 시작 시각을
+    # 기준으로 잰다 — 상세 근거는 `_CLOSING_AUCTION_START` 주석 참고.
+    reference = now
+    if continuous_trading_only and now.time() >= _CLOSING_AUCTION_START:
+        reference = datetime.combine(now.date(), _CLOSING_AUCTION_START)
+    age_seconds = max((reference - _as_naive(latest_ts)).total_seconds(), 0.0)
     if age_seconds >= _STALE_DATA_THRESHOLD_SECONDS:
         return HealthCheck(label, "warning", f"{age_seconds / 60:.0f}분째 결손")
     return HealthCheck(label, "ok", f"{age_seconds:.0f}초 전 갱신")
@@ -198,7 +221,7 @@ def _futures_freshness_check(conn, underlying: str, now: datetime) -> HealthChec
         conn.rollback()
         logger.warning("선물 결손 점검 조회 실패", exc_info=True)
         return HealthCheck(label, "warning", "조회 실패")
-    return _freshness_check(label, latest_ts, now)
+    return _freshness_check(label, latest_ts, now, continuous_trading_only=True)
 
 
 # 2026-07-20 — 옵션체인 콜/풋 조회 성공률 비대칭 발견(NEXT_TODO/DECISION_LOG 참고). 공유
@@ -634,11 +657,12 @@ def _monthly_coverage_check(conn, underlying: str, now: datetime) -> HealthCheck
          이 값은 95.0% → 90.5%로 후퇴했다 — 인프라 배지 옆에 두지 않으면 놓치는 종류의 지표다.
     """
     label = "먼슬리 분 커버리지"
-    if not _is_trading_hours(now):
-        return HealthCheck(label, "info", "장중 아님(평일 09:00~15:45 외)", group="관측 품질")
-    elapsed = int((datetime.combine(now.date(), now.time()) - datetime.combine(now.date(), _TRADING_DAY_START)).total_seconds() // 60) + 1
     try:
-        coverage = db_metrics.monthly_book_coverage(conn, now.date(), elapsed, underlying)
+        # 2026-08-03 COCKPIT 육안 점검: 종전에는 분모로 "09:00 이후 경과 분"을 직접 계산해
+        # 넘겼는데, 분자(monthly_book_coverage)는 하루 전체(장전 07:32~)를 센다 — 기간이 어긋나
+        # **120.7%**가 나왔고 배지는 `< 95%`만 경고하므로 초록불이었다. 인자를 넘기지 않으면
+        # 분자와 같은 구간(observed_span_minutes)을 분모로 쓴다. 장전/장후에도 유효해진다.
+        coverage = db_metrics.monthly_book_coverage(conn, now.date(), underlying=underlying)
     except Exception:
         conn.rollback()
         logger.warning("먼슬리 커버리지 점검 조회 실패", exc_info=True)
@@ -647,7 +671,13 @@ def _monthly_coverage_check(conn, underlying: str, now: datetime) -> HealthCheck
     if pct is None:
         # 만기유동성 폴러의 첫 행이 08:31 부근이라 그 전에는 먼슬리 만기를 특정할 수 없다.
         return HealthCheck(label, "info", coverage.get("reason") or "집계 전", group="관측 품질")
-    detail = f"{coverage['minutes']}분 / 경과 {elapsed}분 = {pct:.1f}% (만기 {coverage['expiry']})"
+    detail = (
+        f"{coverage['minutes']}분 / 관측 {coverage['elapsed_minutes']}분 = {pct:.1f}% "
+        f"(만기 {coverage['expiry']})"
+    )
+    if coverage.get("over_100"):
+        # 커버리지가 100%를 넘는 건 데이터가 좋다는 뜻이 아니라 **지표가 고장났다**는 뜻이다.
+        return HealthCheck(label, "warning", f"{detail} — 100% 초과: 분자/분모 기간 불일치", group="관측 품질")
     status = "warning" if pct < _MONTHLY_COVERAGE_WARNING_PCT else "ok"
     return HealthCheck(label, status, detail, group="관측 품질")
 

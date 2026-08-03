@@ -1261,7 +1261,7 @@ def test_monthly_coverage_badge_warns_below_95_percent(monkeypatch):
     # 핵심 지표: 07-31에 밀림은 83→46건으로 좋아졌는데 이 값은 95.0%→90.3%로 후퇴했다.
     monkeypatch.setattr(
         "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
-        lambda conn, d, elapsed, u: {"expiry": date(2026, 8, 13), "minutes": 447,
+        lambda conn, d, underlying=None: {"expiry": date(2026, 8, 13), "minutes": 447,
                                      "elapsed_minutes": 495, "coverage_pct": 90.3},
     )
     check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 15, 0))
@@ -1270,7 +1270,7 @@ def test_monthly_coverage_badge_warns_below_95_percent(monkeypatch):
 
     monkeypatch.setattr(
         "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
-        lambda conn, d, elapsed, u: {"expiry": date(2026, 8, 13), "minutes": 490,
+        lambda conn, d, underlying=None: {"expiry": date(2026, 8, 13), "minutes": 490,
                                      "elapsed_minutes": 495, "coverage_pct": 99.0},
     )
     assert _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 15, 0)).status == "ok"
@@ -1280,17 +1280,44 @@ def test_monthly_coverage_badge_is_info_before_the_expiry_can_be_resolved(monkey
     # 만기유동성 첫 행이 08:31 부근이라 장전에는 먼슬리 만기를 특정할 수 없다 — 경고가 아니다.
     monkeypatch.setattr(
         "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
-        lambda conn, d, elapsed, u: {"expiry": None, "minutes": None, "coverage_pct": None,
+        lambda conn, d, underlying=None: {"expiry": None, "minutes": None, "coverage_pct": None,
                                      "reason": "만기유동성 미적재(장전)"},
     )
     check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 9, 5))
     assert check.status == "info"
 
 
-def test_monthly_coverage_badge_is_quiet_outside_trading_hours(monkeypatch):
-    check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 1, 20, 0))
-    assert check.status == "info"
-    assert "장중 아님" in check.detail
+def test_monthly_coverage_badge_still_reports_after_the_close(monkeypatch):
+    # 2026-08-03 COCKPIT 육안 점검 이후: 분모가 "09:00 이후 경과 분"이 아니라 **분자와 같은
+    # 관측 구간**이 됐으므로 장 마감 뒤에도 그날 값이 그대로 유효하다(종전에는 "장중 아님" info).
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
+        lambda conn, d, underlying=None: {"expiry": date(2026, 8, 13), "minutes": 489,
+                                          "elapsed_minutes": 493, "coverage_pct": 99.2,
+                                          "over_100": False},
+    )
+    check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 20, 0))
+    assert check.status == "ok"
+    assert "99.2%" in check.detail
+    assert "관측 493분" in check.detail
+
+
+def test_monthly_coverage_badge_warns_when_it_exceeds_100_percent(monkeypatch):
+    """2026-08-03 실측 회귀 — 커버리지 120.7%가 **초록불**로 표시되고 있었다.
+
+    분자는 하루 전체(07:32~, 489분)를 세는데 COCKPIT이 분모로 "09:00 이후 경과 분"(405분)을
+    넘기고 있었다. 배지는 `< 95%`일 때만 경고하므로 **지표가 고장났다는 사실 자체가 초록**이었고
+    4주간 아무도 못 봤다. 100% 초과는 데이터가 좋다는 뜻이 아니라 기간 불일치라는 뜻이다.
+    """
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.monthly_book_coverage",
+        lambda conn, d, underlying=None: {"expiry": date(2026, 8, 13), "minutes": 489,
+                                          "elapsed_minutes": 405, "coverage_pct": 120.7,
+                                          "over_100": True},
+    )
+    check = _monthly_coverage_check(object(), "KOSPI200", datetime(2026, 8, 3, 15, 44))
+    assert check.status == "warning"
+    assert "기간 불일치" in check.detail
 
 
 def test_overrun_count_badge_warns_at_the_pacer_split_reopen_threshold(monkeypatch):
@@ -1315,3 +1342,107 @@ def test_health_checks_carry_a_group_so_the_cockpit_can_split_rows():
     assert HealthCheck("a", "ok", "b").group == "인프라"
     monkeypatched = HealthCheck("a", "ok", "b", group="관측 품질")
     assert monkeypatched.group == "관측 품질"
+
+
+# ===== 2026-08-03 COCKPIT 육안 점검: 종가 단일가 구간 오경보 =====
+
+
+def _futures_conn(latest: datetime):
+    class _Cur:
+        def execute(self, q, p=None): self._q = q
+        def fetchone(self): return (latest,)
+        def __enter__(self): return self
+        def __exit__(self, *e): return False
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def rollback(self): pass
+    return _Conn()
+
+
+def test_futures_badge_is_quiet_during_the_closing_auction(monkeypatch):
+    """매 거래일 15:40~15:45에 반드시 뜨던 오경보를 없앤다.
+
+    KOSPI200 선물·옵션 장 마감 동시호가(15:35~15:45)에는 연속 체결이 없어 WS 체결이 끊기고
+    1분봉도 안 만들어진다. 그런데 _is_trading_hours()는 15:45까지 True이고 결손 임계는 5분이라
+    **정상 상태가 매일 노란불**이 됐다. 08-03 15:44:53 화면이 그 순간을 잡았다("12분째 결손").
+    """
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_active_futures_symbol", lambda c, u: "A01609")
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 8, 3, 15, 44, 53))
+
+    # 08-03 실측: 마지막 선물봉 15:34, 화면 시각 15:44:53 → 종전 로직이면 "12분째 결손".
+    check = _futures_freshness_check(_futures_conn(datetime(2026, 8, 3, 15, 34)), "KOSPI200",
+                                     datetime(2026, 8, 3, 15, 44, 53))
+    assert check.status == "ok", "단일가 구간의 체결 공백은 정상이다"
+
+
+def test_futures_badge_still_warns_when_it_died_before_the_auction(monkeypatch):
+    # 반대 방향 회귀 방지: 단일가 시작 **전부터** 끊겨 있었으면 여전히 경고해야 한다.
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_active_futures_symbol", lambda c, u: "A01609")
+
+    check = _futures_freshness_check(_futures_conn(datetime(2026, 8, 3, 14, 0)), "KOSPI200",
+                                     datetime(2026, 8, 3, 15, 44, 53))
+    assert check.status == "warning"
+    assert "95분째 결손" in check.detail
+
+
+def test_option_chain_badge_keeps_wall_clock_reference_during_the_auction(monkeypatch):
+    # 옵션체인은 REST 폴링이라 단일가 구간에도 계속 들어온다 — 여기까지 완화하면 진짜 결손을 놓친다.
+    class _Cur:
+        def execute(self, q, p=None): pass
+        def fetchone(self): return (datetime(2026, 8, 3, 15, 30),)
+        def __enter__(self): return self
+        def __exit__(self, *e): return False
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def rollback(self): pass
+
+    check = _option_chain_freshness_check(_Conn(), "KOSPI200", datetime(2026, 8, 3, 15, 44, 53))
+    assert check.status == "warning"
+    assert "15분째 결손" in check.detail
+
+
+def test_market_halt_badge_warns_when_subscription_never_established(monkeypatch):
+    """하트비트는 정상인데 H0UNMKO0 구독만 안 걸린 상태 — 08-03에 아무도 못 보던 사각지대.
+
+    그날 장운영정보 수신이 0건이었는데 하트비트가 살아 있어 배지가 초록이었다.
+    데이터 수신에는 임계를 걸 수 없으므로(정상일에도 하루 0~2건) 구독 성립 쪽을 따로 본다.
+    """
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 8, 4, 15, 44))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {"updated_at": datetime(2026, 8, 4, 15, 41), "is_halted": False,
+                      "mkop_cls_code": None, "label": "정상", "halted_since": None,
+                      "last_message_at": None},
+    )
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status",
+        lambda conn: {"updated_at": datetime(2026, 8, 4, 15, 41), "connected_since": None,
+                      "last_message_at": None, "reconnect_count_today": 0,
+                      "market_op_subscribed_at": None},
+    )
+    check = _market_halt_check(object())
+    assert check.status == "warning"
+    assert "구독 미성립" in check.detail
+
+
+def test_market_halt_badge_shows_subscription_time_when_established(monkeypatch):
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 8, 4, 15, 44))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {"updated_at": datetime(2026, 8, 4, 15, 41), "is_halted": False,
+                      "mkop_cls_code": None, "label": "정상", "halted_since": None,
+                      "last_message_at": None},
+    )
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status",
+        lambda conn: {"updated_at": datetime(2026, 8, 4, 15, 41), "connected_since": None,
+                      "last_message_at": None, "reconnect_count_today": 0,
+                      "market_op_subscribed_at": datetime(2026, 8, 4, 7, 31, 4)},
+    )
+    check = _market_halt_check(object())
+    assert check.status == "ok"
+    # 장운영정보 데이터가 0건이어도 구독확립 시각은 있어야 한다 — 그게 이 fix의 전부다.
+    assert "구독확립 07:31:04" in check.detail
+    assert "장운영정보 수신 이력 없음" in check.detail

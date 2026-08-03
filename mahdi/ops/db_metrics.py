@@ -132,17 +132,51 @@ def monthly_book_expiry(conn: ConnectionLike, target: date, underlying: str = "K
     return row[0] if row else None
 
 
+def observed_span_minutes(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> int | None:
+    """
+    계산: 그날 옵션체인 폴러가 **실제로 돈 구간**의 분 수(첫 사이클 ~ 마지막 사이클, 양끝 포함).
+    해석: 2026-08-03 COCKPIT 육안 점검에서 나온 요구. `monthly_book_coverage()`의 분자는 하루
+         전체(장전 포함)를 세는데 COCKPIT 배지는 분모로 "09:00 이후 경과 분"을 넘기고 있어서
+         **커버리지가 120.7%로 나왔다**(489분 / 405분). 기간이 어긋난 두 값을 나누고 있었던 것이다.
+         분모를 이 함수로 구하면 분자와 같은 구간이 되어 100%를 넘을 수 없다.
+    실패 조건: 그날 행이 없으면 None.
+    """
+    row = _fetchone(
+        conn,
+        "SELECT min(timestamp), max(timestamp) FROM option_analysis_1m "
+        "WHERE underlying=%s AND timestamp::date=%s",
+        (underlying, target),
+    )
+    if not row or row[0] is None:
+        return None
+    return int((row[1] - row[0]).total_seconds() // 60) + 1
+
+
 def monthly_book_coverage(
-    conn: ConnectionLike, target: date, elapsed_minutes: int, underlying: str = "KOSPI200"
+    conn: ConnectionLike, target: date, elapsed_minutes: int | None = None, underlying: str = "KOSPI200"
 ) -> dict:
     """
+    입력: DB 커넥션, 대상 날짜, (선택) 분모로 쓸 경과 분, 기초자산 라벨.
     계산: 먼슬리 북의 **1분 연속성** — GEX/감마플립 입력이 몇 %의 분에 실제로 있었는지.
+         `elapsed_minutes`를 안 넘기면 `observed_span_minutes()`로 **분자와 같은 구간**을 쓴다.
     해석: 2026-07-31에 "밀림 83→46건인데 먼슬리 커버리지 95.0%→90.5%"라는 사례가 있었다 —
          인프라 지표만 보면 판단 입력 품질 후퇴를 놓친다. §5-5 배지의 핵심 지표.
+
+         **2026-08-03 COCKPIT 육안 점검**: 분자는 하루 전체(07:32~)를 세는데 COCKPIT이 분모로
+         "09:00 이후 경과 분"을 넘겨 **120.7%**가 나오고 있었다. 그런데 배지는 `pct < 95`일 때만
+         경고하므로 **지표가 고장났다는 사실 자체가 초록불로 표시**됐다 — 4주간 아무도 못 봤다.
+         자동 리포트는 로그 span(하루 전체)을 넘겨 98.8%로 맞았으니, **배지와 리포트가 서로 다른
+         답을 내고 있었다**(README 규약 정면 위반). 이제 인자를 안 넘기면 스스로 맞춘다.
+    실패 조건: 만기유동성 미적재(장전)면 coverage_pct=None. 분모를 못 구해도 None.
+              **100%를 넘으면 그 자체가 기간 불일치 신호**이므로 `over_100` 플래그를 세운다.
     """
     expiry = monthly_book_expiry(conn, target, underlying)
     if expiry is None:
         return {"expiry": None, "minutes": None, "coverage_pct": None, "reason": "만기유동성 미적재(장전)"}
+    if elapsed_minutes is None:
+        elapsed_minutes = observed_span_minutes(conn, target, underlying)
+    if not elapsed_minutes or elapsed_minutes <= 0:
+        return {"expiry": expiry, "minutes": None, "coverage_pct": None, "reason": "관측 구간 없음"}
     row = _fetchone(
         conn,
         "SELECT count(DISTINCT timestamp) FROM option_analysis_1m "
@@ -150,12 +184,15 @@ def monthly_book_coverage(
         (underlying, expiry, target),
     )
     minutes = int(row[0]) if row else 0
-    pct = minutes / elapsed_minutes * 100 if elapsed_minutes > 0 else None
+    pct = minutes / elapsed_minutes * 100
     return {
         "expiry": expiry,
         "minutes": minutes,
         "elapsed_minutes": elapsed_minutes,
-        "coverage_pct": round(pct, 1) if pct is not None else None,
+        "coverage_pct": round(pct, 1),
+        # 커버리지는 정의상 100%를 넘을 수 없다 — 넘었다면 분자와 분모의 기간이 어긋난 것이다.
+        # 조용히 넘어가면 2026-08-03처럼 "고장난 지표가 초록불"이 된다.
+        "over_100": pct > 100.0,
     }
 
 
