@@ -540,6 +540,23 @@ def mark_market_halt_message_seen(conn: ConnectionLike, seen_at: datetime) -> No
         cur.execute("UPDATE market_halt_status SET last_message_at=%s WHERE id IS TRUE", (seen_at,))
 
 
+def mark_market_op_subscribed(conn: ConnectionLike, subscribed_at: datetime) -> None:
+    """
+    입력: H0UNMKO0 구독이 성립한 시각(KIS SUBSCRIBE 응답 rt_cd=0 수신 시점).
+    계산: `ws_status` 싱글턴 행의 `market_op_subscribed_at`만 갱신한다 — 하트비트가 쓰는 다른
+         컬럼(updated_at/connected_since/last_message_at/reconnect_count_today)은 건드리지 않는다.
+    해석: 2026-08-04(COCKPIT 육안 점검). 이 값을 하트비트(300초)에만 맡기면 **기동 직후 5분간
+         NULL이 남는다** — 첫 하트비트가 구독 ACK보다 먼저 돌기 때문이다(08-04 실측: 하트비트
+         07:31:02.7, ACK 07:31:03.2). 그 5분 동안 COCKPIT이 "구독 미성립" 경고를 띄웠고 실제로는
+         구독이 성립해 있었다. ACK은 기동/재연결 시에만 오는 드문 이벤트라 즉시 써도 부담이 없다.
+    실패 조건: 아직 행이 없으면(첫 하트비트 전) UPDATE가 0행을 건드리고 조용히 끝난다 —
+              곧 이어질 하트비트가 메모리에 남은 값을 싣고 간다.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE ws_status SET market_op_subscribed_at=%s WHERE id IS TRUE", (subscribed_at,))
+    conn.commit()
+
+
 def latest_market_halt_state(conn: ConnectionLike) -> dict | None:
     """
     계산: 가장 최근 upsert_market_halt_state() 기록을 반환한다. 2026-07-31부터 `last_message_at`
@@ -746,7 +763,16 @@ def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]
          어긋날 수 있어 북별 최신값을 취한다. 더 이상 코드가 쓰지 않는 옛 series 값(화석 데이터)은
          과거에 몇 건이 쌓여 있든 결과에서 제외한다.
     해석: 반환된 dict는 COCKPIT 만기 유동성 비교 패널(Phase 1.5-④)이 바로 렌더링에 쓸 수 있는
-         키를 가진다. 아직 폴링이 한 번도 안 돌았으면 빈 리스트.
+         키를 가진다. 아직 **오늘** 폴링이 한 번도 안 돌았으면 빈 리스트.
+
+         2026-08-04(COCKPIT 육안 점검): 종전에는 시각 조건이 없어 `DISTINCT ON (series)`가
+         **어제 행이든 4주 전 행이든** 최신 1건을 그대로 돌려줬다 — `latest_option_chain()`이
+         2026-08-03 §2-2에서 고친 것과 **완전히 같은 결함 패턴**인데 이쪽은 안 고쳐져 있었다.
+         실제 피해: 08-04 07:35 화면이 weekly_mon 만기를 **2026-08-03(잔존 0일)** 로 표시했다.
+         그날 실제 북은 이미 2026-08-10으로 롤오버돼 있었고(`option_analysis_1m` 확인),
+         만기유동성 폴러는 08:31부터 도니 그 시각엔 오늘 행이 없어 어제 마지막 행이 나온 것이다.
+         **"잔존 0일"은 만기 당일이라는 뜻이라, 만기가 지난 북을 아직 보고 있다는 오해를 부른다.**
+         어제 값은 오늘 판단에 쓰이지 않으므로 오늘 것만 본다(`monthly_book_expiry()`와 같은 규칙).
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -754,10 +780,10 @@ def latest_expiry_liquidity(conn: ConnectionLike, underlying: str) -> list[dict]
             SELECT DISTINCT ON (series)
                 series, expiry, atm_spread_pct, depth, volume, days_to_expiry
             FROM expiry_liquidity_1m
-            WHERE underlying=%s AND series = ANY(%s)
+            WHERE underlying=%s AND series = ANY(%s) AND timestamp::date=%s
             ORDER BY series, timestamp DESC
             """,
-            (underlying, list(_VALID_EXPIRY_LIQUIDITY_SERIES)),
+            (underlying, list(_VALID_EXPIRY_LIQUIDITY_SERIES), local_now().date()),
         )
         rows = cur.fetchall()
     return [

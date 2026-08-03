@@ -873,3 +873,30 @@ def test_rate_limiter_status_tolerates_missing_total_calls():
     conn = FakeConnection()
     db.record_rate_limiter_status(conn, datetime(2026, 8, 3, 10, 0), 1.2, 0.0)
     assert conn.store["params"][-1] is None
+
+
+def test_latest_expiry_liquidity_only_returns_today(monkeypatch):
+    """2026-08-04 COCKPIT 육안 점검 — 어제 행을 오늘 것처럼 보여주면 안 된다.
+
+    08-04 07:35 화면이 weekly_mon 만기를 2026-08-03(잔존 0일)로 표시했다. 그날 실제 북은 이미
+    2026-08-10으로 롤오버돼 있었고, 만기유동성 폴러가 08:31부터 도니 그 시각엔 오늘 행이 없어
+    어제 마지막 행이 나온 것이다. "잔존 0일"은 만기 당일이라는 뜻이라 오해를 부른다.
+    """
+    conn = FakeReadConnection([])
+    monkeypatch.setattr(db, "local_now", lambda: datetime(2026, 8, 4, 7, 35))
+
+    db.latest_expiry_liquidity(conn, "KOSPI200")
+
+    assert "timestamp::date=%s" in conn.store["query"]
+    assert conn.store["params"][-1] == date(2026, 8, 4)
+
+
+def test_mark_market_op_subscribed_touches_only_its_own_column():
+    # 하트비트가 쓰는 다른 컬럼(updated_at/connected_since/...)을 덮으면 안 된다.
+    conn = FakeConnection()
+    db.mark_market_op_subscribed(conn, datetime(2026, 8, 4, 7, 31, 3))
+
+    query = conn.store["query"]
+    assert "UPDATE ws_status SET market_op_subscribed_at=%s" in query
+    assert "updated_at" not in query and "connected_since" not in query
+    assert conn.committed is True

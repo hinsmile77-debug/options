@@ -811,7 +811,23 @@ async def run_observation_loop(
                 ack.rt_cd, ack.msg_code, ack.message,
             )
         if ack.tr_id == tr_codes.WS_TR_MARKET_OPERATION_INFO and ack.succeeded and ws_liveness is not None:
-            ws_liveness.market_op_subscribed_at = db.local_now()
+            subscribed_at = db.local_now()
+            ws_liveness.market_op_subscribed_at = subscribed_at
+            # 2026-08-04(COCKPIT 육안 점검): **여기서 DB에 즉시 쓴다.** 하트비트(300초)에만 맡기면
+            # 기동 직후 5분간 NULL이 남는다 — 첫 하트비트는 구독 ACK보다 먼저 돌기 때문이다
+            # (08-04 실측: 하트비트 07:31:02.7, ACK 07:31:03.2). 그 5분 동안 COCKPIT이
+            # "H0UNMKO0 구독 미성립"을 띄웠고, 실제로는 구독이 성립해 있었다 — **매일 아침
+            # 반복되는 오경보**이고, 전날 고친 선물 배지 오경보와 같은 종류다.
+            #
+            # 2026-08-01의 "메시지 핸들러에서 DB를 만지지 말라"는 원칙은 **체결 메시지 경로**
+            # (초당 수십 건)를 두고 한 말이다. 구독 ACK은 기동/재연결 시에만 오는 드문 이벤트라
+            # (하루 32~64건) 같은 제약을 적용할 이유가 없다.
+            try:
+                with db.get_connection() as conn:
+                    db.mark_market_op_subscribed(conn, subscribed_at)
+            except Exception:
+                # 실패해도 다음 하트비트가 메모리 값을 싣고 간다 — 구독 자체에는 영향 없다.
+                logger.warning("장운영정보 구독 성립 시각 기록 실패 — 하트비트가 대신 남긴다", exc_info=True)
 
     async def handle_message(message: dict) -> None:
         raw = message.get("raw")

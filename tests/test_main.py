@@ -4449,3 +4449,82 @@ def test_observation_loop_ignores_ack_for_other_tr_ids(monkeypatch):
         )
 
     assert liveness.market_op_subscribed_at is None
+
+
+def test_market_op_ack_is_written_to_db_immediately_not_only_by_heartbeat(monkeypatch):
+    """2026-08-04 회귀 — 하트비트에만 맡기면 매일 아침 5분간 "구독 미성립" 오경보가 뜬다.
+
+    첫 하트비트가 구독 ACK보다 먼저 돌기 때문이다(08-04 실측: 하트비트 07:31:02.7,
+    ACK 07:31:03.2). ACK은 기동/재연결 시에만 오는 드문 이벤트라 즉시 써도 부담이 없다.
+    """
+    ack = json.dumps(
+        {
+            "header": {"tr_id": tr_codes.WS_TR_MARKET_OPERATION_INFO, "tr_key": "005930"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }
+    )
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([ack]))
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+    liveness = mahdi_main.WsLiveness()
+    written: list = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 4, 7, 31, 3))
+    monkeypatch.setattr("mahdi.main.db.mark_market_op_subscribed", lambda conn, ts: written.append(ts))
+
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [manager], FakeRestClient(spot=350.0), futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+                ws_liveness=liveness,
+            )
+        )
+
+    assert written == [datetime(2026, 8, 4, 7, 31, 3)]
+
+
+def test_market_op_ack_db_failure_does_not_break_observation(monkeypatch):
+    # DB 기록이 실패해도 구독 자체와 관측은 계속돼야 한다 — 다음 하트비트가 메모리 값을 싣고 간다.
+    ack = json.dumps(
+        {
+            "header": {"tr_id": tr_codes.WS_TR_MARKET_OPERATION_INFO, "tr_key": "005930"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }
+    )
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([ack]))
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+    liveness = mahdi_main.WsLiveness()
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 4, 7, 31, 3))
+
+    def boom(conn, ts):
+        raise RuntimeError("DB 다운")
+
+    monkeypatch.setattr("mahdi.main.db.mark_market_op_subscribed", boom)
+
+    with pytest.raises(ConnectionError):  # WS 수신 루프는 끝까지 돈다
+        _run(
+            run_observation_loop(
+                ws_client, [manager], FakeRestClient(spot=350.0), futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+                ws_liveness=liveness,
+            )
+        )
+
+    assert liveness.market_op_subscribed_at == datetime(2026, 8, 4, 7, 31, 3)
