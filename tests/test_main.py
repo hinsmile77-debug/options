@@ -3745,8 +3745,14 @@ def test_poll_signal_fusion_cycle_rejects_when_palette_only_says_wait(monkeypatc
     # 07-30에 419건 연속 ENTER를 만든 조합(RANGE_BALANCED + VRP 적정 → ["wait_and_see"])을
     # 그대로 재현해, 이제는 REJECT + reject_reason="strategy_palette:wait_only"가 되는지 검증한다.
     _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    # 행사가 105 = 스팟(100) **위** — 2026-08-04 Fix#3으로 감마 월이 기준선이 되면서
+    # `options_flow`가 이 사이클에도 살아난다(종전에는 gamma_flip이 없어 항상 None이었다).
+    # 스팟이 월 아래이고 GEX가 양수면 회귀 방향 = 강세라, 외국인 순매수(+500)와 **부호가 같다**.
+    # 행사가를 95로 두면 두 멤버가 반대 부호가 되어 `conflict_resolution:no_clear_consensus`로
+    # 먼저 걸리고, 이 테스트가 겨누는 팔레트 경로에 도달하지 못한다 — 그것도 정상 동작이지만
+    # 여기서 검증하려는 것은 **팔레트가 관망만 줄 때** 무엇이 기록되는가다.
     chain_rows = [
-        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+        {"strike": 105.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)

@@ -113,6 +113,7 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     lines += _section("7. 버스트 점유 시간", lambda: _render_bursts(metrics))
     lines += _section("8. 연속 지연 에피소드", lambda: _render_stalls(metrics))
     lines += _section("9. 느린 REST 호출 — 페이서 vs HTTP 귀속", lambda: _render_slow_calls(metrics))
+    lines += _section("9-1. KIS 응답시간 — 서비스 품질 지표", lambda: _render_rest_latency(metrics))
     lines += _section("10. 폴러 실측 위상", lambda: _render_phase(metrics))
     lines += _section("11. 로그 볼륨/정성 항목", lambda: _render_log_volume(metrics))
     if db_metrics:
@@ -120,8 +121,12 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
         lines += _section("13. 판단/레짐/피처", lambda: _render_db_judgement(db_metrics))
         lines += _section("14. 신호 도달률 — 데이터가 판단까지 갔는가",
                           lambda: _render_signal_reach(db_metrics))
+        lines += _section("14-1. 앙상블 멤버별 가용성 — 어느 멤버가 왜 죽었는가",
+                          lambda: _render_member_availability(db_metrics))
+        lines += _section("14-2. 행사가 창 품질 — 수집한 행사가가 스팟을 감쌌는가",
+                          lambda: _render_strike_window(db_metrics, metrics))
         lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
-                          lambda: _render_book_gamma_map(db_metrics))
+                          lambda: _render_book_gamma_map(db_metrics, previous))
         lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
     return "\n".join(lines).rstrip() + "\n"
 
@@ -325,6 +330,130 @@ def _render_log_volume(metrics: dict) -> list[str]:
     return out
 
 
+def _render_rest_latency(metrics: dict) -> list[str]:
+    """
+    2026-08-04 고도화#5 — §2-6이 밀림의 90%를 KIS 응답 지연으로 귀속시켰는데, 지금까지 그 지연은
+    "우리 지표"(밀림 건수)로만 보였다. §9의 `slow_calls`는 임계(5초) 위쪽 꼬리만 보므로
+    "오늘 KIS가 평소보다 느렸는가"에 답할 수 없다.
+    """
+    lat = metrics.get("rest_latency") or {}
+    if not lat:
+        return [
+            "> 계측 전 — `poll_rest_latency_snapshot`(2026-08-04 고도화#5) 도입 이전 로그다. "
+            "다음 거래일부터 5분 창마다 엔드포인트별 p50/p95/p99가 쌓인다.",
+            "",
+        ]
+    out = _table(
+        ["엔드포인트", "호출", "p50(초)", "p95(초)", "p99(초)", "최대(초)"],
+        [
+            [endpoint, f"{s['calls']:,}", f"{s['p50']:.2f}", f"{s['p95']:.2f}",
+             f"{s['p99']:.2f}", f"{s['max']:.2f}"]
+            for endpoint, s in (lat.get("endpoints") or {}).items()
+        ],
+    )
+    grid = lat.get("p95_by_hour") or {}
+    endpoints = sorted({e for row in grid.values() for e in row})
+    if grid and endpoints:
+        out += _table(
+            ["시간대", *endpoints],
+            [[f"{h}시", *[f"{row.get(e, 0):.2f}" if e in row else "—" for e in endpoints]]
+             for h, row in grid.items()],
+        )
+        out += ["> 시간대별 **p95**(초). 매일 같은 시간대가 붉으면 KIS 쪽 혼잡 패턴이다.", ""]
+    warnings = lat.get("warnings") or []
+    threshold = lat.get("p95_warn_threshold")
+    if warnings:
+        hits = ", ".join(f"{w['hour']}시 {w['endpoint']} {w['p95']:.2f}초" for w in warnings)
+        out += [
+            f"- ⚠ p95가 임계({threshold}초)를 넘은 구간 **{len(warnings)}개** — {hits}",
+            "",
+            "> **사전 대응 규칙(`hypotheses.yaml` 2026-08-04-p5, 숫자 보기 전에 확정)**: "
+            f"`inquire-price`의 p95가 {threshold}초를 넘는 시간대가 **이틀 연속 같은 시간대에** "
+            "나타나면, 그 시간대에 한해 위클리 폴링을 2분 → 4분 격분으로 늘린다"
+            "(먼슬리는 건드리지 않는다 — 판단 입력이다).",
+            "> **발동은 사람이 한다.** 지연을 보고 폴링을 자동으로 줄이면 폴링이 줄어 지연이 낮아지고 "
+            "다시 폴링이 느는 되먹임이 생긴다 — 2026-07-08에 페이서를 나눴다가 500 폭주로 "
+            "203분을 잃은 전례가 있다.",
+            "",
+        ]
+    else:
+        out += [f"> ✅ p95가 임계({threshold}초)를 넘은 (시간대, 엔드포인트) 없음.", ""]
+    return out
+
+
+def _render_member_availability(db: dict) -> list[str]:
+    """2026-08-04 고도화#2 — `available_member_count` 숫자 하나로는 어느 멤버가 왜 죽었는지 모른다."""
+    ma = db.get("member_availability") or {}
+    if not ma.get("available"):
+        return [f"> 계측 전 — {ma.get('reason', '사유 미상')}.", ""]
+    out = _table(
+        ["멤버", "가용 분", "가용률", "미가용 대표 사유"],
+        [
+            [
+                m["member"] + ("" if m["implemented"] else " *(미구현)*"),
+                f"{m['available_minutes']:,}",
+                f"{m['available_pct']:.1f}%",
+                m["top_unavailable_reason"] or "—",
+            ]
+            for m in ma.get("members") or []
+        ],
+    )
+    return out + [
+        f"> 분모 {ma.get('minutes', 0):,}분. 사유는 판단 시점에 `risk_gate_state.member_unavailable`로 "
+        "남긴 값이다 — 2026-08-04에는 이 표가 없어 사람이 `signal_layer.py`를 읽어 역산했고, "
+        "그 역산 끝에 `orderflow_ofi_vpin`이 **데이터가 있는데도** 죽어 있다는 것이 나왔다(§2-5).",
+        "",
+    ]
+
+
+def _render_strike_window(db: dict, metrics: dict) -> list[str]:
+    """
+    2026-08-04 고도화#3 — §12 커버리지("데이터가 DB에 있는가")와 §14 신호 도달률("판단까지 갔는가")
+    사이의 빈 칸: **"수집한 행사가가 애초에 맞는 행사가였는가."**
+    """
+    q = db.get("strike_window_quality") or {}
+    rolls = metrics.get("atm_rolls") or {}
+    out: list[str] = []
+    if q.get("available"):
+        out += _table(
+            ["지표", "값", "읽는 법"],
+            [
+                ["ATM 정합률", f"**{q['atm_covered_pct']:.1f}%**",
+                 "그 분의 ATM이 수집 행사가 안에 있었는가 — **핵심 지표**"],
+                ["창 정합률", f"{q['window_covered_pct']:.1f}%",
+                 "설계 창(ATM±2) 전부를 덮었는가 — 100% 밑이 정상(아래 주석)"],
+                ["ATM 이탈 거리", f"중앙 {q['atm_offset_strikes_median']}칸 / 최대 {q['atm_offset_strikes_max']}칸",
+                 "수집 창 중심이 진짜 ATM에서 몇 행사가 떨어졌는가"],
+                ["창 폭 지터", f"{q['width_jitter']}배",
+                 f"스냅샷({q['snapshot_window_minutes']}분 창) 행사가 {q['snapshot_strikes_median']:.0f}개 / 설계 {q['design_strikes']}개"],
+            ],
+        )
+        out += [
+            "> **창 정합률을 합격/불합격으로 읽지 말 것.** 재롤링은 선물 1분봉이 완성될 때 일어나고 "
+            "그 분의 폴링은 이미 시작됐거나 끝났으므로 **구조적으로 한 틱 늦는다.** 게다가 "
+            "ATM 히스테리시스(2026-08-04 Fix#6)는 **일부러** 창을 늦게 옮긴다 — 이 값만 보면 "
+            "그 fix가 회귀로 보인다. 판정은 **ATM 정합률과 이탈 거리**로 한다.",
+            "> 2026-08-03에 하루치 체인 전체가 스팟에서 5.5% 떨어진 외가격에서 수집됐는데 "
+            "먼슬리 커버리지(§12)는 98.8%로 훌륭했다 — **이 표 하나면 그날 바로 잡혔다.**",
+            "",
+        ]
+    else:
+        out += [f"> 계측 전 — {q.get('reason', '사유 미상')}.", ""]
+
+    if rolls.get("count") is not None:
+        pct = rolls.get("round_trip_pct")
+        out += [
+            f"- ATM 롤링 **{rolls['count']}회** / 즉시 왕복 **{rolls['round_trips']}회**"
+            + (f" (**{pct:.1f}%**)" if pct is not None else ""),
+            "",
+            "> 즉시 왕복 = `A→B` 다음 이벤트가 `B→A`. 히스테리시스가 없으면 스팟이 격자 중점 "
+            "근처에서 진동할 때마다 창이 오간다(2026-08-04 실측 194회 중 70회, **36.1%**). "
+            "이 값이 Fix#6의 유일한 직접 지표다.",
+            "",
+        ]
+    return out
+
+
 def _render_parser_audit(metrics: dict) -> list[str]:
     """
     계산: `log_metrics._parser_audit()`가 찾은 "엄격 0 · 느슨 >0" 항목을 경고로 낸다.
@@ -521,7 +650,7 @@ def _render_hypotheses(results: list[dict]) -> list[str]:
     return out
 
 
-def _render_book_gamma_map(db: dict) -> list[str]:
+def _render_book_gamma_map(db: dict, previous: dict | None = None) -> list[str]:
     """2026-08-03 §5-5 — 합산하면 만기별 정보가 서로를 덮는다. 북마다 나눠 본다."""
     books = db.get("book_gamma_map") or []
     out = _table(
@@ -549,11 +678,11 @@ def _render_book_gamma_map(db: dict) -> list[str]:
         "\"장 마지막\"이라고 적었다(핀 행사가가 5시간 전 값이었다).",
         "",
     ]
-    out += _render_wide_oi_landscape(db)
+    out += _render_wide_oi_landscape(db, previous)
     return out
 
 
-def _render_wide_oi_landscape(db: dict) -> list[str]:
+def _render_wide_oi_landscape(db: dict, previous: dict | None = None) -> list[str]:
     """
     2026-08-04 §2-3 / 고도화#4 — "오늘 방문한 전 행사가"의 콜−풋 OI 지형.
 
@@ -580,6 +709,28 @@ def _render_wide_oi_landscape(db: dict) -> list[str]:
             for b in books
         ],
     )
+    # 2026-08-04 고도화#4 — **이 표의 존재 이유는 하루치 표가 아니라 "바뀌는 날"이다.**
+    # 광폭 감마플립이 '없음'에서 벗어나는 날이 「GEX 광폭 체인」 안건을 다시 꺼낼 첫 근거이므로,
+    # 사람이 매일 두 리포트를 나란히 놓고 비교하지 않아도 되게 전일과 대조해 콜아웃을 낸다.
+    prev_books = ((previous or {}).get("db") or {}).get("wide_oi_landscape") or []
+    prev_flip = {str(b["expiry"]): b.get("flip_possible") for b in prev_books}
+    changed = [
+        (str(b["expiry"]), prev_flip[str(b["expiry"])], b["flip_possible"])
+        for b in books
+        if str(b["expiry"]) in prev_flip and prev_flip[str(b["expiry"])] != b["flip_possible"]
+    ]
+    if changed:
+        out += [
+            "- 🔔 **광폭 감마플립 가능 여부가 전일 대비 바뀐 북이 있다** — "
+            + ", ".join(
+                f"{expiry} {'불가→**가능**' if now else '가능→불가'}" for expiry, _was, now in changed
+            ),
+            "",
+            "> 「GEX 광폭 체인」은 2026-08-04에 **폐기**됐다(§2-3 — 딜러 포지션이 전 구간 한 방향이라 "
+            "행사가를 넓혀도 flip이 안 나온다). **그 폐기의 재개 조건이 바로 이 줄이다.**",
+            "",
+        ]
+
     return out + [
         "> **광폭 감마플립 '없음' = 그 북은 방문한 행사가 전 구간에서 GEX 부호가 안 바뀐다**"
         "(딜러 포지션이 한 방향). 이때의 `감마플립 산출률 0%`(§14)는 결함이 아니라 시장 구조이며, "

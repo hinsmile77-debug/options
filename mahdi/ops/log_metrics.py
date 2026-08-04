@@ -65,6 +65,24 @@ _SLOW_CALL_RE = re.compile(
 _CATCHUP_RE = re.compile(
     _TS + r" INFO:mahdi\.main:옵션체인 결손 회수: (\d\d):(\d\d) 분을 먼슬리 (\d+)레그로 채움"
 )
+# 2026-08-04(고도화#5) — REST 응답시간 요약(`mahdi.main.LOG_REST_LATENCY`, 5분 주기).
+# 본문은 `엔드포인트=N건 p50/p95/p99/max초`가 공백으로 이어진 형태라 두 단계로 나눠 읽는다.
+_REST_LATENCY_RE = re.compile(_TS + r" INFO:mahdi\.main:REST 응답시간\([\d.]+초 창\): (.+)$")
+_REST_LATENCY_ITEM_RE = re.compile(
+    r"([\w-]+)=(\d+)건 ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)초"
+)
+# 2026-08-04(고도화#3) — ATM 롤링(`mahdi.main.LOG_ATM_ROLL`). 북마다 1줄이라 같은 시각·같은
+# 스팟이 여러 줄로 나온다 — 이벤트 수를 세려면 (시각, 전창→후창)으로 중복을 제거해야 한다.
+_ATM_ROLL_RE = re.compile(
+    _TS + r" INFO:mahdi\.main:ATM 롤링: 스팟 ([\d.]+) — 행사가 (\S+) → (\S+)"
+)
+# 같은 (전창→후창)이 이 시간 안에 다시 나오면 같은 이벤트의 다른 북 줄로 본다.
+# 08-04 실측으로 세 줄은 0.3초 안에 붙어 나왔고, 진짜 재전이는 폴링 주기(60초) 이상 걸린다.
+_ATM_ROLL_DEDUP_SECONDS = 5.0
+# 2026-08-04(Fix#8) — 수집 예산 초과(`mahdi.main.LOG_CHAIN_BUDGET_EXCEEDED`).
+_BUDGET_RE = re.compile(
+    _TS + r" WARNING:mahdi\.main:옵션체인 수집 예산\([\d.]+초\) 초과 — 남은 (\d+)레그를 포기하고 (\d+)레그로"
+)
 _LEVEL_RE = re.compile(_TS + r" (INFO|WARNING|ERROR|CRITICAL|DEBUG):(\S+?):")
 _FAILURE_RE = re.compile(_TS + r" WARNING:mahdi\.main:(.+?(?:실패|끊김))")
 
@@ -122,6 +140,9 @@ _PARSER_AUDIT_TOKENS = {
     "backoff": "레이트리밋 백오프",
     "slow_calls": "느린 REST 호출",
     "catchups": "옵션체인 결손 회수",
+    "rest_latency": "REST 응답시간",
+    "atm_rolls": "ATM 롤링",
+    "budget_exceeded": "수집 예산",
     "remote_protocol_error": "RemoteProtocolError",
     "read_timeout": "ReadTimeout",
     "connect_error": "ConnectError",
@@ -207,6 +228,9 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     backoff_events: list[tuple[float, str, float]] = []
     slow_calls: list[dict] = []
     catchups: list[dict] = []
+    latency_windows: list[dict] = []
+    atm_rolls: list[tuple[float, str, str]] = []  # (초, 이전 창, 새 창) — 북 중복 제거 후
+    budget_events: list[dict] = []
     failures: collections.Counter = collections.Counter()
     levels: collections.Counter = collections.Counter()
     qualitative: collections.Counter = collections.Counter()
@@ -297,6 +321,41 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             catchups.append({"minute": f"{m.group(6)}:{m.group(7)}", "legs": int(m.group(8))})
             continue
 
+        m = _REST_LATENCY_RE.match(line)
+        if m:
+            at = _seconds_of_day(m)
+            for item in _REST_LATENCY_ITEM_RE.finditer(m.group(6)):
+                latency_windows.append(
+                    {
+                        "at": at, "endpoint": item.group(1), "n": int(item.group(2)),
+                        "p50": float(item.group(3)), "p95": float(item.group(4)),
+                        "p99": float(item.group(5)), "max": float(item.group(6)),
+                    }
+                )
+            continue
+
+        m = _ATM_ROLL_RE.match(line)
+        if m:
+            at = _seconds_of_day(m)
+            before, after = m.group(7), m.group(8)
+            # 롤링은 **북마다 1줄**이라 한 이벤트가 3줄로 나온다(먼슬리/위클리 월/위클리 목).
+            # 세 줄의 타임스탬프는 밀리초가 다르므로 시각까지 포함해 비교하면 중복이 안 걸린다
+            # (08-04 실측: 582줄 = 194이벤트 x 3). 같은 (전창→후창)이 짧은 시간 안에 이어지면
+            # 한 건으로 본다 — 진짜로 같은 전이가 두 번 일어나려면 그 사이에 되돌아가야 하고,
+            # 그러려면 최소 한 번의 폴링 주기(60초)가 필요하다.
+            if atm_rolls and atm_rolls[-1][1] == before and atm_rolls[-1][2] == after \
+                    and at - atm_rolls[-1][0] < _ATM_ROLL_DEDUP_SECONDS:
+                continue
+            atm_rolls.append((at, before, after))
+            continue
+
+        m = _BUDGET_RE.match(line)
+        if m:
+            budget_events.append(
+                {"at": _hhmm(_seconds_of_day(m)), "skipped": int(m.group(6)), "collected": int(m.group(7))}
+            )
+            continue
+
         m = _FAILURE_RE.match(line)
         if m:
             # "옵션 체인 폴링 실패: B01608875 — {...}" → 종목/응답을 떼고 유형만 센다.
@@ -306,14 +365,22 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
                 qualitative["kis_error_response"] += 1
 
     cycles.sort(key=lambda c: c["start"])
-    strict_counts = {
-        "cycles": len(cycles),
-        "overrun": len(overrun_seconds),
-        "backoff": len(backoff_events),
-        "slow_calls": len(slow_calls),
-        "catchups": len(catchups),
-        **{key: qualitative.get(key, 0) for key in _PARSER_AUDIT_TOKENS if key not in ("cycles", "overrun", "backoff", "slow_calls", "catchups")},
-    }
+    # 전용 파서가 센 값이 있으면 그것을 쓰고, 없는 항목만 `qualitative` 카운터로 채운다.
+    # (순서 주의: 종전에는 dict 언팩이 뒤에 있어 **명시 키를 0으로 덮어썼다** — 08-04 구현 중
+    #  실측으로 잡았다. `atm_rolls` 582건이 감사에서 "strict 0"으로 나와 오탐이 떴다.)
+    strict_counts = {key: qualitative.get(key, 0) for key in _PARSER_AUDIT_TOKENS}
+    strict_counts.update(
+        {
+            "cycles": len(cycles),
+            "overrun": len(overrun_seconds),
+            "backoff": len(backoff_events),
+            "slow_calls": len(slow_calls),
+            "catchups": len(catchups),
+            "rest_latency": len(latency_windows),
+            "atm_rolls": len(atm_rolls),
+            "budget_exceeded": len(budget_events),
+        }
+    )
     return {
         "date": target.isoformat(),
         "cycles": _cycle_metrics(cycles, calls, catchups),
@@ -322,6 +389,13 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         "bursts": _burst_metrics(calls),
         "stalls": _stall_metrics(calls),
         "slow_calls": _slow_call_metrics(slow_calls),
+        "rest_latency": _rest_latency_metrics(latency_windows),
+        "atm_rolls": _atm_roll_metrics(atm_rolls),
+        "budget_exceeded": {
+            "count": len(budget_events),
+            "skipped_legs_total": sum(e["skipped"] for e in budget_events),
+            "samples": budget_events[:10],
+        },
         "catchups": {"count": len(catchups), "minutes": [c["minute"] for c in catchups]},
         "poller_phase": _phase_metrics(calls),
         "log_volume": {
@@ -340,6 +414,95 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "max_seconds": round(max(overrun_seconds), 1) if overrun_seconds else 0.0,
             "total_seconds": round(sum(overrun_seconds), 1),
         },
+    }
+
+
+# 2026-08-04(고도화#5) — 사전 대응 규칙의 발동 임계. **숫자를 보기 전에 적는다.**
+#
+# 08-04 실측: 정상 호출은 페이서 포함 ~1.2초이고, 느린 호출 362건의 HTTP 중앙이 5.54초였다.
+# p95가 2.5초를 넘는다는 것은 **스무 번에 한 번꼴로 정상의 두 배 넘게 걸린다**는 뜻이고, 그
+# 구간에서는 20레그 사이클이 60초 예산을 못 지킨다(20 x 2.5 = 50초 = Fix#8 예산 전부).
+#
+# 규칙(발동은 사람이 한다 — `poll_rest_latency_snapshot` docstring의 되먹임 위험 참고):
+#   `inquire-price`의 p95가 2.5초를 넘는 시간대가 **이틀 연속 같은 시간대에** 나타나면,
+#   그 시간대에 한해 위클리 폴링을 2분 → 4분 격분으로 늘린다(먼슬리는 건드리지 않는다 —
+#   판단 입력이다). 총량 축소보다 손실이 작은 순서로 가는 것이 2026-07-31 결정의 원칙이다.
+REST_LATENCY_P95_WARN_SECONDS = 2.5
+
+
+def _rest_latency_metrics(windows: list[dict]) -> dict:
+    """
+    입력: 5분 창마다 남은 엔드포인트별 응답시간 요약(`poll_rest_latency_snapshot`).
+    계산: 엔드포인트별 전일 종합(호출 수 가중 p50/p95 근사, 최대)과 **시간대 x 엔드포인트**
+         p95 격자를 만든다. 임계를 넘은 (시간대, 엔드포인트)는 `warnings`에 모은다.
+    해석: 2026-08-04 고도화#5 — §2-6에서 밀림의 90%가 KIS 응답 지연으로 귀속됐다. 그런데 그
+         지연은 지금까지 "우리 지표"(밀림 건수)로만 보였다. 이 표가 있으면 **매일 반복되는
+         혼잡 시간대**가 드러나고, 그때 비로소 시간대별 폴링 조정이 근거를 갖는다.
+    실패 조건: 창이 없으면(구버전 로그) 빈 dict — 리포트가 "계측 전"으로 표시한다.
+
+    주의: p50/p95는 **창별 값의 호출 수 가중 평균**이지 하루 전체 표본의 진짜 분위수가 아니다
+         (원본 표본은 창마다 버려진다 — 메모리 상수 유지가 그 대가다). 창 사이 분포가 크게
+         다르면 참값과 벌어지므로, **판단은 `max`와 시간대 격자로 한다**.
+    """
+    if not windows:
+        return {}
+    by_endpoint: dict[str, list[dict]] = collections.defaultdict(list)
+    for w in windows:
+        by_endpoint[w["endpoint"]].append(w)
+
+    def weighted(items: list[dict], key: str) -> float:
+        total = sum(i["n"] for i in items)
+        return round(sum(i[key] * i["n"] for i in items) / total, 3) if total else 0.0
+
+    endpoints = {
+        endpoint: {
+            "calls": sum(i["n"] for i in items),
+            "p50": weighted(items, "p50"),
+            "p95": weighted(items, "p95"),
+            "p99": weighted(items, "p99"),
+            "max": round(max(i["max"] for i in items), 3),
+        }
+        for endpoint, items in sorted(by_endpoint.items(), key=lambda kv: -sum(i["n"] for i in kv[1]))
+    }
+
+    grid: dict[str, dict[str, float]] = collections.defaultdict(dict)
+    hourly: dict[tuple[int, str], list[dict]] = collections.defaultdict(list)
+    for w in windows:
+        hourly[(int(w["at"] // 3600), w["endpoint"])].append(w)
+    for (hour, endpoint), items in hourly.items():
+        grid[str(hour)][endpoint] = weighted(items, "p95")
+
+    warnings = [
+        {"hour": hour, "endpoint": endpoint, "p95": p95}
+        for hour, row in sorted(grid.items(), key=lambda kv: int(kv[0]))
+        for endpoint, p95 in sorted(row.items())
+        if p95 > REST_LATENCY_P95_WARN_SECONDS
+    ]
+    return {
+        "endpoints": endpoints,
+        "p95_by_hour": {h: dict(sorted(row.items())) for h, row in sorted(grid.items(), key=lambda kv: int(kv[0]))},
+        "p95_warn_threshold": REST_LATENCY_P95_WARN_SECONDS,
+        "warnings": warnings,
+    }
+
+
+def _atm_roll_metrics(rolls: list[tuple[float, str, str]]) -> dict:
+    """
+    입력: (초, 이전 행사가 창, 새 행사가 창) 목록 — 북 중복은 이미 제거됐다.
+    계산: 롤링 이벤트 수와 **즉시 왕복**(A→B 다음 이벤트가 B→A) 횟수/비율.
+    해석: 2026-08-04 고도화#3 — §2-2에서 롤링 194회 중 70회(36%)가 즉시 왕복이었고, 그것이
+         사람이 읽는 로그 7,539줄 중 6,206줄(82%)을 만들었다. Fix#6(히스테리시스 0.75칸)이
+         이 값을 줄이는지가 그 fix의 유일한 직접 지표다 — 없으면 매번 손으로 세야 한다
+         (08-05 검증 항목에 "손으로 셀 것"이라고 적었던 바로 그 항목이다).
+    실패 조건: 롤링이 없으면 count=0, round_trip_pct=None(0%가 아니다 — 분모가 없다).
+    """
+    round_trips = sum(
+        1 for prev, cur in zip(rolls, rolls[1:]) if prev[1] == cur[2] and prev[2] == cur[1]
+    )
+    return {
+        "count": len(rolls),
+        "round_trips": round_trips,
+        "round_trip_pct": round(round_trips / len(rolls) * 100, 1) if rolls else None,
     }
 
 

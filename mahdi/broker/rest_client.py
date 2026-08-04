@@ -6,6 +6,7 @@ TR ID/경로 상수는 tr_codes.py 단일 소스를 사용한다.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 
@@ -231,6 +232,19 @@ class _RateLimiter:
         logger.info(LOG_BACKOFF_RECOVER, before, after, after / self._min_interval)
 
 
+def _percentile(ordered: list[float], q: float) -> float:
+    """
+    입력: **이미 정렬된** 표본, 분위수(0~1).
+    계산: 최근접 순위법(nearest-rank). 표본이 적을 때 보간법은 관측되지 않은 값을 만들어내는데,
+         응답시간처럼 "실제로 이만큼 걸린 호출이 있었다"가 중요한 지표에서는 그게 해가 된다.
+    실패 조건: 빈 목록이면 0.0.
+    """
+    if not ordered:
+        return 0.0
+    index = min(int(math.ceil(q * len(ordered))) - 1, len(ordered) - 1)
+    return ordered[max(index, 0)]
+
+
 def _is_kis_rate_limit_error(exc: httpx.HTTPStatusError) -> bool:
     """
     계산: KIS가 초당 거래건수 초과 시 돌려주는 특정 에러코드(EGW00201)인지 확인한다(2026-07-20
@@ -257,6 +271,10 @@ class KISRestClient:
         self._token_daemon = token_daemon
         self._client = client or httpx.Client(timeout=_HTTP_TIMEOUT, limits=_HTTP_LIMITS)
         self._rate_limiter = _RateLimiter(min_request_interval)
+        # 2026-08-04(고도화#5) — 엔드포인트별 HTTP 소요시간 표본. `_log_if_slow`가 이미 매 호출마다
+        # 재고 있는 값이라 추가 계측 비용이 없다(임계 이상만 로깅할 뿐 측정은 전부 하고 있었다).
+        self._http_samples: dict[str, list[float]] = {}
+        self._http_samples_lock = threading.Lock()
 
     @property
     def rate_limit_backoff_multiplier(self) -> float:
@@ -285,12 +303,48 @@ class KISRestClient:
             "custtype": "P",
         }
 
+    def drain_http_latency(self) -> dict[str, dict]:
+        """
+        계산: 마지막 호출 이후 쌓인 엔드포인트별 HTTP 소요시간을 p50/p95/p99로 요약하고 **비운다**.
+        해석: 2026-08-04 고도화#5 — §2-6이 밀림의 90%를 KIS 응답 지연으로 귀속시켰는데, 지금
+             리포트는 그 지연을 **우리 지표(밀림 건수)로만** 본다. `slow_calls`는 임계(5초)
+             위쪽 꼬리만 보므로 p50을 알 수 없고, "오늘 KIS가 평소보다 느렸는가"에 답하지 못한다.
+             엔드포인트별 분포를 시간대와 함께 쌓으면 KIS 쪽 혼잡 패턴이 보이고, 그때 비로소
+             "그 시간대에만 폴링 폭을 줄이는" 선택지가 근거를 갖는다(총량 축소보다 손실이 작다).
+
+             **비우는(drain) 이유**: 하루치를 메모리에 들고 있으면 12,852개 표본이 쌓인다.
+             주기적으로 요약해 로그 한 줄로 내보내고 버리면 메모리가 상수로 유지되고, 시간대별
+             추이도 자연히 남는다(로그 줄에 시각이 있다).
+        실패 조건: 없음 — 표본이 없으면 빈 dict.
+        """
+        with self._http_samples_lock:
+            samples, self._http_samples = self._http_samples, {}
+        out: dict[str, dict] = {}
+        for endpoint, values in samples.items():
+            ordered = sorted(values)
+            out[endpoint] = {
+                "n": len(ordered),
+                "p50": _percentile(ordered, 0.50),
+                "p95": _percentile(ordered, 0.95),
+                "p99": _percentile(ordered, 0.99),
+                "max": ordered[-1],
+            }
+        return out
+
+    def _record_http_latency(self, url: str, http_seconds: float) -> None:
+        endpoint = url.split("?", 1)[0].rsplit("/", 1)[-1]
+        with self._http_samples_lock:
+            self._http_samples.setdefault(endpoint, []).append(http_seconds)
+
     def _log_if_slow(self, method: str, url: str, pacer_seconds: float, http_seconds: float) -> None:
         """계산: 페이서 대기 + HTTP 응답이 임계를 넘으면 두 구간을 **나눠서** 남긴다
         (2026-07-31 §4 우선순위 3 — 상세 근거는 SLOW_CALL_LOG_THRESHOLD_SECONDS 주석).
         2026-08-03(§2-8): 진단이 끝나 WARNING → INFO.
         2026-08-04(§2-1): 그 레벨 변경이 `log_metrics._SLOW_CALL_RE`를 침묵시켜 08-04 리포트가
-        362건을 **0건**으로 보고했다. 포맷은 이제 `LOG_SLOW_CALL` 상수이고 계약 테스트가 지킨다."""
+        362건을 **0건**으로 보고했다. 포맷은 이제 `LOG_SLOW_CALL` 상수이고 계약 테스트가 지킨다.
+        2026-08-04(고도화#5): 임계와 무관하게 **모든 호출의 HTTP 소요를 표본에 넣는다** —
+        꼬리(느린 호출)만 보면 "오늘 KIS가 평소보다 느렸는가"에 답할 수 없다."""
+        self._record_http_latency(url, http_seconds)
         total = pacer_seconds + http_seconds
         if total < SLOW_CALL_LOG_THRESHOLD_SECONDS:
             return

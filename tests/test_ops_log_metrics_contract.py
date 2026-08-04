@@ -39,6 +39,7 @@ from datetime import date
 
 import pytest
 
+from mahdi import main
 from mahdi.broker import rest_client
 from mahdi.ops import log_metrics
 
@@ -174,3 +175,96 @@ def test_parser_audit_does_not_fire_on_a_genuinely_quiet_day():
     """오탐 방지: 아무 일도 안 일어난 날은 엄격 0 · 느슨 0이라 경고가 없어야 한다."""
     quiet = f"{_TS} INFO:mahdi.main:직전 정상 기동: 2026-08-04 07:31:00 (24.0시간 전)"
     assert _parse(quiet)["parser_audit"]["blind"] == {}
+
+
+# ===== mahdi.main 쪽 지표성 로그 (2026-08-04 고도화#1 규약 A 확장) =====
+#
+# 08-04에는 `rest_client`만 상수화했는데, 아래 여섯 줄은 **리포트 §1~§4·§8·§9-1·§14-2의 거의
+# 전부**를 떠받친다 — 여기가 깨지면 잃는 것이 더 크다.
+
+
+def test_chain_cycle_breakdown_line_is_parsed():
+    line = _emit(
+        "mahdi.main", "INFO", main.LOG_CHAIN_CYCLE_BREAKDOWN,
+        33.90, 0.12, 0.05, 0.31, 20, 0.0, "", "3건",
+    )
+    cycles = _parse(line)["cycles"]
+    assert cycles["count"] == 1
+    assert cycles["rest_seconds"]["mean"] == 33.9
+    # `rows_distribution`은 2026-08-04 Fix#8의 검증 지표다 — 수집 예산이 걸리면 20 미만
+    # 사이클이 나타나야 하고, 하나도 없으면 예산이 안 걸린 것이다.
+    assert cycles["rows_distribution"] == {20: 1}
+
+
+def test_chain_overrun_line_is_parsed():
+    line = _emit(
+        "mahdi.main", "WARNING", main.LOG_CHAIN_OVERRUN,
+        60, 18.3, 41.7, 78.3, 0.12, 20, "", "7건",
+    )
+    overrun = _parse(line)["overrun"]
+    assert overrun["count"] == 1
+    assert overrun["max_seconds"] == 18.3
+
+
+def test_chain_catchup_line_is_parsed():
+    line = _emit("mahdi.main", "INFO", main.LOG_CHAIN_CATCHUP, "14:31", 10, "14:30")
+    catchups = _parse(line)["catchups"]
+    assert catchups["count"] == 1
+    assert catchups["minutes"] == ["14:31"]
+
+
+def test_budget_exceeded_line_is_parsed():
+    """2026-08-04 Fix#8 — 이 줄이 없으면 "예산이 실제로 걸렸는가"를 셀 수 없다."""
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 6, 14)
+    budget = _parse(line)["budget_exceeded"]
+    assert budget["count"] == 1
+    assert budget["skipped_legs_total"] == 6
+
+
+def test_atm_roll_lines_are_deduplicated_across_books():
+    """회귀 방지 §2-2 / 고도화#3: 롤링은 **북마다 1줄**이라 한 이벤트가 3줄로 나온다.
+
+    세 줄의 타임스탬프는 밀리초가 다르므로 시각까지 넣어 비교하면 중복이 안 걸린다 —
+    08-04 실측 582줄은 실제로 **194 이벤트**다.
+    """
+    lines = [
+        f"2026-08-05 10:11:12,{ms} INFO:mahdi.main:"
+        + main.LOG_ATM_ROLL % (1001.25, "997.5~1007.5", "1000.0~1010.0")
+        for ms in ("345", "372", "401")
+    ]
+    rolls = _parse(*lines)["atm_rolls"]
+    assert rolls["count"] == 1
+    assert rolls["round_trips"] == 0
+
+
+def test_atm_roll_round_trip_is_counted():
+    lines = [
+        f"2026-08-05 10:11:12,345 INFO:mahdi.main:"
+        + main.LOG_ATM_ROLL % (1001.3, "997.5~1007.5", "1000.0~1010.0"),
+        f"2026-08-05 10:12:12,345 INFO:mahdi.main:"
+        + main.LOG_ATM_ROLL % (1000.9, "1000.0~1010.0", "997.5~1007.5"),
+    ]
+    rolls = _parse(*lines)["atm_rolls"]
+    assert rolls["count"] == 2
+    assert rolls["round_trips"] == 1
+    assert rolls["round_trip_pct"] == 50.0
+
+
+def test_rest_latency_line_is_parsed_and_warns_above_threshold():
+    """2026-08-04 고도화#5 — §2-6이 밀림의 90%를 KIS 지연으로 귀속시킨 뒤 만든 계측."""
+    body = "inquire-price=250건 1.10/2.80/4.50/6.20초 inquire-asking-price=30건 0.90/1.20/1.50/1.80초"
+    line = _emit("mahdi.main", "INFO", main.LOG_REST_LATENCY, 300.0, body)
+    lat = _parse(line)["rest_latency"]
+
+    assert lat["endpoints"]["inquire-price"]["calls"] == 250
+    assert lat["endpoints"]["inquire-price"]["p95"] == 2.80
+    assert lat["endpoints"]["inquire-price"]["max"] == 6.20
+    # p95 2.80초 > 임계 2.5초 → 사전 대응 규칙의 발동 후보로 표시돼야 한다.
+    assert [w["endpoint"] for w in lat["warnings"]] == ["inquire-price"]
+    assert lat["warnings"][0]["hour"] == "10"
+
+
+def test_rest_latency_is_silent_when_every_endpoint_is_fast():
+    body = "inquire-price=250건 1.10/1.80/2.10/2.40초"
+    line = _emit("mahdi.main", "INFO", main.LOG_REST_LATENCY, 300.0, body)
+    assert _parse(line)["rest_latency"]["warnings"] == []

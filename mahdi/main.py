@@ -186,6 +186,32 @@ OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS = 25.0
 # rows 20 미만이 하나도 안 생겼다면 예산이 안 걸린 것이고, 절반이 얇아졌다면 임계가 너무 낮다.
 OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS = 50.0
 
+# ===== 2026-08-04(고도화#1 규약 A) — 지표성 로그의 포맷 계약 =====
+#
+# `mahdi/ops/log_metrics.py`가 정규식으로 읽는 줄들이다. 08-03에 `rest_client` 쪽에서 이 계약이
+# 세 번 깨졌고(레벨 변경 / 예외 처리 변경 / 트레이스백 제거), 08-04 리포트가 그 셋을 전부
+# **개선으로 표시**했다(§2-1). 그때는 rest_client만 상수화했는데, `main.py`의 네 줄은
+# **리포트 §1~§4·§8의 거의 전부**(사이클·밀림·결손 회수)를 떠받치므로 위험이 더 크다.
+#
+# 규약: 이 상수들을 바꾸면 `tests/test_ops_log_metrics_contract.py`가 깨진다. 파서를 함께 고쳐야
+# 테스트가 다시 통과한다 — 로그만 바꾸고 넘어가는 일이 조용히 지나갈 수 없게 하는 것이 전부다.
+# (`log_metrics`는 여전히 이 모듈을 import하지 않는다 — 순수 파서로 남긴다. 계약은 테스트가 진다.)
+LOG_CHAIN_CYCLE_BREAKDOWN = (
+    "옵션체인 사이클 소요 분해: REST수집 %.2f초 + DB적재 %.2f초 + 상태기록 %.2f초 + 기타 %.2f초 "
+    "(rows=%d, 밀림=%.1f초%s, 타폴러동시호출추정=%s)"
+)
+LOG_CHAIN_OVERRUN = (
+    "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기 "
+    "(REST수집 %.2f초, DB적재 %.2f초, rows=%d%s, 타폴러동시호출추정=%s)"
+)
+LOG_CHAIN_CATCHUP = "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로 채움(밀린 사이클 %s)"
+LOG_CHAIN_BUDGET_EXCEEDED = (
+    "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
+    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8)"
+)
+LOG_ATM_ROLL = "ATM 롤링: 스팟 %.2f — 행사가 %s → %s"
+LOG_REST_LATENCY = "REST 응답시간(%.0f초 창): %s"
+
 # 2026-07-29 신규 — 서킷브레이커/거래정지 감지(mahdi/risk/market_halt.py)용 H0UNMKO0(국내주식
 # 장운영정보) 구독 대상. CB/시장임시정지는 시장 전체 이벤트라 아무 종목이나 구독해도 그 순간의
 # MKOP_CLS_CODE로 시장 전체 상태를 알 수 있다 — KOSPI 최대형주(삼성전자)라 세션 상태 변화를
@@ -676,7 +702,7 @@ async def _reroll_books_to_spot(
         after = subscription_manager.desired_strikes
         if before != after:
             logger.info(
-                "ATM 롤링: 스팟 %.2f — 행사가 %s → %s",
+                LOG_ATM_ROLL,
                 spot,
                 f"{min(before):.1f}~{max(before):.1f}" if before else "(없음)",
                 f"{min(after):.1f}~{max(after):.1f}" if after else "(없음)",
@@ -1303,8 +1329,7 @@ async def _collect_option_chain_cycle(
     if skipped:
         # 사이클당 최대 1줄 — 레그마다 남기면 08-04 §2-2의 로그 폭증을 우리 손으로 재현한다.
         logger.warning(
-            "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
-            "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8)",
+            LOG_CHAIN_BUDGET_EXCEEDED,
             OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows),
         )
     return rows, latest_spot, any_strikes
@@ -1371,6 +1396,50 @@ def _update_atm_iv(regime_state_machine: RegimeStateMachine | None, rows: list[d
     ivs = [r["iv"] for r in rows if r["strike"] == atm_strike and r.get("iv") is not None]
     if ivs:
         regime_state_machine.update_iv(sum(ivs) / len(ivs))
+
+
+# 2026-08-04(고도화#5) — REST 응답시간 요약 주기. 5분이면 하루 99줄로 로그 부담이 없고
+# (08-04 사람이 읽는 줄 7,539줄 대비 1.3%), 시간대별 혼잡 패턴을 보기에 충분한 해상도다.
+REST_LATENCY_SNAPSHOT_SECONDS = 300.0
+
+
+async def poll_rest_latency_snapshot(
+    rest_client: KISRestClient,
+    interval_seconds: float = REST_LATENCY_SNAPSHOT_SECONDS,
+) -> None:
+    """
+    계산: `interval_seconds`마다 엔드포인트별 HTTP 응답시간 p50/p95/p99를 INFO 한 줄로 남긴다.
+    해석: 2026-08-04 고도화#5 — §2-6이 밀림의 90%를 KIS 응답 지연으로 귀속시켰는데, 지금
+         리포트는 그 지연을 **우리 지표(밀림 건수)로만** 본다. `slow_calls`는 임계(5초) 위쪽
+         꼬리만 보므로 "오늘 KIS가 평소보다 느렸는가"에 답할 수 없다.
+
+         **왜 폴러로 빼는가**: 옵션체인 사이클 끝에 붙이면 하루 445줄이 되고(그 자체가 §2-2에서
+         고친 로그 폭증의 재현이다), 사이클 실패 시 계측도 함께 사라진다. 안전장치 생존 신호를
+         독립 타이머로 분리한 것과 같은 원칙이다(§5-4).
+
+         **자동 적응은 하지 않는다**: "p95가 임계를 넘으면 폴링을 줄인다"는 규칙은
+         `hypotheses.yaml`(2026-08-04-p5)에 **숫자를 보기 전에** 적어뒀지만, 지연을 보고 폴링을
+         바꾸면 폴링이 줄어 지연이 낮아지고 다시 폴링이 늘어나는 되먹임이 생긴다. 2026-07-08에
+         페이서를 나눴다가 500 폭주로 203분을 잃은 전례가 있다 — **먼저 며칠 재고, 규칙은
+         사람이 발동한다.**
+    실패 조건: 표본이 없으면(그 창에 호출이 없었으면) 아무 줄도 남기지 않는다 — 장전/장후에
+              매 5분 빈 줄을 찍지 않기 위함.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            stats = rest_client.drain_http_latency()
+        except Exception:
+            logger.warning("REST 응답시간 스냅샷 실패 — 관측 자체에는 영향 없음", exc_info=True)
+            continue
+        if not stats:
+            continue
+        # `엔드포인트=n건 p50/p95/p99/max` 를 호출 수 내림차순으로 이어 붙인다.
+        body = " ".join(
+            f"{endpoint}={s['n']}건 {s['p50']:.2f}/{s['p95']:.2f}/{s['p99']:.2f}/{s['max']:.2f}초"
+            for endpoint, s in sorted(stats.items(), key=lambda kv: kv[1]["n"], reverse=True)
+        )
+        logger.info(LOG_REST_LATENCY, interval_seconds, body)
 
 
 async def poll_ws_heartbeat(
@@ -1494,7 +1563,7 @@ async def _catch_up_missed_option_chain_minute(
         return False
 
     logger.info(
-        "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로 채움(밀린 사이클 %s)",
+        LOG_CHAIN_CATCHUP,
         catchup_time.strftime("%H:%M"), len(rows), overran_poll_time.strftime("%H:%M"),
     )
     return True
@@ -1667,8 +1736,7 @@ async def poll_option_chain(
         )
         if overrun_seconds > 0:
             logger.warning(
-                "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기 "
-                "(REST수집 %.2f초, DB적재 %.2f초, rows=%d%s, 타폴러동시호출추정=%s)",
+                LOG_CHAIN_OVERRUN,
                 interval_seconds, overrun_seconds, delay, collect_seconds, insert_seconds, len(rows),
                 ", 재시도함" if retried else "", other_poller_calls_text,
             )
@@ -1725,8 +1793,7 @@ async def poll_option_chain(
             0.0,
         )
         logger.info(
-            "옵션체인 사이클 소요 분해: REST수집 %.2f초 + DB적재 %.2f초 + 상태기록 %.2f초 + 기타 %.2f초 "
-            "(rows=%d, 밀림=%.1f초%s, 타폴러동시호출추정=%s)",
+            LOG_CHAIN_CYCLE_BREAKDOWN,
             collect_seconds, insert_seconds, db_write_seconds, other_seconds,
             len(rows), overrun_seconds, ", 재시도함" if retried else "", other_poller_calls_text,
         )
@@ -2503,8 +2570,13 @@ def _build_signal_inputs(
     if legs and spot is not None:
         gex = calculate_gex(legs, spot)
         gamma_flip = find_gamma_flip(legs, spot)
+        # 2026-08-04 Fix#3 — 감마 월은 **노출이 0보다 클 때만** 기준선으로 쓴다.
+        # `gamma_walls()`는 행사가별 |gamma x OI x ...| 합을 내림차순으로 줄 뿐이라, OI가 전부
+        # 0인 북(08-04 weekly_mon이 그랬다)에서도 "노출 0짜리 1등 행사가"를 돌려준다. 그것을
+        # 기준선으로 쓰면 딜러 포지션이 없는 북에서 방향 신호를 지어내게 된다 —
+        # `find_gamma_flip()`이 전 구간 0인 곡선에서 허수 flip을 냈던 것과 **같은 종류의 결함**이다.
         walls = gamma_walls(legs, spot, top_n=1)
-        gamma_wall = walls[0][0] if walls else None
+        gamma_wall = walls[0][0] if walls and walls[0][1] > 0 else None
         drift = vanna_charm_drift(with_computed_charm(legs, spot), now.time())
         total_charm = drift["total_charm"]
         charm_active = drift["charm_active"]
@@ -2996,6 +3068,8 @@ async def main() -> None:
             # 독립한 타이머에서 낸다(CB 감지 / WS 연결).
             poll_market_halt_heartbeat(market_halt_monitor),
             poll_ws_heartbeat(ws_liveness),
+            # 2026-08-04 고도화#5 — KIS 응답시간을 서비스 품질 지표로 승격(밀림의 90%가 여기서 온다).
+            poll_rest_latency_snapshot(rest_client),
         ]
         if overseas_future_master is not None:
             tasks.append(

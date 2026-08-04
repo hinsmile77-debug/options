@@ -13,7 +13,7 @@ from datetime import date
 
 from mahdi.data import db
 from mahdi.data.db import ConnectionLike
-from mahdi.fusion.signal_layer import IMPLEMENTED_MEMBER_FIELDS
+from mahdi.fusion.signal_layer import IMPLEMENTED_MEMBER_FIELDS, MEMBER_FIELDS
 
 logger = logging.getLogger("mahdi.ops.db_metrics")
 
@@ -67,6 +67,8 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
         ("book_coverage", _book_coverage),
         ("book_gamma_map", book_gamma_map),
         ("wide_oi_landscape", wide_oi_landscape),
+        ("member_availability", member_availability),
+        ("strike_window_quality", strike_window_quality),
         ("signal_decisions", _signal_decisions),
         ("signal_reach", signal_reach),
         ("risk_gate_distinct", _risk_gate_distinct),
@@ -379,6 +381,170 @@ def wide_oi_landscape(conn: ConnectionLike, target: date, underlying: str = "KOS
             }
         )
     return out
+
+
+def member_availability(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 앙상블 멤버마다 **그날 몇 분이나 살아 있었는지**와, 죽어 있었다면 **가장 흔한 사유**를
+         `signal_decisions.risk_gate_state`에서 집계한다.
+    해석: 2026-08-04 고도화#2 — 종전 §14는 `앙상블 최대 가용 멤버 2개` 한 줄뿐이었다. 그 "2개"가
+         어느 둘인지 알아내려고 08-04에 사람이 `signal_layer.py`를 읽어 역산해야 했고, 그 역산
+         끝에 `orderflow_ofi_vpin`이 **데이터가 있는데도** 죽어 있다는 것이 나왔다(§2-5).
+         사유까지 남으니 이제 표 한 줄로 끝난다.
+    실패 조건: `member_unavailable` 키가 없는 날(2026-08-04 이전)은 `{"available": False}` —
+              0%로 표시해 "전 멤버가 죽었다"는 거짓 신호를 만들지 않는다.
+    """
+    total_row = _fetchone(
+        conn,
+        "SELECT count(*) FROM signal_decisions "
+        "WHERE timestamp::date=%s AND risk_gate_state ? 'member_unavailable'",
+        (target,),
+    )
+    minutes = int(total_row[0]) if total_row else 0
+    if not minutes:
+        return {"available": False, "reason": "member_unavailable 미기록(2026-08-04 고도화#2 이전)"}
+
+    rows = _fetchall(
+        conn,
+        "SELECT member, reason, count(*) FROM signal_decisions, "
+        "     LATERAL jsonb_each_text(risk_gate_state->'member_unavailable') AS t(member, reason) "
+        "WHERE timestamp::date=%s GROUP BY member, reason",
+        (target,),
+    )
+    unavailable: dict[str, dict[str, int]] = {}
+    for member, reason, count in rows:
+        unavailable.setdefault(member, {})[reason] = int(count)
+
+    members = []
+    for name in MEMBER_FIELDS:
+        by_reason = unavailable.get(name, {})
+        dead_minutes = sum(by_reason.values())
+        top_reason = max(by_reason.items(), key=lambda kv: kv[1])[0] if by_reason else None
+        members.append(
+            {
+                "member": name,
+                "available_minutes": minutes - dead_minutes,
+                "available_pct": round((minutes - dead_minutes) / minutes * 100, 1),
+                "top_unavailable_reason": top_reason,
+                "implemented": name in IMPLEMENTED_MEMBER_FIELDS,
+            }
+        )
+    return {"available": True, "minutes": minutes, "members": members}
+
+
+# 설계상 한 북이 유지하는 편측 행사가 수(`main.STRIKES_EACH_SIDE`). 여기에 두는 이유는
+# db_metrics를 관측 루프에 의존시키지 않기 위함이며, 두 값이 갈라지면 테스트가 잡는다.
+STRIKE_WINDOW_EACH_SIDE = 2
+KOSPI200_STRIKE_INTERVAL = 2.5
+
+
+def strike_window_quality(
+    conn: ConnectionLike, target: date, underlying: str = "KOSPI200"
+) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜, 기초자산 라벨.
+    계산: **수집한 행사가가 스팟을 제대로 감싸고 있었는가**를 분 단위로 잰다.
+         (a) **ATM 정합률** — 그 분의 스팟에서 계산한 ATM이 그 분에 실제로 수집된 먼슬리 행사가
+             집합 안에 있었는가. **이것이 핵심 지표다**(08-03의 결함이면 0%가 나온다).
+         (b) 창 정합률 — 설계 창(ATM±2, 5행사가)을 **전부** 덮었는가.
+         (c) **ATM 이탈 거리** — 수집 창의 중심이 그 분의 진짜 ATM에서 몇 행사가나 떨어졌는가.
+         (d) 창 폭 지터 — 체인 스냅샷(신선도 창) 안의 서로 다른 행사가 수 ÷ 설계값.
+
+         **(b)를 합격/불합격으로 읽지 말 것.** 100% 밑이 정상이다: 재롤링은 선물 1분봉이 완성될
+         때 일어나는데 그 분의 폴링은 이미 시작됐거나 끝났으므로 **구조적으로 한 틱 늦는다**.
+         게다가 Fix#6(히스테리시스 0.75칸)은 **일부러** 창을 늦게 옮긴다 — (b)만 보면 그 fix가
+         회귀로 보인다. (b)는 추세로 읽고(급락하면 무언가 바뀐 것), 판정은 (a)와 (c)로 한다.
+         08-04 실측(히스테리시스 적용 전): (a) **96.1%** / (b) 35.5% / (c) 중앙 **1.0칸** ·
+         최대 **7.0칸**(=17.5p). 최대값이 큰 것은 09시대 스팟 급변 구간이다 — (c)의 최대가
+         편측 폭(2칸)을 넘는 분은 **그 분의 체인이 스팟을 아예 못 감쌌다**는 뜻이므로
+         (a)와 함께 읽는다.
+    해석: 2026-08-04 고도화#3 — 지표 사이에 빈 칸이 있었다.
+           §12 커버리지  = "데이터가 DB에 있는가"
+           §14 신호 도달률 = "그 데이터가 판단까지 갔는가"
+         그 사이에 **"수집한 행사가가 애초에 맞는 행사가였는가"** 가 없었다. 08-03에 하루치
+         체인 전체가 스팟에서 5.5% 떨어진 외가격에서 수집됐는데(재롤링이 WS 연결당 1회만 돌아
+         행사가가 07:31 값에 고정됐다) 커버리지는 98.8%로 훌륭했고 감마플립 산출률도 0%라는
+         같은 답만 냈다 — **이 지표 하나면 그날 바로 잡혔다.**
+         (c)는 Fix#6b(신선도 창 10→5분)의 직접 지표다. 08-04 실측으로 10분 창에서는 먼슬리
+         중앙 14레그(설계 10), 5분 창에서는 12레그였다.
+    실패 조건: 그날 먼슬리 북을 식별할 수 없거나(장전) 스팟이 없으면 `{"available": False}`.
+    """
+    expiry = monthly_book_expiry(conn, target, underlying)
+    if expiry is None:
+        return {"available": False, "reason": "만기유동성 미적재(먼슬리 북 식별 불가)"}
+
+    interval = KOSPI200_STRIKE_INTERVAL
+    side = STRIKE_WINDOW_EACH_SIDE
+    row = _fetchone(
+        conn,
+        """
+        WITH per_minute AS (
+            SELECT o.timestamp AS ts,
+                   round((s.spot / %(interval)s)::numeric) * %(interval)s AS atm,
+                   array_agg(DISTINCT o.strike) AS strikes
+            FROM option_analysis_1m o
+            JOIN underlying_spot_1m s
+              ON s.underlying = o.underlying AND s.timestamp = o.timestamp
+            WHERE o.underlying=%(underlying)s AND o.timestamp::date=%(target)s AND o.expiry=%(expiry)s
+            GROUP BY o.timestamp, s.spot
+        )
+        SELECT count(*),
+               count(*) FILTER (WHERE atm = ANY(strikes)),
+               count(*) FILTER (WHERE (
+                   SELECT bool_and(atm + g * %(interval)s = ANY(strikes))
+                   FROM generate_series((-%(side)s)::int, (%(side)s)::int) AS g
+               )),
+               percentile_cont(0.5) WITHIN GROUP (
+                   ORDER BY abs(atm - (( (SELECT min(x) FROM unnest(strikes) x)
+                                       + (SELECT max(x) FROM unnest(strikes) x) ) / 2)) / %(interval)s
+               ),
+               max(abs(atm - (( (SELECT min(x) FROM unnest(strikes) x)
+                              + (SELECT max(x) FROM unnest(strikes) x) ) / 2)) / %(interval)s)
+        FROM per_minute
+        """,
+        {"interval": interval, "side": side, "underlying": underlying, "target": target, "expiry": expiry},
+    )
+    if not row or not row[0]:
+        return {"available": False, "reason": "먼슬리 체인 미적재"}
+    minutes, atm_hit, window_hit = int(row[0]), int(row[1]), int(row[2])
+    offset_median = float(row[3]) if row[3] is not None else None
+    offset_max = float(row[4]) if row[4] is not None else None
+
+    jitter = _fetchone(
+        conn,
+        """
+        WITH mins AS (
+            SELECT DISTINCT timestamp AS m FROM option_analysis_1m
+            WHERE underlying=%(underlying)s AND timestamp::date=%(target)s AND expiry=%(expiry)s
+        )
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY c), max(c)
+        FROM mins, LATERAL (
+            SELECT count(DISTINCT o.strike) AS c FROM option_analysis_1m o
+            WHERE o.underlying=%(underlying)s AND o.expiry=%(expiry)s
+              AND o.timestamp <= mins.m
+              AND o.timestamp > mins.m - (%(window)s || ' min')::interval
+        ) x
+        """,
+        {"underlying": underlying, "target": target, "expiry": expiry,
+         "window": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES},
+    )
+    design_strikes = side * 2 + 1
+    median_strikes = float(jitter[0]) if jitter and jitter[0] is not None else None
+    return {
+        "available": True,
+        "expiry": expiry,
+        "minutes": minutes,
+        "atm_covered_pct": round(atm_hit / minutes * 100, 1),
+        "window_covered_pct": round(window_hit / minutes * 100, 1),
+        "atm_offset_strikes_median": round(offset_median, 2) if offset_median is not None else None,
+        "atm_offset_strikes_max": round(offset_max, 2) if offset_max is not None else None,
+        "design_strikes": design_strikes,
+        "snapshot_strikes_median": median_strikes,
+        "snapshot_strikes_max": int(jitter[1]) if jitter and jitter[1] is not None else None,
+        "width_jitter": round(median_strikes / design_strikes, 2) if median_strikes else None,
+        "snapshot_window_minutes": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES,
+    }
 
 
 def _signal_decisions(conn: ConnectionLike, target: date) -> list[dict]:

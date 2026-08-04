@@ -206,3 +206,117 @@ def test_book_gamma_map_section_survives_empty_input():
     out = report.render(_TODAY, db_metrics={"book_gamma_map": []})
     assert "## 15. 북별 감마 지형" in out
     assert "데이터 없음" in out.split("## 15. 북별 감마 지형", 1)[1]
+
+
+# ===== 2026-08-04 고도화 6종의 렌더링 =====
+
+_WIDE_BOOK_NO_FLIP = {
+    "expiry": "2026-08-13", "strikes": 25, "strike_min": 952.5, "strike_max": 1012.5,
+    "search_pct": 4.75, "net_call_put_oi": -6292, "call_heavy_strikes": 4,
+    "put_heavy_strikes": 20, "wide_gamma_flip": None, "flip_possible": False,
+}
+
+
+def test_wide_oi_landscape_calls_out_when_flip_becomes_possible():
+    """고도화#4 — 이 표의 존재 이유는 하루치 값이 아니라 **바뀌는 날**이다.
+
+    「GEX 광폭 체인」은 2026-08-04에 폐기됐고(딜러 포지션이 전 구간 한 방향), 그 폐기의
+    재개 조건이 바로 이 전환이다. 사람이 매일 두 리포트를 나란히 놓지 않아도 뜨게 한다.
+    """
+    today = {"wide_oi_landscape": [{**_WIDE_BOOK_NO_FLIP, "wide_gamma_flip": 985.25,
+                                    "flip_possible": True}]}
+    previous = {"db": {"wide_oi_landscape": [_WIDE_BOOK_NO_FLIP]}}
+
+    out = "\n".join(report._render_book_gamma_map(today, previous))
+
+    assert "🔔" in out
+    assert "2026-08-13 불가→**가능**" in out
+
+
+def test_wide_oi_landscape_is_quiet_when_nothing_changed():
+    today = {"wide_oi_landscape": [_WIDE_BOOK_NO_FLIP]}
+    previous = {"db": {"wide_oi_landscape": [_WIDE_BOOK_NO_FLIP]}}
+
+    out = "\n".join(report._render_book_gamma_map(today, previous))
+
+    assert "🔔" not in out
+    assert "없음" in out  # 광폭 감마플립 열
+
+
+def test_wide_oi_landscape_does_not_crash_without_a_previous_day():
+    out = "\n".join(report._render_book_gamma_map({"wide_oi_landscape": [_WIDE_BOOK_NO_FLIP]}, None))
+    assert "🔔" not in out
+
+
+def test_rest_latency_section_says_not_measured_yet_instead_of_zero():
+    """고도화#5 — 계측 도입 이전 로그를 "p95 0초"로 표시하면 08-04 §2-1과 같은 거짓 개선이 된다."""
+    out = "\n".join(report._render_rest_latency({}))
+    assert "계측 전" in out
+    assert "0.00" not in out
+
+
+def test_rest_latency_section_renders_the_pre_committed_rule_when_p95_is_high():
+    metrics = {
+        "rest_latency": {
+            "endpoints": {"inquire-price": {"calls": 9000, "p50": 1.1, "p95": 2.8,
+                                            "p99": 4.5, "max": 6.2}},
+            "p95_by_hour": {"13": {"inquire-price": 2.8}},
+            "p95_warn_threshold": 2.5,
+            "warnings": [{"hour": "13", "endpoint": "inquire-price", "p95": 2.8}],
+        }
+    }
+    out = "\n".join(report._render_rest_latency(metrics))
+
+    assert "임계(2.5초)를 넘은 구간 **1개**" in out
+    assert "이틀 연속 같은 시간대" in out  # 사전 대응 규칙이 리포트에 인용된다
+    assert "발동은 사람이 한다" in out  # 자동 적응 금지가 함께 남는다
+
+
+def test_member_availability_names_the_dead_member_and_the_reason():
+    """고도화#2 — `available_member_count` 숫자 하나로는 어느 멤버가 왜 죽었는지 모른다."""
+    db = {
+        "member_availability": {
+            "available": True, "minutes": 494,
+            "members": [
+                {"member": "flow_position", "available_minutes": 494, "available_pct": 100.0,
+                 "top_unavailable_reason": None, "implemented": True},
+                {"member": "orderflow_ofi_vpin", "available_minutes": 0, "available_pct": 0.0,
+                 "top_unavailable_reason": "ofi/queue_imbalance 없음", "implemented": True},
+                {"member": "lstm_temporal", "available_minutes": 0, "available_pct": 0.0,
+                 "top_unavailable_reason": "미학습(Phase 3)", "implemented": False},
+            ],
+        }
+    }
+    out = "\n".join(report._render_member_availability(db))
+
+    assert "orderflow_ofi_vpin" in out and "ofi/queue_imbalance 없음" in out
+    assert "*(미구현)*" in out  # 학습 전 멤버는 살아있는 결함과 구분돼야 한다
+
+
+def test_strike_window_section_warns_against_reading_window_match_as_pass_fail():
+    """고도화#3 — 창 정합률은 구조적으로 100% 밑이다(재롤링 1틱 지연 + 히스테리시스).
+
+    이 주석이 빠지면 Fix#6(히스테리시스)이 다음 점검에서 **회귀로 오독**된다.
+    """
+    db = {
+        "strike_window_quality": {
+            "available": True, "expiry": "2026-08-13", "minutes": 488,
+            "atm_covered_pct": 96.1, "window_covered_pct": 35.5,
+            "atm_offset_strikes_median": 1.0, "atm_offset_strikes_max": 7.0,
+            "design_strikes": 5, "snapshot_strikes_median": 6.0, "snapshot_strikes_max": 11,
+            "width_jitter": 1.2, "snapshot_window_minutes": 5,
+        }
+    }
+    metrics = {"atm_rolls": {"count": 194, "round_trips": 70, "round_trip_pct": 36.1}}
+    out = "\n".join(report._render_strike_window(db, metrics))
+
+    assert "합격/불합격으로 읽지 말 것" in out
+    assert "일부러" in out  # 히스테리시스가 의도적으로 창을 늦게 옮긴다는 사실
+    assert "ATM 롤링 **194회**" in out and "**36.1%**" in out
+
+
+def test_strike_window_section_says_not_measured_yet_when_the_book_is_unknown():
+    out = "\n".join(report._render_strike_window(
+        {"strike_window_quality": {"available": False, "reason": "만기유동성 미적재"}}, {}
+    ))
+    assert "계측 전" in out and "만기유동성 미적재" in out
