@@ -657,12 +657,25 @@ def test_get_propagates_remote_protocol_error_when_retry_also_fails():
 def test_default_client_bounds_pool_and_keepalive():
     # 호출이 페이서로 직렬화되므로 커넥션이 여러 개 필요 없다 — 좁은 풀 + 긴 keep-alive가
     # RemoteProtocolError를 줄인다(08-03 §4 우선순위 3).
-    from mahdi.broker.rest_client import _HTTP_LIMITS, _HTTP_TIMEOUT
+    #
+    # 2026-08-04(§2-6 / Fix#8): read 10.0 → 4.0초. 08-04에 08-03의 판정표가 답을 냈다 —
+    # 느린 호출 362건의 총 2,278초 중 **HTTP가 90%(2,050초)**, 페이서는 10%(229초)뿐이다.
+    # read 10초는 느린 레그 한둘이 60초 사이클을 통째로 덮게 두고, 그것이 08-04 미회수 결손
+    # 5분(14:31/15:11/15:15/15:17/15:19)을 만들었다. 참고: 08-03에 커넥션 풀을 좁히고
+    # keep-alive를 늘린 조치(p3)는 `RemoteProtocolError` 8 → **25건**으로 오히려 악화됐다
+    # (§2-1의 계측 실명 때문에 리포트에는 "실측 없음"으로 찍혔다) — 풀 설정 자체는 다음
+    # 거래일 실측을 보고 다시 판단한다.
+    from mahdi.broker.rest_client import _HTTP_LIMITS, _HTTP_READ_TIMEOUT_SECONDS, _HTTP_TIMEOUT
 
     assert _HTTP_LIMITS.max_connections == 4
     assert _HTTP_LIMITS.keepalive_expiry == 15.0
     assert _HTTP_TIMEOUT.connect == 3.0
-    assert _HTTP_TIMEOUT.read == 10.0
+    assert _HTTP_TIMEOUT.read == _HTTP_READ_TIMEOUT_SECONDS == 4.0
+    # 옵션체인 사이클 예산(50초) 안에 최소 10레그(먼슬리 1북)는 돌 수 있어야 한다 —
+    # 그러지 못하면 예산과 타임아웃이 서로를 무력화한다.
+    from mahdi.main import OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS
+
+    assert _HTTP_READ_TIMEOUT_SECONDS * 10 <= OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS
 
 
 def test_slow_call_log_is_info_not_warning(caplog):

@@ -142,6 +142,38 @@ def test_find_gamma_flip_excludes_zero_iv_legs_instead_of_poisoning_the_sum(capl
     assert not caplog.records, "정상 산출 경로에서는 경고를 남기지 않는다"
 
 
+def test_find_gamma_flip_returns_none_when_the_whole_book_has_no_open_interest():
+    """2026-08-04(운영점검보고서 §2-9 후속) — OI가 전부 0인 북에서 **허수 flip 레벨**이 나왔다.
+
+    종전 코드는 `if v_prev == 0: return grid[i_prev]`로 처음 만난 0을 그대로 flip으로 돌려줬다.
+    OI가 전부 0이면 GEX(S)가 모든 구간에서 0이므로 이 분기가 **항상 첫 그리드 점**
+    (= spot x (1 - search_pct))을 반환한다. 08-04 실측: weekly_mon(2026-08-10, 롤오버 직후라
+    OI 미형성) 북에서 스팟 1000.03에 대해 `감마플립 950.03`이 나왔다 — 정확히 5% 아래,
+    즉 탐색 격자의 왼쪽 끝이다. 사람이 읽으면 시장 구조로 오해하는 완전한 허수다.
+    """
+    legs = [
+        OptionLeg(strike=k, option_type=t, oi=0.0, iv=0.18, t_years=0.02, gamma=0.01)
+        for k in (340.0, 345.0, 350.0, 355.0, 360.0)
+        for t in ("c", "p")
+    ]
+    assert find_gamma_flip(legs, spot=350) is None
+
+
+def test_find_gamma_flip_ignores_a_tangent_zero_that_does_not_cross():
+    """0을 스치기만 하고 같은 부호로 돌아오면 교차가 아니다 — flip을 지어내지 않는다."""
+    # 콜만 있는 체인은 전 구간 양수고, OI 0인 레그를 섞어도 곡선이 0을 스치지 않는다.
+    legs = [*_no_flip_legs(), _leg(350, "c", 0.0)]
+    assert find_gamma_flip(legs, spot=350) is None
+
+
+def test_find_gamma_flip_still_finds_a_real_crossing_next_to_an_exact_zero():
+    """회귀 방지: 0 처리를 고치면서 **진짜 교차**까지 놓치면 안 된다."""
+    legs = [*_flip_legs(), _leg(350, "c", 0.0), _leg(350, "p", 0.0)]
+    flip = find_gamma_flip(legs, spot=350)
+    assert flip is not None
+    assert 335 < flip < 345
+
+
 def test_find_gamma_flip_warns_when_too_few_usable_legs(caplog):
     # 조용한 실패가 §2-1 버그를 넉 달간 가렸다 — 산출 불가는 반드시 로그에 남는다.
     legs = [OptionLeg(strike=350, option_type="c", oi=100, iv=0.0, t_years=0.0, gamma=0.0)]

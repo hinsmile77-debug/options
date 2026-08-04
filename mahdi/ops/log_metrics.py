@@ -54,8 +54,12 @@ _BACKOFF_RE = re.compile(
     _TS + r" INFO:mahdi\.broker\.rest_client:레이트리밋 백오프 (확대|회복): "
     r"[\d.]+s -> [\d.]+s \(기준 대비 ([\d.]+)배\)"
 )
+# 2026-08-04(운영점검보고서 §2-1) — **레벨을 정규식에 고정하지 않는다.**
+# 08-03에 이 줄이 WARNING → INFO로 내려가면서 이 정규식이 통째로 눈이 멀었고, 08-04 리포트는
+# 실제 362건을 **0건**으로 보고했다(그리고 §1의 전일 델타는 "▼933 ✅"라는 개선으로 표시됐다).
+# 로그 레벨은 사람이 읽는 우선순위일 뿐 계측의 정체성이 아니다 — 문구로만 식별한다.
 _SLOW_CALL_RE = re.compile(
-    _TS + r" WARNING:mahdi\.broker\.rest_client:느린 REST 호출 ([\d.]+)초 = "
+    _TS + r" (?:INFO|WARNING):mahdi\.broker\.rest_client:느린 REST 호출 ([\d.]+)초 = "
     r"페이서대기 ([\d.]+)초 \+ HTTP ([\d.]+)초 \(배율 ([\d.]+)배, (\w+) (\S+)\)"
 )
 _CATCHUP_RE = re.compile(
@@ -76,11 +80,52 @@ _QUALITATIVE_MARKERS = {
     "egw00201": "EGW00201",
 }
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
+#
+# 2026-08-04(§2-1) 경고: 이 방식은 **예외가 처리되지 않고 위로 전파될 때만** 참이다. 예외를
+# 잡아서 한 줄로 요약하는 순간(=대개 옳은 수정) 이 카운터는 조용히 0이 된다. 08-03에 두 곳에서
+# 정확히 그 일이 일어났다:
+#   - `RemoteProtocolError` → 1회 재시도 도입(§4-3). 트레이스백 소멸, 실제 25건이 "실측 없음"으로.
+#   - `HTTPStatusError`     → 트레이스백 제거(§2-8). 08-03 105건이 08-04에 키 자체가 사라짐.
+# 그래서 아래 `_HANDLED_EXCEPTION_MARKERS`(처리된 예외의 요약 줄)와 `_FAILURE_RE` 기반 대체
+# 계측을 함께 둔다. **예외 처리 방식을 바꾸면 여기도 함께 바꿔야 한다** — 그것을 잊었을 때
+# 알려주는 것이 `_PARSER_AUDIT_TOKENS`다.
 _EXCEPTION_PREFIXES = {
     "remote_protocol_error": "httpx.RemoteProtocolError",
     "http_status_error": "httpx.HTTPStatusError",
     "read_timeout": "httpx.ReadTimeout",
     "connect_error": "httpx.ConnectError",
+}
+
+# 처리된(=트레이스백이 없는) 예외의 요약 줄. 위 트레이스백 카운트와 **같은 키에 합산**한다 —
+# 한 사건이 어느 쪽으로 기록되든 하루 총계는 같아야 하기 때문이다.
+# 포맷 원본: `mahdi.broker.rest_client.LOG_REMOTE_PROTOCOL_RETRY`
+# (계약은 tests/test_ops_log_metrics_contract.py가 지킨다 — 이 모듈은 순수 파서로 남긴다).
+_HANDLED_EXCEPTION_MARKERS = {
+    "remote_protocol_error": "커넥션 재사용 실패(RemoteProtocolError)",
+}
+
+# KIS가 rt_cd/msg_cd를 실은 에러 응답(대개 HTTP 500). 2026-08-03 §2-8이 트레이스백을 떼면서
+# `http_status_error`(트레이스백 기반)가 죽었으므로, 지금 로그 모양 그대로에서 다시 센다:
+#   WARNING:mahdi.main:옵션 체인 폴링 실패: C01608875 — {"rt_cd":"1","msg_cd":"EGW00201",...}
+# `_FAILURE_RE`가 이미 잡는 줄이라 추가 순회가 필요 없다.
+_KIS_ERROR_BODY_TOKEN = '"rt_cd"'
+
+# ===== 0건 보고의 증명(2026-08-04 §2-1 / 고도화#1 규약 C) =====
+#
+# 엄격 파서가 0을 냈을 때, **그 마커의 핵심 토큰이 로그에 실제로 없는지** 느슨하게 한 번 더 센다.
+# 엄격 0 · 느슨 >0 이면 그것은 "오늘 안 일어났다"가 아니라 **"파서가 눈이 멀었다"** 는 뜻이다.
+# 08-04에 이 감사가 있었다면 `slow_calls` 0건(느슨 362건)이 즉시 ⚠로 떴을 것이다.
+# 토큰은 포맷이 바뀌어도 살아남을 만큼 짧게 고른다(레벨·수치·엔드포인트를 포함하지 않는다).
+_PARSER_AUDIT_TOKENS = {
+    "cycles": "옵션체인 사이클 소요 분해",
+    "overrun": "스케줄이",
+    "backoff": "레이트리밋 백오프",
+    "slow_calls": "느린 REST 호출",
+    "catchups": "옵션체인 결손 회수",
+    "remote_protocol_error": "RemoteProtocolError",
+    "read_timeout": "ReadTimeout",
+    "connect_error": "ConnectError",
+    "kis_error_response": _KIS_ERROR_BODY_TOKEN,
 }
 
 
@@ -165,6 +210,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     failures: collections.Counter = collections.Counter()
     levels: collections.Counter = collections.Counter()
     qualitative: collections.Counter = collections.Counter()
+    audit_loose: collections.Counter = collections.Counter()
     overrun_seconds: list[float] = []
     total_bytes = 0
     httpx_bytes = 0
@@ -187,6 +233,12 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         for key, prefix in _EXCEPTION_PREFIXES.items():
             if line.startswith(prefix):
                 qualitative[key] += 1
+        for key, marker in _HANDLED_EXCEPTION_MARKERS.items():
+            if marker in line:
+                qualitative[key] += 1
+        for key, token in _PARSER_AUDIT_TOKENS.items():
+            if token in line:
+                audit_loose[key] += 1
 
         # 레벨 집계는 아래 continue들보다 **먼저** 해야 한다 — httpx/사이클/백오프 줄이 전부
         # continue로 빠져나가면 INFO가 2건으로 집계된다(2026-08-01 최초 실행에서 실제로 겪었다).
@@ -249,8 +301,19 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         if m:
             # "옵션 체인 폴링 실패: B01608875 — {...}" → 종목/응답을 떼고 유형만 센다.
             failures[m.group(6).split(":")[0].strip()] += 1
+            # 2026-08-04 §2-1: `http_status_error`(트레이스백 기반)를 대체하는 계측.
+            if _KIS_ERROR_BODY_TOKEN in line:
+                qualitative["kis_error_response"] += 1
 
     cycles.sort(key=lambda c: c["start"])
+    strict_counts = {
+        "cycles": len(cycles),
+        "overrun": len(overrun_seconds),
+        "backoff": len(backoff_events),
+        "slow_calls": len(slow_calls),
+        "catchups": len(catchups),
+        **{key: qualitative.get(key, 0) for key in _PARSER_AUDIT_TOKENS if key not in ("cycles", "overrun", "backoff", "slow_calls", "catchups")},
+    }
     return {
         "date": target.isoformat(),
         "cycles": _cycle_metrics(cycles, calls, catchups),
@@ -270,6 +333,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "by_level": dict(levels),
         },
         "qualitative": dict(qualitative),
+        "parser_audit": _parser_audit(strict_counts, audit_loose),
         "failures": dict(failures.most_common()),
         "overrun": {
             "count": len(overrun_seconds),
@@ -277,6 +341,26 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "total_seconds": round(sum(overrun_seconds), 1),
         },
     }
+
+
+def _parser_audit(strict: dict[str, int], loose: collections.Counter) -> dict:
+    """
+    입력: 엄격 파서가 센 값들, 같은 항목의 느슨한 토큰 등장 횟수.
+    계산: **엄격이 0인데 느슨이 0이 아닌** 항목을 골라낸다 — 그것이 파서가 눈이 먼 자리다.
+    해석: 2026-08-04 §2-1 / 고도화#1 규약 C — *"0건 보고는 증명을 동반한다."*
+         08-03에 로그 세 곳의 레벨·예외 처리를 바꾸면서 파서 세 개가 조용히 죽었고, 리포트는
+         그것을 **개선(▼933 ✅)으로 표시**했다. 지표가 나아진 것과 계측기가 꺼진 것은 로그를
+         직접 세보기 전에는 구분되지 않는다 — 이 함수가 그 구분을 자동화한다.
+         `blind`가 비어 있지 않으면 그날 리포트의 해당 값을 **믿으면 안 된다**.
+    실패 조건: 없음 — 느슨 토큰이 지나치게 짧아 오탐이 나면 `_PARSER_AUDIT_TOKENS`를 조인다
+              (오탐은 ⚠ 1줄이지만, 미탐은 08-04처럼 하루치 판정을 통째로 뒤집는다).
+    """
+    blind = {
+        key: {"strict": strict.get(key, 0), "loose": loose[key]}
+        for key in _PARSER_AUDIT_TOKENS
+        if strict.get(key, 0) == 0 and loose[key] > 0
+    }
+    return {"blind": blind, "loose_counts": dict(loose)}
 
 
 def _cycle_metrics(cycles: list[dict], calls: list[tuple[float, str, str]], catchups: list[dict]) -> dict:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from mahdi.broker.rest_client import SLOW_CALL_LOG_THRESHOLD_SECONDS
 from mahdi.ops import db_metrics as db_metrics_module  # 임계를 리포트에 그대로 인용하기 위함
 
 # 전일 대비 델타를 붙일 핵심 지표. (라벨, 지표 경로, 포맷, 개선 방향)
@@ -261,7 +262,9 @@ def _render_stalls(metrics: dict) -> list[str]:
 def _render_slow_calls(metrics: dict) -> list[str]:
     sc = metrics.get("slow_calls") or {}
     if not sc.get("count"):
-        return ["임계(3초) 초과 호출 없음.", ""]
+        # 2026-08-04 §2-1: 임계값을 문자열에 박아두지 않는다 — 08-03에 3.0 → 5.0으로 올렸는데
+        # 이 줄만 "임계(3초)"로 남아 있었다. 실제 상수를 그대로 인용한다.
+        return [f"임계({SLOW_CALL_LOG_THRESHOLD_SECONDS:.0f}초) 초과 호출 없음.", ""]
     out = [
         f"- **{sc['count']}건** — 페이서대기 우세 **{sc.get('pacer_dominant', 0)}건** / "
         f"HTTP 우세 **{sc.get('http_dominant', 0)}건**",
@@ -317,8 +320,34 @@ def _render_log_volume(metrics: dict) -> list[str]:
     ]
     out += _table(["레벨", "건수"], [[k, str(v)] for k, v in (lv.get("by_level") or {}).items()])
     out += _table(["정성 항목", "건수"], [[k, str(v)] for k, v in (metrics.get("qualitative") or {}).items()])
+    out += _render_parser_audit(metrics)
     out += _table(["실패 유형", "건수"], [[k, str(v)] for k, v in (metrics.get("failures") or {}).items()])
     return out
+
+
+def _render_parser_audit(metrics: dict) -> list[str]:
+    """
+    계산: `log_metrics._parser_audit()`가 찾은 "엄격 0 · 느슨 >0" 항목을 경고로 낸다.
+    해석: 2026-08-04 §2-1 / 고도화#1 규약 C — **0건 보고는 증명을 동반한다.**
+         08-03에 로그 세 곳을 바꾸면서 파서 셋이 조용히 죽었고, 08-04 리포트는 그것을
+         `느린 REST 호출 0건 (▼933 ✅)` 이라는 **개선**으로 표시했다. 이 절이 있었다면
+         같은 표 아래에 `⚠ slow_calls: 파서 0건 / 로그 실재 362건`이 떴을 것이다.
+    실패 조건: 없음 — 감사 결과가 없으면 한 줄짜리 정상 확인만 남긴다(침묵하지 않는다).
+    """
+    audit = metrics.get("parser_audit") or {}
+    blind = audit.get("blind") or {}
+    if not blind:
+        return ["> ✅ 계측 감사: 0건으로 보고된 항목 중 로그에 실재하는 것 없음(파서 정상).", ""]
+    return [
+        "> ⚠ **계측 감사 실패 — 아래 지표를 믿지 말 것.** 파서는 0을 냈는데 로그에는 실재한다. "
+        "로그 문구/레벨/예외 처리를 바꾸고 `mahdi/ops/log_metrics.py`를 안 고쳤을 때 이렇게 된다 "
+        "(2026-08-03에 실제로 3건 발생, 08-04 §2-1).",
+        "",
+        *_table(
+            ["항목", "파서(엄격)", "로그 실재(느슨)"],
+            [[k, str(v["strict"]), f"**{v['loose']}**"] for k, v in blind.items()],
+        ),
+    ]
 
 
 def _render_db_tables(db: dict) -> list[str]:
@@ -398,7 +427,11 @@ def _render_signal_reach(db: dict) -> list[str]:
         [
             [
                 "앙상블 최대 가용 멤버",
-                f"{reach['member_count_max']}개 / 이론 최대 3개",
+                # 2026-08-04 §2-5: 종전에는 "이론 최대 3개"가 하드코딩돼 있었고, 그 3이
+                # `orderflow_ofi_vpin`이 죽어 있다는 사실을 분모 안에 숨기고 있었다.
+                # 구현된 멤버 수를 아는 쪽(fusion.signal_layer)에서 가져온다.
+                f"{reach['member_count_max']}개 / 이론 최대 "
+                f"{db_metrics_module.SIGNAL_REACH_WARNINGS['member_count_max_min']}개",
                 f"< {db_metrics_module.SIGNAL_REACH_WARNINGS['member_count_max_min']}",
             ],
             [
@@ -510,6 +543,50 @@ def _render_book_gamma_map(db: dict) -> list[str]:
         "> 만기 당일 북은 잔존만기 0이라 **감마플립이 정의되지 않는다**(`—`가 정상) — 대신 "
         "핀 리스크(v6 §A3 만기 Pinning)가 그 북에서만 의미를 갖는다. 먼슬리(최근월)가 "
         "GEX/감마플립의 주 입력이고(v6 §11.4 게이트), 위클리는 핀 리스크 전용으로 읽는다.",
+        f"> 위 표는 **장 마지막 {db_metrics_module.db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES}분 창**의 "
+        "스냅샷이다 — 라이브 판단과 같은 함수(`db.option_chain_as_of()`)를 쓴다. "
+        "2026-08-04 §2-7 이전에는 시각 경계가 없어 **그날 방문한 전 행사가**를 합쳐 놓고 "
+        "\"장 마지막\"이라고 적었다(핀 행사가가 5시간 전 값이었다).",
         "",
     ]
+    out += _render_wide_oi_landscape(db)
     return out
+
+
+def _render_wide_oi_landscape(db: dict) -> list[str]:
+    """
+    2026-08-04 §2-3 / 고도화#4 — "오늘 방문한 전 행사가"의 콜−풋 OI 지형.
+
+    이 표가 08-04에 「GEX 광폭 체인」 결정을 뒤집었다: ATM 지터가 우연히 만든 25행사가(±3%)
+    구간에서도 먼슬리 C−P 부호가 안 바뀌어, **행사가를 넓혀도 감마플립은 안 나온다**는 것이
+    확인됐다. Fix#6이 지터를 줄이면 그 관측이 사라지므로 매일 자동으로 남긴다(추가 REST 0건).
+    """
+    books = db.get("wide_oi_landscape") or []
+    if not books:
+        return []
+    out = _table(
+        ["만기", "행사가 수", "범위", "탐색폭", "C−P 합", "C편중", "P편중", "광폭 감마플립"],
+        [
+            [
+                str(b["expiry"]),
+                str(b["strikes"]),
+                f"{b['strike_min']:.1f}~{b['strike_max']:.1f}",
+                f"±{b['search_pct']:.1f}%",
+                f"{b['net_call_put_oi']:,}",
+                str(b["call_heavy_strikes"]),
+                str(b["put_heavy_strikes"]),
+                f"**{b['wide_gamma_flip']:.2f}**" if b["flip_possible"] else "없음",
+            ]
+            for b in books
+        ],
+    )
+    return out + [
+        "> **광폭 감마플립 '없음' = 그 북은 방문한 행사가 전 구간에서 GEX 부호가 안 바뀐다**"
+        "(딜러 포지션이 한 방향). 이때의 `감마플립 산출률 0%`(§14)는 결함이 아니라 시장 구조이며, "
+        "**행사가 창을 넓혀도 해결되지 않는다** — 2026-08-04에 ATM 지터가 만든 25행사가(±3%)로 "
+        "실측 확인했고, 그 결과로 「GEX 광폭 체인」 안건이 폐기됐다(§2-3).",
+        "> 이 값이 '없음'에서 벗어나는 날이 그 안건을 다시 꺼낼 첫 근거다. "
+        "주의: 행사가별 C−P 부호가 국소적으로 바뀌는 것과 GEX(S) 부호가 바뀌는 것은 다른 사건이다 "
+        "— 국소 부호로 판정하면 08-04 먼슬리가 '가능'으로 잘못 나온다.",
+        "",
+    ]

@@ -313,6 +313,50 @@ def latest_underlying_spot(conn: ConnectionLike, underlying: str) -> float | Non
     return float(row[0]) if row else None
 
 
+# 2026-08-04(운영점검보고서 §2-5 / Fix#2) — 미시구조 값의 신선도 경계.
+# 체인 스냅샷과 같은 원칙을 쓴다: 오래된 값을 조용히 들고 오면 "지금 시장"이 아닌 것으로 판단한다.
+# 선물 1분봉은 매분 완성되므로 3분이면 결손 2분을 견디고도 충분하다(08-04 market_raw_1m 996행 /
+# 410분, 선물 A01609만 410/410분).
+MICROSTRUCTURE_MAX_AGE_MINUTES = 3
+
+
+def latest_market_microstructure(
+    conn: ConnectionLike, symbol: str, as_of: datetime | None = None
+) -> dict | None:
+    """
+    입력: DB 커넥션, 종목코드(선물 단축코드), (선택) 기준 시각 — 없으면 `local_now()`.
+    계산: `MICROSTRUCTURE_MAX_AGE_MINUTES`분 이내에 완성된 그 종목의 1분봉에서 주문흐름 지표
+         (`ofi`/`microprice`/`bid_ask_spread`/`vpin`)를 꺼낸다.
+    해석: 2026-08-04 §2-5 — `_build_signal_inputs()`가 `ofi=None`으로 **하드코딩**돼 있었고
+         docstring은 *"아직 라이브 집계 파이프라인이 없어(체결 틱 기반 실시간 호가 집계 미구현)"*
+         라고 적혀 있었다. **사실이 아니었다**: `MinuteBarAggregator`가 이 값들을 이미 매분
+         계산해 `market_raw_1m`에 적재하고 있고, 08-04 실측으로 선물 A01609의 410분 전부
+         `ofi`가 non-null(그중 404분이 0이 아님)이었다. 즉 앙상블 멤버 `orderflow_ofi_vpin`은
+         데이터가 없어서가 아니라 **읽어서 넘기지 않아서** 하루 종일 죽어 있었다.
+    실패 조건: 신선도 창 안에 봉이 없으면 None — 호출측이 그 멤버만 비운다(다른 폴러의
+              "부분 실패 허용"과 같은 원칙). 오래된 값을 대신 돌려주지 않는다.
+    """
+    now = as_of or local_now()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ofi, microprice, bid_ask_spread, vpin, timestamp FROM market_raw_1m "
+            "WHERE symbol=%s AND timestamp <= %s AND timestamp >= %s "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (symbol, now, now - timedelta(minutes=MICROSTRUCTURE_MAX_AGE_MINUTES)),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    ofi, microprice, spread, vpin, timestamp = row
+    return {
+        "ofi": float(ofi) if ofi is not None else None,
+        "microprice": float(microprice) if microprice is not None else None,
+        "bid_ask_spread": float(spread) if spread is not None else None,
+        "vpin": float(vpin) if vpin is not None else None,
+        "timestamp": timestamp,
+    }
+
+
 def insert_investor_flow(
     conn: ConnectionLike,
     timestamp: datetime,
@@ -691,7 +735,31 @@ def get_active_futures_symbol(conn: ConnectionLike, underlying: str) -> str | No
 # 이월돼 구멍이 안 생긴다"고 적었는데, 그 의도는 **1~2분 이월**이었다. 여기에 밀림·결손이 겹쳐
 # 최대 몇 분 더 벌어질 수 있는 여유를 더해 10분으로 잡는다(2026-08-03 실측 최대 밀림 48.2초,
 # 미회수 결손 6분). 이보다 오래된 값은 "이월"이 아니라 "유령"이다.
-CHAIN_SNAPSHOT_MAX_AGE_MINUTES = 10
+# 2026-08-04(운영점검보고서 §2-2 / Fix#6b) — 10분 → 5분.
+#
+# §2-2는 체인 스냅샷 오염(설계 30레그인데 09시 실측 50레그, 최대 72)을 ATM 지터 탓으로 봤고
+# Fix#6(히스테리시스)이 고칠 것으로 예측했다. **구현 후 08-04 스팟 시계열로 리플레이해보니
+# 그 예측이 틀렸다** — 히스테리시스는 왕복(36 → 10회)과 롤링 횟수(182 → 131회)를 줄이지만
+# 10분 창 안의 행사가 수는 **7개로 전혀 안 변한다**(ratio 0.0/0.75/1.0 전부 동일).
+#
+# 오염의 실제 원인은 왕복이 아니라 **스팟의 실제 이동거리**다. 08-04에 스팟이 954~1008(54p =
+# 행사가 21칸)을 움직였고, 10분이면 어떤 롤링 정책이든 여러 칸을 지난다. 그리고
+# `DISTINCT ON (expiry, strike, option_type)`은 **ATM 창 밖으로 빠진 행사가를 다시 폴링하지 않으므로
+# 그 마지막 값이 창 만료까지 남는다** — 창 길이가 곧 오염 길이다.
+#
+# 08-04 실측(먼슬리 단독 기준, Fix#5로 판단 입력이 먼슬리 전용이 된 뒤의 지표):
+#
+#   창    중앙 레그   최대 레그   GAMMA_FLIP_MIN_LEGS 미달 분
+#   2분      10          16              0
+#   3분      12          16              0
+#   5분      12          20              0
+#   10분     14          30              0        ← 현행. 설계값 10의 3배까지 벌어진다
+#
+# 5분을 고른 이유: 중앙 레그가 3분과 같으면서(12) 위클리 2북을 **각각 2회씩** 포함한다
+# (위클리는 격분 폴링이라 3분 창은 1회만 포함 — 그 1회가 실패하면 그 북이 통째로 빠진다.
+# 08-04에 옵션체인 폴링 실패가 38건 있었으므로 이건 가정이 아니라 실측된 위험이다).
+# 2분은 중앙 10레그로 설계값과 정확히 같지만 결손 분(08-04 48분) 2회 연속에 빈 체인이 된다.
+CHAIN_SNAPSHOT_MAX_AGE_MINUTES = 5
 
 _CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", "expiry", "timestamp")
 
@@ -964,7 +1032,8 @@ def insert_signal_decision(
     입력: 시각, conviction(v6 §11.1 4단계 문자열), decision("ENTER"/"HOLD"/"REJECT"),
          거절 사유(있으면), 리스크/신호 게이트 상태 요약(JSONB 직렬화), 실행 모드
          ("ADVISORY"/"CONFIRM"/"AUTO"), (선택) 판단 시점의 옵션 체인 입력
-         (`gamma_flip`/`gex`/`chain_leg_count`/`chain_oldest_leg_age_seconds` 키, 마이그레이션 022).
+         (`gamma_flip`/`gex`/`chain_leg_count`/`chain_oldest_leg_age_seconds` 키, 마이그레이션 022;
+         `gex_expiry` 키는 마이그레이션 023 — 어느 북으로 GEX를 냈는지, 2026-08-04 §2-8/Fix#5).
     계산: `signal_decisions`는 `decision_id`가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이
          새 행을 남기는 append-only 로그(§18.2 "거절된 신호도 기록한다")라 단순 INSERT만 한다.
     해석: 2026-08-03 §5-1 — 체인 입력을 판단 행에 함께 남겨야 "신호 도달률"을 사후 집계할 수
@@ -979,11 +1048,13 @@ def insert_signal_decision(
         cur.execute(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
             "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
-            "chain_oldest_leg_age_seconds) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "chain_oldest_leg_age_seconds, gex_expiry) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
                 chain.get("gamma_flip"), chain.get("gex"),
                 chain.get("chain_leg_count"), chain.get("chain_oldest_leg_age_seconds"),
+                chain.get("gex_expiry"),
             ),
         )
     conn.commit()

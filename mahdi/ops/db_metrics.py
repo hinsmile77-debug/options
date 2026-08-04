@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 from datetime import date
 
+from mahdi.data import db
 from mahdi.data.db import ConnectionLike
+from mahdi.fusion.signal_layer import IMPLEMENTED_MEMBER_FIELDS
 
 logger = logging.getLogger("mahdi.ops.db_metrics")
 
@@ -64,6 +66,7 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
         ("tables", _tables),
         ("book_coverage", _book_coverage),
         ("book_gamma_map", book_gamma_map),
+        ("wide_oi_landscape", wide_oi_landscape),
         ("signal_decisions", _signal_decisions),
         ("signal_reach", signal_reach),
         ("risk_gate_distinct", _risk_gate_distinct),
@@ -240,6 +243,18 @@ def book_gamma_map(conn: ConnectionLike, target: date, underlying: str = "KOSPI2
     해석: 2026-08-03 §5-5 — 세 북을 합산하면 만기별 정보가 서로를 덮는다. 특히 **만기 당일 북은
          잔존만기가 0이라 감마플립이 정의되지 않는 반면 핀 리스크(v6 §A3)는 그 북에서만** 나온다.
          2026-08-03이 실제로 weekly_mon 만기일이었는데 그날 GEX는 세 북 합산 하나뿐이었다.
+
+         2026-08-04(운영점검보고서 §2-7 / Fix#7) — **위 "장 마지막 스냅샷"은 거짓말이었다.**
+         쿼리에 `timestamp::date=target`만 있고 **시각 경계가 없어서**, 그날 한 번이라도 방문한
+         모든 행사가가 최신값으로 남았다. 실측 피해:
+           - 보고된 레그 수 46/48/50 → 실제 장 마지막 창의 레그는 10/12/12(행사가 5~6개)
+           - 만기 08-10의 `핀 행사가 957.5`는 **10시경에만 창에 있던 행사가**다(장 마감 창은
+             995~1007.5). 즉 핀 리스크가 5시간 전 데이터로 계산됐다.
+           - iv/gamma가 최대 7시간 차이 나는 값끼리 합산됐다.
+         이것은 2026-08-03 §2-2가 `latest_option_chain()`에서 고친 결함과 **완전히 같은 패턴**이고,
+         그 수정과 같은 날 작성된 새 파일에서 재발했다(`latest_expiry_liquidity()`까지 합치면
+         세 번째다). 그래서 새 SQL을 쓰지 않고 **`db.option_chain_as_of()`를 그대로 재사용한다** —
+         체인을 읽는 경로를 하나로 모으면 이 결함이 네 번째로 재발할 수 없다(고도화#1 규약 B).
     실패 조건: 그날 체인/스팟이 없으면 빈 목록 — 지어내지 않는다.
     """
     from mahdi.features.options_intel import calculate_gex, find_gamma_flip, legs_by_expiry, pin_risk
@@ -254,20 +269,15 @@ def book_gamma_map(conn: ConnectionLike, target: date, underlying: str = "KOSPI2
         return []
     spot = float(spot_row[0])
 
-    rows = _fetchall(
+    last_chain_at = _fetchone(
         conn,
-        "SELECT DISTINCT ON (expiry, strike, option_type) expiry, strike, option_type, oi, iv, gamma "
-        "FROM option_analysis_1m WHERE underlying=%s AND timestamp::date=%s AND expiry >= %s "
-        "ORDER BY expiry, strike, option_type, timestamp DESC",
-        (underlying, target, target),
+        "SELECT max(timestamp) FROM option_analysis_1m WHERE underlying=%s AND timestamp::date=%s",
+        (underlying, target),
     )
-    chain_rows = [
-        {
-            "expiry": expiry, "strike": float(strike), "option_type": option_type,
-            "oi": float(oi or 0.0), "iv": float(iv or 0.0), "gamma": float(gamma or 0.0),
-        }
-        for expiry, strike, option_type, oi, iv, gamma in rows
-    ]
+    if not last_chain_at or last_chain_at[0] is None:
+        return []
+    # 라이브 판단이 보는 것과 **같은 함수·같은 신선도 창**으로 그날 마지막 스냅샷을 만든다.
+    chain_rows = db.option_chain_as_of(conn, underlying, last_chain_at[0].replace(tzinfo=None))
 
     out = []
     for expiry, legs in legs_by_expiry(chain_rows, target).items():
@@ -281,6 +291,91 @@ def book_gamma_map(conn: ConnectionLike, target: date, underlying: str = "KOSPI2
                 "pin_strike": pin["strike"] if pin else None,
                 "pin_concentration_pct": round(pin["concentration"] * 100, 1) if pin else None,
                 "expiry_today": expiry == target,
+            }
+        )
+    return out
+
+
+def wide_oi_landscape(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> list[dict]:
+    """
+    입력: DB 커넥션, 대상 날짜, 기초자산 라벨.
+    계산: 그날 **한 번이라도 방문한 모든 행사가**로 북별 체인을 만들어,
+         (a) 콜−풋 OI 편중(어느 쪽으로 몇 행사가나 쏠렸는가)과
+         (b) **그 폭 전체를 탐색 구간으로 준 감마플립**(`find_gamma_flip(search_pct=방문폭)`)을 낸다.
+
+         (b)가 이 함수의 핵심이다. 행사가별 C−P 부호가 국소적으로 바뀌는 것과 GEX(S) 부호가
+         바뀌는 것은 **다른 사건**이다 — GEX(S)는 모든 행사가의 감마 가중 합이라, 08-04 먼슬리처럼
+         작은 양수 행사가 4개(+11/+265/+15/+6)가 1000.0의 −3,847에 묻히면 국소 부호 전환이
+         6번 있어도 GEX(S)는 전 구간 음수다. 국소 부호로 판정하면 "가능"이라는 **틀린 답**이 나온다.
+    해석: 2026-08-04 §2-3 / 고도화#4 — 이 표가 08-04의 결정을 뒤집었다.
+
+         `7716dd4`(08-04 07:49)는 *"감마플립 0%의 원인은 코드가 아니라 행사가 창"* 이라는 전제로
+         먼슬리 광폭 체인(ATM±7)에 REST 예산을 얼마나 쓸지 정하려 했다. 그런데 그날 ATM 지터
+         (§2-2)가 **공짜로 25행사가(952.5~1012.5, ±3%) 자연실험**을 만들어줬고, 그 결과는:
+           먼슬리 25행사가 중 **20개에서 C−P가 음수**, 양수 5개의 합 +297 vs 1000.0 한 자리 −3,847.
+         즉 이 북은 어느 폭으로 잘라도 GEX가 부호를 안 바꾼다 — **광폭 체인은 밀림만 늘린다.**
+
+         그런데 Fix#6(ATM 히스테리시스)이 지터를 줄이면 **이 관측 능력도 함께 줄어든다.**
+         그래서 같은 판정을 매일 자동으로 남긴다 — 추가 REST 호출은 0건이다(이미 있는 데이터다).
+         `sign_flips`가 0에서 벗어나는 날이 **감마플립이 살아날 수 있는 첫 날**이고, 그때 비로소
+         광폭 체인 안건을 다시 꺼낼 근거가 생긴다.
+    실패 조건: 그날 체인이 없으면 빈 목록.
+    """
+    from mahdi.features.options_intel import find_gamma_flip, legs_by_expiry
+
+    spot_row = _fetchone(
+        conn,
+        "SELECT spot FROM underlying_spot_1m WHERE underlying=%s AND timestamp::date=%s "
+        "ORDER BY timestamp DESC LIMIT 1",
+        (underlying, target),
+    )
+    if not spot_row or spot_row[0] is None:
+        return []
+    spot = float(spot_row[0])
+
+    rows = _fetchall(
+        conn,
+        "SELECT DISTINCT ON (expiry, strike, option_type) "
+        "       expiry, strike, option_type, oi, iv, gamma "
+        "FROM option_analysis_1m WHERE underlying=%s AND timestamp::date=%s AND expiry >= %s "
+        "ORDER BY expiry, strike, option_type, timestamp DESC",
+        (underlying, target, target),
+    )
+    chain_rows = [
+        {
+            "expiry": expiry, "strike": float(strike), "option_type": option_type,
+            "oi": float(oi or 0.0), "iv": float(iv or 0.0), "gamma": float(gamma or 0.0),
+        }
+        for expiry, strike, option_type, oi, iv, gamma in rows
+    ]
+
+    oi_by_strike: dict[date, dict[float, float]] = {}
+    for row in chain_rows:
+        sign = 1.0 if row["option_type"].lower() == "c" else -1.0
+        book = oi_by_strike.setdefault(row["expiry"], {})
+        book[row["strike"]] = book.get(row["strike"], 0.0) + sign * row["oi"]
+
+    out = []
+    for expiry, legs in legs_by_expiry(chain_rows, target).items():
+        diffs = oi_by_strike.get(expiry, {})
+        if not diffs:
+            continue
+        strikes = sorted(diffs)
+        # 방문한 행사가 전체를 덮는 탐색 폭 — "체인을 이만큼 넓혔다면 어땠을까"에 답하는 값이다.
+        reach = max(abs(strikes[0] - spot), abs(strikes[-1] - spot)) / spot if spot else 0.0
+        wide_flip = find_gamma_flip(legs, spot, search_pct=reach) if reach > 0 else None
+        out.append(
+            {
+                "expiry": expiry,
+                "strikes": len(strikes),
+                "strike_min": strikes[0],
+                "strike_max": strikes[-1],
+                "search_pct": round(reach * 100, 2),
+                "net_call_put_oi": round(sum(diffs.values())),
+                "call_heavy_strikes": sum(1 for d in diffs.values() if d > 0),
+                "put_heavy_strikes": sum(1 for d in diffs.values() if d < 0),
+                "wide_gamma_flip": wide_flip,
+                "flip_possible": wide_flip is not None,
             }
         )
     return out
@@ -307,13 +402,20 @@ def _signal_decisions(conn: ConnectionLike, target: date) -> list[dict]:
 #
 # 아래 임계는 08-03 실측을 기준선으로 잡았다(전부 그날 경고를 냈을 값들이다).
 SIGNAL_REACH_WARNINGS = {
-    # 앙상블 6멤버 중 2개는 미학습(xgboost/lstm), orderflow는 파이프라인 미구현이라 이론상
-    # 최대는 3이다. 최대 가용 멤버가 3 미만이면 옵션 신호(options_flow)가 죽어 있다는 뜻이다.
-    "member_count_max_min": 3,
+    # 2026-08-04(§2-5 / 고도화#2) — 종전 값은 **3이었고 그 근거 주석이 틀렸다**:
+    #   "orderflow는 파이프라인 미구현이라 이론상 최대는 3이다"
+    # 그런데 `market_raw_1m.ofi`는 08-04에 선물 410분 **전부** 채워져 있었다(404분이 0 아님).
+    # `orderflow_ofi_vpin`은 데이터가 없어서가 아니라 `main._build_signal_inputs()`가
+    # `ofi=None`으로 하드코딩해서 죽어 있었다(Fix#2). 즉 임계 3은 **죽은 멤버 하나를 분모 안에
+    # 숨기고 있었다** — 08-04 리포트가 `2개 / 이론 최대 3개`로 출력한 것이 그 결과다.
+    # 이제 구현 여부를 아는 쪽(`fusion.signal_layer`)에서 가져온다. 하드코딩하지 않는다.
+    "member_count_max_min": len(IMPLEMENTED_MEMBER_FIELDS),
     # 탐색 범위 밖이라 정상적으로 못 구하는 분이 있으므로 100%를 요구하지 않는다.
     "gamma_flip_pct_min": 80.0,
-    # db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES(10분)에 여유를 더한 값 — 넘으면 경계가 깨진 것이다.
-    "chain_age_seconds_max": 900.0,
+    # db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES에 여유(1.5배)를 더한 값 — 넘으면 경계가 깨진 것이다.
+    # 2026-08-04 Fix#6b로 창이 10분 → 5분이 됐으므로 임계도 함께 내려간다(상수에서 파생시켜
+    # 두 값이 갈라지지 않게 한다 — 08-04 §2-1이 하드코딩된 임계 문자열로 겪은 문제와 같은 종류).
+    "chain_age_seconds_max": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60 * 1.5,
 }
 
 

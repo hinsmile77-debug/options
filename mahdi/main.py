@@ -39,11 +39,26 @@ from mahdi.data import yfinance_fallback
 from mahdi.engines.regime import RegimeState
 from mahdi.engines.regime_pipeline import RegimeStateMachine
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state, parse_balance_response, snapshot_to_row
-from mahdi.features.options_intel import OptionLeg, calculate_gex, calculate_vrp, find_gamma_flip, legs_from_chain_rows
+from mahdi.features.options_intel import (
+    OptionLeg,
+    calculate_gex,
+    calculate_vrp,
+    find_gamma_flip,
+    gamma_walls,
+    legs_by_expiry,
+    legs_from_chain_rows,
+    vanna_charm_drift,
+    with_computed_charm,
+)
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
 from mahdi.fusion.meta_label import TradePermission
-from mahdi.fusion.signal_layer import SignalInputs
+from mahdi.fusion.signal_layer import (
+    MEMBER_FIELDS,
+    UNTRAINED_MEMBER_FIELDS,
+    SignalInputs,
+    build_member_scores,
+)
 from mahdi.fusion.strategy_palette import entry_strategies
 from mahdi.logutil import WarningThrottle
 from mahdi.risk.circuit_breaker import MarketConditions
@@ -150,6 +165,26 @@ OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
 # (회수 사이클까지 밀려 연쇄되는 것을 막는다). 먼슬리 10콜 × 기준 1.0초에 백오프 여유를 더해
 # 잡았다 — 07-31 실측 밀림 46건 중 대기 25초 미만은 4건뿐이라 대부분 회수 가능하다.
 OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS = 25.0
+
+# 2026-08-04(운영점검보고서 §2-6 / Fix#8) — 한 사이클이 REST 수집에 쓸 수 있는 최대 시간.
+#
+# 08-03 §4-3이 미리 적어둔 판정표에 08-04 실측이 답을 줬다: 느린 호출 362건의 총 2,278초 중
+# **HTTP가 2,050초(90%)**, 페이서 대기는 229초(10%)다(08-03은 54%/46%). 페이서 쪽은 1,661 → 229초로
+# 86% 줄었으니 **우리가 통제하는 스케줄링 여유분은 사실상 소진됐고**, 남은 밀림 48건은 KIS 응답
+# 지연에서 온다. 밀린 사이클의 내부 구성이 그 증거다: REST수집 평균 **78.3초**, DB적재 0.1초,
+# rows 20 — 레그당 3.9초(정상 사이클은 1.7초)다.
+#
+# 지금까지는 "20레그를 다 모을 때까지" 기다렸고, 그래서 느린 레그 몇 개가 **다음 분의 사이클을
+# 통째로 덮었다**. 08-04 미회수 결손 5분(14:31 / 15:11 / 15:15 / 15:17 / 15:19)이 전부 그 패턴이다.
+#
+# 50초 근거: 주기가 60초이고 DB적재+상태기록이 ~0.5초, 결손 회수(`OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS`
+# =25초)가 남은 시간에 돌아야 한다. 50초를 넘긴 시점의 남은 레그는 이번 분에 넣어도 이미 늦은
+# 값이고, 포기하면 다음 분이 정시에 시작된다.
+#
+# **이것은 교환이지 개선이 아니다**: rows가 20 미만인 사이클이 새로 생긴다(= 그 분의 체인이
+# 얇아진다). 검증할 때 `overrun.count` 감소와 `cycles.rows` 분포를 반드시 나란히 읽을 것 —
+# rows 20 미만이 하나도 안 생겼다면 예산이 안 걸린 것이고, 절반이 얇아졌다면 임계가 너무 낮다.
+OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS = 50.0
 
 # 2026-07-29 신규 — 서킷브레이커/거래정지 감지(mahdi/risk/market_halt.py)용 H0UNMKO0(국내주식
 # 장운영정보) 구독 대상. CB/시장임시정지는 시장 전체 이벤트라 아무 종목이나 구독해도 그 순간의
@@ -1213,6 +1248,7 @@ async def _collect_option_chain_cycle(
     underlying: str,
     poll_time: datetime,
     warning_throttle: WarningThrottle,
+    deadline: float | None = None,
 ) -> tuple[list[dict], float | None, bool]:
     """
     입력/계산: poll_option_chain 한 사이클분 — 북마다 행사가×콜/풋 각각에 get_quote()를 호출해
@@ -1226,19 +1262,29 @@ async def _collect_option_chain_cycle(
     로그(2026-07-20): 조회 실패는 `_log_kis_call_failure`로 응답 바디(레이트리밋 등 KIS 원인
               코드)를 함께 남기고, `warning_throttle`로 반복을 억제한다 — 이전에는 매 건 풀
               트레이스백이 그대로 찍혀 로그가 파묻혔고, 원인(레이트리밋 vs 그 외)도 알 수 없었다.
+
+    2026-08-04(§2-6 / Fix#8) `deadline`(monotonic 초, None이면 무제한): 이 시각을 지나면 남은
+              레그를 **포기하고 지금까지 모은 rows로 반환한다**. 근거는
+              `OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS` 주석. 북 순서가 먼슬리 우선이므로
+              (`_books_due_this_cycle`) 잘려나가는 쪽은 항상 위클리 뒤쪽이다 — 판단 입력인
+              먼슬리가 먼저 채워지는 것이 이 순서의 존재 이유다.
     """
     latest_spot: float | None = None
     rows: list[dict] = []
     any_strikes = False
+    skipped = 0
     for subscription_manager, series in books:
         strikes = subscription_manager.desired_strikes
         if not strikes:
             continue
         any_strikes = True
-        for strike in strikes:
+        for strike in sorted(strikes):
             for option_type in ("C", "P"):
                 symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
                 if symbol is None:
+                    continue
+                if deadline is not None and time.monotonic() >= deadline:
+                    skipped += 1
                     continue
                 try:
                     resp = await asyncio.to_thread(rest_client.get_quote, symbol)
@@ -1254,6 +1300,13 @@ async def _collect_option_chain_cycle(
                 row, spot = parsed
                 rows.append(row)
                 latest_spot = spot
+    if skipped:
+        # 사이클당 최대 1줄 — 레그마다 남기면 08-04 §2-2의 로그 폭증을 우리 손으로 재현한다.
+        logger.warning(
+            "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
+            "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8)",
+            OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows),
+        )
     return rows, latest_spot, any_strikes
 
 
@@ -1515,8 +1568,12 @@ async def poll_option_chain(
         # 전체 books로 own_calls_expected를 세면 "타폴러동시호출추정"이 홀수 분마다 20건씩 부풀려진다.
         due_books = _books_due_this_cycle(books, poll_time)
         collect_started = time.monotonic()
+        # 2026-08-04 Fix#8: 예산은 **사이클 시작 기준**으로 한 번만 잡는다. 재시도 경로도 같은
+        # 데드라인을 쓰므로 "재시도 때문에 2배로 밀리는" 일이 생기지 않는다.
+        collect_deadline = collect_started + OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS
         rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
-            rest_client, due_books, master, underlying, poll_time, warning_throttle
+            rest_client, due_books, master, underlying, poll_time, warning_throttle,
+            deadline=collect_deadline,
         )
         collect_seconds = time.monotonic() - collect_started
 
@@ -1531,13 +1588,16 @@ async def poll_option_chain(
             for subscription_manager, _ in due_books
             if subscription_manager.desired_strikes
         )
-        if not rows:
+        # 2026-08-04 Fix#8: 예산이 이미 끝났으면 재시도해도 전 레그가 즉시 건너뛰어져 빈손으로
+        # 돌아온다 — 백오프 대기 시간만 다음 분을 더 밀 뿐이다. 이번 분은 포기하고 정시 복귀한다.
+        if not rows and time.monotonic() < collect_deadline:
             logger.warning("옵션 체인 폴링 전체 실패 — %.0f초 후 재시도", retry_backoff_seconds)
             await asyncio.sleep(retry_backoff_seconds)
             retried = True
             retry_started = time.monotonic()
             rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
-                rest_client, due_books, master, underlying, poll_time, warning_throttle
+                rest_client, due_books, master, underlying, poll_time, warning_throttle,
+                deadline=collect_deadline,
             )
             collect_seconds += time.monotonic() - retry_started
             if not rows:
@@ -2342,22 +2402,95 @@ async def poll_investor_flow(
         await asyncio.sleep(delay)
 
 
+def _signal_book_legs(chain_rows: list[dict], today: date) -> tuple[list, "date | None"]:
+    """
+    입력: 체인 스냅샷 행, 잔존만기 계산 기준일.
+    계산: **먼슬리(최근월) 북 하나**의 레그만 골라 (레그, 그 북의 만기)를 돌려준다.
+    해석: 2026-08-04 §2-8 / Fix#5 — 종전에는 `legs_from_chain_rows()`로 세 만기를 평탄화해
+         한 덩어리로 GEX/감마플립을 계산했다. 그런데 v6 §11.4와 자동 리포트 §15 각주는 둘 다
+         *"먼슬리(최근월)가 GEX/감마플립의 주 입력이고 위클리는 핀 리스크 전용"* 이라고 적고
+         있었다 — **코드가 문서와 다르게 동작했다.** 08-04 실측 피해: 08-06 위클리 GEX +90.8B
+         (콜 편중)와 08-13 먼슬리 −51.0B(풋 편중)가 상쇄돼 라이브 GEX가 하루 동안
+         −33.5B ~ +99.1B를 오갔고(양수 233분 / 음수 259분), `_options_flow_score()`가 GEX
+         부호로 회귀/증폭을 가르므로 **신호 부호가 그 상쇄에 좌우됐다.**
+
+         "먼슬리"를 **만기가 가장 먼 북**으로 고르는 이유: `option_analysis_1m`에는 series
+         컬럼이 없다. 폴링 중인 북은 먼슬리 1 + 위클리 2뿐이고 위클리는 늘 먼슬리보다 가까우므로
+         (위클리는 매주 만기, 먼슬리는 월 1회) 최대 만기가 곧 먼슬리다. 월물 만기 주간에
+         이 관계가 뒤집힐 수 있는데(`db_metrics.monthly_book_expiry()` 주석 참고), 그때는
+         먼슬리가 이미 만기 당일이라 `usable_for_black_scholes()`가 걸러 GEX가 0이 된다 —
+         `signal_decisions.gex_expiry`(마이그레이션 023)에 실제 사용 만기를 남기는 이유다.
+    실패 조건: 체인이 비었으면 ([], None).
+    """
+    by_expiry = legs_by_expiry(chain_rows, today)
+    if not by_expiry:
+        return [], None
+    expiry = max(by_expiry)
+    return by_expiry[expiry], expiry
+
+
+def _member_unavailable_reasons(inputs: SignalInputs) -> dict[str, str]:
+    """
+    입력: 이번 사이클의 SignalInputs.
+    계산: 산출되지 **않은** 앙상블 멤버마다 "어느 원재료가 없어서인가"를 한 줄로 남긴다.
+    해석: 2026-08-04 고도화#2 — 종전에는 `available_member_count` 숫자 하나뿐이라, 08-04에
+         "2개"가 어느 둘인지 알아내려고 사람이 `signal_layer.py`를 읽어 역산해야 했다.
+         그리고 그 역산 끝에 `orderflow_ofi_vpin`이 **데이터가 있는데도** 죽어 있다는 것이
+         나왔다(§2-5). 사유를 남겨두면 다음에는 판단 행 조회 한 번으로 끝난다.
+    실패 조건: 없음 — 가용한 멤버는 키 자체가 없다(빈 dict = 전 멤버 가용).
+    """
+    scores = build_member_scores(inputs)
+    reasons: dict[str, str] = {}
+    for name in MEMBER_FIELDS:
+        if getattr(scores, name) is not None:
+            continue
+        if name in UNTRAINED_MEMBER_FIELDS:
+            reasons[name] = "미학습(Phase 3)"
+        elif name == "regime_hmm":
+            reasons[name] = "regime_state 없음" if inputs.regime_state is None else "방향성 없는 레짐"
+        elif name == "options_flow":
+            missing = [
+                label for label, value in (
+                    ("gex", inputs.gex), ("spot", inputs.spot),
+                    ("기준선(flip/wall)", inputs.gamma_flip if inputs.gamma_flip is not None else inputs.gamma_wall),
+                ) if value is None
+            ]
+            reasons[name] = f"입력 없음: {', '.join(missing)}" if missing else "성분 전부 부호 0"
+        elif name == "orderflow_ofi_vpin":
+            reasons[name] = "ofi/queue_imbalance 없음" if inputs.ofi is None else "ofi 부호 0"
+        elif name == "flow_position":
+            reasons[name] = "foreign_net_flow 없음" if inputs.foreign_net_flow is None else "순매수 부호 0"
+        else:
+            reasons[name] = "미상"
+    return reasons
+
+
 def _build_signal_inputs(
-    conn, regime_state: RegimeState | None, underlying: str = UNDERLYING
+    conn, regime_state: RegimeState | None, underlying: str = UNDERLYING,
+    futures_symbol: str | None = None,
 ) -> tuple[SignalInputs, dict]:
     """
-    입력: DB 커넥션, 이번 사이클의 최신 레짐 상태(RegimeStateMachine.last_state), underlying 라벨.
-    계산: option_analysis_1m 체인 스냅샷(legs_from_chain_rows) + underlying_spot_1m 스팟으로
-         GEX/Gamma Flip을, investor_flow_1m 최신값으로 외국인 순매수 부호를 구성한다. OFI/큐
-         임밸런스는 아직 라이브 집계 파이프라인이 없어(체결 틱 기반 실시간 호가 집계 미구현)
-         None으로 둔다 — orderflow_ofi_vpin 멤버는 이번 증분에서 항상 미가용.
-         **함께 반환하는 dict는 판단 행에 그대로 남길 체인 입력 관측치**다(마이그레이션 022).
+    입력: DB 커넥션, 이번 사이클의 최신 레짐 상태(RegimeStateMachine.last_state), underlying 라벨,
+         (선택) 선물 단축코드 — 주문흐름(OFI) 조회 대상.
+    계산: option_analysis_1m 체인 스냅샷에서 **먼슬리 북만** 뽑아(`_signal_book_legs`) GEX /
+         Gamma Flip / 감마 월 / Charm을, market_raw_1m 최신 1분봉에서 OFI를,
+         investor_flow_1m 최신값으로 외국인 순매수 부호를 구성한다.
+         **함께 반환하는 dict는 판단 행에 그대로 남길 체인 입력 관측치**다(마이그레이션 022/023).
     해석: 체인/스팟 조회가 비어있거나 실패하면 그 부분만 None으로 남기고 계속 진행한다(다른
          폴러들의 "부분 실패 허용" 원칙과 동일 — Signal Fusion 자체가 None을 안전하게 처리하도록
          설계돼 있음).
          2026-08-03 §5-1: 두 번째 반환값이 있는 이유는 **"그 데이터가 신호까지 도달했는가"를
          사후에 셀 수 있어야 하기 때문**이다. 08-03에 먼슬리 커버리지는 98.8%였는데 감마플립
          산출률은 0%였고, 그 사실을 알아낼 지표가 하나도 없었다.
+
+         2026-08-04(§2-4/§2-5/§2-8) — 이 함수가 앙상블 멤버 **2개를 죽이고 있었다**:
+           Fix#2: `ofi=None` 하드코딩. docstring은 *"라이브 집계 파이프라인이 없어"* 라고 적었지만
+                  `market_raw_1m.ofi`는 08-04에 선물 410분 **전부** 채워져 있었다(404분이 0 아님).
+                  `orderflow_ofi_vpin`은 데이터가 없어서가 아니라 안 읽어서 죽어 있었다.
+           Fix#4: `total_charm`/`charm_active` 미배선. 필드도 `vanna_charm_drift()`도 있는데
+                  호출만 안 했고, 호출했어도 `charm`이 0이었을 것이다(DB 컬럼 전부 NULL) —
+                  그래서 `with_computed_charm()`으로 읽기 시점에 계산해 채운다.
+           Fix#3: 감마 월을 폴백 기준선으로 넘긴다(`OPTIONS_FLOW_GAMMA_WALL_FALLBACK`).
     실패 조건: 없음 — 개별 조회 결과 부재는 SignalInputs 필드의 None으로 흡수된다.
     """
     chain_rows = db.latest_option_chain(conn, underlying)
@@ -2365,12 +2498,24 @@ def _build_signal_inputs(
     flow = db.latest_investor_flow(conn, underlying)
 
     now = db.local_now()
-    gex = gamma_flip = None
-    if chain_rows and spot is not None:
-        legs = legs_from_chain_rows(chain_rows, today=now.date())
-        if legs:
-            gex = calculate_gex(legs, spot)
-            gamma_flip = find_gamma_flip(legs, spot)
+    gex = gamma_flip = gamma_wall = total_charm = None
+    legs, gex_expiry = _signal_book_legs(chain_rows, now.date()) if chain_rows else ([], None)
+    if legs and spot is not None:
+        gex = calculate_gex(legs, spot)
+        gamma_flip = find_gamma_flip(legs, spot)
+        walls = gamma_walls(legs, spot, top_n=1)
+        gamma_wall = walls[0][0] if walls else None
+        drift = vanna_charm_drift(with_computed_charm(legs, spot), now.time())
+        total_charm = drift["total_charm"]
+        charm_active = drift["charm_active"]
+    else:
+        charm_active = False
+
+    micro = (
+        db.latest_market_microstructure(conn, futures_symbol, as_of=now)
+        if futures_symbol is not None
+        else None
+    )
 
     # timestamp는 `_chain_snapshot()`이 항상 채우지만, 나이는 어디까지나 부가 관측치라 없으면
     # 그 항목만 비운다 — 이것 때문에 판단 자체가 죽으면 안 된다.
@@ -2378,17 +2523,27 @@ def _build_signal_inputs(
     chain_inputs = {
         "gamma_flip": gamma_flip,
         "gex": gex,
-        "chain_leg_count": len(chain_rows),
+        # 레그 수는 **판단에 실제로 쓴 북 기준**이다(Fix#5로 먼슬리 전용이 됐다). 스냅샷 전체
+        # 레그 수를 세면 위클리까지 포함돼 "신호에 쓴 입력의 크기"를 재지 못한다.
+        "chain_leg_count": len(legs),
         "chain_oldest_leg_age_seconds": (
             (now - oldest.replace(tzinfo=None)).total_seconds() if oldest is not None else None
         ),
+        "gex_expiry": gex_expiry,
     }
     signal_inputs = SignalInputs(
         regime_state=regime_state,
         gex=gex,
         gamma_flip=gamma_flip,
+        gamma_wall=gamma_wall,
         spot=spot,
-        ofi=None,
+        total_charm=total_charm,
+        charm_active=charm_active,
+        ofi=micro["ofi"] if micro is not None else None,
+        # 큐 임밸런스는 아직 없다 — `market_raw_1m`에 호가 잔량 열이 없고, 체결 기반
+        # buy/sell_volume은 OFI와 같은 정보라 성분을 두 번 세게 된다(부호만 쓰는 설계에서
+        # 같은 신호를 2표로 만드는 것은 가중치를 조용히 바꾸는 짓이다). 호가 잔량을 적재하게
+        # 되면 그때 채운다.
         queue_imbalance=None,
         foreign_net_flow=flow[0] if flow is not None else None,
     )
@@ -2505,10 +2660,12 @@ async def poll_signal_fusion_cycle(
     underlying: str = UNDERLYING,
     interval_seconds: float = SIGNAL_FUSION_POLL_INTERVAL_SECONDS,
     phase_offset_seconds: float = 0.0,
+    futures_symbol: str | None = None,
 ) -> None:
     """
     입력: 다른 폴러가 매 선물봉마다 갱신하는 RegimeStateMachine(최신 레짐은 last_state로 읽음 —
-         2026-07-28 2차 신규), underlying 라벨.
+         2026-07-28 2차 신규), underlying 라벨, (선택) 선물 단축코드 — 주문흐름(OFI) 조회
+         대상이며 None이면 `orderflow_ofi_vpin` 멤버만 미가용이 된다(2026-08-04 Fix#2).
     계산: 매 사이클 `SignalFusionEngine.evaluate()`를 실행해 방향/확신도/거래허가/전략 후보를
          계산하고 `signal_decisions`에 기록한다. **실제 주문은 절대 내지 않는다**(ADVISORY
          전용) — 다만 2026-07-28 8차부터 계좌 추적기가 생겨, 진입 후보(`decision="ENTER"`)일
@@ -2542,7 +2699,7 @@ async def poll_signal_fusion_cycle(
         try:
             with db.get_connection() as conn:
                 signal_inputs, chain_inputs = _build_signal_inputs(
-                    conn, regime_state_machine.last_state, underlying
+                    conn, regime_state_machine.last_state, underlying, futures_symbol=futures_symbol
                 )
                 decision = fusion_engine.evaluate(signal_inputs, MetaLabelContext())
 
@@ -2570,6 +2727,11 @@ async def poll_signal_fusion_cycle(
                     # COCKPIT은 "관망 중"을 표시할 수 있어야 하고, 사후 분석은 실제 진입 후보만
                     # 세야 한다.
                     "entry_strategies": entry_candidates,
+                    # 2026-08-04 고도화#2 — **어느 멤버가 왜 죽었는가.**
+                    # 08-04까지는 `available_member_count`(=2) 한 숫자뿐이라, 그게 어느 멤버인지
+                    # 알려면 사람이 코드를 읽어 역산해야 했다(이 보고서가 실제로 그렇게 만들어졌다).
+                    # 사유까지 남기면 다음 회귀는 표 한 줄로 잡힌다.
+                    "member_unavailable": _member_unavailable_reasons(signal_inputs),
                 }
 
                 # 2026-07-30 Fix#6: halt 상태와 계좌 상태는 진입 여부와 무관하게 매 사이클 구해
@@ -2822,7 +2984,10 @@ async def main() -> None:
             ),
             poll_investor_flow(rest_client, phase_offset_seconds=INVESTOR_FLOW_PHASE_OFFSET_SECONDS),
             poll_signal_fusion_cycle(
-                regime_state_machine, phase_offset_seconds=SIGNAL_FUSION_PHASE_OFFSET_SECONDS
+                regime_state_machine,
+                phase_offset_seconds=SIGNAL_FUSION_PHASE_OFFSET_SECONDS,
+                # 2026-08-04 Fix#2 — 주문흐름(OFI)은 선물 1분봉에서 온다(`market_raw_1m`).
+                futures_symbol=futures_symbol,
             ),
             poll_account_balance_cycle(
                 rest_client, phase_offset_seconds=ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS

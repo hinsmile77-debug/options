@@ -16,8 +16,10 @@ from mahdi.broker.ws_client import KISWebSocketClient
 from mahdi.data import yfinance_fallback
 from mahdi.data.subscription_manager import RollingSubscriptionManager
 from mahdi.engines.regime import RegimeLabel, RegimeState
-from mahdi.features.options_intel import OptionLeg, calculate_gex
+from mahdi.features.options_intel import OptionLeg, calculate_gex, legs_from_chain_rows
 from mahdi.features.orderflow import calculate_vpin
+from mahdi.fusion.signal_layer import SignalInputs, build_member_scores
+from mahdi.logutil import WarningThrottle
 from mahdi.risk.market_halt import MarketHaltMonitor
 import mahdi.main as mahdi_main
 from mahdi.main import (
@@ -830,7 +832,7 @@ def test_poll_option_chain_sends_gap_alert_after_5min_then_recovery_notice(monke
         idx["i"] += 1
         return poll_times[idx["i"]]
 
-    async def fake_collect(rest_client, books, master, underlying, poll_time, warning_throttle):
+    async def fake_collect(rest_client, books, master, underlying, poll_time, warning_throttle, deadline=None):
         return outcomes[idx["i"]]
 
     monkeypatch.setattr("mahdi.main.db.local_now", fake_local_now)
@@ -2941,6 +2943,101 @@ def test_poll_option_chain_leg_fetch_failure_logs_kis_response_body_and_is_throt
     assert "초당 거래건수를 초과하였습니다" in logged_message
 
 
+# --- 옵션체인 수집 예산(2026-08-04 운영점검보고서 §2-6 / Fix#8) ------------------------------
+
+
+_OPTION_QUOTE_FIXTURE = {
+    "output1": {
+        "futs_last_tr_date": "20260813", "gama": "0.01", "hts_ints_vltl": "18.5",
+        "hist_vltl": "15.0", "hts_otst_stpl_qty": "1000", "delta_val": "0.5",
+        "theta": "-0.1", "vega": "0.2", "otst_stpl_qty_icdc": "10", "acml_vol": "100",
+    },
+    "output3": {"bstp_nmix_prpr": "1000.0"},
+}
+
+
+class _FakeManagerManyStrikes:
+    def __init__(self, strikes: frozenset[float]):
+        self._strikes = strikes
+
+    @property
+    def desired_strikes(self) -> frozenset[float]:
+        return self._strikes
+
+
+class _FakeRestClientCountingQuotes:
+    """호출 때마다 monotonic 시계를 진행시켜 "느린 KIS 응답"을 흉내낸다."""
+
+    def __init__(self, clock: list[float], seconds_per_call: float, resp: dict):
+        self._clock = clock
+        self._seconds_per_call = seconds_per_call
+        self._resp = resp
+        self.calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        self._clock[0] += self._seconds_per_call
+        return self._resp
+
+
+def _collect_with_budget(monkeypatch, seconds_per_call: float, budget: float):
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientCountingQuotes(clock, seconds_per_call, _OPTION_QUOTE_FIXTURE)
+    books = [(_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular")]
+    rows, _spot, any_strikes = _run(
+        _collect_option_chain_cycle(
+            rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 10, 0),
+            WarningThrottle(60.0), deadline=clock[0] + budget,
+        )
+    )
+    return rest_client, rows, any_strikes
+
+
+def test_collect_option_chain_cycle_stops_calling_once_the_budget_is_spent(monkeypatch, caplog):
+    """회귀 방지 §2-6: 느린 레그가 사이클 전체를 잡아먹어 다음 분을 덮는 것을 막는다.
+
+    08-04 실측 — 밀림 48건의 REST수집 평균이 78.3초(레그당 3.9초, 정상 1.7초)였고,
+    미회수 결손 5분이 전부 그 시간대에 몰렸다.
+    """
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rest_client, rows, any_strikes = _collect_with_budget(monkeypatch, seconds_per_call=10.0, budget=50.0)
+
+    assert any_strikes
+    assert len(rest_client.calls) == 5  # 10초 x 5건 = 50초에서 예산 소진, 나머지 5레그는 미호출
+    assert len(rows) == 5
+    budget_records = [r for r in caplog.records if "수집 예산" in r.getMessage()]
+    assert len(budget_records) == 1  # 레그마다가 아니라 사이클당 1줄
+    assert "남은 5레그" in budget_records[0].getMessage()
+
+
+def test_collect_option_chain_cycle_collects_everything_when_it_fits(monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rest_client, rows, _ = _collect_with_budget(monkeypatch, seconds_per_call=1.0, budget=50.0)
+
+    assert len(rest_client.calls) == 10  # 5행사가 x (C,P)
+    assert len(rows) == 10
+    assert [r for r in caplog.records if "수집 예산" in r.getMessage()] == []
+
+
+def test_collect_option_chain_cycle_without_deadline_is_unbounded(monkeypatch):
+    """`deadline=None`(기본값)은 종전과 완전히 동일하게 동작해야 한다 — 백테스트/테스트 경로 보호."""
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientCountingQuotes(clock, 999.0, _OPTION_QUOTE_FIXTURE)
+    rows, _spot, _any = _run(
+        _collect_option_chain_cycle(
+            rest_client, [(_FakeManagerManyStrikes(frozenset({1000.0, 1002.5})), "regular")],
+            _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 10, 0), WarningThrottle(60.0),
+        )
+    )
+    assert len(rows) == 4  # 예산이 없으면 아무리 느려도 전부 모은다
+
+
 # --- Signal Fusion 라이브 배선(2026-07-28 2차, ADVISORY 전용) --------------------------------
 
 
@@ -2964,12 +3061,139 @@ def test_build_signal_inputs_computes_gex_and_gamma_flip_from_chain_and_spot(mon
     assert inputs.spot == 350.5
     assert inputs.gex is not None  # 콜/풋 감마가 있으니 계산됨
     assert inputs.foreign_net_flow == 500.0
-    assert inputs.ofi is None  # 라이브 OFI 집계 파이프라인 없음 — 항상 None
-    assert inputs.queue_imbalance is None
+    assert inputs.ofi is None  # futures_symbol을 안 넘겼으므로 이 사이클만 미가용
+    assert inputs.queue_imbalance is None  # 호가 잔량 미적재 — 지어내지 않는다
     # 2026-08-03 §5-1: 판단 행에 남길 체인 입력 관측치를 함께 돌려준다(마이그레이션 022).
     assert chain_inputs["gex"] == inputs.gex
     assert chain_inputs["gamma_flip"] == inputs.gamma_flip
     assert chain_inputs["chain_leg_count"] == 2
+    # 2026-08-04 Fix#5(마이그레이션 023): 어느 북으로 GEX를 냈는지 함께 남긴다.
+    assert chain_inputs["gex_expiry"] == date(2026, 8, 13)
+
+
+# --- 판단 파이프라인 배선(2026-08-04 운영점검보고서 §2-4/§2-5/§2-8, Fix#2·#3·#4·#5) ---------
+
+
+def _chain_row(strike: float, opt: str, oi: float, expiry: date, *, iv: float = 0.18,
+               gamma: float = 0.02) -> dict:
+    return {"strike": strike, "option_type": opt, "oi": oi, "iv": iv, "gamma": gamma,
+            "gex": 0.0, "expiry": expiry, "timestamp": datetime(2026, 8, 5, 10, 0)}
+
+
+_MONTHLY = date(2026, 8, 13)
+_WEEKLY = date(2026, 8, 6)
+
+
+def _two_book_chain() -> list[dict]:
+    """먼슬리는 풋 편중(GEX 음수), 위클리는 콜 편중(GEX 양수) — 08-04 실측과 같은 배치."""
+    return [
+        *[_chain_row(k, t, oi, _MONTHLY) for k, t, oi in
+          ((345.0, "C", 10), (345.0, "P", 900), (350.0, "C", 20), (350.0, "P", 800),
+           (355.0, "C", 30), (355.0, "P", 700))],
+        *[_chain_row(k, t, oi, _WEEKLY) for k, t, oi in
+          ((345.0, "C", 1500), (345.0, "P", 10), (350.0, "C", 1400), (350.0, "P", 20),
+           (355.0, "C", 1300), (355.0, "P", 30))],
+    ]
+
+
+def _patch_chain(monkeypatch, chain_rows, spot=350.5, micro=None):
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: spot)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr(
+        "mahdi.main.db.latest_market_microstructure", lambda conn, symbol, as_of=None: micro
+    )
+
+
+def test_build_signal_inputs_uses_only_the_monthly_book(monkeypatch):
+    """회귀 방지 §2-8(Fix#5): 세 만기를 평탄화해 합산하면 부호가 반대인 북끼리 상쇄된다.
+
+    08-04 실측 — 위클리 08-06 GEX +90.8B(콜 편중)와 먼슬리 08-13 −51.0B(풋 편중)가 섞여
+    라이브 GEX가 하루 동안 −33.5B ~ +99.1B를 오갔고(양수 233분 / 음수 259분), GEX 부호가
+    곧 `options_flow`의 회귀/증폭 판정이라 **신호 부호가 그 상쇄에 좌우됐다.**
+    v6 §11.4는 먼슬리를 주 입력으로 규정한다 — 코드를 문서에 맞춘다.
+    """
+    _patch_chain(monkeypatch, _two_book_chain())
+
+    inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert chain_inputs["gex_expiry"] == _MONTHLY
+    assert chain_inputs["chain_leg_count"] == 6  # 위클리 6레그는 판단에 안 쓴다
+    assert inputs.gex is not None and inputs.gex < 0  # 먼슬리 단독 = 풋 편중 = 음수
+    # 두 북을 합치면 양수가 되어 부호가 뒤집힌다 — 그것이 08-04까지의 동작이었다.
+    both = calculate_gex(legs_from_chain_rows(_two_book_chain(), today=date(2026, 8, 5)), 350.5)
+    assert both > 0
+
+
+def test_build_signal_inputs_wires_ofi_from_market_raw_when_futures_symbol_is_known(monkeypatch):
+    """회귀 방지 §2-5(Fix#2): `ofi=None` 하드코딩이 앙상블 멤버 하나를 통째로 죽였다.
+
+    docstring은 *"라이브 집계 파이프라인이 없어"* 라고 적었지만 `market_raw_1m.ofi`는 08-04에
+    선물 410분 **전부** 채워져 있었다(404분이 0 아님).
+    """
+    _patch_chain(monkeypatch, _two_book_chain(), micro={"ofi": -12.5, "microprice": 350.4,
+                                                        "bid_ask_spread": 0.05, "vpin": 0.4,
+                                                        "timestamp": datetime(2026, 8, 5, 10, 0)})
+
+    inputs, _ = _build_signal_inputs(
+        conn=object(), regime_state=None, underlying="KOSPI200", futures_symbol="A01609"
+    )
+
+    assert inputs.ofi == -12.5
+    assert build_member_scores(inputs).orderflow_ofi_vpin == -1.0  # 부호만 쓴다
+
+
+def test_build_signal_inputs_leaves_ofi_none_when_the_bar_is_stale(monkeypatch):
+    """신선도 창 밖이면 `latest_market_microstructure()`가 None을 준다 — 옛 값을 쓰지 않는다."""
+    _patch_chain(monkeypatch, _two_book_chain(), micro=None)
+
+    inputs, _ = _build_signal_inputs(
+        conn=object(), regime_state=None, underlying="KOSPI200", futures_symbol="A01609"
+    )
+
+    assert inputs.ofi is None
+    assert build_member_scores(inputs).orderflow_ofi_vpin is None
+
+
+def test_build_signal_inputs_fills_charm_and_gamma_wall(monkeypatch):
+    """회귀 방지 §2-4(Fix#3/#4): `options_flow`의 두 진입로가 **둘 다** 끊겨 있었다.
+
+    - Charm 경로: `total_charm`/`charm_active`를 아예 안 채웠고, 채웠어도 0이었다
+      (`option_analysis_1m.charm` 컬럼은 존재하지만 08-04에 9,288행 전부 NULL).
+    - 감마플립 경로: 이 북에서 flip이 구조적으로 안 나온다(§2-3) → 감마 월로 폴백한다.
+    """
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 5, 14, 30))
+    _patch_chain(monkeypatch, _two_book_chain())
+
+    inputs, _ = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert inputs.gamma_wall is not None
+    assert inputs.charm_active is True  # 14:00 이후 (v6 §13.2)
+    assert inputs.total_charm is not None and inputs.total_charm != 0.0
+    # flip이 없어도 wall 폴백으로 멤버가 산다 — 이것이 Fix#3의 전부다.
+    assert inputs.gamma_flip is None
+    assert build_member_scores(inputs).options_flow is not None
+
+
+def test_options_flow_falls_back_to_none_when_the_gate_is_off(monkeypatch):
+    """게이트를 끄면 08-04 이전 동작과 **완전히 동일**해야 한다 — 되돌릴 수 있어야 한다."""
+    monkeypatch.setattr("mahdi.fusion.signal_layer.OPTIONS_FLOW_GAMMA_WALL_FALLBACK", False)
+    inputs = SignalInputs(gex=-1.0, gamma_flip=None, gamma_wall=350.0, spot=355.0)
+    assert build_member_scores(inputs).options_flow is None
+
+
+def test_member_unavailable_reasons_names_the_missing_ingredient():
+    """2026-08-04 고도화#2 — 숫자 하나(`available_member_count`)로는 어느 멤버가 왜 죽었는지 모른다."""
+    from mahdi.main import _member_unavailable_reasons
+
+    reasons = _member_unavailable_reasons(SignalInputs())
+
+    assert reasons["xgboost_tabular"] == "미학습(Phase 3)"
+    assert reasons["lstm_temporal"] == "미학습(Phase 3)"
+    assert reasons["regime_hmm"] == "regime_state 없음"
+    assert reasons["orderflow_ofi_vpin"] == "ofi/queue_imbalance 없음"
+    assert reasons["flow_position"] == "foreign_net_flow 없음"
+    assert "gex" in reasons["options_flow"]
 
 
 def test_build_signal_inputs_handles_missing_chain_and_flow_gracefully(monkeypatch):

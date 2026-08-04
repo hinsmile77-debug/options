@@ -98,7 +98,13 @@ def test_repository_hypotheses_file_is_valid_and_uses_resolvable_metric_paths():
     assert entries, "가설 파일이 비어 있다"
     for entry in entries:
         assert entry.get("id") and entry.get("가설")
-        assert str(entry.get("상태")).lower() in {"pending", "confirmed", "refuted", "inconclusive"}
+        # 2026-08-04 신규 `untested`: **그날 프로세스에 fix가 안 실려 검증 자체가 성립 안 됨.**
+        # 08-03 p4가 그랬다 — fix 커밋 07:45, 관측 루프 기동 07:30으로 15분 차이였다.
+        # 이걸 `refuted`로 적으면 멀쩡한 fix를 되돌리게 되고, `pending`으로 두면 "검증했는데
+        # 아직 판단 못 함"과 섞인다. 세 번째 상태가 필요하다.
+        assert str(entry.get("상태")).lower() in {
+            "pending", "confirmed", "refuted", "inconclusive", "untested"
+        }
         for prediction in entry["예측"]:
             assert "metric" in prediction and "expect" in prediction
 

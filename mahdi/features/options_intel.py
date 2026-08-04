@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, time
 from typing import Sequence
 
+from vollib.black_scholes.greeks.analytical import delta as _bs_delta
 from vollib.black_scholes.greeks.analytical import gamma as _bs_gamma
 
 logger = logging.getLogger("mahdi.features.options_intel")
@@ -136,6 +137,62 @@ def usable_for_black_scholes(leg: OptionLeg) -> bool:
     return leg.iv > 0 and leg.t_years > 0 and leg.strike > 0
 
 
+# 2026-08-04(운영점검보고서 §2-4 / Fix#4) — Charm 계산의 시간 스텝(1영업일 ≈ 1/365년).
+_CHARM_TIME_STEP_YEARS = 1.0 / 365.0
+
+
+def with_computed_charm(
+    legs: Sequence[OptionLeg], spot: float, risk_free_rate: float = 0.035
+) -> list[OptionLeg]:
+    """
+    입력: 옵션 체인 레그, 현재 스팟, 무위험이자율.
+    계산: 레그마다 **Charm(= 하루 경과당 델타 변화량)** 을 Black-Scholes 델타의 수치 미분으로
+         채워 새 레그 목록을 돌려준다. `charm = delta(T - 1일) - delta(T)`.
+    해석: 2026-08-04 §2-4 — `_options_flow_score()`의 두 진입로 중 Charm 경로(v6 §13.2
+         "14:00 이후 Charm 드리프트 방향 우선")가 **배선이 끊겨 있었다.** `SignalInputs`에
+         `total_charm`/`charm_active` 필드가 있고 `vanna_charm_drift()`도 구현돼 있는데,
+         `main._build_signal_inputs()`가 둘 다 채우지 않았다. 그리고 채우더라도 값이 0이었을
+         것이다 — `legs_from_chain_rows()`가 `charm=0.0` 기본값을 두고(체인 조회에 그 컬럼이
+         없다), `option_analysis_1m.charm` 컬럼은 존재하지만 **적재된 적이 없다**
+         (08-04 실측: 9,288행 전부 NULL).
+
+         **부호 규약(여기서 처음 정한다)**: 시간이 **흐르는** 방향(잔존만기 감소)의 델타 변화다.
+         양수면 시간이 갈수록 델타가 커지고(딜러가 매수 방향으로 재헤지), 음수면 그 반대다.
+         `_options_flow_score()`는 이 부호만 쓴다.
+
+         쓰기 경로(`_parse_option_quote`)가 아니라 **읽기 시점에** 계산하는 이유: KIS는 Charm을
+         주지 않으므로 어차피 우리가 계산해야 하고, 읽기 시점에 하면 (a) 과거 데이터 백필이
+         필요 없고 (b) 백테스트 리플레이가 라이브와 **같은 함수**로 같은 값을 얻는다.
+         비용은 레그당 vollib 호출 2회다(먼슬리 10레그면 분당 20회 — `find_gamma_flip`의
+         41 x 레그수에 비하면 무시할 수준).
+    실패 조건: 계산 불가 레그(`usable_for_black_scholes()` 탈락)는 charm=0.0으로 남겨 그대로
+              돌려준다 — 배제하면 호출측이 레그 수가 줄어든 이유를 알 수 없다. 0은 부호가
+              없으므로 합계에 기여하지 않는다.
+    """
+    out: list[OptionLeg] = []
+    with contextlib.redirect_stdout(io.StringIO()):  # vollib.ref_python의 디버그 print 흡수
+        for leg in legs:
+            if not usable_for_black_scholes(leg) or leg.t_years <= _CHARM_TIME_STEP_YEARS:
+                out.append(leg)
+                continue
+            now_delta = _bs_delta(leg.option_type, spot, leg.strike, leg.t_years, risk_free_rate, leg.iv)
+            next_delta = _bs_delta(
+                leg.option_type, spot, leg.strike,
+                leg.t_years - _CHARM_TIME_STEP_YEARS, risk_free_rate, leg.iv,
+            )
+            charm = next_delta - now_delta
+            if not math.isfinite(charm):
+                out.append(leg)
+                continue
+            out.append(
+                OptionLeg(
+                    strike=leg.strike, option_type=leg.option_type, oi=leg.oi, iv=leg.iv,
+                    t_years=leg.t_years, gamma=leg.gamma, vanna=leg.vanna, charm=charm,
+                )
+            )
+    return out
+
+
 def find_gamma_flip(
     legs: Sequence[OptionLeg],
     spot: float,
@@ -199,13 +256,25 @@ def find_gamma_flip(
         )
         return None
 
-    for prev, cur in zip(finite, finite[1:]):
-        (i_prev, v_prev), (i_cur, v_cur) = prev, cur
-        if v_prev == 0:
-            return grid[i_prev]
-        if v_prev * v_cur < 0:
+    # 2026-08-04(운영점검보고서 §2-9 후속) — 종전 코드는 `if v_prev == 0: return grid[i_prev]`로
+    # **정확히 0인 첫 그리드 점을 그대로 flip 레벨로 돌려줬다.** 그런데 OI가 전부 0인 북
+    # (08-04의 weekly_mon 2026-08-10: 2,233레그 중 OI≠0이 128개, 평균 0)은 GEX(S)가 **모든 구간에서
+    # 0**이라, 이 분기가 `grid[0]` = spot x 0.95를 flip으로 반환했다. 실측: 스팟 1000.03에서
+    # `감마플립 950.03` — 사람이 읽으면 "5% 아래에 딜러 전환선이 있다"로 읽는 완전한 허수다.
+    # 0은 "여기서 부호가 바뀐다"와 "이 북엔 포지션이 없다"를 구분하지 못한다. **비영(非零) 값의
+    # 부호 전환만** flip으로 인정하고, 중간의 정확한 0은 건너뛴다(접점은 교차가 아니다).
+    if all(v == 0 for _i, v in finite):
+        return None
+
+    last_nonzero: tuple[int, float] | None = None
+    for i_cur, v_cur in finite:
+        if v_cur == 0:
+            continue
+        if last_nonzero is not None and last_nonzero[1] * v_cur < 0:
+            i_prev, v_prev = last_nonzero
             frac = v_prev / (v_prev - v_cur)
             return grid[i_prev] + frac * (grid[i_cur] - grid[i_prev])
+        last_nonzero = (i_cur, v_cur)
     return None
 
 

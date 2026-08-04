@@ -76,7 +76,43 @@ SLOW_CALL_LOG_THRESHOLD_SECONDS = 5.0
 # `connect=3.0`: 종전 timeout=10.0은 연결·읽기·쓰기 전부에 10초였다. 연결 자체가 3초를 넘으면
 # 재시도가 더 빠르고, 읽기 10초는 그대로 둔다(KIS 응답이 실제로 느린 경우가 있다).
 _HTTP_LIMITS = httpx.Limits(max_connections=4, max_keepalive_connections=2, keepalive_expiry=15.0)
-_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
+
+# 2026-08-04(운영점검보고서 §2-6 / Fix#8) — read 타임아웃을 10.0 → 4.0초로 낮춘다.
+#
+# 08-04 실측이 08-03 §4-3의 판정표에 답을 줬다: 느린 호출 362건의 총 2,278초 중 **HTTP가
+# 2,050초(90%)** 이고 페이서 대기는 229초(10%)뿐이다(08-03은 54% / 46%였다). 즉 우리가 통제하는
+# 스케줄링 쪽 여유분은 사실상 소진됐고, 남은 밀림은 KIS 응답 지연이다.
+#
+# 그런데 read 10초는 **한 레그가 사이클 전체를 잡아먹게 둔다**: 옵션체인 사이클은 60초 주기에
+# 20레그(먼슬리 10 + 위클리 격분 10)를 도는데, 10초짜리 호출 2건이면 그 사이클은 이미 밀린다.
+# 08-04 미회수 결손 5분(14:31 / 15:11 / 15:15 / 15:17 / 15:19)이 전부 이 패턴이다.
+#
+# 4.0초 근거: 08-04 느린 호출의 HTTP 시간 중앙이 약 5.6초이고 정상 호출은 페이서 포함 ~1.2초다.
+# 4초를 넘긴 호출은 그 사이클 안에서 회수 가치가 이미 낮다 — 포기하고 다음 레그로 가는 편이
+# 남은 레그를 살린다(레그별 부분 실패 허용은 `_collect_option_chain_cycle`에 이미 있다).
+# `connect=3.0`은 그대로 둔다(08-03 근거 유지).
+#
+# **주의**: 이 값을 낮추면 타임아웃 예외가 늘어난다. 그것은 회귀가 아니라 **의도된 교환**이다 —
+# `qualitative.read_timeout` 증가와 `overrun.count` 감소를 반드시 나란히 읽을 것.
+_HTTP_READ_TIMEOUT_SECONDS = 4.0
+_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0, read=_HTTP_READ_TIMEOUT_SECONDS)
+
+# ===== 2026-08-04(운영점검보고서 §2-1 / Fix#1) — 로그 포맷 계약 =====
+#
+# 08-03에 이 파일의 로그 세 곳을 바꿨는데(느린 호출 WARNING→INFO, RemoteProtocolError 재시도
+# 도입, HTTPStatusError 트레이스백 제거) **`mahdi/ops/log_metrics.py`의 파서가 전부 눈이 멀었다.**
+# 그 결과 08-04 자동 리포트는 `slow_calls 0건`(실제 362건), `remote_protocol_error 실측 없음`
+# (실제 25건), `http_status_error 0건`(08-03은 105건)을 보고했다. 심지어 아래 `_log_if_slow`의
+# 주석은 *"지표 집계는 계속 이 줄을 읽는다"* 고 **단언**하고 있었다 — 검증되지 않은 단언이었다.
+#
+# 그래서 포맷 문자열을 모듈 상수로 끌어올린다. `log_metrics`는 순수 파서로 남기기 위해 이 모듈을
+# **import하지 않는다**(그 설계 결정은 유지한다) — 대신 `tests/test_ops_log_metrics_contract.py`가
+# 양쪽을 동시에 import해 "이 상수로 만든 줄을 저 파서가 세는가"를 검증한다. 포맷을 바꾸면
+# 테스트가 깨지므로, 로그만 바꾸고 파서를 안 고치는 일이 다시는 조용히 지나갈 수 없다.
+LOG_SLOW_CALL = "느린 REST 호출 %.2f초 = 페이서대기 %.2f초 + HTTP %.2f초 (배율 %.2f배, %s %s)"
+LOG_REMOTE_PROTOCOL_RETRY = "커넥션 재사용 실패(RemoteProtocolError) — 1회 재시도: %s"
+LOG_BACKOFF_EXPAND = "레이트리밋 백오프 확대: %.2fs -> %.2fs (기준 대비 %.2f배)"
+LOG_BACKOFF_RECOVER = "레이트리밋 백오프 회복: %.2fs -> %.2fs (기준 대비 %.2f배)"
 
 
 class _RateLimiter:
@@ -172,10 +208,7 @@ class _RateLimiter:
             )
             after = self._current_interval
         if after != before:
-            logger.info(
-                "레이트리밋 백오프 확대: %.2fs -> %.2fs (기준 대비 %.2f배)",
-                before, after, after / self._min_interval,
-            )
+            logger.info(LOG_BACKOFF_EXPAND, before, after, after / self._min_interval)
 
     def record_success(self) -> None:
         """호출 성공마다 호출 — 넓어진 간격이 있을 때만 연속 성공을 세어 서서히 되돌린다.
@@ -195,10 +228,7 @@ class _RateLimiter:
                 after = self._current_interval
             else:
                 return
-        logger.info(
-            "레이트리밋 백오프 회복: %.2fs -> %.2fs (기준 대비 %.2f배)",
-            before, after, after / self._min_interval,
-        )
+        logger.info(LOG_BACKOFF_RECOVER, before, after, after / self._min_interval)
 
 
 def _is_kis_rate_limit_error(exc: httpx.HTTPStatusError) -> bool:
@@ -258,12 +288,14 @@ class KISRestClient:
     def _log_if_slow(self, method: str, url: str, pacer_seconds: float, http_seconds: float) -> None:
         """계산: 페이서 대기 + HTTP 응답이 임계를 넘으면 두 구간을 **나눠서** 남긴다
         (2026-07-31 §4 우선순위 3 — 상세 근거는 SLOW_CALL_LOG_THRESHOLD_SECONDS 주석).
-        2026-08-03(§2-8): 진단이 끝나 WARNING → INFO. 지표 집계는 계속 이 줄을 읽는다."""
+        2026-08-03(§2-8): 진단이 끝나 WARNING → INFO.
+        2026-08-04(§2-1): 그 레벨 변경이 `log_metrics._SLOW_CALL_RE`를 침묵시켜 08-04 리포트가
+        362건을 **0건**으로 보고했다. 포맷은 이제 `LOG_SLOW_CALL` 상수이고 계약 테스트가 지킨다."""
         total = pacer_seconds + http_seconds
         if total < SLOW_CALL_LOG_THRESHOLD_SECONDS:
             return
         logger.info(
-            "느린 REST 호출 %.2f초 = 페이서대기 %.2f초 + HTTP %.2f초 (배율 %.2f배, %s %s)",
+            LOG_SLOW_CALL,
             total, pacer_seconds, http_seconds, self._rate_limiter.current_multiplier,
             method, url.split("?", 1)[0].rsplit("/", 1)[-1],
         )
@@ -294,7 +326,7 @@ class KISRestClient:
         try:
             response = self._send_get(url, **kwargs)
         except httpx.RemoteProtocolError:
-            logger.info("커넥션 재사용 실패(RemoteProtocolError) — 1회 재시도: %s", url.split("?", 1)[0])
+            logger.info(LOG_REMOTE_PROTOCOL_RETRY, url.split("?", 1)[0])
             response = self._send_get(url, **kwargs)
         try:
             response.raise_for_status()
