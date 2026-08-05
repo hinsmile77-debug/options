@@ -112,6 +112,42 @@ def test_repository_hypotheses_file_is_valid_and_uses_resolvable_metric_paths():
             assert "metric" in prediction and "expect" in prediction
 
 
+# 자동 리포트가 실제로 내는 최상위 절 이름. 여기 없는 접두사를 쓰면 그 예측은 **영원히
+# "실측 없음"** 이 되어 검정이 무력화된다 — 위 테스트의 주석이 바로 그 위험을 적어두고도
+# 정작 리포지터리 파일의 경로는 검사하지 않고 있었다.
+#
+# 2026-08-06(운영점검 장전편) — 그 빈틈이 실제로 뚫려 있었다. `2026-08-05-p2`의 **주장 지표
+# 두 개**가 `log.failures.…`로 적혀 있었는데 리포트의 절 이름은 `failures`다(`log_` 접두사는
+# 모듈 이름이지 지표 경로가 아니다). 08-06 07:52 리포트가 그 둘을 "실측 없음"으로 냈고,
+# 같은 날 로그에는 해당 실패가 3건 실재했다. **주장 지표가 죽은 채로 가설이 하루를 갔다.**
+_METRIC_ROOTS = {
+    "cycles", "rest", "backoff", "bursts", "stalls", "slow_calls", "rest_latency",
+    "atm_rolls", "budget_exceeded", "catchups", "poller_phase", "log_volume",
+    "qualitative", "parser_audit", "failures", "overrun",
+}
+
+
+def test_every_repository_metric_path_starts_at_a_real_report_section():
+    """지표 경로의 **첫 마디**가 자동 리포트의 실제 절 이름인지 본다.
+
+    `db.` 접두사는 DB 지표 쪽으로 갈라지므로(`hypotheses._lookup`) 여기서는 로그 지표만 본다.
+    전체 경로를 검사하지 않는 이유는 하위 키가 그날 데이터에 따라 없을 수 있기 때문이다 —
+    없는 것과 **틀린 것**은 다르고, 이 테스트가 잡아야 하는 것은 후자다.
+    """
+    entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
+    wrong = [
+        (entry["id"], prediction["metric"])
+        for entry in entries
+        for prediction in entry["예측"]
+        if not str(prediction["metric"]).startswith("db.")
+        and str(prediction["metric"]).split(".")[0] not in _METRIC_ROOTS
+    ]
+    assert not wrong, (
+        f"자동 리포트에 없는 절에서 시작하는 지표 경로: {wrong} — "
+        "이런 경로는 조용히 '실측 없음'이 되어 그 가설을 검정 불가로 만든다"
+    )
+
+
 @pytest.mark.parametrize(
     "path",
     [

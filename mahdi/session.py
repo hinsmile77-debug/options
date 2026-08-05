@@ -62,3 +62,21 @@ def is_continuous_trading(now) -> bool:
     """연속 체결이 일어나는 구간인가 — WS 기반 데이터(1분봉·OFI·VPIN)의 존재 전제다."""
     moment = now.time() if hasattr(now, "time") else now
     return TRADING_DAY_START <= moment < CLOSING_AUCTION_START
+
+
+def is_preopen(now) -> bool:
+    """입력: datetime(또는 time). 반환: 장 개시(`TRADING_DAY_START`) 전인가.
+
+    2026-08-06(운영점검 장전편 §2-5 / Fix#5) — 이 구간에는 **기초자산 스팟이 설계상 없다.**
+    2026-08-05 `9ffcb9c`가 장전 스팟 적재를 의도적으로 끊었기 때문이다(그전에는 전일 종가가
+    75분간 stale하게 실려 ATM 정합률 지표를 통과해 버렸다). `_build_signal_inputs()`는
+    `db.UNDERLYING_SPOT_MAX_AGE_MINUTES` 경계로 그것을 받아 GEX/감마플립/VRP를 **틀린 값 대신
+    미가용**으로 만든다 — 의도된 정상 동작이다.
+
+    그런데 관측 쪽에 이 개념이 없어서, 08-06 장전 내내 COCKPIT이 노란불로
+    *"options_flow가 한 번도 활성화되지 않았다"* 를 냈다. **설계대로 동작한 것을 매일 90분씩
+    장애로 신고한 것이다.** `is_closing_auction()`이 15:36~15:44에 대해 하는 일과 정확히 같은
+    일을 07:31~09:00에 대해 한다.
+    """
+    moment = now.time() if hasattr(now, "time") else now
+    return moment < TRADING_DAY_START

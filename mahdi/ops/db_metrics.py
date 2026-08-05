@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
+from mahdi import session
 from mahdi.data import db
 from mahdi.data.db import ConnectionLike
 from mahdi.features.options_intel import (
@@ -37,6 +38,11 @@ CHAIN_LEGS_PER_CYCLE_DESIGN = 20  # 먼슬리 10 + 위클리 1북 10(격분)
 # 2026-08-05(§2-8) — "시장 구조상 불가피한 미가용" 사유. `main.MEMBER_UNAVAILABLE_CLOSING_AUCTION`과
 # 같은 문자열이어야 §14-1이 그 분들을 분리해 낼 수 있다(계약 테스트가 지킨다).
 STRUCTURAL_UNAVAILABLE_REASON = "종가 단일가(연속체결 없음)"
+
+# 2026-08-06(§2-5 / Fix#5) — 장전 스팟 부재(`main.MEMBER_UNAVAILABLE_PREOPEN`)도 같은 계열이다.
+# 두 사유 모두 결함이 아니라 시장 구조/설계이므로 §14-1의 「그중 구조적」 열이 함께 세야 한다.
+# 문자열 일치는 `tests/test_ops_metric_conventions.py`가 기계적으로 지킨다.
+STRUCTURAL_UNAVAILABLE_REASONS = frozenset({STRUCTURAL_UNAVAILABLE_REASON, "장전(스팟 미적재)"})
 
 # 하루치 적재량을 볼 테이블 — (테이블, 시각 컬럼, 비고).
 _DAILY_TABLES: list[tuple[str, str, str]] = [
@@ -140,14 +146,34 @@ def _tables(conn: ConnectionLike, target: date) -> list[dict]:
     return rows
 
 
-def monthly_book_expiry(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> date | None:
+def monthly_book_expiry_with_source(
+    conn: ConnectionLike, target: date, underlying: str = "KOSPI200"
+) -> tuple[date | None, str | None]:
     """
-    계산: 그날의 **먼슬리(regular) 만기일**을 `expiry_liquidity_1m`에서 찾는다.
-    해석: `option_analysis_1m`에는 `series` 컬럼이 없어 만기일만으로는 어느 북인지 모른다.
-         `MAX(expiry)`를 먼슬리로 간주하는 방법은 **월물 만기 주간에 뒤집힌다**(먼슬리가 다음
-         위클리(월)보다 가까워질 수 있다) — 그래서 `series`를 실제로 가진 테이블에서 끌어온다.
-    실패 조건: 만기유동성 폴러의 첫 행은 08:31 부근이라 **장전에는 None**이다 — 호출측이
-              "집계 전"으로 표시해야 한다(지어내지 않는다).
+    계산: 그날의 **먼슬리(최근월) 만기일**과 그것을 어디서 얻었는지를 함께 돌려준다.
+         1순위 `expiry_liquidity_1m`(series='regular' — 유일하게 series를 실제로 가진 테이블),
+         2순위 `signal_decisions.gex_expiry`(그날 최빈값).
+    해석: 2026-08-06(운영점검 장전편 §2-3 / Fix#3) — 1순위만 있던 종전 구현은
+         **만기유동성 폴러에 매달려 있었고, 그 폴러는 08:31 전에 한 행도 남기지 않는다**(Fix#2).
+         그래서 이 함수에 걸려 있는 지표 **세 개가 매일 장전 내내 통째로 눈이 멀었다**:
+         §12 먼슬리 절대 커버리지 / §14-2 행사가 창 품질 / `monthly_leg_completeness()`.
+         실제 피해가 08-06 07:48에 났다 — EGW00201 1건이 먼슬리 북을 10 → 9레그로 깎았는데
+         **그것을 재라고 08-05 Fix#3이 만든 지표가 못 봤다.**
+
+         2순위를 `signal_decisions.gex_expiry`(마이그레이션 023)로 두는 이유가 핵심이다.
+         그 컬럼은 **판단이 실제로 그 분에 GEX를 낸 북**이고(`signal_book_legs()`가 골라
+         `_build_signal_inputs()`가 기록한다), 장전에도 매분 채워진다. 즉 판단 경로는 처음부터
+         만기유동성 폴러 없이도 먼슬리를 옳게 식별하고 있었고 **그 답을 DB에 남기고 있었다.**
+
+         > **지표의 입력은 감시 대상의 입력보다 약해서는 안 된다.** 2026-08-05 고도화#1이
+         > *"지표는 감시 대상과 **독립한** 입력을 써야 한다"* 를 규약으로 올렸는데, 여기서 난
+         > 것은 그 반대쪽 실패다 — 독립성만으로는 부족하다.
+
+         1순위를 남겨두는 이유: `gex_expiry`는 `MAX(expiry)` 규칙의 산물이라 **월물 만기 주간에
+         뒤집힐 수 있다**(`signal_book_legs()` 주석). `series`를 실제로 가진 1순위가 있으면
+         그것이 늘 옳으므로 먼저 본다. 출처를 함께 돌려주는 것은 리포트가 **어느 쪽으로 답했는지
+         보이게** 하기 위해서다 — 폴백이 조용히 쓰이면 1순위가 죽은 것을 영영 모른다.
+    실패 조건: 둘 다 없으면 (None, None) — 호출측이 "집계 전"으로 표시한다(지어내지 않는다).
     """
     row = _fetchone(
         conn,
@@ -156,7 +182,24 @@ def monthly_book_expiry(conn: ConnectionLike, target: date, underlying: str = "K
         "ORDER BY timestamp DESC LIMIT 1",
         (underlying, target),
     )
-    return row[0] if row else None
+    if row:
+        return row[0], "expiry_liquidity"
+
+    row = _fetchone(
+        conn,
+        "SELECT gex_expiry FROM signal_decisions "
+        "WHERE timestamp::date=%s AND gex_expiry IS NOT NULL "
+        "GROUP BY gex_expiry ORDER BY count(*) DESC, gex_expiry DESC LIMIT 1",
+        (target,),
+    )
+    if row:
+        return row[0], "signal_decisions"
+    return None, None
+
+
+def monthly_book_expiry(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> date | None:
+    """출처 없이 만기일만 필요한 호출측용 — 상세 규칙은 `monthly_book_expiry_with_source()` 참고."""
+    return monthly_book_expiry_with_source(conn, target, underlying)[0]
 
 
 def observed_span_minutes(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> int | None:
@@ -373,13 +416,19 @@ def monthly_book_coverage(
     실패 조건: 만기유동성 미적재(장전)면 coverage_pct=None. 분모를 못 구해도 None.
               **100%를 넘으면 그 자체가 기간 불일치 신호**이므로 `over_100` 플래그를 세운다.
     """
-    expiry = monthly_book_expiry(conn, target, underlying)
+    expiry, expiry_source = monthly_book_expiry_with_source(conn, target, underlying)
     if expiry is None:
-        return {"expiry": None, "minutes": None, "coverage_pct": None, "reason": "만기유동성 미적재(장전)"}
+        return {
+            "expiry": None, "minutes": None, "coverage_pct": None,
+            "reason": "먼슬리 북 식별 불가(만기유동성·판단 이력 모두 없음)",
+        }
     if elapsed_minutes is None:
         elapsed_minutes = observed_span_minutes(conn, target, underlying)
     if not elapsed_minutes or elapsed_minutes <= 0:
-        return {"expiry": expiry, "minutes": None, "coverage_pct": None, "reason": "관측 구간 없음"}
+        return {
+            "expiry": expiry, "expiry_source": expiry_source,
+            "minutes": None, "coverage_pct": None, "reason": "관측 구간 없음",
+        }
     row = _fetchone(
         conn,
         "SELECT count(DISTINCT timestamp) FROM option_analysis_1m "
@@ -390,6 +439,8 @@ def monthly_book_coverage(
     pct = minutes / elapsed_minutes * 100
     return {
         "expiry": expiry,
+        # 2026-08-06 Fix#3 — 폴백이 조용히 쓰이면 1순위(만기유동성 폴러)가 죽은 것을 영영 모른다.
+        "expiry_source": expiry_source,
         "minutes": minutes,
         "elapsed_minutes": elapsed_minutes,
         "coverage_pct": round(pct, 1),
@@ -623,7 +674,9 @@ def member_availability(conn: ConnectionLike, target: date) -> dict:
         # 섞어두면 08-05처럼 종가 단일가 9분이 `orderflow_ofi_vpin` 83.0%에 녹아들어
         # "이 멤버는 원래 좀 죽는다"로 읽힌다. 분자에서 빼지 않고 열을 따로 두는 이유는
         # 가용률의 정의를 조용히 바꾸지 않기 위해서다(전일 대비 델타가 의미를 잃는다).
-        structural = by_reason.get(STRUCTURAL_UNAVAILABLE_REASON, 0)
+        structural = sum(
+            count for reason, count in by_reason.items() if reason in STRUCTURAL_UNAVAILABLE_REASONS
+        )
         members.append(
             {
                 "member": name,
@@ -676,7 +729,7 @@ def strike_window_quality(
     """
     expiry = monthly_book_expiry(conn, target, underlying)
     if expiry is None:
-        return {"available": False, "reason": "만기유동성 미적재(먼슬리 북 식별 불가)"}
+        return {"available": False, "reason": "먼슬리 북 식별 불가(만기유동성·판단 이력 모두 없음)"}
 
     interval = KOSPI200_STRIKE_INTERVAL
     side = STRIKE_WINDOW_EACH_SIDE
@@ -710,7 +763,11 @@ def strike_window_quality(
         {"interval": interval, "side": side, "underlying": underlying, "target": target, "expiry": expiry},
     )
     if not row or not row[0]:
-        return {"available": False, "reason": "먼슬리 체인 미적재"}
+        # 2026-08-06 — 이 분기는 위 SQL이 `underlying_spot_1m`과 **조인**한 결과가 빈 경우다.
+        # 종전 문구("먼슬리 체인 미적재")는 Fix#3 전에는 만기 식별 실패와 뭉뚱그려져 있어
+        # 그럴듯했지만, 이제 체인이 976행 있는데도 이 문구가 나온다(08-06 08:20 실측).
+        # **실제 원인은 거의 항상 스팟 쪽**이다 — 장전에는 설계상 스팟이 없다(`9ffcb9c`).
+        return {"available": False, "reason": "스팟 미적재 — 체인과 겹치는 분이 없다(장전에는 정상)"}
     minutes, atm_hit, window_hit = int(row[0]), int(row[1]), int(row[2])
     offset_median = float(row[3]) if row[3] is not None else None
     offset_max = float(row[4]) if row[4] is not None else None
@@ -908,10 +965,20 @@ SIGNAL_REACH_WARNINGS = {
     # 그래서 이 경고 문구는 더 이상 "행사가 창을 확인하라"고 말하지 않는다 —
     # 판정은 아래 `gamma_flip_out_of_range_count`(불변식, 0이어야 한다)로 한다.
     "gamma_flip_pct_min": 80.0,
-    # db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES에 여유(1.5배)를 더한 값 — 넘으면 경계가 깨진 것이다.
-    # 2026-08-04 Fix#6b로 창이 10분 → 5분이 됐으므로 임계도 함께 내려간다(상수에서 파생시켜
-    # 두 값이 갈라지지 않게 한다 — 08-04 §2-1이 하드코딩된 임계 문자열로 겪은 문제와 같은 종류).
-    "chain_age_seconds_max": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60 * 1.5,
+    # 2026-08-06(§2-4 / Fix#4) — 종전 값은 `db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60 * 1.5`
+    # = 450초(7.5분)였다. 그 파생은 **재는 대상이 전 북일 때**의 것이다: 스냅샷 창(5분)이 허용하는
+    # 최대 나이에 여유를 더한 값이라, 창 자체가 상한이므로 사실상 울릴 수 없었다.
+    #
+    # Fix#4로 이 값이 **먼슬리 북 하나**의 나이가 됐고, 먼슬리는 설계상 **매 분** 폴링된다.
+    # 판단은 분의 ~10초 지점에서 돌므로 건강한 나이는 70~130초다(08-06 장전 실측 70.05초).
+    # 180초 = "먼슬리가 2사이클 이상 밀렸다" — 그때는 GEX/감마플립의 유일한 입력이 늙은 것이므로
+    # 경고가 맞다.
+    #
+    # **임계는 물리적 상한 아래에 있어야 한다**(2026-08-05 §2-4의 교훈 — Fix#8이 read를 4초로
+    # 내렸는데 느린 호출 임계가 5초에 남아 자기를 정당화한 계측을 침묵시켰다). 여기서 물리적
+    # 상한은 스냅샷 창 `db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60` = 300초이고 180 < 300이다.
+    # 이 부등식은 `tests/test_ops_db_metrics.py`의 불변식 테스트가 기계적으로 지킨다.
+    "chain_age_seconds_max": 180.0,
 }
 
 
@@ -1015,16 +1082,36 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
     }
     out["gamma_flip_out_of_range_count"] = _gamma_flip_out_of_range_count(conn, target)
 
+    # 2026-08-06(§2-5 / Fix#5) — 표본이 **전부 장전**이면 아래 두 경고는 잴 대상이 아직 없다.
+    # 장전에는 스팟이 설계상 없어(`mahdi.session.is_preopen`) `options_flow`가 미가용인 것이
+    # 정상이고, 그러면 `member_count_max`도 감마플립 산출률도 구조적으로 낮게 나온다.
+    # 그것을 경고로 내면 매일 07:31~09:00에 **설계대로 동작한 것을 장애로 신고**하게 된다
+    # (08-06 장전 COCKPIT이 실제로 그랬다). 판정을 유예할 뿐 숨기지 않는다 — note로 남긴다.
+    row_open = _fetchone(
+        conn,
+        "SELECT count(*) FROM signal_decisions WHERE timestamp::date=%s AND timestamp::time >= %s",
+        (target, session.TRADING_DAY_START),
+    )
+    out["decisions_after_open"] = int(row_open[0]) if row_open else 0
+    preopen_only = out["decisions_after_open"] == 0
+
     warnings: list[str] = []
+    notes: list[str] = []
     if member_max < SIGNAL_REACH_WARNINGS["member_count_max_min"]:
-        warnings.append(
-            f"앙상블 최대 가용 멤버 {member_max}개 — options_flow가 한 번도 활성화되지 않았다"
-        )
+        message = f"앙상블 최대 가용 멤버 {member_max}개 — options_flow가 한 번도 활성화되지 않았다"
+        if preopen_only:
+            notes.append(
+                f"앙상블 최대 가용 멤버 {member_max}개 — 아직 장전 표본뿐이다"
+                "(스팟 미적재로 options_flow가 미가용인 것은 설계된 정상)"
+            )
+        else:
+            warnings.append(message)
     if flip_pct < SIGNAL_REACH_WARNINGS["gamma_flip_pct_min"]:
-        warnings.append(
+        message = (
             f"감마플립 산출률 {flip_pct}% — 이 북에서는 0%가 정상일 수 있다"
             "(08-04 §2-3: 전 구간 단조). 판정은 아래 범위 밖 건수로 한다"
         )
+        (notes if preopen_only else warnings).append(message)
     out_of_range = out["gamma_flip_out_of_range_count"]
     if out_of_range is None:
         # "검사 못 했다"를 조용히 넘기지 않는다 — 이 침묵이 08-04 §2-1의 본체였다.
@@ -1040,6 +1127,7 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
             f"체인 스냅샷 최고령 레그 {age_max / 60:.0f}분 — 신선도 경계가 깨졌다"
         )
     out["warnings"] = warnings
+    out["notes"] = notes
     return out
 
 

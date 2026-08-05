@@ -122,14 +122,25 @@ def test_theoretical_member_ceiling_is_derived_not_hardcoded():
     assert "이론 최대 3개" not in report_text
 
 
-def test_chain_age_warning_threshold_follows_the_snapshot_window():
-    """신선도 창을 바꾸면 경고 임계도 따라와야 한다 — 2026-08-04 Fix#6b(10분 → 5분)."""
+def test_chain_age_warning_threshold_stays_below_the_snapshot_window():
+    """임계는 **물리적 상한 아래**에 있어야 한다 — 위에 놓이면 구조적으로 못 울린다.
+
+    2026-08-04 Fix#6b 때는 임계를 창에서 파생시켰다(`창 x 1.5` = 450초). 그런데 그 파생은
+    임계를 **창보다 크게** 만들어, 스냅샷 창(300초)이 이미 상한인 값에 450초 임계를 건 꼴이었다.
+    2026-08-06 §2-4 실측: 08-05 하루의 52%가 250초였는데 경고는 한 번도 안 울렸다.
+
+    2026-08-06 Fix#4로 이 지표는 **먼슬리 북 하나**의 나이가 됐고(먼슬리는 매 분 폴링된다)
+    건강한 값은 70~130초다. 임계 180초 = "먼슬리가 2사이클 이상 밀렸다".
+
+    창을 바꾸든 임계를 바꾸든, 임계가 창 위로 올라가면 이 테스트가 깨진다 — 그것이 요점이다
+    (2026-08-05 §2-4가 느린 호출 임계에서 겪은 것과 같은 계열의 불변식).
+    """
     from mahdi.data import db
     from mahdi.ops import db_metrics
 
-    assert (
-        db_metrics.SIGNAL_REACH_WARNINGS["chain_age_seconds_max"]
-        == db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60 * 1.5
+    window_seconds = db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60
+    assert db_metrics.SIGNAL_REACH_WARNINGS["chain_age_seconds_max"] < window_seconds, (
+        "체인 나이 경고 임계가 스냅샷 창 위에 있으면 그 경고는 구조적으로 울리지 않는다"
     )
 
 
@@ -187,6 +198,10 @@ def test_closing_auction_boundary_has_a_single_source():
     assert data_source._CLOSING_AUCTION_START is session.CLOSING_AUCTION_START
     # 사유 문자열도 한 곳에서 온다 — 갈라지면 §14-1의 "구조적" 열이 조용히 0이 된다.
     assert main.MEMBER_UNAVAILABLE_CLOSING_AUCTION == db_metrics.STRUCTURAL_UNAVAILABLE_REASON
+    # 2026-08-06 Fix#5 — 장전 스팟 부재도 같은 계열의 구조적 사유다. 둘 다 집합 안에 있어야
+    # §14-1이 그 분들을 가용률에서 분리해 낸다.
+    assert main.MEMBER_UNAVAILABLE_CLOSING_AUCTION in db_metrics.STRUCTURAL_UNAVAILABLE_REASONS
+    assert main.MEMBER_UNAVAILABLE_PREOPEN in db_metrics.STRUCTURAL_UNAVAILABLE_REASONS
 
 
 # ===== 규약 D — 품질 지표는 감시 대상과 독립한 입력을 쓴다 (2026-08-05 고도화#1) =====

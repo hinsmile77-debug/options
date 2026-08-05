@@ -512,6 +512,21 @@ EXPIRY_LIQUIDITY_WINDOW_MINUTES = 10  # 한 바퀴(북 전체를 한 번씩)를 
 # 않으므로 회귀 테스트(test_expiry_liquidity_slots_cover_every_book)가 이를 잡는다.
 EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES = (1, 3, 5)
 
+# 2026-08-06(운영점검 장전편 §2-2 / Fix#2) — 이 폴러의 **장전 슬롯은 구조적으로 0행을 낳는다.**
+#
+# 옵션 호가는 장전 동시호가(08:30)부터 나온다. 그 전에는 `_parse_asking_price_leg()`가 스프레드를
+# 못 구하고, 아래 `if not spread_values: continue`가 그 북을 통째로 버린다. DB가 그것을 그대로
+# 증언한다 — `expiry_liquidity_1m`의 **첫 행이 08-04/08-05 모두 08:31:00**이고, 08-06 07:57까지도
+# 0행이다(그 사이 REST는 7슬롯 70콜을 썼다).
+#
+# 07:31~08:29 = 18슬롯 x 10콜 = **180콜/일이 아무것도 남기지 않는다.** 그 구간 REST의 11.8%다.
+# 게다가 그 버스트의 첫 레그가 08-06 장전 EGW00201 8건 중 3건을 냈다(Fix#1의 "유휴 뒤 첫 쌍" 패턴).
+#
+# **슬롯을 비우는 방식으로 막는다** — `due_books`를 빈 목록으로 만들면 아래 루프가 "슬롯이 아닌
+# 분"과 완전히 같은 무작업 사이클을 돌고 고정 틱은 그대로 전진한다. 위상 격자가 리셋되지 않는
+# 것이 중요하다(2026-07-31에 그 경로로 격자가 매 분 리셋된 적이 있다).
+EXPIRY_LIQUIDITY_FIRST_POLL_TIME = dtime(8, 30)
+
 # 2026-07-09 실측: poll_option_chain(60초, ~28콜)과 poll_expiry_liquidity(300초, ~11콜)가 같은
 # 순간에 공유 _RateLimiter 큐에 들어가면 그 사이클만 대기시간이 늘어나 poll_option_chain의
 # "작업 후 sleep" 실측 주기(60초+작업시간, 평소에도 60초를 넘김)가 분 경계를 하나 더 건너뛰어
@@ -2007,7 +2022,9 @@ def _expiry_liquidity_books_due(
 ) -> list[tuple[RollingSubscriptionManager, str]]:
     """
     입력: (구독 매니저, series) 튜플 목록, 이번 사이클의 폴링 시각.
-    계산: `EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES`가 books 인덱스별로 지정한 `minute % 10` 슬롯과
+    계산: 08:30(`EXPIRY_LIQUIDITY_FIRST_POLL_TIME`) 이전이면 **무조건 빈 목록**이고(Fix#2 —
+         장전에는 호가가 없어 어떤 슬롯도 행을 남기지 못한다), 그 뒤로는
+         `EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES`가 books 인덱스별로 지정한 `minute % 10` 슬롯과
          일치하는 북만 돌려준다 — 슬롯이 아닌 분에는 빈 리스트(이번 분은 조회 안 함).
     해석: 2026-07-31 §2-1 원인(a) — 3북 33콜을 한 번에 쏘던 것을 북 하나씩 홀수분에 흩는다.
          상세 근거는 `EXPIRY_LIQUIDITY_BOOK_SLOT_MINUTES` 주석 참고. 슬롯 배정을 벽시계 분으로
@@ -2015,6 +2032,8 @@ def _expiry_liquidity_books_due(
     실패 조건: 슬롯 튜플보다 북이 많으면 초과분은 영영 조회되지 않는다 —
               `test_expiry_liquidity_slots_cover_every_book`이 이 불일치를 잡는다.
     """
+    if poll_time.time() < EXPIRY_LIQUIDITY_FIRST_POLL_TIME:
+        return []
     slot = poll_time.minute % EXPIRY_LIQUIDITY_WINDOW_MINUTES
     return [
         book
@@ -2620,6 +2639,17 @@ async def poll_investor_flow(
 # 사유만 가른다. **멤버를 살리지는 않는다** — 없는 값을 지어내는 것과 왜 없는지 아는 것은 다르다.
 MEMBER_UNAVAILABLE_CLOSING_AUCTION = "종가 단일가(연속체결 없음)"
 
+# 2026-08-06(운영점검 장전편 §2-5 / Fix#5) — 장전 스팟 부재 사유. 위와 **완전히 같은 계열**이다.
+#
+# 08-05 `9ffcb9c`가 장전 스팟 적재를 의도적으로 끊은 뒤로, 07:31~09:00의 `options_flow` 미가용은
+# **설계된 정상**이다(스팟이 없으면 GEX·감마플립·VRP를 틀린 값 대신 미가용으로 남긴다).
+# 그런데 사유가 `입력 없음: gex, spot, 기준선(flip/wall)`으로만 남아 장애와 구분되지 않았고,
+# 그래서 08-06 장전 내내 COCKPIT 신호 도달률 배지가 노란불로
+# *"options_flow가 한 번도 활성화되지 않았다"* 를 냈다 — **매일 90분씩 나는 구조적 오경보**다.
+#
+# 여기서도 멤버를 살리지 않는다. 사유만 가른다.
+MEMBER_UNAVAILABLE_PREOPEN = "장전(스팟 미적재)"
+
 
 def _member_scores_for_record(scores) -> dict[str, float]:
     """
@@ -2676,7 +2706,12 @@ def _member_unavailable_reasons(inputs: SignalInputs, now: datetime, scores=None
                     ("기준선(flip/wall)", inputs.gamma_flip if inputs.gamma_flip is not None else inputs.gamma_wall),
                 ) if value is None
             ]
-            reasons[name] = f"입력 없음: {', '.join(missing)}" if missing else "성분 전부 부호 0"
+            if inputs.spot is None and session.is_preopen(now):
+                # 2026-08-06 Fix#5 — 스팟이 없어서 죽은 것이고, 장전에 스팟이 없는 것은 설계다.
+                # `spot`이 있는데도 죽었다면 그건 장전이라도 진짜 결함이므로 아래로 떨어뜨린다.
+                reasons[name] = MEMBER_UNAVAILABLE_PREOPEN
+            else:
+                reasons[name] = f"입력 없음: {', '.join(missing)}" if missing else "성분 전부 부호 0"
         elif name == "orderflow_ofi_vpin":
             if inputs.ofi is not None:
                 reasons[name] = "ofi 부호 0"
@@ -2766,7 +2801,19 @@ def _build_signal_inputs(
 
     # timestamp는 `_chain_snapshot()`이 항상 채우지만, 나이는 어디까지나 부가 관측치라 없으면
     # 그 항목만 비운다 — 이것 때문에 판단 자체가 죽으면 안 된다.
-    oldest = min((row["timestamp"] for row in chain_rows if row.get("timestamp") is not None), default=None)
+    #
+    # 2026-08-06(운영점검 장전편 §2-4 / Fix#4) — **`chain_rows`가 아니라 `monthly_rows`에서 잰다.**
+    # 종전 구현은 전 북(먼슬리 + 위클리 2)의 최솟값이었는데, 위클리는 2026-08-03 fix로 월=짝수분/
+    # 목=홀수분 격분이라 **항상 한 북이 정확히 2분 뒤처져 있다.** 그 뒤처진 북이 매분 최솟값을
+    # 가져가므로 이 값은 신선도가 아니라 **격분 설계상수**를 재고 있었다:
+    #
+    #   08-06 장전 실측: 07:34~07:57 판단 전부 130.039~130.077초 (17분 연속, 편차 0.04초)
+    #   08-05 전량 실측: 250초 258분(52%) / 130초 170분 / 190초 64분 / 70초 1분 — 고유값 4종
+    #
+    # 임계가 7.5분이라 250초로도 **울릴 수 없는 지표**였고, 그래서 아무도 하루의 절반이 250초인
+    # 것을 못 봤다. 바로 위 `chain_leg_count`는 "판단에 실제로 쓴 북 기준"이라고 주석까지 달고
+    # 먼슬리만 세는데 나이만 전 북 기준이었던 것 — **한 dict 안에서 두 줄이 서로 다른 것을 쟀다.**
+    oldest = min((row["timestamp"] for row in monthly_rows if row.get("timestamp") is not None), default=None)
     chain_inputs = {
         "gamma_flip": gamma_flip,
         "gex": gex,

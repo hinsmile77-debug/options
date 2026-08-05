@@ -897,3 +897,87 @@ def test_endpoint_label_stays_parseable_by_the_ops_report():
     paths = [v for k, v in vars(tr_codes).items() if k.startswith("PATH_") and isinstance(v, str)]
     for path in paths:
         assert re.fullmatch(r"[\w-]+", endpoint_label(f"https://x{path}")), path
+
+
+# ===== 2026-08-06(운영점검 장전편 §2-1 / Fix#1) — 페이서는 완료 시각 기준으로 다음 슬롯을 민다 =====
+
+
+class _FakeClock:
+    """단조 시계를 손으로 굴린다 — 실제로 자면 테스트가 느려지고, 무엇보다 **구/신 구현이
+    구분되지 않는다**(둘 다 "대충 1초쯤 기다린다"로 보인다). 잠든 시간을 그대로 시각에
+    더해주는 이 시계라야 "무엇을 기준으로 예약했는가"가 드러난다."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_pacer_reserves_next_slot_from_completion_not_from_start():
+    """**이 fix의 유일한 직접 지표다.**
+
+    종전 구현은 다음 슬롯을 **호출 시작 시각** 기준으로 잡았다. 앞 호출이 0.5초 걸리면 다음
+    호출은 시작 +1.0초 = **완료 +0.5초**에 나간다. KIS는 자기 처리 완료 기준으로 초당 건수를
+    세는 것으로 보이므로 그것이 창 안으로 들어간다.
+
+    08-05 전량(12,561콜) + 08-06 장전(752콜) 대조에서 예외가 하나도 없었다 — EGW00201 65건이
+    **전부** 직전 호출과의 완료 간격 1.00초 미만이었고, 1.00초 이상인 **10,811건에서는 0건**이다.
+
+    따라서 이 테스트가 요구하는 것은 하나다: **완료로부터 min_interval이 지나야 다음이 나간다.**
+    """
+    clock = _FakeClock()
+    with mock.patch("mahdi.broker.rest_client.time", clock):
+        limiter = _RateLimiter(1.0)
+        limiter.wait()  # 유휴 뒤 첫 호출 — 즉시 나간다
+        clock.now += 0.5  # 이 호출이 0.5초 걸렸다
+        limiter.record_completion()
+        completed_at = clock.now
+
+        limiter.wait()
+        gap = clock.now - completed_at
+
+    assert gap == pytest.approx(1.0), (
+        f"완료로부터 {gap:.2f}초 만에 다음 호출이 나갔다(시작 기준이면 0.5초) — "
+        "이 간격이 1.00초 밑이면 EGW00201이 다시 하루 57건 난다"
+    )
+
+
+def test_pacer_completion_never_pulls_the_reservation_earlier():
+    """`record_completion()`은 **늦추기만** 한다.
+
+    백오프 확대 직후처럼 `wait()`가 이미 더 먼 미래를 예약해 둔 상황에서 완료 시각 기준으로
+    덮어쓰면 그 보수성이 깎인다 — 두 경로가 서로의 안전마진을 지우면 안 된다.
+    """
+    clock = _FakeClock()
+    with mock.patch("mahdi.broker.rest_client.time", clock):
+        limiter = _RateLimiter(1.0)
+        limiter.record_rate_limit_hit()  # 간격 1.5초로 확대
+        limiter.wait()
+        reserved = limiter._next_allowed
+        limiter.record_completion()  # 완료가 즉시라면 now+1.5 < reserved
+        assert limiter._next_allowed >= reserved, "완료 기준 재예약이 기존 예약을 앞당겼다"
+
+
+def test_pacer_completion_is_recorded_even_when_the_call_raises():
+    """타임아웃/500으로 끝난 호출도 KIS 입장에서는 **처리한 호출**이다.
+
+    예외 경로에서 밀지 않으면, 실패가 잦은 구간에서 정확히 그 구간의 페이싱이 느슨해진다 —
+    이미 레이트리밋에 걸려 있는 상황을 우리 손으로 악화시키는 셈이다.
+    """
+    settings = _settings()
+    daemon = mock.Mock(spec=TokenDaemon)
+    daemon.get_token.return_value = "tok"
+    client = mock.Mock(spec=httpx.Client)
+    client.get.side_effect = httpx.ReadTimeout("timeout")
+    rest = KISRestClient(settings, daemon, client=client)
+
+    with mock.patch.object(rest._rate_limiter, "record_completion") as recorded:
+        with pytest.raises(httpx.ReadTimeout):
+            rest._send_get(f"{tr_codes.VPS_REST_DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-price")
+    recorded.assert_called_once()

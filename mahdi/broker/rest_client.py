@@ -313,6 +313,35 @@ class _RateLimiter:
         if delay > 0:
             time.sleep(delay)
 
+    def record_completion(self) -> None:
+        """호출이 끝난 직후 호출 — 다음 슬롯을 **완료 시각 + 간격**으로 다시 민다(늦추기만 한다).
+
+        2026-08-06(운영점검 장전편 §2-1 / Fix#1) — `wait()`는 다음 슬롯을 **호출 시작 시각**
+        기준으로 예약한다. 그런데 KIS는 자기가 처리를 끝낸 시점 기준으로 초당 건수를 세는 것으로
+        보인다: 앞 호출이 느리면 다음 호출이 정확히 +min_interval에 나가도 KIS의 창 안으로 들어간다.
+
+        08-05 전량(12,561콜) + 08-06 장전(752콜) 대조에서 **예외가 하나도 없었다**:
+
+          직전 호출과의 완료 간격 < 1.00초 : 2,500건 중 EGW00201 **65건**(2.6%)
+          직전 호출과의 완료 간격 >= 1.00초: **10,811건 중 0건(0.00%)**
+
+        그리고 08-05 전체 호출의 **19.6%가 간격 1.00초 미만**이었다 — 페이서가 1.0초를 지킨다고
+        믿고 있었지만 다섯 중 하나가 한도 밑으로 나가고 있었다. 대가는 EGW00201 자체가 아니라
+        그것이 유발한 백오프다: 08-05 확대 84건, **시간가중 평균 배율 1.214배** = 하루 종일
+        REST를 21% 느리게 썼다. 그 느려짐이 사이클 지연 → 예산 절단 → 먼슬리 북 두께로 흘러간다
+        (08-06 07:48 실측: EGW00201 1건이 먼슬리 북을 10 → 9레그로 깎았다).
+
+        **비용보다 이득이 크다**: 호출당 평균 rtt(~0.06초)만큼 실효 간격이 늘지만(1.00 → ~1.06초),
+        백오프가 사라지면 배율이 1.214 → 1.00으로 돌아온다. +0.06초 손해 vs -0.21초 이득이다.
+
+        `max()`인 이유: `wait()`가 이미 더 먼 미래를 예약해 뒀으면(백오프 확대 직후 등) 그것을
+        당기면 안 된다. 이 함수는 **늦추기만** 한다 — 그래야 두 경로가 서로의 보수성을 깎지 않는다.
+        """
+        if self._min_interval <= 0:
+            return
+        with self._lock:
+            self._next_allowed = max(self._next_allowed, time.monotonic() + self._current_interval)
+
     def record_rate_limit_hit(self) -> None:
         """레이트리밋 실패가 감지되면 호출 — 다음 wait()부터 넓어진 간격이 바로 적용된다.
 
@@ -499,6 +528,9 @@ class KISRestClient:
             timed_out = True
             raise
         finally:
+            # 2026-08-06 Fix#1: 다음 슬롯을 완료 시각 기준으로 다시 민다. 타임아웃으로 끝난
+            # 호출도 KIS 입장에서는 처리한 호출이므로 **예외 경로에서도** 밀어야 한다.
+            self._rate_limiter.record_completion()
             # 예외(타임아웃 등)로 끝난 호출이야말로 계측이 필요하다 — finally에서 재고 넘긴다.
             self._log_if_slow(
                 "GET", url, http_started - pacer_started, time.monotonic() - http_started,
@@ -546,6 +578,7 @@ class KISRestClient:
             timed_out = True
             raise
         finally:
+            self._rate_limiter.record_completion()  # 2026-08-06 Fix#1 — GET과 같은 규칙
             self._log_if_slow(
                 "POST", url, http_started - pacer_started, time.monotonic() - http_started,
                 timed_out=timed_out,

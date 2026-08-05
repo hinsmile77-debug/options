@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 
@@ -508,7 +509,14 @@ def _regime_fit_progress_check(conn, underlying: str) -> HealthCheck:
     remaining_rows = _REGIME_FIT_TARGET_ROWS - total_rows
     avg_rows_per_day = total_rows / distinct_days if distinct_days else 0.0
     if avg_rows_per_day > 0:
-        eta_detail = f"약 {remaining_rows / avg_rows_per_day:.0f}영업일 남음(하루 평균 {avg_rows_per_day:.0f}행 기준 추정)"
+        # 2026-08-06(운영점검 장전편 §2-6 / Fix#6) — `.0f`(반올림)가 아니라 `ceil`이다.
+        # 부분 영업일에는 임계에 **도달하지 않는다** — 2.48영업일이 남았으면 도달일은 3영업일
+        # 뒤다. 종전 표기는 08-06 화면에 "약 2영업일 남음"을 냈는데(7,032행 / 하루 391행),
+        # 08-05 보고서 §9가 실제 도달일을 **08-10(월) = 3영업일 뒤**로 이미 확정해 둔 뒤였다.
+        # 08-04 보고서가 "08-08(금)"이라는 존재하지 않는 날짜를 적었던 것과 같은 계열의 사고다 —
+        # 일정은 낙관적으로 반올림하면 안 된다.
+        eta_days = math.ceil(remaining_rows / avg_rows_per_day)
+        eta_detail = f"약 {eta_days}영업일 남음(하루 평균 {avg_rows_per_day:.0f}행 기준 추정)"
     else:
         eta_detail = "누적 속도 계산 불가"
     return HealthCheck(
@@ -812,6 +820,11 @@ def _signal_reach_check(conn, now: datetime) -> HealthCheck:
     warnings = reach.get("warnings") or []
     if warnings:
         return HealthCheck(label, "warning", f"{detail} — {warnings[0]}", group="관측 품질")
+    # 2026-08-06 Fix#5 — 장전에는 판정을 유예한다. **숨기지는 않는다**: 같은 문장을 info로 낸다.
+    # 노란불이 아니어야 하는 이유는 §2-5에 있다(설계대로 동작한 것을 매일 90분씩 장애로 신고했다).
+    notes = reach.get("notes") or []
+    if notes:
+        return HealthCheck(label, "info", f"{detail} — {notes[0]}", group="관측 품질")
     return HealthCheck(label, "ok", detail, group="관측 품질")
 
 

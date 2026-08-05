@@ -648,6 +648,15 @@ def _render_parser_audit(metrics: dict) -> list[str]:
     ]
 
 
+# 2026-08-06(Fix#3) — 먼슬리 북을 무엇으로 식별했는지. 1순위(`expiry_liquidity`)일 때는 아무
+# 표시도 하지 않는다(정상이 조용해야 이상이 눈에 띈다). 폴백일 때만 출처를 드러낸다 —
+# 08:31 전에는 폴백이 정상이지만, **장 끝난 뒤 리포트에 이 꼬리가 붙어 있으면 만기유동성 폴러가
+# 하루 종일 죽어 있었다는 뜻**이라 그 자체가 경보다.
+_MONTHLY_EXPIRY_SOURCE_LABEL = {
+    "signal_decisions": " — 출처 `signal_decisions.gex_expiry` 폴백(만기유동성 미적재)",
+}
+
+
 def _render_db_tables(db: dict) -> list[str]:
     rows = [
         [r["table"], f"{r['rows']:,}", f"{r['minutes']:,}" if r.get("minutes") is not None else "—",
@@ -674,7 +683,9 @@ def _render_db_tables(db: dict) -> list[str]:
         out += [
             f"- **먼슬리 절대 커버리지: {_fmt(monthly.get('coverage_pct'), '{:.1f}%')}** "
             f"({monthly.get('minutes')}분 / 경과 {monthly.get('elapsed_minutes')}분, "
-            f"만기 {monthly.get('expiry') or monthly.get('reason')})",
+            f"만기 {monthly.get('expiry') or monthly.get('reason')}"
+            # 2026-08-06 Fix#3 — 폴백이 조용히 쓰이면 1순위(만기유동성 폴러)가 죽은 것을 모른다.
+            f"{_MONTHLY_EXPIRY_SOURCE_LABEL.get(monthly.get('expiry_source'), '')})",
             "> **이것이 GEX/감마플립 입력의 1분 연속성**이다 — 인프라 지표(밀림·백오프)가 좋아져도 "
             "이 값이 나빠질 수 있으므로 반드시 나란히 읽는다(2026-07-31: 밀림 83→46건인데 "
             "커버리지 95.0%→90.5%).",
@@ -780,7 +791,10 @@ def _render_signal_reach(db: dict) -> list[str]:
     )
     for warning in reach.get("warnings") or []:
         out.append(f"- ⚠ {warning}")
-    if not reach.get("warnings"):
+    # 2026-08-06 Fix#5 — 장전 표본만 있는 구간의 판정 유예. 경고가 아니지만 **보이기는 한다**.
+    for note in reach.get("notes") or []:
+        out.append(f"- ℹ {note}")
+    if not reach.get("warnings") and not reach.get("notes"):
         out.append("- 경고 없음")
     out += [
         "",
