@@ -5,12 +5,15 @@ import pytest
 
 from mahdi.data import db
 from mahdi.dashboard.data_source import (
+    FLOW_RADAR_ROW_CAP,
+    FLOW_RADAR_WINDOW_MINUTES,
     _rest_demand_check,
     _backoff_headroom_check,
     _monthly_coverage_check,
     _overrun_count_check,
     HealthCheck,
     _cbot_status_check,
+    _atm_roll_churn_check,
     _fossil_data_check,
     _macro_freshness_check,
     _freshness_check,
@@ -346,6 +349,49 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
     assert snap.option_ofi_series == [12.0]
     assert snap.option_microprice_series == [40.7]
     assert snap.option_vpin_series == [0.55]  # 2026-07-06: 옵션도 VPIN이 실제로 계산됨
+
+
+def test_load_snapshot_bounds_both_flow_series_by_the_same_time_window(monkeypatch):
+    """2026-08-05 P2-9 회귀 — 종전에는 `LIMIT 60`(행 상한)이라 두 계열의 실효 창이 달랐다.
+
+    선물은 거의 매분 체결돼 60행 ≈ 60분이었지만 거래가 뜸한 옵션은 60행이 몇 시간에 걸쳤고,
+    x축만 선물 창으로 강제돼 **창 밖 점이 보이지도 않으면서 y축만 잡아늘였다**(08-05 실측:
+    OFI 축 −30까지인데 보이는 값은 −6~+8, 가격 축 26까지인데 보이는 최대 21).
+    """
+    ts = datetime(2026, 8, 5, 12, 12)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "spot": [(1042.85, ts)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5)],
+        "option_symbol": [("B09F9WA21",)],
+        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47)],
+    }
+    conn = _FakeConnection(responses)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield conn
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
+
+    load_snapshot()
+
+    series_queries = [
+        (q, p) for q, p in conn.query_log
+        if "market_raw_1m" in q and "close, ofi, microprice, vpin" in q
+    ]
+    assert len(series_queries) == 2  # 선물 + 옵션
+    expected_cutoff = ts - timedelta(minutes=FLOW_RADAR_WINDOW_MINUTES)
+    for query, params in series_queries:
+        assert "timestamp >=" in query, "행 상한이 아니라 시간 창으로 잘라야 한다"
+        # 룩백 기준은 datetime.now()가 아니라 스냅샷 시각(regime_state.timestamp)이어야
+        # 리플레이/재현 시나리오에서도 창이 실제 데이터 시각 기준으로 맞는다.
+        assert params[1] == expected_cutoff
+        assert params[2] == FLOW_RADAR_ROW_CAP  # 창 안에서도 행 폭증 방어는 유지
 
 
 def test_load_snapshot_picks_option_flow_symbol_by_windowed_volume_with_deterministic_tiebreak(monkeypatch):
@@ -874,6 +920,63 @@ def test_macro_freshness_check_handles_query_error():
     assert conn.rollback_calls == 1
 
 
+# --- _atm_roll_churn_check (2026-08-05 P2-12) -------------------------------------------------
+#
+# 08-03에 "창이 하루 종일 안 움직였다"를 고친 뒤 그 반대편 비용(창이 너무 자주 움직인다)이
+# 계측되지 않았다. 롤 1회마다 창을 벗어난 종목의 1분봉이 끊기므로 이 값은 관측 연속성의
+# 선행지표다 — P0-1에서 정직하게 그리기 시작한 Flow Radar 공백의 **원인 쪽**이다.
+_NOW = datetime(2026, 8, 5, 12, 12)
+
+
+def _ws_status(atm_roll_count: int) -> dict:
+    return {
+        "updated_at": _NOW, "connected_since": datetime(2026, 8, 5, 7, 30),
+        "last_message_at": _NOW, "reconnect_count_today": 0,
+        "market_op_subscribed_at": datetime(2026, 8, 5, 7, 30),
+        "atm_roll_count_today": atm_roll_count,
+    }
+
+
+def test_atm_roll_churn_check_ok_below_threshold(monkeypatch):
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(6))
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "ok"
+    assert check.group == "관측 품질"
+    assert "6회" in check.detail
+
+
+def test_atm_roll_churn_check_warns_at_the_observed_08_05_level(monkeypatch):
+    # 08-05 실측 77회 — 임계(20)의 약 4배. 방향성 이동이 아니라 격자 중간점 근처에서 오간 결과다.
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(77))
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "warning"
+    assert "77회" in check.detail
+    assert "히스테리시스" in check.detail
+
+
+def test_atm_roll_churn_check_is_info_without_ws_status(monkeypatch):
+    # 관측 루프 미기동 판정은 `_ws_liveness_check`의 몫 — 여기서 중복 경고하지 않는다.
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: None)
+    assert _atm_roll_churn_check(object(), _NOW).status == "info"
+
+
+def test_atm_roll_churn_check_handles_query_error(monkeypatch):
+    def boom(conn):
+        raise RuntimeError("DB 오류")
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_ws_status", boom)
+    conn = _BrokenHealthConnection()
+
+    check = _atm_roll_churn_check(conn, _NOW)
+
+    assert check.status == "warning"
+    assert conn.rollback_calls == 1
+
+
 # --- _schema_integrity_check ----------------------------------------------------------------------
 
 def test_schema_integrity_check_ok_when_all_columns_present():
@@ -881,7 +984,10 @@ def test_schema_integrity_check_ok_when_all_columns_present():
     # information_schema.columns를 대조 — 전부 있으면 ok.
     # 2026-08-05(P1-7): 대상 테이블이 regime_state로 늘었다. 가짜 커서는 테이블 구분 없이 같은
     # 행 목록을 돌려주므로 두 테이블의 컬럼을 합쳐 넣는다.
-    rows = [(c,) for c in (*db.macro_snapshot_columns(), *db.regime_state_columns())]
+    rows = [
+        (c,)
+        for c in (*db.macro_snapshot_columns(), *db.regime_state_columns(), *db.ws_status_columns())
+    ]
     conn = _FakeHealthConnection({"schema_columns_rows": rows})
     check = _schema_integrity_check(conn)
     assert check.status == "ok"
@@ -892,7 +998,11 @@ def test_schema_integrity_check_warns_when_regime_state_migration_missing():
     조회 실패로 **합성 폴백**에 빠진다. 010/011로 실제로 겪은 사고와 같은 형태라 배지가 잡아야 한다."""
     rows = [
         (c,)
-        for c in (*db.macro_snapshot_columns(), *(c for c in db.regime_state_columns() if c != "is_warmup"))
+        for c in (
+            *db.macro_snapshot_columns(),
+            *(c for c in db.regime_state_columns() if c != "is_warmup"),
+            *db.ws_status_columns(),
+        )
     ]
     conn = _FakeHealthConnection({"schema_columns_rows": rows})
 
@@ -901,6 +1011,26 @@ def test_schema_integrity_check_warns_when_regime_state_migration_missing():
     assert check.status == "warning"
     assert "regime_state" in check.detail
     assert "is_warmup" in check.detail
+
+
+def test_schema_integrity_check_warns_when_ws_status_migration_missing():
+    """2026-08-05 P2-12 — 마이그레이션 026 미적용이면 WS 하트비트 기록이 실패하고,
+    `poll_ws_heartbeat`가 그 예외를 삼키므로(관측은 계속돼야 하니 옳다) WS 배지 3종이 조용히 멈춘다."""
+    rows = [
+        (c,)
+        for c in (
+            *db.macro_snapshot_columns(),
+            *db.regime_state_columns(),
+            *(c for c in db.ws_status_columns() if c != "atm_roll_count_today"),
+        )
+    ]
+    conn = _FakeHealthConnection({"schema_columns_rows": rows})
+
+    check = _schema_integrity_check(conn)
+
+    assert check.status == "warning"
+    assert "ws_status" in check.detail
+    assert "atm_roll_count_today" in check.detail
 
 
 def test_schema_integrity_check_warns_when_migration_not_applied_live():
@@ -1233,6 +1363,8 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._monthly_coverage_check", make_check("monthly_coverage"))
     monkeypatch.setattr("mahdi.dashboard.data_source._overrun_count_check", make_check("overrun_count"))
     monkeypatch.setattr("mahdi.dashboard.data_source._ws_liveness_check", make_check("ws_liveness"))
+    # 2026-08-05(P2-12) ATM 롤 churn — P0-1에서 정직하게 그리기 시작한 Flow Radar 공백의 원인 쪽 지표
+    monkeypatch.setattr("mahdi.dashboard.data_source._atm_roll_churn_check", make_check("atm_roll"))
     # 2026-08-03(§5-1) 신호 도달률 — 커버리지가 답하지 못하는 "판단까지 갔는가"
     monkeypatch.setattr("mahdi.dashboard.data_source._signal_reach_check", make_check("signal_reach"))
 
@@ -1243,6 +1375,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
         "schema", "fossil",
         "regime", "regime_fit_progress", "shutdown", "rate_limiter",
         "rest_demand", "backoff_headroom", "monthly_coverage", "overrun_count", "ws_liveness",
+        "atm_roll",
         "signal_reach",
     ]
     assert [c.label for c in result] == calls

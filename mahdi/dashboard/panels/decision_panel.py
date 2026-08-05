@@ -32,6 +32,51 @@ DECISION_LABEL_KO: dict[str, str] = {
     "REJECT": "진입 없음",
 }
 
+# 2026-08-05(COCKPIT 육안 점검 P2-11) — 거부사유 원문 → 한글.
+#
+# 08-05 화면의 판단 표는 시각/결정/확신도가 전부 한글인데 거부사유만 `strategy_palette:wait_only`,
+# `conflict_resolution:no_clear_consensus` 같은 내부 식별자였다. 20행 중 19행이 같은 문자열이라
+# **읽을 것이 없는 열**로 보이는데, 실제로는 "팔레트가 관망을 지시함"과 "앙상블이 합의에 못
+# 이름"이 전혀 다른 원인이다 — 후자는 신호가 갈렸다는 뜻이고 전자는 신호를 볼 자리가 없었다는 뜻이다.
+#
+# 매핑에 없는 사유는 **원문을 그대로 보여준다.** 새 사유가 생겼을 때 "알 수 없음" 같은 말로
+# 덮으면 그 사유를 추적할 수단을 잃는다(정보를 줄이는 방향으로 실패하지 않는다).
+# 원문은 `mahdi/fusion/engine.py`(meta_label / conflict_resolution / strategy_palette:*)와
+# `strategy_palette.py`의 `reason` 값들이 단일 소스다.
+REJECT_REASON_LABEL_KO: dict[str, str] = {
+    "meta_label:no_trade": "메타 라벨: 거래 안 함",
+    "conflict_resolution:no_clear_consensus": "충돌 조정: 명확한 합의 없음",
+    "strategy_palette:wait_only": "팔레트: 관망 지시만 있음",
+    "strategy_palette:defensive_regime_no_new_entries": "팔레트: 방어 레짐 — 신규 진입 금지",
+    "strategy_palette:short_gamma_requires_not_met": "팔레트: 숏감마 전제 미충족",
+    "strategy_palette:no_strategy_for_this_cell": "팔레트: 해당 셀에 전략 없음",
+}
+
+
+def reject_reason_ko(reason: str | None) -> str:
+    """매핑에 있으면 한글로, 없으면 원문 그대로(정보를 줄이지 않는다). 사유가 없으면 "-"."""
+    if not reason:
+        return "-"
+    return REJECT_REASON_LABEL_KO.get(reason, reason)
+
+
+def _unavailable_members_label(risk_gate_state: dict) -> str:
+    """
+    입력: 판단 행의 `risk_gate_state`.
+    계산: 산출되지 않은 앙상블 멤버 수와 이름을 한 칸으로 요약한다.
+    해석: 2026-08-05 P2-11. `member_unavailable`(어느 멤버가 왜 죽었는가)은 2026-08-04에 **바로
+         이런 추적을 위해** 판단 행에 남기기 시작한 값인데(그전에는 사람이 signal_layer.py를 읽어
+         역산해야 했다) COCKPIT에는 한 번도 표시되지 않았다. 08-05 화면에서 11:59의 단 한 건
+         이상행(소규모 테스트 / 합의 없음)을 파고들 방법이 없었던 이유다.
+    실패 조건: 키가 없으면(구 버전 행) "-".
+    """
+    unavailable = risk_gate_state.get("member_unavailable")
+    if unavailable is None:
+        return "-"
+    if not unavailable:
+        return "전원 가용"
+    return f"{len(unavailable)}개 미가용: {', '.join(sorted(unavailable))}"
+
 _EXIT_STAGE_NOT_WIRED_CARD = {
     "label": "청산 단계 (실행엔진)",
     "value": "미배선",
@@ -115,14 +160,25 @@ def build_decision_summary_cards(latest: dict | None) -> list[dict]:
     allowed_strategies = risk_gate_state.get("allowed_strategies") or []
     time_label = latest["timestamp"].strftime("%H:%M:%S")
 
+    # 2026-08-05(P2-11) — 확신도는 진입 후보가 아닌 사이클에서는 계산만 되고 **쓰이지 않는다.**
+    # 08-05 화면은 "진입 없음"과 "표준"을 나란히 놓아 "표준 확신도인데도 진입을 안 했다"로
+    # 읽혔지만, 실제로는 팔레트에 진입 전략이 없어 확신도가 소비될 자리가 없었다.
+    is_entry = decision == "ENTER"
+    conviction_card = {
+        "label": "확신도",
+        "value": conviction_label if is_entry else f"{conviction_label} (미사용)",
+        "status": "neutral",
+        "help": None if is_entry else "진입 후보가 아니어서 이 확신도는 이번 사이클에 쓰이지 않았습니다.",
+    }
+
     return [
         {
             "label": "최근 판단",
             "value": f"{DECISION_LABEL_KO.get(decision, decision)} ({time_label})",
-            "status": "ok" if decision == "ENTER" else "info",
-            "help": latest.get("reject_reason"),
+            "status": "ok" if is_entry else "info",
+            "help": reject_reason_ko(latest.get("reject_reason")) if latest.get("reject_reason") else None,
         },
-        {"label": "확신도", "value": conviction_label, "status": "neutral", "help": None},
+        conviction_card,
         _allowed_strategy_card(allowed_strategies),
         _risk_engine_card(risk_gate_state),
         _EXIT_STAGE_NOT_WIRED_CARD,
@@ -135,9 +191,10 @@ def build_decision_history_table(history: list[dict]) -> go.Figure:
     계산: 최근 판단 이력을 `macro_panel.build_macro_snapshot_table`과 동일한 `go.Table` 스타일로
          타임라인 표시한다 — 시각/결정/확신도/RiskEngine 승인/거부사유.
     """
-    times, decisions, convictions, risk_labels, reasons = [], [], [], [], []
+    times, decisions, convictions, risk_labels, reasons, members = [], [], [], [], [], []
     for row in history:
-        risk_engine = (row.get("risk_gate_state") or {}).get("risk_engine")
+        risk_gate_state = row.get("risk_gate_state") or {}
+        risk_engine = risk_gate_state.get("risk_engine")
         if risk_engine is None:
             risk_label = "-"
         elif risk_engine == "account_tracker_not_ready":
@@ -148,15 +205,28 @@ def build_decision_history_table(history: list[dict]) -> go.Figure:
             risk_label = "거부"
         times.append(row["timestamp"].strftime("%H:%M:%S"))
         decisions.append(DECISION_LABEL_KO.get(row["decision"], row["decision"]))
-        convictions.append(CONVICTION_LABEL_KO.get(row["conviction"], row["conviction"]))
+        # 2026-08-05(P2-11): 확신도는 진입 후보가 아닌 행에서는 **쓰이지 않은 값**이다 — 그런데
+        # 08-05 화면은 "진입 없음 / 표준"을 나란히 놓아 "표준 확신도로 진입을 안 했다"로 읽혔다.
+        # 실제로는 팔레트에 진입 전략이 없어 확신도가 소비된 적이 없다.
+        conviction = CONVICTION_LABEL_KO.get(row["conviction"], row["conviction"])
+        convictions.append(conviction if row["decision"] == "ENTER" else f"{conviction} (미사용)")
         risk_labels.append(risk_label)
-        reasons.append(row.get("reject_reason") or "-")
+        reasons.append(reject_reason_ko(row.get("reject_reason")))
+        members.append(_unavailable_members_label(risk_gate_state))
 
     fig = go.Figure(
         go.Table(
-            header=dict(values=["시각", "결정", "확신도", "RiskEngine", "거부사유"], align="center"),
-            cells=dict(values=[times, decisions, convictions, risk_labels, reasons], align="center"),
+            header=dict(
+                values=["시각", "결정", "확신도", "RiskEngine", "거부사유", "앙상블 미가용 멤버"],
+                align="center",
+            ),
+            cells=dict(
+                values=[times, decisions, convictions, risk_labels, reasons, members], align="center"
+            ),
         )
     )
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=min(400, 60 + 28 * max(len(history), 1)))
+    # 2026-08-05(P2-11): 상한이 400이라 기본 20행(= 60 + 28*20 = 620)이 들어가지 않아 **마지막
+    # 행이 잘려 보였다**(08-05 화면의 11:55 행). 호출측이 이미 `limit`으로 행 수를 묶으므로
+    # 상한은 그 기본값이 온전히 들어가는 크기면 된다.
+    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=min(640, 60 + 28 * max(len(history), 1)))
     return fig

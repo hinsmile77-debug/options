@@ -6,8 +6,6 @@ Regime · Gamma Map · Flow Radar · 수급 패널만 표시한다. 주문 실�
 
 from __future__ import annotations
 
-import time
-
 import streamlit as st
 
 from mahdi.dashboard.data_source import (
@@ -35,28 +33,63 @@ from mahdi.dashboard.panels.regime_panel import REGIME_LABEL_KO, build_regime_pr
 
 _CARD_BADGE = {"ok": st.success, "warning": st.warning, "info": st.info, "neutral": st.info}
 
+# 2026-08-05(COCKPIT 육안 점검 P2-8) — 한 줄에 놓는 배지 최대 개수.
+#
+# `st.columns(len(cards))`로 전부 한 줄에 펴면 개수가 늘어날수록 각 열이 좁아진다. 08-05 화면의
+# "인프라" 행은 12칸이라 한 칸이 화면 폭의 8%였고, 라벨 하나("거래소 서킷브레이커/거래정지")가
+# 3~4줄로 접히면서 카드 높이가 제각각이 됐다 — **"3초 룰"(스크롤 없이 한눈에)이 깨진 상태**다.
+# 2026-08-01에 "인프라/관측 품질" 두 그룹으로 나눈 것이 같은 문제의 1차 대응이었는데, 그때도
+# 인프라 쪽은 11칸이었고 그 뒤 매크로 신선도가 붙어 12칸이 됐다. 그룹을 더 쪼개는 대신 **행당
+# 칸 수에 상한**을 둔다 — 그러면 배지가 몇 개로 늘어나도 각 칸의 폭이 더는 줄지 않는다.
+#
+# 6인 이유: 1920px 폭에서 한 칸이 약 300px로, 가장 긴 라벨도 2줄 안에 들어간다. 관측 품질 그룹
+# (현재 7개)은 6+1로 나뉘는데, 마지막 행이 한 칸만 남더라도 `st.columns`가 폭을 균등 분할하므로
+# 남은 칸이 넓어지지는 않는다(왼쪽 정렬로 자연스럽게 보인다).
+_MAX_BADGES_PER_ROW = 6
+
+
+def _chunked(items: list, size: int) -> list[list]:
+    """items를 size개씩 끊어 리스트의 리스트로 돌려준다 — 배지 그리드 행 분할용."""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
 
 def _render_cards(cards: list[dict]) -> None:
     """카드 dict(label/value/status/help) 리스트를 st.columns 배지로 렌더링한다 — "3초 룰"
     (스크롤 없이 한눈에 파악)을 위해 `get_health_summary()`의 기존 배지 스타일을 그대로 재사용.
-    향후 카드가 늘어나도 이 함수는 그대로고, 호출측 리스트에 dict만 추가하면 된다."""
-    cols = st.columns(len(cards))
-    for col, card in zip(cols, cards):
-        badge = _CARD_BADGE.get(card["status"], st.info)
-        with col:
-            badge(f"**{card['label']}**\n\n{card['value']}")
-            if card.get("help"):
-                st.caption(card["help"])
+    향후 카드가 늘어나도 이 함수는 그대로고, 호출측 리스트에 dict만 추가하면 된다.
+    `_MAX_BADGES_PER_ROW`를 넘으면 여러 행으로 접는다(2026-08-05 P2-8)."""
+    for row in _chunked(cards, _MAX_BADGES_PER_ROW):
+        for col, card in zip(st.columns(_MAX_BADGES_PER_ROW), row):
+            badge = _CARD_BADGE.get(card["status"], st.info)
+            with col:
+                badge(f"**{card['label']}**\n\n{card['value']}")
+                if card.get("help"):
+                    st.caption(card["help"])
 
 st.set_page_config(page_title="마흐디 COCKPIT v1", layout="wide")
 
-REFRESH_INTERVAL_SECONDS = 10  # 1분봉 적재 주기보다 짧게 잡아 새 봉을 빠르게 반영
+# 2026-08-05(COCKPIT 육안 점검 P2-10) — 10초 → 30초.
+#
+# 종전 구조는 `render()` → `time.sleep(10)` → `st.rerun()`이었다. 두 가지 비용이 있었다.
+#
+# ① **데이터가 없는데도 돈다.** 이 화면의 모든 원천은 1분봉·1분 판단·5분 매크로다. 10초 주기의
+#    6번 중 5번은 **직전과 완전히 같은 값**을 다시 조회해 다시 그린다(리런마다 DB 커넥션을
+#    6개 넘게 새로 연다 — `db.get_connection()`은 풀이 없다).
+# ② **조작이 최대 10초 늦게 먹힌다.** Streamlit은 스크립트 실행 중에 들어온 리런 요청을
+#    다음 `st.*` 호출 시점에 처리하는데, `time.sleep()` 동안에는 그 지점이 없다. 슬랙 알림
+#    토글을 눌러도 잠자던 10초가 끝나야 반영됐다.
+#
+# 30초는 1분봉 주기의 절반이라 "새 봉을 빠르게 반영한다"는 원래 성질을 유지하면서 ①을 3분의 1로
+# 줄인다. ②는 주기를 늘리면 오히려 나빠지므로 **구조를 바꿔서** 없앴다 — 아래 `render()`를
+# `st.fragment(run_every=...)`로 감싸 자동 갱신을 조각 안에 가두고, 슬랙 토글은 조각 **밖**
+# 최상위에 두어 클릭 즉시 처리되게 했다(`time.sleep`/`st.rerun`은 제거).
+REFRESH_INTERVAL_SECONDS = 30
 
 
 @st.cache_resource
 def _log_cockpit_startup_once() -> None:
-    # 2026-07-22(운영점검보고서 §1-1) — 이 스크립트는 REFRESH_INTERVAL_SECONDS마다 st.rerun()으로
-    # 처음부터 다시 실행되지만, st.cache_resource로 감싸면 실제 프로세스당 딱 1회만 호출된다.
+    # 2026-07-22(운영점검보고서 §1-1) — 이 스크립트는 REFRESH_INTERVAL_SECONDS마다 다시 실행되지만,
+    # st.cache_resource로 감싸면 실제 프로세스당 딱 1회만 호출된다.
     # 좀비 프로세스(전날 떠서 안 죽고 남아있는 것)를 로그만으로 즉시 구분할 수 있게 한다.
     print(record_cockpit_startup(), flush=True)
 
@@ -64,24 +97,14 @@ def _log_cockpit_startup_once() -> None:
 _log_cockpit_startup_once()
 
 
-def render() -> None:
-    snapshot = load_snapshot()
+def render_controls() -> None:
+    """자동 갱신 조각 **밖**에서 그리는 것들 — 제목과 조작 위젯.
 
+    2026-08-05(P2-10): 위젯을 조각 밖에 두는 것이 핵심이다. 조각 안에 있으면 `run_every` 타이머와
+    사용자 클릭이 같은 실행 흐름을 공유해 조작 반영이 갱신 주기만큼 밀린다(종전 `time.sleep(10)`
+    구조에서 실제로 최대 10초 지연됐다). 밖에 두면 클릭은 즉시 최상위 리런으로 처리된다.
+    """
     st.title("마흐디 COCKPIT — 관측 전용 (Phase 1)")
-
-    # 2026-07-29 신규 — 거래소 서킷브레이커/거래정지(mahdi.risk.market_halt) 실시간 감지. 평시엔
-    # 아무것도 그리지 않는다(상시 배지는 "오늘의 점검 요약" 그리드가 이미 맡고 있음) — 발동 중일
-    # 때만 스크롤 없이 즉시 눈에 띄어야 하므로 st.error로 최상단에 크게 띄운다.
-    halt_status = get_market_halt_status()
-    if halt_status and halt_status["is_halted"]:
-        st.error(
-            f"🚨 거래소 서킷브레이커/거래정지 발동 중 — {halt_status['label']}"
-            f"(코드 {halt_status['mkop_cls_code']}, {halt_status['halted_since']:%H:%M:%S}부터) — "
-            f"신규 진입 자동 차단됨"
-        )
-
-    if not snapshot.is_live:
-        st.warning("DB에서 데이터를 찾지 못해 합성 리플레이 데이터로 표시 중입니다 (독립 실행 모드).")
 
     # 2026-07-19(§5-4 "능동 알림 도입") — Slack On/Off. COCKPIT과 관측 루프(mahdi.main)는 서로
     # 다른 프로세스라 DB(slack_alert_settings)를 통해 값을 주고받는다 — 여기서 저장하면 재시작
@@ -98,6 +121,30 @@ def render() -> None:
         if slack_toggle != current_slack_enabled:
             set_slack_alerts_enabled(slack_toggle)
 
+
+@st.fragment(run_every=REFRESH_INTERVAL_SECONDS)
+def render() -> None:
+    """REFRESH_INTERVAL_SECONDS마다 **이 조각만** 다시 그린다(2026-08-05 P2-10).
+
+    종전에는 스크립트 전체를 `time.sleep()` + `st.rerun()`으로 다시 돌렸다 — 조작 반영이 최대
+    주기만큼 밀리고, 페이지 전체가 재구성돼 차트 줌·스크롤 위치가 매번 초기화됐다.
+    """
+    snapshot = load_snapshot()
+
+    # 2026-07-29 신규 — 거래소 서킷브레이커/거래정지(mahdi.risk.market_halt) 실시간 감지. 평시엔
+    # 아무것도 그리지 않는다(상시 배지는 "오늘의 점검 요약" 그리드가 이미 맡고 있음) — 발동 중일
+    # 때만 스크롤 없이 즉시 눈에 띄어야 하므로 st.error로 최상단에 크게 띄운다.
+    halt_status = get_market_halt_status()
+    if halt_status and halt_status["is_halted"]:
+        st.error(
+            f"🚨 거래소 서킷브레이커/거래정지 발동 중 — {halt_status['label']}"
+            f"(코드 {halt_status['mkop_cls_code']}, {halt_status['halted_since']:%H:%M:%S}부터) — "
+            f"신규 진입 자동 차단됨"
+        )
+
+    if not snapshot.is_live:
+        st.warning("DB에서 데이터를 찾지 못해 합성 리플레이 데이터로 표시 중입니다 (독립 실행 모드).")
+
     # 2026-07-19(§5-6 "오늘의 점검 요약") — 운영점검보고서 §1-B 장중 체크리스트 중 SQL로
     # 자동화 가능한 항목들(데이터 결손율·CBOT 상태·series 화이트리스트 위반·레짐 stability_flag
     # 비율)을 매번 사람이 DB를 직접 조회하지 않고 상단 배지로 상시 노출한다.
@@ -111,9 +158,12 @@ def render() -> None:
         groups.setdefault(check.group, []).append(check)
     for group_name, checks in groups.items():
         st.caption(group_name)
-        for col, check in zip(st.columns(len(checks)), checks):
-            badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
-            badge(f"**{check.label}**\n\n{check.detail}")
+        # 2026-08-05(P2-8): 그룹 안에서도 행당 `_MAX_BADGES_PER_ROW`개까지만 펴 각 칸의 폭을
+        # 지킨다 — 08-05 인프라 12칸 화면은 한 칸이 폭의 8%라 라벨이 3~4줄로 접혔다.
+        for row in _chunked(checks, _MAX_BADGES_PER_ROW):
+            for col, check in zip(st.columns(_MAX_BADGES_PER_ROW), row):
+                badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
+                badge(f"**{check.label}**\n\n{check.detail}")
 
     # 2026-07-29 신규 — ADVISORY 모드지만 마흐디가 지금 어떤 진입 판단을 내리고 있는지(청산
     # 단계는 ExecutionEngine 미배선이라 자리만 확보) + 계좌 현황/수익률을 "3초 룰"로 최상단에
@@ -238,7 +288,7 @@ def render() -> None:
     )
 
 
+render_controls()
+# 자동 갱신은 `render`에 붙은 `st.fragment(run_every=...)`가 담당한다 —
+# `time.sleep()` + `st.rerun()`은 2026-08-05(P2-10)에 제거했다(위 REFRESH_INTERVAL_SECONDS 주석).
 render()
-
-time.sleep(REFRESH_INTERVAL_SECONDS)
-st.rerun()

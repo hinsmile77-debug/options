@@ -40,6 +40,25 @@ _LEGACY_MIXED_SYMBOL = "KOSPI200_OPT"
 # 기준을 바꿔, 단일 틱의 우연한 타이밍이 아니라 실제 상대적 활발함이 선정을 좌우하게 한다.
 FLOW_RADAR_OPTION_LOOKBACK_MINUTES = 10
 
+# 2026-08-05(COCKPIT 육안 점검 P2-9) — Flow Radar가 그리는 시간 창.
+#
+# 종전에는 두 계열 모두 `LIMIT 60`(**행** 60개)이었다. 선물은 거의 매분 체결돼 60행 ≈ 60분이라
+# 의도와 우연히 일치했지만, **옵션은 거래가 뜸해 60행이 몇 시간에 걸친다.** 그런데 app.py가
+# 옵션 x축을 선물 창(약 60분)으로 강제하므로(거래가 1~2점뿐일 때 x축이 마이크로초로 깨지는
+# 2026-07-06 문제 대응) 창 밖 점들은 **안 보이는데 y축 자동범위에는 그대로 들어간다.**
+#
+# 08-05 화면 실측이 정확히 그 상태였다: 옵션 OFI 축이 −30까지 내려가 있는데 보이는 데이터는
+# −6~+8이었고, 가격 축은 26까지인데 보이는 최대는 21이었다 — 실제 변동이 축 아래쪽에 눌려
+# 사실상 평평하게 보였다. 조회를 시간 기준으로 바꾸면 창 밖 점이 **애초에 오지 않으므로**
+# 이 왜곡이 원인에서 사라진다(Plotly 축 설정으로 덮는 것보다 근본적이다).
+#
+# 60분인 이유: 종전 선물 계열의 실효 창(60행 ≈ 60분)과 같게 둬 화면의 시간 폭을 바꾸지 않는다 —
+# 이번 변경의 목적은 창을 바꾸는 게 아니라 **두 계열이 같은 창을 보게** 하는 것이다.
+FLOW_RADAR_WINDOW_MINUTES = 60
+# 시간 창 안에서도 행 수 상한은 유지한다 — 1분봉이라 정상적으로는 60행을 넘을 수 없지만,
+# 재처리/중복 적재 등으로 창 안 행이 폭증하면 대시보드가 그것을 그리다 멈추면 안 된다.
+FLOW_RADAR_ROW_CAP = 240
+
 
 @dataclass(frozen=True, slots=True)
 class ChainPoint:
@@ -392,6 +411,10 @@ def _schema_integrity_check(conn) -> HealthCheck:
     required = {
         "macro_snapshot_5m": db.macro_snapshot_columns(),
         "regime_state": db.regime_state_columns(),
+        # 2026-08-05(P2-12, 마이그레이션 026): 미적용이면 WS 하트비트 기록이 실패하는데
+        # `poll_ws_heartbeat`가 그 예외를 삼키므로(관측 자체는 계속돼야 하니 옳은 처리다)
+        # WS 배지 3종이 **조용히** 멈춘다.
+        "ws_status": db.ws_status_columns(),
     }
     missing_by_table: dict[str, list[str]] = {}
     try:
@@ -534,6 +557,16 @@ _REST_DEMAND_WARNING_PCT = 60.0  # 07-31 실측 43.6%. 60%를 넘으면 폴러 �
 _BACKOFF_HEADROOM_WARNING_RATIO = 0.9
 _MONTHLY_COVERAGE_WARNING_PCT = 95.0  # GEX/감마플립 입력의 1분 연속성(07-31 실측 90.3%)
 _OVERRUN_COUNT_WARNING = 30  # 07-31 실측 46건. 페이서 분리 재개 조건과 같은 숫자다.
+# 2026-08-05(P2-12) — 하루 ATM 롤 횟수 경고 임계. **잠정치다.**
+#
+# 20의 근거: 행사가 격자는 2.5p이므로 창이 움직이려면 선물이 격자 중간점(1.25p)을 넘어야 한다.
+# 일중 실현 변동폭이 20~30p(1~3%)인 정상적인 날에 방향성 이동만으로 중간점을 넘는 횟수는
+# 한 자릿수~십몇 회다. 20은 그 위에 여유를 준 값이다.
+# 08-05 실측은 **77회**(08:46~12:20, 평균 2.7분마다) — 이 임계의 약 4배이고, 방향성 이동이 아니라
+# 중간점 근처에서 오간 결과다(11:55 1035~1045 → 11:57 되돌림 → 12:01 재이동이 로그에 그대로 있다).
+# 롤 로직에 히스테리시스가 없어서 생기는 현상인데, 그 수정은 구독 정책 변경이라 별건이다
+# ([[NEXT_TODO]]) — 먼저 **보이게** 만든다. 며칠 실측이 쌓이면 이 값을 조정할 것.
+_ATM_ROLL_WARNING = 20
 # WS 하트비트(mahdi.main.WS_HEARTBEAT_SECONDS=300초)의 2배. CB 하트비트와 같은 기준이다.
 _WS_HEARTBEAT_STALE_SECONDS = 600.0
 
@@ -832,6 +865,43 @@ def _ws_liveness_check(conn, now: datetime) -> HealthCheck:
     return HealthCheck(label, status_level, detail, group="관측 품질")
 
 
+def _atm_roll_churn_check(conn, now: datetime) -> HealthCheck:
+    """
+    계산: 오늘 ATM 행사가 창이 실제로 이동한 횟수(`ws_status.atm_roll_count_today`,
+         마이그레이션 026)를 `_ATM_ROLL_WARNING`과 대조한다.
+    해석: 2026-08-05(COCKPIT 육안 점검 P2-12) — **관측 연속성의 선행지표.** 롤 1회마다 창을
+         벗어난 종목의 WS 구독이 해제돼 그 종목 1분봉이 끊긴다. 08-05에 Flow Radar 옵션이
+         11:26~12:02를 직선으로 그린 것(P0-1)이 그 결과였고, 그 35분은 구독 해제 구간이었다.
+         P0-1로 화면은 이제 그 공백을 정직하게 그리지만, **공백 자체를 줄이려면 롤 횟수를 봐야
+         한다** — 그런데 그 값은 로그의 "ATM 롤링" 줄을 세야만(그것도 북 수로 나눠야만) 알 수
+         있었다. 07-31에 REST 수요를 계량하기 전과 같은 상태다.
+    실패 조건: 조회 실패는 warning. `ws_status` 행이 없으면(관측 루프 미기동/마이그레이션 020
+              미적용) info — 그 판정은 `_ws_liveness_check`의 몫이라 여기서 중복 경고하지 않는다.
+    """
+    label = "ATM 행사가 창 롤 횟수(오늘)"
+    try:
+        status = db.latest_ws_status(conn)
+    except Exception:
+        conn.rollback()
+        logger.warning("ATM 롤 횟수 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="관측 품질")
+    if status is None:
+        return HealthCheck(label, "info", "감지 상태 미기록", group="관측 품질")
+    count = status["atm_roll_count_today"]
+    if count is None:
+        # 마이그레이션 026 미적용 — 스키마 정합성 배지가 그 사실을 따로 경고하므로 여기서는
+        # 중복 경고하지 않고 "아직 못 센다"만 알린다(값을 0으로 지어내면 "롤이 없었다"가 된다).
+        return HealthCheck(label, "info", "집계 전(마이그레이션 026 적용 전)", group="관측 품질")
+    detail = f"{count}회 — 롤마다 창을 벗어난 종목의 1분봉이 끊긴다(Flow Radar 공백의 원인)"
+    if count >= _ATM_ROLL_WARNING:
+        return HealthCheck(
+            label, "warning",
+            f"{detail} · 임계 {_ATM_ROLL_WARNING}회 초과 — 히스테리시스 없이 격자 중간점을 오가는지 확인",
+            group="관측 품질",
+        )
+    return HealthCheck(label, "ok", detail, group="관측 품질")
+
+
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     """
     입력: 기초자산 라벨.
@@ -871,6 +941,9 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _monthly_coverage_check(conn, underlying, now),
                 _overrun_count_check(conn, now),
                 _ws_liveness_check(conn, now),
+                # 2026-08-05(P2-12) — WS 생존 배지 바로 옆. 같은 구독 도메인이고, P0-1에서 정직하게
+                # 그리기 시작한 Flow Radar 공백의 **원인 쪽** 지표다.
+                _atm_roll_churn_check(conn, now),
                 # 2026-08-03(§5-1) — 커버리지 바로 아래 칸. 08-03에 커버리지 98.8%인 날
                 # 감마플립 산출률은 0%였다(데이터는 DB에 있었지만 판단까지 가지 않았다).
                 _signal_reach_check(conn, now),
@@ -998,13 +1071,17 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     try:
         with db.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    # is_warmup(마이그레이션 025, 2026-08-05 P1-7): prob_vector가 학습된 확률인지
-                    # warmup_fallback()의 one-hot 상수인지 — 화면이 그 둘을 같게 그리면 안 된다.
-                    "SELECT timestamp, regime, prob_vector, higher_tf_regime, stability_flag, is_warmup "
-                    "FROM regime_state ORDER BY timestamp DESC LIMIT 1"
+                # is_warmup(마이그레이션 025, 2026-08-05 P1-7): prob_vector가 학습된 확률인지
+                # warmup_fallback()의 one-hot 상수인지 — 화면이 그 둘을 같게 그리면 안 된다.
+                # 마이그레이션 미적용 구간(커밋 ~ 다음 장전 기동)에도 **표시용 컬럼 하나 때문에
+                # 화면 전체가 합성 데이터로 떨어지면 안 되므로** 없어도 계속한다(P2-10 검증 중 실측 —
+                # `db._select_with_optional_columns()` docstring 참고).
+                regime_row = db._select_with_optional_columns(
+                    conn,
+                    base="SELECT timestamp, regime, prob_vector, higher_tf_regime, stability_flag",
+                    optional=("is_warmup",),
+                    tail=" FROM regime_state ORDER BY timestamp DESC LIMIT 1",
                 )
-                regime_row = cur.fetchone()
                 if regime_row is None:
                     return None
                 # 리런 시각(datetime.now())이 아니라 스냅샷 자체의 최신 시각을 룩백 기준으로 쓴다 —
@@ -1037,13 +1114,19 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
             # 옵션에도 VPIN을 적용하면서 그 휴리스틱이 깨졌기 때문).
             futures_flow_symbol = db.get_active_futures_symbol(conn, underlying)
 
+            # 2026-08-05(P2-9) — 두 Flow Radar 계열이 **같은 시간 창**을 보게 한다. 종전에는
+            # 행 수 상한(LIMIT 60)이라 선물은 우연히 60분이었지만 거래가 뜸한 옵션은 몇 시간에
+            # 걸쳤고, x축만 선물 창으로 강제돼 창 밖 점이 y축만 잡아늘였다(상세 근거는
+            # `FLOW_RADAR_WINDOW_MINUTES` 주석).
+            flow_cutoff = as_of_ts - timedelta(minutes=FLOW_RADAR_WINDOW_MINUTES)
+
             with conn.cursor() as cur:
                 futures_rows: list = []
                 if futures_flow_symbol is not None:
                     cur.execute(
                         "SELECT timestamp, close, ofi, microprice, vpin FROM market_raw_1m "
-                        "WHERE symbol=%s ORDER BY timestamp DESC LIMIT 60",
-                        (futures_flow_symbol,),
+                        "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
+                        (futures_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
                     futures_rows = cur.fetchall()
 
@@ -1066,8 +1149,8 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 if option_flow_symbol is not None:
                     cur.execute(
                         "SELECT timestamp, close, ofi, microprice, vpin FROM market_raw_1m "
-                        "WHERE symbol=%s ORDER BY timestamp DESC LIMIT 60",
-                        (option_flow_symbol,),
+                        "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
+                        (option_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
                     option_rows = cur.fetchall()
     except Exception:

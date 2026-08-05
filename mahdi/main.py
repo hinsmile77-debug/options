@@ -320,6 +320,18 @@ class WsLiveness:
     # rt_cd=0 수신 시점). `last_message_at`(데이터 수신)과는 전혀 다른 신호다 — 08-03에 장운영정보
     # 데이터가 0건이었는데도 하트비트는 정상이라 "구독이 살아 있는가"를 판별할 방법이 없었다.
     market_op_subscribed_at: datetime | None = None
+    # 2026-08-05(COCKPIT 육안 점검 P2-12) — 오늘 ATM±N 행사가 창이 재롤링된 횟수.
+    #
+    # 08-03에 "창이 하루 종일 한 번도 안 움직였다"를 고치면서 선물 봉마다 재롤링하게 됐는데,
+    # 그 반대편 비용이 계측되지 않았다: 08-05 실측 **77회**(08:46~12:20, 평균 2.7분마다).
+    # 롤 한 번마다 창을 벗어난 종목은 구독 해제되고 그 종목의 1분봉이 끊긴다 — P0-1에서 고친
+    # Flow Radar 공백(11:27~12:02, 35분)이 정확히 그 결과였다. 즉 이 숫자는 **관측 연속성의
+    # 직접적인 선행지표**인데 COCKPIT에 없었다(로그를 세야만 알 수 있었다 — 07-31 REST 수요를
+    # 계량하기 전과 같은 상태다).
+    #
+    # `reconnect_count`와 같은 방식으로 관측 루프가 증가시키고 독립 하트비트가 DB에 남긴다.
+    # 프로세스가 매일 아침 새로 뜨므로 "오늘" 카운트는 자연히 초기화된다.
+    atm_roll_count: int = 0
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
@@ -721,13 +733,18 @@ class _WebsocketsAdapter(WSConnection):
 
 
 async def _reroll_books_to_spot(
-    subscription_managers: list[RollingSubscriptionManager], spot: float
+    subscription_managers: list[RollingSubscriptionManager],
+    spot: float,
+    ws_liveness: WsLiveness | None = None,
 ) -> None:
     """
-    입력: 구독 롤링 매니저 목록, 방금 완성된 선물 1분봉의 종가.
+    입력: 구독 롤링 매니저 목록, 방금 완성된 선물 1분봉의 종가, (선택) 생존 상태 객체.
     계산: ATM이 실제로 이동한 매니저만 roll_to_spot()으로 재롤링하고, 이동했을 때만 INFO 1줄을
          남긴다(`roll_to_spot()` 자체가 diff 기반이라 변화가 없으면 무동작이지만, "언제 어디서
          어디로 옮겼는가"는 로그에 남아야 한다).
+         `ws_liveness`를 주면 **실제로 이동한 롤 1회를 카운트**한다(2026-08-05 P2-12) —
+         매니저가 여러 개라도 "창이 한 번 움직였다"가 사람이 세고 싶은 단위다(로그는 북마다
+         한 줄씩 남으므로 줄 수를 3으로 나눠야 하는데, 그렇게 세면 북 수가 바뀔 때 조용히 틀린다).
     해석: 2026-08-03(운영점검보고서 §2-2 후속 조사) — `RollingSubscriptionManager`의 모듈
          docstring은 *"현재가가 바뀌어 ATM이 이동하면 범위를 벗어난 행사가 구독을 해제하고 새로
          진입한 행사가를 구독한다"* 고 선언하지만, **`roll_to_spot()`은 WS 연결당 단 한 번**
@@ -752,17 +769,21 @@ async def _reroll_books_to_spot(
     실패 조건: 개별 매니저의 롤링 실패(구독 슬롯 한도 등)는 그대로 전파한다 — 구독 상태가
               불명확해진 채로 관측을 이어가면 안 된다.
     """
+    rolled = False
     for subscription_manager in subscription_managers:
         before = subscription_manager.desired_strikes
         await subscription_manager.roll_to_spot(spot)
         after = subscription_manager.desired_strikes
         if before != after:
+            rolled = True
             logger.info(
                 LOG_ATM_ROLL,
                 spot,
                 f"{min(before):.1f}~{max(before):.1f}" if before else "(없음)",
                 f"{min(after):.1f}~{max(after):.1f}" if after else "(없음)",
             )
+    if rolled and ws_liveness is not None:
+        ws_liveness.atm_roll_count += 1
 
 
 async def run_observation_loop(
@@ -1024,7 +1045,7 @@ async def run_observation_loop(
                 },
             )
             if tick_symbol == futures_symbol:
-                await _reroll_books_to_spot(subscription_managers, bar.close)
+                await _reroll_books_to_spot(subscription_managers, bar.close, ws_liveness)
                 regime_state_machine.update_bar(bar)
                 state = regime_state_machine.step(conn, bar.minute)
                 db.insert_regime_state(
@@ -1535,6 +1556,9 @@ async def poll_ws_heartbeat(
                     conn, db.local_now(), ws_liveness.connected_since,
                     ws_liveness.last_message_at, ws_liveness.reconnect_count,
                     ws_liveness.market_op_subscribed_at,
+                    # 2026-08-05(P2-12) — 관측 연속성의 선행지표. `reconnect_count`와 같은 방식으로
+                    # 관측 루프가 메모리에서 세고 이 하트비트가 DB에 남긴다.
+                    ws_liveness.atm_roll_count,
                 )
         except Exception:
             logger.warning("WS 하트비트 기록 실패 — 관측 자체에는 영향 없음", exc_info=True)

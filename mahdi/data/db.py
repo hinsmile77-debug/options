@@ -11,6 +11,7 @@ db/migrations/008_timestamp_policy_docs.sql 참고.
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Iterator, Protocol
@@ -18,6 +19,8 @@ from typing import Any, Iterator, Protocol
 import psycopg
 
 from mahdi.config.settings import DBSettings, get_db_settings
+
+logger = logging.getLogger("mahdi.data.db")
 
 
 def local_now() -> datetime:
@@ -90,6 +93,46 @@ def get_connection(settings: DBSettings | None = None) -> Iterator[psycopg.Conne
         yield conn
     finally:
         conn.close()
+
+
+def _select_with_optional_columns(
+    conn: ConnectionLike, *, base: str, optional: tuple[str, ...], tail: str, params: tuple = ()
+) -> tuple | None:
+    """
+    입력: SELECT의 앞부분(`base`), **아직 없을 수도 있는** 컬럼 목록(`optional`), 뒷부분(`tail`).
+    계산: `optional`을 포함해 조회하고, 그 컬럼이 없다는 오류(42703)가 나면 롤백 후 **없이** 다시
+         조회한다. 두 번째 경로에서는 optional 자리에 None을 채워 반환 튜플의 길이를 맞춘다.
+    해석: 2026-08-05(COCKPIT 육안 점검 P2-10 검증 중 실측) — 마이그레이션 025/026을 커밋한 직후
+         라이브 DB에 아직 적용되지 않은 상태로 COCKPIT을 띄웠더니, **표시용 컬럼 하나 때문에
+         `_load_from_db()` 전체가 실패해 화면이 합성(가짜) 데이터로 떨어졌다.** 2026-07-21에
+         마이그레이션 010/011로 겪은 사고와 같은 형태다.
+
+         그때 만든 대응은 (a) 장전 스크립트가 매 기동마다 전 마이그레이션 재적용 (b) 스키마 정합성
+         배지였다. 둘 다 유효하지만 **커밋 시점과 다음 기동 사이의 구간**이 비어 있었다 — 그리고
+         그 구간에 화면은 가짜 데이터를 그린다(경고 배너는 뜨지만, 그 배너를 봐야 할 사람이
+         보는 것은 차트다).
+
+         **표시용으로 추가한 컬럼이 화면 전체를 죽여서는 안 된다**는 것이 이 함수의 유일한 목적이다.
+         값이 없으면 그 칸만 None이 되고(호출측이 "미기록"으로 표시) 나머지 판정은 살아 있다.
+         새 컬럼이 **판단에 쓰이는** 것이라면 이 함수를 쓰지 말 것 — 조용히 없는 값으로 판단하는
+         것이 훨씬 위험하다.
+    실패 조건: 행이 없으면 None. 42703이 아닌 오류는 그대로 전파한다(진짜 문제를 삼키지 않는다).
+    """
+    optional_sql = "".join(f", {c}" for c in optional)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"{base}{optional_sql}{tail}", params)
+            return cur.fetchone()
+    except psycopg.errors.UndefinedColumn:
+        conn.rollback()
+        logger.warning(
+            "컬럼 %s 미존재 — 마이그레이션 미적용으로 보고 그 값 없이 조회한다(db/migrations 적용 필요)",
+            ", ".join(optional),
+        )
+    with conn.cursor() as cur:
+        cur.execute(f"{base}{tail}", params)
+        row = cur.fetchone()
+    return (*row, *(None,) * len(optional)) if row is not None else None
 
 
 def _upsert(conn: ConnectionLike, table: str, columns: tuple[str, ...], conflict_keys: tuple[str, ...], row: dict) -> None:
@@ -168,6 +211,15 @@ _REGIME_STATE_COLUMNS = ("timestamp", "regime", "prob_vector", "higher_tf_regime
 def regime_state_columns() -> tuple[str, ...]:
     """해석: `macro_snapshot_columns()`와 동일 — 코드가 실제로 쓰는 컬럼 목록의 단일 소스."""
     return _REGIME_STATE_COLUMNS
+
+
+def ws_status_columns() -> tuple[str, ...]:
+    """
+    해석: `macro_snapshot_columns()`와 동일. 마이그레이션 026(atm_roll_count_today) 미적용이면
+         WS 하트비트 기록이 실패하는데, 그 실패는 `poll_ws_heartbeat`가 "관측 자체에는 영향 없음"
+         이라며 로그만 남기고 삼킨다 — 즉 **조용히** WS 배지 3종이 전부 멈춘다. 배지가 잡아야 한다.
+    """
+    return _WS_STATUS_COLUMNS
 
 
 # 2026-08-05(COCKPIT 육안 점검 P1-4) — LOCF(forward-fill)가 거슬러 올라갈 수 있는 최대 나이.
@@ -760,6 +812,8 @@ def latest_market_halt_state(conn: ConnectionLike) -> dict | None:
 _WS_STATUS_COLUMNS = (
     "id", "updated_at", "connected_since", "last_message_at", "reconnect_count_today",
     "market_op_subscribed_at",
+    # 2026-08-05(P2-12, 마이그레이션 026) — 관측 연속성의 선행지표. 상세 근거는 그 파일 주석.
+    "atm_roll_count_today",
 )
 
 
@@ -770,6 +824,7 @@ def upsert_ws_status(
     last_message_at: datetime | None,
     reconnect_count_today: int,
     market_op_subscribed_at: datetime | None = None,
+    atm_roll_count_today: int = 0,
 ) -> None:
     """
     입력: 하트비트 시각과 `mahdi.main.WsLiveness`의 현재 값.
@@ -782,6 +837,7 @@ def upsert_ws_status(
         "id": True, "updated_at": updated_at, "connected_since": connected_since,
         "last_message_at": last_message_at, "reconnect_count_today": reconnect_count_today,
         "market_op_subscribed_at": market_op_subscribed_at,
+        "atm_roll_count_today": atm_roll_count_today,
     }
     _upsert(conn, "ws_status", _WS_STATUS_COLUMNS, ("id",), row)
 
@@ -792,18 +848,22 @@ def latest_ws_status(conn: ConnectionLike) -> dict | None:
     실패 조건: 관측 루프가 아직 안 돌았으면 None — 호출측(COCKPIT)이 "미기록"으로 구분해야 한다
               (지어내지 않는다).
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT updated_at, connected_since, last_message_at, reconnect_count_today, "
-            "market_op_subscribed_at FROM ws_status LIMIT 1"
-        )
-        row = cur.fetchone()
+    row = _select_with_optional_columns(
+        conn,
+        base="SELECT updated_at, connected_since, last_message_at, reconnect_count_today, "
+             "market_op_subscribed_at",
+        optional=("atm_roll_count_today",),
+        tail=" FROM ws_status LIMIT 1",
+    )
     if row is None:
         return None
     return {
         "updated_at": row[0], "connected_since": row[1],
         "last_message_at": row[2], "reconnect_count_today": int(row[3]),
         "market_op_subscribed_at": row[4],
+        # 마이그레이션 026(2026-08-05 P2-12) 미적용이면 None — 그때는 이 배지 하나만 "미기록"이
+        # 되고 나머지 WS 판정은 그대로 산다(`_select_with_optional_columns` 참고).
+        "atm_roll_count_today": row[5],
     }
 
 

@@ -1,6 +1,9 @@
 import json
 from datetime import date, datetime, timedelta
 
+import psycopg
+import pytest
+
 from mahdi.data import db
 
 
@@ -905,11 +908,11 @@ def test_upsert_ws_status_writes_the_singleton_row():
     assert conn.store["params"][0] is True  # id
 
 
-def test_latest_ws_status_returns_all_five_signals():
+def test_latest_ws_status_returns_all_six_signals():
     conn = FakeReadConnection(
         [(
             datetime(2026, 8, 3, 15, 43), datetime(2026, 8, 3, 7, 31), datetime(2026, 8, 3, 15, 33), 0,
-            datetime(2026, 8, 3, 7, 31, 4),
+            datetime(2026, 8, 3, 7, 31, 4), 77,
         )]
     )
     state = db.latest_ws_status(conn)
@@ -920,10 +923,136 @@ def test_latest_ws_status_returns_all_five_signals():
     assert state["reconnect_count_today"] == 0
     # 2026-08-03 §4 우선순위 4 — "구독이 성립했는가"는 "데이터가 왔는가"와 별개 신호다.
     assert state["market_op_subscribed_at"] == datetime(2026, 8, 3, 7, 31, 4)
+    # 2026-08-05 P2-12(마이그레이션 026) — 관측 연속성의 선행지표. 08-05 실측 77회.
+    assert state["atm_roll_count_today"] == 77
+
+
+def test_latest_ws_status_keeps_unknown_atm_roll_count_as_none():
+    """마이그레이션 026 미적용 구간에서는 None — 0으로 지어내면 "롤이 없었다"는 거짓말이 된다.
+
+    호출측(`_atm_roll_churn_check`)이 이 None을 "집계 전"으로 표시하고, 미적용 사실 자체는
+    스키마 정합성 배지가 따로 경고한다.
+    """
+    conn = FakeReadConnection(
+        [(datetime(2026, 8, 3, 15, 43), None, None, 0, None, None)]
+    )
+    assert db.latest_ws_status(conn)["atm_roll_count_today"] is None
 
 
 def test_latest_ws_status_returns_none_when_observation_loop_never_ran():
     assert db.latest_ws_status(FakeReadConnection([])) is None
+
+
+# --- _select_with_optional_columns (2026-08-05, P2-10 검증 중 실측한 사고의 회귀) ----------------
+#
+# 마이그레이션 025/026을 커밋한 직후 라이브 DB에 적용 전 상태로 COCKPIT을 띄우니, **표시용 컬럼
+# 하나 때문에 `_load_from_db()` 전체가 실패해 화면이 합성(가짜) 데이터로 떨어졌다.** 2026-07-21에
+# 010/011로 겪은 사고와 같은 형태이며, 그때의 대응(장전 전체 재적용 + 스키마 배지)이 못 덮는
+# 구간 — 커밋 시점 ~ 다음 기동 — 이 정확히 이 사고 구간이다.
+
+
+class _UndefinedColumnOnceCursor:
+    """`optional` 컬럼이 포함된 첫 쿼리만 42703으로 실패시키고, 두 번째(없는 버전)는 성공시킨다."""
+
+    def __init__(self, marker: str, row: tuple, log: list):
+        self._marker = marker
+        self._row = row
+        self._log = log
+        self._failed = False
+
+    def execute(self, query: str, params=None) -> None:
+        self._log.append(query)
+        if self._marker in query:
+            self._failed = True
+            raise psycopg.errors.UndefinedColumn(f'column "{self._marker}" does not exist')
+
+    def fetchone(self):
+        return None if self._failed else self._row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _UndefinedColumnOnceConnection:
+    def __init__(self, marker: str, row: tuple):
+        self._marker = marker
+        self._row = row
+        self.queries: list[str] = []
+        self.rollback_calls = 0
+
+    def cursor(self):
+        return _UndefinedColumnOnceCursor(self._marker, self._row, self.queries)
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+def test_select_with_optional_columns_retries_without_the_missing_column():
+    conn = _UndefinedColumnOnceConnection("is_warmup", (datetime(2026, 8, 5, 12, 12), 2, [0.1] * 8, None, False))
+
+    row = db._select_with_optional_columns(
+        conn,
+        base="SELECT timestamp, regime, prob_vector, higher_tf_regime, stability_flag",
+        optional=("is_warmup",),
+        tail=" FROM regime_state ORDER BY timestamp DESC LIMIT 1",
+    )
+
+    assert len(conn.queries) == 2  # 있는 버전 → 실패 → 없는 버전
+    assert "is_warmup" in conn.queries[0]
+    assert "is_warmup" not in conn.queries[1]
+    assert conn.rollback_calls == 1  # 실패한 트랜잭션을 정리하지 않으면 이후 조회가 전부 죽는다
+    # 반환 길이는 optional을 포함한 형태로 맞춰야 호출측 언패킹이 안 깨진다.
+    assert len(row) == 6
+    assert row[5] is None
+
+
+def test_select_with_optional_columns_passes_through_other_errors():
+    """42703이 아닌 오류는 삼키지 않는다 — 진짜 문제를 "컬럼 없음"으로 오해하면 안 된다."""
+
+    class _BrokenCursor:
+        def execute(self, query, params=None):
+            raise psycopg.errors.SyntaxError("구문 오류")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _BrokenConn:
+        def cursor(self):
+            return _BrokenCursor()
+
+    with pytest.raises(psycopg.errors.SyntaxError):
+        db._select_with_optional_columns(
+            _BrokenConn(), base="SELECT a", optional=("b",), tail=" FROM t"
+        )
+
+
+def test_select_with_optional_columns_returns_none_when_no_rows():
+    class _EmptyCursor:
+        def execute(self, query, params=None):
+            pass
+
+        def fetchone(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _EmptyConn:
+        def cursor(self):
+            return _EmptyCursor()
+
+    assert db._select_with_optional_columns(
+        _EmptyConn(), base="SELECT a", optional=("b",), tail=" FROM t"
+    ) is None
 
 
 def test_rate_limiter_status_records_total_calls_for_demand_calculation():

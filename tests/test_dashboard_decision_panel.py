@@ -124,12 +124,57 @@ def test_build_decision_history_table_renders_recent_rows():
 
     fig = build_decision_history_table(history)
 
-    times, decisions, convictions, risk_labels, reasons = fig.data[0].cells.values
+    times, decisions, convictions, risk_labels, reasons, members = fig.data[0].cells.values
     assert list(times) == ["09:05:00", "09:00:00"]
     assert list(decisions) == ["진입 후보", "진입 없음"]
     assert risk_labels[0] == "승인(0.50)"
     assert risk_labels[1] == "-"
+    # 2026-08-05(P2-11): 매핑에 없는 사유는 원문 그대로 — 새 사유를 "알 수 없음"으로 덮으면
+    # 그 사유를 추적할 수단을 잃는다.
     assert reasons[1] == "defensive_regime_no_new_entries"
+    # 진입 후보가 아닌 행의 확신도는 쓰이지 않은 값이라 그 사실을 함께 쓴다.
+    assert convictions[0] == "고확신"
+    assert convictions[1] == "거래 없음 (미사용)"
+    assert list(members) == ["-", "-"]  # member_unavailable 키가 없는 구 버전 행
+
+
+def test_build_decision_history_table_translates_known_reject_reasons():
+    """2026-08-05 P2-11 — 08-05 화면은 시각/결정/확신도가 전부 한글인데 거부사유만 내부 식별자였다.
+
+    20행 중 19행이 같은 문자열이라 "읽을 것이 없는 열"로 보이지만, 실제로는 팔레트 관망과
+    앙상블 합의 실패가 전혀 다른 원인이다.
+    """
+    history = [
+        {"timestamp": datetime(2026, 8, 5, 12, 12), "conviction": "STANDARD", "decision": "REJECT",
+         "reject_reason": "strategy_palette:wait_only", "risk_gate_state": {}, "exec_mode": "ADVISORY"},
+        {"timestamp": datetime(2026, 8, 5, 11, 59), "conviction": "SMALL_TEST", "decision": "REJECT",
+         "reject_reason": "conflict_resolution:no_clear_consensus", "risk_gate_state": {},
+         "exec_mode": "ADVISORY"},
+    ]
+
+    reasons = build_decision_history_table(history).data[0].cells.values[4]
+
+    assert reasons[0] == "팔레트: 관망 지시만 있음"
+    assert reasons[1] == "충돌 조정: 명확한 합의 없음"
+
+
+def test_build_decision_history_table_surfaces_unavailable_ensemble_members():
+    """`member_unavailable`은 2026-08-04에 바로 이런 추적을 위해 판단 행에 남기기 시작한 값인데
+    COCKPIT에는 한 번도 표시되지 않았다 — 08-05에 11:59 이상행을 파고들 방법이 없었던 이유다."""
+    history = [
+        {"timestamp": datetime(2026, 8, 5, 12, 12), "conviction": "STANDARD", "decision": "REJECT",
+         "reject_reason": "strategy_palette:wait_only",
+         "risk_gate_state": {"member_unavailable": {"regime_hmm": "방향성 없는 레짐",
+                                                    "orderflow_ofi_vpin": "미시구조 없음"}},
+         "exec_mode": "ADVISORY"},
+        {"timestamp": datetime(2026, 8, 5, 12, 11), "conviction": "STANDARD", "decision": "REJECT",
+         "reject_reason": None, "risk_gate_state": {"member_unavailable": {}}, "exec_mode": "ADVISORY"},
+    ]
+
+    members = build_decision_history_table(history).data[0].cells.values[5]
+
+    assert members[0] == "2개 미가용: orderflow_ofi_vpin, regime_hmm"
+    assert members[1] == "전원 가용"  # 빈 dict와 키 부재("-")는 다르다
 
 
 def test_build_decision_history_table_handles_empty_history():
