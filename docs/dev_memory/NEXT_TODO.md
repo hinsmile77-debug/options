@@ -32,21 +32,38 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 - [ ] 부수 효과: 잔고 조회가 성공하기 시작하면 `risk_gate_state.risk_engine`이
       `account_tracker_not_ready`에서 실제 평가 결과로 바뀌는 분이 는다 — **의도된 결과**다.
 
+### Fix#3 (메타 라벨 실입력)
+
+- [ ] **HIGH_CONVICTION 0건 / STANDARD 증가** — 주장 지표. 08-05 전수 재계산 기준 13 → 0.
+      **0건은 회귀가 아니라 정정이다** — GEX 음수 + 레짐 불안정인 날에 최고 등급이 나오던 것이
+      결함이었다. GEX가 양수로 돌아서고 `stability_flag`가 True가 되는 날에는 다시 나와야 하며,
+      **그날에도 0이면** 배선이 과하게 조인 것이니 재검토할 것.
+- [ ] **Fix#1과 반드시 함께 읽을 것** — `short_gamma_requires`는 `highest_confidence`를 요구한다.
+      Fix#3으로 HIGH_CONVICTION이 사라지면 overpriced 분의 `limited_premium_sell`이 **확정적으로**
+      게이트에 걸린다. 두 fix의 효과를 분리하려면 `signal_decisions.vrp`(어느 열)와
+      conviction(어느 등급)을 나눠 볼 것.
+
+### Fix#4 (느린 호출 임계)
+
+- [ ] **`slow_calls.count >= 15`** — 주장 지표. 08-05는 ReadTimeout 21건인데 slow_calls 0건이었다.
+- [ ] **새 불변식: `slow_calls.count >= qualitative.read_timeout`** — 타임아웃은 이제 임계와
+      무관하게 반드시 느린 호출 줄을 남긴다. 이 부등식이 깨지면 배선이 끊긴 것이다.
+- [ ] **로그 볼륨 100~300줄 예상**(사람이 읽는 줄의 4~10%). **1,000줄을 넘으면 임계를 3.5초로**
+      올린다 — 단 4.0초 미만은 유지해야 한다(불변식 테스트가 막는다).
+
 ## [MW0601] 2026-08-05 신규 발견 — 아직 안 고친 것
 
-- [ ] **`MetaLabelContext()`가 전 필드 기본값** (08-05 §2 이상점 2, **P1**) —
-      `gamma_regime_stable=True`가 낙관적 하드코딩이라 `conviction_score`를 올린다.
-      2026-07-10 `warmup_fallback(RANGE_BALANCED, 0.0, 0.0)` 하드코딩과 **같은 형태의 결함**.
-      최소한 `regime_state.stability_flag`를 넘기고, 계산 불가 항목은 `None`으로 넘겨
-      **낙관적 기본값을 없앨 것**.
+- [x] **(2026-08-05 구현) `MetaLabelContext()` 전 필드 기본값 — Fix#3.**
+      `gamma_regime_stable`을 `GEX>=0 & stability_flag`로 배선(`_build_meta_label_context()`).
+      **`event_proximity_minutes`는 여전히 None** — 매크로 이벤트 캘린더 소스가 프로젝트에
+      없다. 이것만은 "사실"이 아니라 **미지**이므로 아래에 별도 항목으로 남긴다.
 - [ ] **`already_used_strategies_today` 미전달** (08-05 §2 이상점 6, P2) —
       `enforce_daily_strategy_cap`(하루 2개 제한)이 전 이력 무효. ADVISORY라 드러나지 않을 뿐,
       "안전장치는 죽었는지 알 수 있어야 한다"는 §5-4 원칙 위반이다.
-- [ ] **slow-call 임계(5.0초) > read 타임아웃(4.0초)** (08-05 §2 이상점 4, P1) —
-      타임아웃 호출은 총 ~4.0초라 임계에 못 미쳐 §9 "페이서 vs HTTP 귀속" 표가 **0건**이다.
-      08-05에 ReadTimeout이 21건 실재하는데 리포트는 "임계 초과 호출 없음"이었다.
-      **Fix#8이 자기를 정당화한 계측을 침묵시켰다.** 임계를 3.0초로 내리고 타임아웃 전용
-      카운터를 신설할 것. Fix#2로 잔고/만기유동성이 10초로 돌아왔으므로 그쪽은 다시 잡힌다.
+- [x] **(2026-08-05 구현) slow-call 임계 > read 타임아웃 — Fix#4.**
+      임계 5.0 → 3.0초 + 타임아웃은 임계와 무관하게 무조건 로깅 + **불변식 테스트**로
+      `임계 < min(모든 read 타임아웃)`을 기계적으로 강제
+      (`test_slow_call_threshold_must_stay_below_every_read_timeout`).
 - [ ] **`_record_http_latency()`가 국내/해외 `inquire-price`를 한 행에 섞는다** (P2) —
       둘 다 마지막 경로 조각이 `inquire-price`다. §9-1의 `inquire-price` 행에 매크로 호출
       (~88건/일, 약 3%)이 섞여 있다. `timeout_for_url()`은 전체 경로로 키를 잡아 이미
@@ -67,6 +84,11 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 - [ ] **계측 감사에 "임계-물리한계 정합성" 규칙 추가** (08-05 고도화#3) — 현재 감사는
       *"0건 보고인데 로그에 실재하는가"* 한 방향만 본다. 이상점 4는 **로그에도 없어서** 통과했다.
       지표의 발동 임계가 시스템의 물리적 상한(타임아웃·예산·창 크기)보다 크면 경고할 것.
+- [ ] **`event_proximity_minutes`가 여전히 None** (08-05 Fix#3에서 의도적으로 남김, P2) —
+      매크로 이벤트 캘린더 소스가 프로젝트 어디에도 없다. `classify()`는 이 값이 15분 미만이면
+      ×0.5 페널티를 거는데, 지금은 **FOMC·옵션만기·고용지표 직전에도 페널티가 안 걸린다.**
+      값을 지어내면 무작위 페널티가 되므로 캘린더 소스를 먼저 정해야 한다
+      (KIS에는 없다 — 외부 소스 또는 수기 테이블).
 - [ ] **멤버별 점수를 `signal_decisions`에 남길 것** (08-05 고도화#1) — 지금은 가용성만 있고
       점수가 없어, **`OPTIONS_FLOW_GAMMA_WALL_FALLBACK` 유지 여부(사용자 결정 대기)를 데이터로
       답할 수 없다.** 08-05의 방향 ±0.692가 어느 멤버에서 왔는지 DB로 역산이 불가능하다.

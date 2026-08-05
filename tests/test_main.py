@@ -4904,3 +4904,116 @@ def test_poll_signal_fusion_cycle_falls_back_to_fair_when_vrp_is_unavailable(mon
     assert captured == [0.0]  # 팔레트에는 안전한 쪽
     assert recorded[0]["vrp"] is None  # 기록에는 "못 쟀다"가 그대로
 
+
+# --- MetaLabelContext 실입력 배선(2026-08-05 §2 이상점 2 / Fix#3) ---------------------------
+
+
+def _signal_inputs_with(gex, stability_flag):
+    from mahdi.fusion.signal_layer import SignalInputs
+
+    regime_state = (
+        RegimeState(regime=RegimeLabel.RANGE_BALANCED, prob_vector=(1.0,) + (0.0,) * 7,
+                    stability_flag=stability_flag)
+        if stability_flag is not None else None
+    )
+    return SignalInputs(regime_state=regime_state, gex=gex)
+
+
+def test_meta_label_context_marks_gamma_regime_unstable_on_negative_gex():
+    """`MetaLabelInputs` 주석이 정의를 이미 적어두었다 — `GEX>=0 & stability_flag`.
+    같은 두 값을 `engine.py`가 팔레트 게이트로 쓰고 있었는데 메타 라벨에는 안 연결돼 있었다."""
+    from mahdi.main import _build_meta_label_context
+
+    assert _build_meta_label_context(_signal_inputs_with(-9.9e9, True)).gamma_regime_stable is False
+    assert _build_meta_label_context(_signal_inputs_with(1.0e9, False)).gamma_regime_stable is False
+    assert _build_meta_label_context(_signal_inputs_with(1.0e9, True)).gamma_regime_stable is True
+
+
+def test_meta_label_context_is_conservative_when_inputs_are_missing():
+    """모르면 '안정'으로 치지 않는다 — 페널티를 거는 쪽이 보수적이다."""
+    from mahdi.main import _build_meta_label_context
+
+    assert _build_meta_label_context(_signal_inputs_with(None, True)).gamma_regime_stable is False
+    assert _build_meta_label_context(_signal_inputs_with(1.0e9, None)).gamma_regime_stable is False
+
+
+def test_meta_label_context_does_not_invent_slippage_or_win_rate():
+    """`trade_history`/`execution_logs`가 둘 다 0행이다. 체결이 없으면 슬리피지도 없으므로
+    False는 낙관이 아니라 사실이고, 승률은 None(=이력 없음, 중립 1.0배)이 정확한 표현이다.
+    `event_proximity_minutes`만은 **사실이 아니라 미지**다 — 캘린더 소스가 없어 못 채운다."""
+    from mahdi.main import _build_meta_label_context
+
+    ctx = _build_meta_label_context(_signal_inputs_with(1.0e9, True))
+    assert ctx.recent_slippage_elevated is False
+    assert ctx.recent_same_setup_win_rate is None
+    assert ctx.event_proximity_minutes is None
+
+
+def test_optimistic_gamma_default_was_inflating_conviction_by_one_grade():
+    """08-05 실측 재현 — HIGH_CONVICTION 6건의 `conviction_score`는 정확히 0.75였다
+    (= regime_confidence 1.0 x 동조비 3/4, 페널티 0회). 먼슬리 GEX는 −9.9bn이고
+    `stability_flag`는 하루 종일 False였으므로 감마 레짐 페널티(x0.85)가 걸렸어야 하고,
+    그랬다면 0.6375 < standard_max(0.65) → STANDARD로 내려갔어야 한다.
+    """
+    from mahdi.fusion.meta_label import MetaLabelInputs, TradePermission, classify
+
+    thresholds = {"standard_max": 0.65, "gamma_regime_penalty_factor": 0.85}
+    base = dict(regime_confidence=1.0, signal_agreement_count=3, available_member_count=4)
+
+    optimistic = classify(MetaLabelInputs(**base, gamma_regime_stable=True), thresholds)
+    truthful = classify(MetaLabelInputs(**base, gamma_regime_stable=False), thresholds)
+
+    assert optimistic.conviction_score == pytest.approx(0.75)
+    assert optimistic.trade_permission is TradePermission.HIGH_CONVICTION
+    assert truthful.conviction_score == pytest.approx(0.6375)
+    assert truthful.trade_permission is TradePermission.STANDARD
+
+
+def test_poll_signal_fusion_cycle_passes_real_meta_label_context(monkeypatch):
+    """회귀 방지 §2 이상점 2(Fix#3): `MetaLabelContext()`를 인자 없이 만들면 곱셈 페널티 4종이
+    하나도 안 걸린다. 2026-07-10 `warmup_fallback(RANGE_BALANCED, 0.0, 0.0)` 하드코딩과
+    같은 형태의 결함 — 함수는 입력을 받도록 설계돼 있는데 호출측이 상수를 넣고 있었다."""
+    from mahdi.fusion.engine import SignalFusionEngine
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    # 먼슬리 풋 편중 → GEX 음수(08-05 실측과 같은 배치) → 감마 레짐 불안정이어야 한다.
+    _patch_chain(monkeypatch, [
+        _vrp_chain_row(345.0, "C", _MONTHLY, iv=0.86, rv=0.78),
+        _vrp_chain_row(345.0, "P", _MONTHLY, iv=0.90, rv=0.78),
+        _vrp_chain_row(350.0, "C", _MONTHLY, iv=0.86, rv=0.78),
+        _vrp_chain_row(350.0, "P", _MONTHLY, iv=0.90, rv=0.78),
+    ], spot=350.5)
+
+    captured: list = []
+    real_evaluate = SignalFusionEngine.evaluate
+
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+        captured.append(meta_context)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+
+    monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
+
+    recorded: list = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None: recorded.append(risk_gate_state),
+    )
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 1:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+    # regime_state가 None이므로 stability_flag를 모른다 → 안정으로 치지 않는다.
+    assert captured and captured[0].gamma_regime_stable is False

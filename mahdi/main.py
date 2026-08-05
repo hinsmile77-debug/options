@@ -2637,6 +2637,49 @@ def _build_signal_inputs(
     return signal_inputs, chain_inputs
 
 
+def _build_meta_label_context(signal_inputs: SignalInputs) -> MetaLabelContext:
+    """
+    입력: 이번 사이클의 SignalInputs.
+    계산: v6 §11.2 메타 라벨 입력 중 **호출측만 알 수 있는 4개**를 실데이터로 채운다.
+    해석: 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 2 / Fix#3) — 종전에는
+         `MetaLabelContext()`를 **인자 없이** 생성했다. 그 기본값은 전부 "페널티 없음"쪽이라
+         `classify()`의 곱셈 페널티 4종이 하나도 걸리지 않았고, 특히
+         `gamma_regime_stable=True`는 **낙관적 하드코딩**이었다.
+
+         이것은 2026-07-10에 `warmup_fallback(RANGE_BALANCED, macro_score=0.0, gap_zscore=0.0)`을
+         하드코딩된 인자로 호출해 레짐이 하루 종일 고정돼 있던 것과 **같은 형태의 결함**이다:
+         함수는 입력을 받도록 설계돼 있는데 호출측이 상수를 넣고 있었다.
+
+         실제 피해(08-05): 그날 HIGH_CONVICTION 6건의 `conviction_score`는 정확히 0.75였다
+         (= regime_confidence 1.0 x 동조비 3/4, 페널티 0회). 먼슬리 GEX는 −9.9bn(음수)이고
+         `stability_flag`는 하루 종일 False였으므로 `gamma_regime_stable`은 **False가 맞았고**,
+         그랬다면 0.75 x 0.85 = 0.6375 < standard_max(0.65) → STANDARD로 내려갔어야 한다.
+         즉 그 6건은 낙관적 기본값이 만든 한 등급 위의 확신도였다.
+
+         **`gamma_regime_stable`의 정의**는 `MetaLabelInputs` 주석이 이미 적어둔 그대로
+         `GEX>=0 & stability_flag`다. 같은 두 값을 `engine.py`가 이미 팔레트 게이트
+         (`positive_gex`/`stable_regime`)로 쓰고 있다 — 정의를 새로 만든 게 아니라 **이미 있던
+         정의를 메타 라벨에도 연결한 것**이다.
+
+         **나머지 셋을 그대로 두는 근거**(추측으로 채우지 않는다):
+           - `recent_slippage_elevated=False` — `trade_history`/`execution_logs`가 **둘 다 0행**이다.
+             체결이 없으면 슬리피지도 없으므로 False는 낙관이 아니라 **사실**이다. 실행이
+             배선되는 날 이 자리가 채울 곳이다.
+           - `recent_same_setup_win_rate=None` — 같은 이유. `classify()`가 None을 "이력 없음
+             (중립 1.0배)"으로 정의해 두었으므로 None이 정확한 표현이다.
+           - `event_proximity_minutes=None` — **이건 사실이 아니라 미지다.** 매크로 이벤트
+             캘린더 소스가 프로젝트 어디에도 없어 지금은 채울 수 없다(알려진 결함으로
+             [[NEXT_TODO]]에 남긴다). 값을 지어내면 ×0.5 페널티가 무작위로 걸린다.
+    실패 조건: 없음 — `regime_state`나 `gex`가 없으면 `gamma_regime_stable`은 False가 된다
+              (모르면 안정으로 치지 않는다 = 페널티를 거는 쪽이 보수적이다).
+    """
+    positive_gex = signal_inputs.gex is not None and signal_inputs.gex >= 0
+    stable_regime = (
+        signal_inputs.regime_state.stability_flag if signal_inputs.regime_state is not None else False
+    )
+    return MetaLabelContext(gamma_regime_stable=positive_gex and stable_regime)
+
+
 def _account_state_snapshot_from_row(row: dict | None) -> BalanceSnapshot | None:
     return BalanceSnapshot(**row) if row is not None else None
 
@@ -2800,9 +2843,14 @@ async def poll_signal_fusion_cycle(
                 # 0.0 = fair = `wait_and_see`(관망)라 08-05 이전의 상시 동작과 같고, 없는 값을
                 # 지어내 진입을 만들지 않는다. "못 쟀다"와 "쟀는데 적정이다"의 구분은 팔레트가
                 # 아니라 `signal_decisions.vrp`(NULL vs 0.0)가 보존한다.
+                # 2026-08-05(§2 이상점 2 / Fix#3) — 메타 라벨 입력도 실데이터로 채운다.
+                # 종전의 `MetaLabelContext()`는 전 필드가 "페널티 없음"이라
+                # `gamma_regime_stable=True`가 확신도를 한 등급 부풀렸다(근거는 함수 주석).
                 vrp = chain_inputs.get("vrp")
                 decision = fusion_engine.evaluate(
-                    signal_inputs, MetaLabelContext(), vrp=vrp if vrp is not None else 0.0
+                    signal_inputs,
+                    _build_meta_label_context(signal_inputs),
+                    vrp=vrp if vrp is not None else 0.0,
                 )
 
                 # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)

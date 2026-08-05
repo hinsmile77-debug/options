@@ -696,14 +696,14 @@ def test_slow_call_log_is_info_not_warning(caplog):
     assert records[0].levelno == logging.INFO
 
 
-def test_slow_call_threshold_ignores_calls_under_five_seconds(caplog):
+def test_slow_call_threshold_ignores_calls_under_the_threshold(caplog):
     client = KISRestClient(
         _settings(), _token_daemon(),
         client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
         min_request_interval=0.0,
     )
     with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
-        client._log_if_slow("GET", "https://x/uapi/inquire-price", pacer_seconds=2.0, http_seconds=2.5)
+        client._log_if_slow("GET", "https://x/uapi/inquire-price", pacer_seconds=1.0, http_seconds=1.5)
 
     assert not [r for r in caplog.records if "느린 REST 호출" in r.message]
 
@@ -789,3 +789,77 @@ def test_get_quote_actually_sends_the_four_second_read_timeout():
 
     assert captured["timeout"]["read"] == 4.0
 
+
+# ===== 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 4 / Fix#4) — 임계-물리한계 정합성 =====
+
+
+def test_slow_call_threshold_must_stay_below_every_read_timeout():
+    """**이 파일에서 가장 중요한 불변식이다.**
+
+    08-04 Fix#8이 read를 4.0초로 낮추면서 임계 5.0초가 **물리적 상한 위로 올라갔다.**
+    그 순간 `slow_calls`는 구조적으로 0이 됐고(08-05에 ReadTimeout 21건이 실재하는데
+    리포트 §9는 "임계 초과 호출 없음"), §0 가설 검정은 그 0을 "반증"으로 찍었다.
+    계측 감사는 이걸 못 잡는다 — 로그에 실재하지도 않으므로 "파서 정상"으로 통과한다.
+
+    임계와 타임아웃 중 **어느 쪽을 바꿔도** 이 테스트가 깨져야 그 실수가 반복되지 않는다.
+    """
+    from mahdi.broker.rest_client import (
+        _ENDPOINT_READ_TIMEOUT_SECONDS,
+        _HTTP_READ_TIMEOUT_SECONDS,
+        SLOW_CALL_LOG_THRESHOLD_SECONDS,
+    )
+
+    every_read_timeout = [_HTTP_READ_TIMEOUT_SECONDS, *_ENDPOINT_READ_TIMEOUT_SECONDS.values()]
+    assert SLOW_CALL_LOG_THRESHOLD_SECONDS < min(every_read_timeout), (
+        "느린 호출 임계가 read 타임아웃보다 크면 그 지표는 구조적으로 0건이 된다 "
+        "(08-04 Fix#8이 정확히 그렇게 자기 근거가 된 계측을 침묵시켰다)"
+    )
+
+
+def test_timed_out_call_is_always_logged_even_below_the_threshold(caplog):
+    """타임아웃은 정의상 가장 극단적인 느린 호출인데, 총 소요가 타임아웃 값에서 잘리는 탓에
+    임계 아래로 떨어질 수 있다 — 임계에 의존하지 않고 구조적으로 보장한다."""
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+        min_request_interval=0.0,
+    )
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
+        client._log_if_slow(
+            "GET", "https://x/uapi/inquire-price", pacer_seconds=0.0, http_seconds=0.5, timed_out=True
+        )
+
+    assert [r for r in caplog.records if "느린 REST 호출" in r.message]
+
+
+def test_read_timeout_produces_an_attributable_slow_call_line(caplog):
+    """08-05 실측 재현: ReadTimeout 21건이 §9 "페이서 vs HTTP 귀속" 표에 **한 건도** 안 잡혔다.
+    타임아웃이 나면 그 호출의 페이서/HTTP 분해가 반드시 남아야 한다 — §2-6이 "밀림의 90%는
+    KIS 지연"이라고 귀속시킨 근거가 바로 그 표다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    with caplog.at_level(logging.INFO, logger="mahdi.broker.rest_client"):
+        with pytest.raises(httpx.ReadTimeout):
+            client.get_quote("201S03")
+
+    slow = [r for r in caplog.records if "느린 REST 호출" in r.message]
+    assert len(slow) == 1
+    # 파서(`log_metrics._SLOW_CALL_RE`)가 읽는 형태 그대로여야 한다.
+    assert "페이서대기" in slow[0].message and "HTTP" in slow[0].message
+
+
+def test_slow_call_line_still_matches_the_ops_parser_after_the_threshold_change():
+    """임계를 바꿔도 포맷 계약은 그대로다 — 08-03에 레벨만 바꾸고 파서를 안 고쳐
+    362건이 0건으로 보고된 전례가 있다."""
+    from mahdi.ops.log_metrics import _SLOW_CALL_RE
+    from mahdi.broker.rest_client import LOG_SLOW_CALL
+
+    rendered = LOG_SLOW_CALL % (4.02, 0.02, 4.00, 1.00, "GET", "inquire-price")
+    line = f"2026-08-06 09:20:31,123 INFO:mahdi.broker.rest_client:{rendered}"
+    assert _SLOW_CALL_RE.match(line) is not None

@@ -60,7 +60,26 @@ DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 # 경고를 파묻는다(08-03 사람이 읽는 줄 4,629줄의 20%가 이 한 줄이었다). 계측을 없애지 않는 이유는
 # 커넥션 풀 조치(아래 `_HTTP_LIMITS`)의 효과를 같은 지표로 재야 하기 때문이다 — **고치기 위해
 # 만든 계측을 고친 뒤에 끄면 회귀를 못 잡는다.**
-SLOW_CALL_LOG_THRESHOLD_SECONDS = 5.0
+#
+# 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 4 / Fix#4) — 5.0 → **3.0초로 되돌린다.**
+# 바로 위 문단이 "고치기 위해 만든 계측을 고친 뒤에 끄면 회귀를 못 잡는다"고 적어놓고,
+# **정확히 그 일이 벌어졌다.**
+#
+# 08-04 Fix#8이 read 타임아웃을 4.0초로 낮췄다. 그 순간부터 HTTP 소요는 구조적으로 4.0초를
+# 넘을 수 없는데 이 임계는 5.0초였다 — 즉 **임계가 물리적 상한 위에 놓였다.** 결과는 08-05
+# 실측이 그대로 보여준다: `httpx.ReadTimeout`이 21건 실재하는데 자동 리포트 §9는
+# "임계(5초) 초과 호출 없음"이었고, §0의 가설 검정은 `slow_calls 0건`을 **반증**으로 찍었다.
+# 그 0건은 파서 결함이 아니라(계측 감사는 정상 통과했다) **Fix#8이 자기를 정당화한 계측을
+# 침묵시킨 것**이다 — §2-6이 "밀림의 90%는 KIS 지연"이라고 귀속시킨 바로 그 표다.
+#
+# 3.0 근거: 등록된 read 타임아웃 중 **최솟값(4.0초)보다 낮아야** 타임아웃 직전 구간이 보인다.
+# 이 부등식은 `tests/test_broker_rest_client.py`의 불변식 테스트가 기계적으로 지킨다 —
+# 둘 중 하나만 바뀌어도 테스트가 깨진다(2026-08-05 고도화#3 "임계-물리한계 정합성"의 국소 적용).
+#
+# 로그 볼륨 재검토: 08-03에 3.0초가 933건을 만든 것은 read가 10초여서 꼬리가 길었기 때문이다.
+# 지금은 4.0초에서 잘리고 페이서도 08-04에 정리됐다(밀림 0건) — 08-05 §9-1 기준 3초를 넘는
+# 호출은 혼잡 시간대에 집중된 소수다. 예측치는 `hypotheses.yaml` 2026-08-05-p4에 적어둔다.
+SLOW_CALL_LOG_THRESHOLD_SECONDS = 3.0
 
 # 2026-08-03(§4 우선순위 3) — 커넥션 풀/타임아웃.
 #
@@ -400,17 +419,25 @@ class KISRestClient:
         with self._http_samples_lock:
             self._http_samples.setdefault(endpoint, []).append(http_seconds)
 
-    def _log_if_slow(self, method: str, url: str, pacer_seconds: float, http_seconds: float) -> None:
+    def _log_if_slow(
+        self, method: str, url: str, pacer_seconds: float, http_seconds: float,
+        *, timed_out: bool = False,
+    ) -> None:
         """계산: 페이서 대기 + HTTP 응답이 임계를 넘으면 두 구간을 **나눠서** 남긴다
         (2026-07-31 §4 우선순위 3 — 상세 근거는 SLOW_CALL_LOG_THRESHOLD_SECONDS 주석).
         2026-08-03(§2-8): 진단이 끝나 WARNING → INFO.
         2026-08-04(§2-1): 그 레벨 변경이 `log_metrics._SLOW_CALL_RE`를 침묵시켜 08-04 리포트가
         362건을 **0건**으로 보고했다. 포맷은 이제 `LOG_SLOW_CALL` 상수이고 계약 테스트가 지킨다.
         2026-08-04(고도화#5): 임계와 무관하게 **모든 호출의 HTTP 소요를 표본에 넣는다** —
-        꼬리(느린 호출)만 보면 "오늘 KIS가 평소보다 느렸는가"에 답할 수 없다."""
+        꼬리(느린 호출)만 보면 "오늘 KIS가 평소보다 느렸는가"에 답할 수 없다.
+        2026-08-05(§2 이상점 4 / Fix#4): `timed_out`이면 **임계를 무시하고 반드시 남긴다.**
+        타임아웃은 정의상 가장 극단적인 느린 호출인데, 그 총 소요가 타임아웃 값에서 잘리는
+        탓에 임계 아래로 떨어질 수 있다 — 임계를 3.0초로 내린 지금도 read가 10초인
+        엔드포인트에서는 같은 역전이 다시 생길 수 있으므로(예: 잔고 read 10초 vs 임계 3초는
+        안전하지만, 앞으로 임계를 다시 올리면 아니다) 임계에 의존하지 않고 구조적으로 보장한다."""
         self._record_http_latency(url, http_seconds)
         total = pacer_seconds + http_seconds
-        if total < SLOW_CALL_LOG_THRESHOLD_SECONDS:
+        if total < SLOW_CALL_LOG_THRESHOLD_SECONDS and not timed_out:
             return
         logger.info(
             LOG_SLOW_CALL,
@@ -426,11 +453,18 @@ class KISRestClient:
         self._rate_limiter.wait()
         kwargs.setdefault("timeout", timeout_for_url(url))
         http_started = time.monotonic()
+        timed_out = False
         try:
             return self._client.get(url, **kwargs)
+        except httpx.TimeoutException:
+            timed_out = True
+            raise
         finally:
             # 예외(타임아웃 등)로 끝난 호출이야말로 계측이 필요하다 — finally에서 재고 넘긴다.
-            self._log_if_slow("GET", url, http_started - pacer_started, time.monotonic() - http_started)
+            self._log_if_slow(
+                "GET", url, http_started - pacer_started, time.monotonic() - http_started,
+                timed_out=timed_out,
+            )
 
     def _get(self, url: str, **kwargs) -> dict:
         """모든 REST GET 호출의 단일 진입점 — 실제 전송 직전에 _rate_limiter로 페이싱하고,
@@ -466,10 +500,17 @@ class KISRestClient:
         self._rate_limiter.wait()
         kwargs.setdefault("timeout", timeout_for_url(url))
         http_started = time.monotonic()
+        timed_out = False
         try:
             response = self._client.post(url, **kwargs)
+        except httpx.TimeoutException:
+            timed_out = True
+            raise
         finally:
-            self._log_if_slow("POST", url, http_started - pacer_started, time.monotonic() - http_started)
+            self._log_if_slow(
+                "POST", url, http_started - pacer_started, time.monotonic() - http_started,
+                timed_out=timed_out,
+            )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
