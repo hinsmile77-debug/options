@@ -28,7 +28,14 @@ from mahdi.broker import tr_codes
 from mahdi.broker.rest_client import KISRestClient
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.broker.ws_client import ApprovalKeyIssuer, KISWebSocketClient, Subscription, WSConnection
-from mahdi.config.settings import PROJECT_ROOT, get_db_settings, get_kis_settings, get_risk_limits, get_slack_settings
+from mahdi.config.settings import (
+    PROJECT_ROOT,
+    get_db_settings,
+    get_event_calendar,
+    get_kis_settings,
+    get_risk_limits,
+    get_slack_settings,
+)
 from mahdi import notify
 from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
@@ -53,6 +60,10 @@ from mahdi.features.options_intel import (
 )
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
+from mahdi.fusion.event_calendar import (
+    NEEDS_ATTENTION as EVENT_CALENDAR_NEEDS_ATTENTION,
+    minutes_to_next_event,
+)
 from mahdi.fusion.meta_label import TradePermission
 from mahdi.fusion.signal_layer import (
     MEMBER_FIELDS,
@@ -238,6 +249,25 @@ LOG_CHAIN_BUDGET_EXCEEDED = (
 )
 LOG_ATM_ROLL = "ATM 롤링: 스팟 %.2f — 행사가 %s → %s"
 LOG_REST_LATENCY = "REST 응답시간(%.0f초 창): %s"
+
+# 2026-08-05 — 이벤트 캘린더 미기입 경고.
+#
+# 수기 테이블(`mahdi/config/event_calendar.yaml`)의 실패 모드는 "안 채우는 것"이 아니라
+# **"안 채운 걸 아무도 모르는 것"** 이다. 안 채우면 `event_proximity_minutes`가 None으로
+# 돌아가고, 그것은 2026-08-05 이전(페널티 한 번도 안 걸림)과 **완전히 같은 상태**인데
+# 지표상으로는 아무 일도 안 일어난 것처럼 보인다.
+#
+# 그래서 이 줄은 **`log_metrics._QUALITATIVE_MARKERS`에 등록**돼 자동 리포트 §11 정성 항목에
+# 매일 건수로 찍힌다(계약은 `tests/test_ops_log_metrics_contract.py`가 지킨다).
+# 문구를 바꾸면 그 테스트가 깨진다 — 08-04 §2-1에서 로그 문구만 바꾸고 파서를 안 고쳐
+# 362건이 0건으로 보고된 전례가 있다.
+LOG_EVENT_CALENDAR_NOT_COVERED = (
+    "이벤트 캘린더 미기입: %s — `mahdi/config/event_calendar.yaml`의 covered_through(%s)가 "
+    "오늘(%s)보다 앞선다. 이벤트 근접 페널티가 걸리지 않는 상태다"
+)
+# 매 사이클(60초) 남기면 하루 495줄이 된다 — 08-04 §2-2에서 고친 로그 폭증의 재현이다.
+# 1시간이면 하루 8줄로 §11 카운트에는 충분히 잡히고 사람이 읽는 줄은 거의 안 늘어난다.
+EVENT_CALENDAR_WARNING_WINDOW_SECONDS = 3600.0
 
 # 2026-07-29 신규 — 서킷브레이커/거래정지 감지(mahdi/risk/market_halt.py)용 H0UNMKO0(국내주식
 # 장운영정보) 구독 대상. CB/시장임시정지는 시장 전체 이벤트라 아무 종목이나 구독해도 그 순간의
@@ -2681,7 +2711,10 @@ def _build_signal_inputs(
     return signal_inputs, chain_inputs
 
 
-def _build_meta_label_context(signal_inputs: SignalInputs) -> MetaLabelContext:
+def _build_meta_label_context(
+    signal_inputs: SignalInputs,
+    event_proximity_minutes: float | None = None,
+) -> MetaLabelContext:
     """
     입력: 이번 사이클의 SignalInputs.
     계산: v6 §11.2 메타 라벨 입력 중 **호출측만 알 수 있는 4개**를 실데이터로 채운다.
@@ -2711,9 +2744,11 @@ def _build_meta_label_context(signal_inputs: SignalInputs) -> MetaLabelContext:
              배선되는 날 이 자리가 채울 곳이다.
            - `recent_same_setup_win_rate=None` — 같은 이유. `classify()`가 None을 "이력 없음
              (중립 1.0배)"으로 정의해 두었으므로 None이 정확한 표현이다.
-           - `event_proximity_minutes=None` — **이건 사실이 아니라 미지다.** 매크로 이벤트
-             캘린더 소스가 프로젝트 어디에도 없어 지금은 채울 수 없다(알려진 결함으로
-             [[NEXT_TODO]]에 남긴다). 값을 지어내면 ×0.5 페널티가 무작위로 걸린다.
+           - `event_proximity_minutes` — 2026-08-05에 수기 캘린더
+             (`mahdi/config/event_calendar.yaml`)로 배선했다. 호출측이
+             `fusion.event_calendar.minutes_to_next_event()` 결과를 넘긴다. **캘린더가
+             미기입이면 None이 그대로 들어온다** — 그때 페널티를 지어내지 않는 대신 호출측이
+             경고를 남긴다(`minutes`가 None인 두 이유를 가르는 것이 그 모듈의 핵심이다).
     실패 조건: 없음 — `regime_state`나 `gex`가 없으면 `gamma_regime_stable`은 False가 된다
               (모르면 안정으로 치지 않는다 = 페널티를 거는 쪽이 보수적이다).
     """
@@ -2721,7 +2756,10 @@ def _build_meta_label_context(signal_inputs: SignalInputs) -> MetaLabelContext:
     stable_regime = (
         signal_inputs.regime_state.stability_flag if signal_inputs.regime_state is not None else False
     )
-    return MetaLabelContext(gamma_regime_stable=positive_gex and stable_regime)
+    return MetaLabelContext(
+        gamma_regime_stable=positive_gex and stable_regime,
+        event_proximity_minutes=event_proximity_minutes,
+    )
 
 
 def _account_state_snapshot_from_row(row: dict | None) -> BalanceSnapshot | None:
@@ -2867,6 +2905,10 @@ async def poll_signal_fusion_cycle(
     # **0회에 경고를 걸지는 않는다**(그러면 CB 하트비트와 같은 실수: 정상을 이상으로 표시).
     risk_gate_invocations = 0
     risk_gate_last_invoked_at: datetime | None = None
+    # 2026-08-05 — 캘린더는 프로세스당 1회만 읽는다(`get_event_calendar()`가 `@lru_cache`).
+    # 미기입 경고는 1시간 창으로 억제한다 — 근거는 `LOG_EVENT_CALENDAR_NOT_COVERED` 주석.
+    event_calendar_raw = get_event_calendar()
+    calendar_throttle = WarningThrottle(logger, EVENT_CALENDAR_WARNING_WINDOW_SECONDS)
     next_tick: float | None = None
     while True:
         poll_time = db.local_now().replace(second=0, microsecond=0)
@@ -2900,10 +2942,21 @@ async def poll_signal_fusion_cycle(
                 except Exception:
                     logger.warning("오늘 사용 전략 조회 실패 — 이번 사이클은 상한 없이 진행", exc_info=True)
                     already_used_today = frozenset()
+                # 2026-08-05 — 이벤트 근접도(수기 캘린더). `minutes`가 None인 두 이유를
+                # 가르는 것이 이 모듈의 핵심이다: `no_upcoming`(확인했고 없다)은 조용하고,
+                # `not_covered`/`empty`(모른다)만 경고한다. 어느 쪽이든 페널티는 지어내지 않는다.
+                proximity = minutes_to_next_event(poll_time, event_calendar_raw)
+                if proximity.status in EVENT_CALENDAR_NEEDS_ATTENTION:
+                    calendar_throttle.warning(
+                        "event_calendar_not_covered", LOG_EVENT_CALENDAR_NOT_COVERED,
+                        proximity.status, proximity.covered_through, poll_time.date(),
+                    )
                 vrp = chain_inputs.get("vrp")
                 decision = fusion_engine.evaluate(
                     signal_inputs,
-                    _build_meta_label_context(signal_inputs),
+                    _build_meta_label_context(
+                        signal_inputs, event_proximity_minutes=proximity.minutes
+                    ),
                     vrp=vrp if vrp is not None else 0.0,
                     already_used_strategies_today=already_used_today,
                 )

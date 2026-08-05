@@ -5215,3 +5215,86 @@ def test_market_op_unsubscribe_does_not_forge_a_liveness_signal(monkeypatch):
     _run_loop_with_ack(monkeypatch, ack, liveness)
 
     assert liveness.market_op_subscribed_at is None
+
+
+# --- 이벤트 근접도 배선(2026-08-05, 수기 캘린더 (a)안) ---------------------------------------
+
+
+def test_meta_label_context_carries_event_proximity_through():
+    from mahdi.main import _build_meta_label_context
+
+    ctx = _build_meta_label_context(_signal_inputs_with(1.0e9, True), event_proximity_minutes=10.0)
+    assert ctx.event_proximity_minutes == 10.0
+
+
+def test_meta_label_context_keeps_none_when_the_calendar_cannot_answer():
+    """미기입/이벤트없음 둘 다 None이 들어온다 — 페널티를 지어내지 않는다.
+    그 둘의 구분은 페널티가 아니라 **경고**로 처리한다(아래 테스트)."""
+    from mahdi.main import _build_meta_label_context
+
+    ctx = _build_meta_label_context(_signal_inputs_with(1.0e9, True), event_proximity_minutes=None)
+    assert ctx.event_proximity_minutes is None
+
+
+def _run_fusion_cycle_with_calendar(monkeypatch, calendar, recorded, now):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    _patch_chain(monkeypatch, [], spot=None)
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.entry_strategies_used_today", lambda conn, on_date: frozenset())
+    monkeypatch.setattr("mahdi.main.get_event_calendar", lambda: calendar)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: now)
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None: recorded.append(risk_gate_state),
+    )
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 1:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+
+def test_fusion_cycle_warns_when_the_event_calendar_is_not_covered(monkeypatch, caplog):
+    """**이 경고가 수기 방식(a)의 유일한 방어선이다.** 캘린더를 안 채우면 시스템은
+    2026-08-05 이전 상태로 조용히 되돌아가고, 그 사실 자체가 안 보인다."""
+    calendar = {"covered_through": "2026-08-13", "events": []}
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        _run_fusion_cycle_with_calendar(monkeypatch, calendar, [], datetime(2026, 8, 20, 10, 0))
+
+    assert [r for r in caplog.records if "이벤트 캘린더 미기입" in r.getMessage()]
+
+
+def test_fusion_cycle_stays_quiet_when_the_calendar_says_no_upcoming_event(monkeypatch, caplog):
+    """"확인했고 이벤트가 없다"는 사실이다 — 경고하면 상시 오경보가 된다
+    (07-30 CB 하트비트에서 겪은 "정상을 이상으로 표시"와 같은 실수)."""
+    calendar = {"covered_through": "2026-08-13", "events": []}
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        _run_fusion_cycle_with_calendar(monkeypatch, calendar, [], datetime(2026, 8, 12, 10, 0))
+
+    assert not [r for r in caplog.records if "이벤트 캘린더 미기입" in r.getMessage()]
+
+
+def test_fusion_cycle_applies_the_event_penalty_near_an_event(monkeypatch):
+    """만기 15분 전이면 확신도에 x0.5가 걸려야 한다 — 08-05까지 한 번도 안 걸리던 페널티다."""
+    calendar = {
+        "covered_through": "2026-08-13",
+        "events": [{"when": "2026-08-06 15:35", "name": "위클리(목) 만기"}],
+    }
+    near: list = []
+    _run_fusion_cycle_with_calendar(monkeypatch, calendar, near, datetime(2026, 8, 6, 15, 25))
+
+    far: list = []
+    _run_fusion_cycle_with_calendar(monkeypatch, calendar, far, datetime(2026, 8, 6, 10, 0))
+
+    assert near[0]["conviction_score"] == pytest.approx(far[0]["conviction_score"] * 0.5)

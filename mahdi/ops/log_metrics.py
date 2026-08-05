@@ -96,6 +96,13 @@ _QUALITATIVE_MARKERS = {
     "market_operation_message": "장운영정보(H0UNMKO0) 수신",
     "option_chain_gap_alert": "옵션체인 결손 알림",
     "egw00201": "EGW00201",
+    # 2026-08-05 — 수기 이벤트 캘린더가 안 채워진 상태. **이 항목이 존재하는 이유가 곧
+    # 수기 방식을 고른 대가다**: 안 채우면 `event_proximity_minutes`가 None으로 돌아가고
+    # 그것은 2026-08-05 이전(페널티 한 번도 안 걸림)과 완전히 같은 상태인데, 지표상으로는
+    # 아무 일도 없는 것처럼 보인다. 여기 등록해 매일 건수로 드러낸다.
+    # 포맷 원본: `mahdi.main.LOG_EVENT_CALENDAR_NOT_COVERED`
+    # (계약은 tests/test_ops_log_metrics_contract.py가 지킨다 — 이 모듈은 순수 파서로 남긴다.)
+    "event_calendar_not_covered": "이벤트 캘린더 미기입",
 }
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
@@ -147,6 +154,7 @@ _PARSER_AUDIT_TOKENS = {
     "read_timeout": "ReadTimeout",
     "connect_error": "ConnectError",
     "kis_error_response": _KIS_ERROR_BODY_TOKEN,
+    "event_calendar_not_covered": "이벤트 캘린더",
 }
 
 

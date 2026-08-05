@@ -268,3 +268,30 @@ def test_rest_latency_is_silent_when_every_endpoint_is_fast():
     body = "inquire-price=250건 1.10/1.80/2.10/2.40초"
     line = _emit("mahdi.main", "INFO", main.LOG_REST_LATENCY, 300.0, body)
     assert _parse(line)["rest_latency"]["warnings"] == []
+
+
+# ===== 2026-08-05: 이벤트 캘린더 미기입 (수기 방식을 고른 대가를 드러내는 계측) =====
+
+
+def test_event_calendar_not_covered_line_is_counted():
+    """수기 캘린더의 실패 모드는 "안 채우는 것"이 아니라 **"안 채운 걸 모르는 것"** 이다.
+
+    안 채우면 `event_proximity_minutes`가 None으로 돌아가고, 그것은 2026-08-05 이전
+    (페널티 한 번도 안 걸림)과 **완전히 같은 상태**인데 지표상으로는 아무 일도 없어 보인다.
+    이 줄이 §11 정성 항목에 매일 찍히는 것이 그 유일한 방어선이다.
+    """
+    line = _emit(
+        "mahdi.main", "WARNING", main.LOG_EVENT_CALENDAR_NOT_COVERED,
+        "not_covered", date(2026, 8, 13), date(2026, 8, 20),
+    )
+    metrics = _parse(line)
+
+    assert metrics["qualitative"]["event_calendar_not_covered"] == 1
+
+
+def test_event_calendar_marker_survives_the_parser_audit():
+    """0건 보고가 "안 일어났다"인지 "파서가 눈이 멀었다"인지 가르는 감사 토큰이 있어야 한다."""
+    assert "event_calendar_not_covered" in log_metrics._PARSER_AUDIT_TOKENS
+    token = log_metrics._PARSER_AUDIT_TOKENS["event_calendar_not_covered"]
+    # 감사 토큰은 포맷이 바뀌어도 살아남을 만큼 짧아야 하고, 실제 줄에 들어 있어야 한다.
+    assert token in main.LOG_EVENT_CALENDAR_NOT_COVERED

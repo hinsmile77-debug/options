@@ -90,3 +90,18 @@ def get_risk_limits() -> dict[str, Any]:
 @lru_cache
 def get_strategy_params() -> dict[str, Any]:
     return _load_yaml("strategy_params.yaml")
+
+
+@lru_cache
+def get_event_calendar() -> dict[str, Any]:
+    """
+    계산: `event_calendar.yaml`(수기 매크로 이벤트 캘린더)을 읽는다 — 2026-08-05 신규.
+    해석: 다른 설정과 같이 `@lru_cache`라 **프로세스당 1회만** 읽는다. 파일을 고쳐도 관측 루프를
+         재시작해야 반영된다(장전 07:30 기동에 자연히 반영). 파일이 없으면 빈 dict를 돌려주고
+         호출측(`fusion.event_calendar`)이 `status="empty"`로 경고한다 — **여기서 예외를 던지면
+         캘린더 하나 때문에 관측 루프 전체가 못 뜬다.**
+    """
+    try:
+        return _load_yaml("event_calendar.yaml") or {}
+    except FileNotFoundError:
+        return {}
