@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 
 import numpy as np
 
@@ -18,7 +18,7 @@ from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel
 from mahdi.engines.regime_pipeline import FEATURE_VERSION
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
-from mahdi.features.options_intel import OptionLeg, find_gamma_flip, gamma_walls as compute_gamma_walls
+from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute_gamma_walls, signal_book_legs
 from mahdi.ops import db_metrics
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
@@ -56,9 +56,17 @@ class DashboardSnapshot:
     higher_tf_regime: RegimeLabel | None
     stability_flag: bool
     spot: float
+    # chain/gamma_flip/gamma_walls는 전부 **`gex_expiry` 한 북**에서만 나온다 — 세 북(먼슬리 +
+    # 위클리 월·목)을 합산하면 만기별 정보가 서로를 덮기 때문(2026-08-05 P0-2, 아래 `gex_expiry`
+    # 주석 참고). 화면에 어느 북인지 반드시 함께 표시해야 하므로 만기를 스냅샷에 싣는다.
     chain: list[ChainPoint]
     gamma_flip: float | None
     gamma_walls: list[float]
+    # 2026-08-05(COCKPIT 육안 점검 P0-2) — 위 세 값이 실제로 어느 북에서 나왔는지. 관측 루프가
+    # `signal_decisions.gex_expiry`(마이그레이션 023)에 같은 값을 남기므로, 화면의 만기와 판단
+    # 이력의 만기를 대조하면 "화면과 판단이 같은 체인을 보고 있는가"를 사람이 확인할 수 있다.
+    # 체인이 비었으면 None.
+    gex_expiry: date | None
     # Flow Radar는 선물(기초자산)과 옵션(가장 활발한 종목) 두 계열을 따로 보여준다 — 선물은
     # WS 구독이 항상 켜져 있어 거의 매분 체결되므로, "가장 최근 활동"만으로 대표 종목을 뽑으면
     # 옵션이 영원히 안 뽑힌다(2026-07-06 사용자 지적으로 분리). VPIN은 종목 구분 없이 둘 다 계산된다.
@@ -890,6 +898,30 @@ def load_snapshot(underlying: str = "KOSPI200") -> DashboardSnapshot:
     return live if live is not None else _synthetic_snapshot()
 
 
+def _gamma_wall_strikes(legs: list, spot: float) -> list[float]:
+    """
+    입력: **한 북**의 옵션 레그(`signal_book_legs()` 결과), 기초자산 스팟.
+    계산: 감마 월 후보 행사가를 관측 루프(`main._build_signal_inputs`)와 **완전히 같은 규칙**으로
+         구한다 — `gamma_walls(top_n=1)` + **노출 > 0 가드**.
+    해석: 2026-08-05(COCKPIT 육안 점검 P0-3). 두 가지가 어긋나 있었다.
+
+         ① `gamma_walls()`는 행사가별 |gamma x OI x ...| 합을 내림차순으로 줄 뿐이라, **OI가 전부
+            0이어도 1등은 나온다.** 관측 루프는 이걸 알고 `walls[0][1] > 0`로 막고 있었는데
+            (main.py, 2026-08-04) COCKPIT은 노출값을 버리고 행사가만 취해 가드가 없었다 —
+            `find_gamma_flip()`이 전 구간 0인 곡선에서 허수 flip을 냈던 것과 같은 종류의 결함이다.
+         ② 엔진은 top_n=1인데 COCKPIT은 기본값 3이었다. 행사가 창이 ATM±2(5개)뿐이라 "5개 중
+            3개가 월"이 되어 순위의 정보량이 사실상 없었고(08-05 화면 GW1/GW2/GW3가 1050/1040/
+            1047.5 = 창의 양 끝), 무엇보다 **화면의 월과 판단이 쓰는 월이 달랐다.**
+    실패 조건: 레그가 없거나 최상위 노출이 0 이하면 빈 목록 — 선을 긋지 않는다(값을 지어내지 않음).
+    """
+    if not legs:
+        return []
+    walls = compute_gamma_walls(legs, spot, top_n=1)
+    if not walls or walls[0][1] <= 0:
+        return []
+    return [walls[0][0]]
+
+
 def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     try:
         with db.get_connection() as conn:
@@ -975,21 +1007,26 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     regime_prob = {RegimeLabel(i): float(p) for i, p in enumerate(prob_vector)}
 
     today = db.local_now().date()
-    legs = [
-        OptionLeg(
-            strike=row["strike"],
-            option_type=row["option_type"].lower(),
-            oi=row["oi"],
-            iv=row["iv"],
-            t_years=max((row["expiry"] - today).days, 0) / 365.0,
-            gamma=row["gamma"],
-        )
-        for row in chain_rows
-        if row["expiry"] is not None
-    ]
+    # 2026-08-05(COCKPIT 육안 점검 P0-2) — **화면과 판단이 같은 체인을 보게 한다.**
+    #
+    # 종전에는 여기서 `legs`를 인라인으로 만들며 `chain_rows` 전체(먼슬리 + 위클리 월·목 세 북)를
+    # 평탄화했고, GEX 막대도 만기 구분 없이 행사가별로 합산했다. 그런데 관측 루프는 2026-08-04
+    # Fix#5로 **먼슬리 한 북만** 쓰도록 이미 고쳐져 있었다(`signal_book_legs()` docstring의 실측
+    # 피해 참고) — 즉 **COCKPIT만 Fix#5 이전 상태로 남아 있었다.** 08-05 화면 실측: 잔존 1일
+    # 위클리(t=1/365)의 감마가 압도적이라 GEX 프로파일을 사실상 그 북이 지배하는데, 화면에는
+    # 그 사실을 알릴 표시가 없었다.
+    #
+    # 이제 엔진과 **같은 함수**를 호출한다(배지와 리포트에 같은 함수를 강제하는 `_signal_reach_check`
+    # 규약과 동일한 이유). 인라인 복제도 함께 없앤다 — 그 사본에는 2026-08-03에 `legs_from_chain_rows()`
+    # 에 넣은 만기 경과 레그 배제가 반영돼 있지 않았다(지금은 `_chain_snapshot()`의 SQL이 이미
+    # 걸러 결과가 같지만, 규약이 어긋난 사본을 남겨둘 이유가 없다).
+    legs, gex_expiry = signal_book_legs(chain_rows, today)
 
+    # GEX 막대도 `legs`와 같은 북만 — 막대와 감마플립/감마월이 다른 체인에서 나오면 안 된다.
     by_strike: dict[float, float] = {}
     for row in chain_rows:
+        if gex_expiry is None or row.get("expiry") != gex_expiry:
+            continue
         by_strike[row["strike"]] = by_strike.get(row["strike"], 0.0) + row["gex"]
     chain = [ChainPoint(strike=s, gex=g) for s, g in sorted(by_strike.items())]
 
@@ -1008,7 +1045,8 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         spot=spot,
         chain=chain,
         gamma_flip=find_gamma_flip(legs, spot) if legs else None,
-        gamma_walls=[strike for strike, _ in compute_gamma_walls(legs, spot)] if legs else [],
+        gamma_walls=_gamma_wall_strikes(legs, spot),
+        gex_expiry=gex_expiry,
         futures_flow_symbol=futures_flow_symbol,
         timestamps=[row[0] for row in futures_rows],
         ofi_series=[float(row[2]) for row in futures_rows],
@@ -1061,6 +1099,9 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
 
     strikes = [340 + 2.5 * i for i in range(9)]
     chain = [ChainPoint(strike=s, gex=float(rng.normal(0, 1) * (1 if s < spot[-1] else -1) * 5e8)) for s in strikes]
+    # 합성 체인은 북이 하나뿐이라는 전제 — 라이브와 같은 형태를 유지하려고 만기를 하나 지어낸다
+    # (합성 모드는 이미 `is_live=False` 배너로 "가짜 데이터"임을 명시한다).
+    synthetic_gex_expiry = (now + timedelta(days=23)).date()
 
     regime_prob = {r: 0.0 for r in RegimeLabel}
     dominant = rng.choice(list(RegimeLabel))
@@ -1080,7 +1121,8 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         spot=float(spot[-1]),
         chain=chain,
         gamma_flip=float(spot[-1] - rng.uniform(-5, 5)),
-        gamma_walls=[strikes[2], strikes[6]],
+        gamma_walls=[strikes[6]],  # 라이브와 동일하게 1개(엔진 top_n=1)
+        gex_expiry=synthetic_gex_expiry,
         futures_flow_symbol=None,
         timestamps=timestamps,
         ofi_series=list(ofi_series),
@@ -1099,7 +1141,7 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         expiry_liquidity=[
             {
                 "series": "regular",
-                "expiry": (now + timedelta(days=23)).date(),
+                "expiry": synthetic_gex_expiry,
                 "atm_spread_pct": float(abs(rng.normal(0.04, 0.01))),
                 "depth": float(abs(rng.normal(200, 40))),
                 "volume": float(abs(rng.normal(500, 100))),

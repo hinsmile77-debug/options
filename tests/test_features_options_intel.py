@@ -15,6 +15,7 @@ from mahdi.features.options_intel import (
     legs_by_expiry,
     legs_from_chain_rows,
     pin_risk,
+    signal_book_legs,
     usable_for_black_scholes,
     vanna_charm_drift,
 )
@@ -265,6 +266,35 @@ def test_legs_by_expiry_keeps_the_same_exclusion_rules_as_the_flat_conversion():
          "expiry": date(2026, 7, 1)},  # 이미 만기
     ]
     assert legs_by_expiry(rows, today=date(2026, 8, 3)) == {}
+
+
+# ===== 2026-08-05 P0-2: 관측 루프와 COCKPIT이 공유하는 북 선택 =====
+
+
+def test_signal_book_legs_picks_only_the_monthly_book():
+    """만기가 가장 먼 북(= 먼슬리) 하나만 — 위클리와 합산하면 GEX 부호가 상쇄로 좌우된다(08-04 §2-8)."""
+    rows = [
+        {"strike": 1045.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "expiry": date(2026, 8, 13)},  # 먼슬리
+        {"strike": 1045.0, "option_type": "P", "oi": 900.0, "iv": 0.40, "gamma": 0.09,
+         "expiry": date(2026, 8, 6)},   # 위클리(목) — 잔존 1일이라 감마가 압도적
+        {"strike": 1047.5, "option_type": "C", "oi": 800.0, "iv": 0.35, "gamma": 0.08,
+         "expiry": date(2026, 8, 10)},  # 위클리(월)
+    ]
+
+    legs, expiry = signal_book_legs(rows, today=date(2026, 8, 5))
+
+    assert expiry == date(2026, 8, 13)
+    assert len(legs) == 1
+    assert legs[0].strike == 1045.0
+    assert legs[0].option_type == "c"
+
+
+def test_signal_book_legs_returns_empty_without_usable_rows():
+    assert signal_book_legs([], today=date(2026, 8, 5)) == ([], None)
+    expired = [{"strike": 1045.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01,
+                "expiry": date(2026, 7, 1)}]
+    assert signal_book_legs(expired, today=date(2026, 8, 5)) == ([], None)
 
 
 def test_pin_risk_is_computable_on_expiry_day_when_gamma_flip_is_not():

@@ -102,6 +102,40 @@ def legs_by_expiry(chain_rows: Sequence[dict], today: date) -> dict[date, list[O
     }
 
 
+def signal_book_legs(chain_rows: Sequence[dict], today: date) -> tuple[list[OptionLeg], date | None]:
+    """
+    입력: 체인 스냅샷 행, 잔존만기 계산 기준일.
+    계산: **먼슬리(최근월) 북 하나**의 레그만 골라 (레그, 그 북의 만기)를 돌려준다.
+    해석: 2026-08-04 §2-8 / Fix#5 — 종전에는 `legs_from_chain_rows()`로 세 만기를 평탄화해
+         한 덩어리로 GEX/감마플립을 계산했다. 그런데 v6 §11.4와 자동 리포트 §15 각주는 둘 다
+         *"먼슬리(최근월)가 GEX/감마플립의 주 입력이고 위클리는 핀 리스크 전용"* 이라고 적고
+         있었다 — **코드가 문서와 다르게 동작했다.** 08-04 실측 피해: 08-06 위클리 GEX +90.8B
+         (콜 편중)와 08-13 먼슬리 −51.0B(풋 편중)가 상쇄돼 라이브 GEX가 하루 동안
+         −33.5B ~ +99.1B를 오갔고(양수 233분 / 음수 259분), `_options_flow_score()`가 GEX
+         부호로 회귀/증폭을 가르므로 **신호 부호가 그 상쇄에 좌우됐다.**
+
+         "먼슬리"를 **만기가 가장 먼 북**으로 고르는 이유: `option_analysis_1m`에는 series
+         컬럼이 없다. 폴링 중인 북은 먼슬리 1 + 위클리 2뿐이고 위클리는 늘 먼슬리보다 가까우므로
+         (위클리는 매주 만기, 먼슬리는 월 1회) 최대 만기가 곧 먼슬리다. 월물 만기 주간에
+         이 관계가 뒤집힐 수 있는데(`db_metrics.monthly_book_expiry()` 주석 참고), 그때는
+         먼슬리가 이미 만기 당일이라 `usable_for_black_scholes()`가 걸러 GEX가 0이 된다 —
+         `signal_decisions.gex_expiry`(마이그레이션 023)에 실제 사용 만기를 남기는 이유다.
+
+         2026-08-05(COCKPIT 육안 점검 P0-2): `mahdi/main.py`의 private 헬퍼였던 것을 여기로
+         옮긴다. **COCKPIT(`dashboard/data_source.py`)이 같은 규칙을 쓰지 않아 화면의 Gamma
+         Map은 위 Fix#5 이전 상태 — 세 북 평탄화 — 그대로였다.** 판단 근거와 화면이 다른 체인을
+         보고 있으면 화면으로 판단을 검증할 수 없다(`_signal_reach_check`가 배지와 리포트에
+         같은 함수를 강제하는 것과 같은 이유). 관측 루프와 대시보드가 공유할 수 있는 유일한
+         자리가 이 모듈이라 여기에 둔다.
+    실패 조건: 체인이 비었으면 ([], None).
+    """
+    by_expiry = legs_by_expiry(chain_rows, today)
+    if not by_expiry:
+        return [], None
+    expiry = max(by_expiry)
+    return by_expiry[expiry], expiry
+
+
 def calculate_gex(legs: Sequence[OptionLeg], spot: float, multiplier: float = 250_000) -> float:
     """
     GEX = Sigma(Gamma x OI x multiplier x S^2/100), call(+) put(-) 관례.

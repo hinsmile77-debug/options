@@ -143,8 +143,18 @@ def render() -> None:
         strikes = [c.strike for c in snapshot.chain]
         gex = [c.gex for c in snapshot.chain]
         st.plotly_chart(
-            build_gamma_profile_chart(strikes, gex, snapshot.spot, snapshot.gamma_flip, snapshot.gamma_walls),
+            build_gamma_profile_chart(
+                strikes, gex, snapshot.spot, snapshot.gamma_flip, snapshot.gamma_walls, expiry=snapshot.gex_expiry
+            ),
             width='stretch',
+        )
+        # 2026-08-05(P0-2) — 판단 근거와 같은 북(먼슬리)만 그린다는 사실을 화면에 남긴다. 위클리
+        # 북의 만기 Pinning은 별도 신호(v6 §A3)이고 여기서 합산하면 서로를 덮으므로, 여기 없다는
+        # 것이 곧 "안 본다"가 아님을 함께 적어둔다(핀 리스크 패널은 아직 미구현).
+        st.caption(
+            "GEX·감마플립·감마월은 전부 위 만기(먼슬리) **한 북**에서만 산출합니다 — "
+            "관측 루프의 진입 판단과 같은 체인입니다. 위클리 북의 만기 Pinning은 여기 포함되지 "
+            "않습니다(핀 리스크 패널 미구현)."
         )
     with col_right:
         st.subheader("수급 (Position Intelligence)")

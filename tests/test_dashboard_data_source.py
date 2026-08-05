@@ -153,6 +153,9 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
         yield _FakeConnection(responses)
 
     monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    # 2026-08-05(P0-2): 체인 레그가 `signal_book_legs()`를 거치면서 만기 경과분이 배제되므로,
+    # 이 테스트의 만기(7/9)가 미래가 되도록 기준일을 고정한다(고정 안 하면 실행 날짜에 따라 결과가 바뀐다).
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
 
     snap = load_snapshot()
 
@@ -161,9 +164,103 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
     assert len(snap.chain) == 1  # 같은 행사가의 콜/풋이 하나로 합산됨
     assert snap.chain[0].strike == 1340.0
     assert snap.chain[0].gex == pytest.approx(200.0)  # 1000.0 + (-800.0)
+    assert snap.gex_expiry == date(2026, 7, 9)
     assert snap.foreign_net == -150.0
     assert snap.institution_net == 250.0
     assert snap.individual_net == -40.0
+
+
+def test_load_snapshot_gamma_map_uses_only_the_monthly_book_like_the_engine(monkeypatch):
+    """2026-08-05 P0-2 회귀 — **화면과 판단이 같은 체인을 봐야 한다.**
+
+    관측 루프는 08-04 Fix#5로 먼슬리 한 북만 쓰는데(`signal_book_legs`), COCKPIT만 그 이전
+    상태(세 북 평탄화)로 남아 있었다. 잔존 1일 위클리는 감마가 압도적이라 GEX 프로파일을
+    사실상 그 북이 지배했고, 화면에는 그 사실을 알릴 표시조차 없었다.
+    """
+    ts = datetime(2026, 8, 5, 12, 12)
+    monthly, weekly_thu, weekly_mon = date(2026, 8, 13), date(2026, 8, 6), date(2026, 8, 10)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "chain": [
+            (1045.0, "C", 100.0, 0.60, 0.02, 1_000.0, monthly, ts, 0.5),
+            (1047.5, "P", 120.0, 0.62, 0.03, -400.0, monthly, ts, 0.5),
+            # 위클리 두 북 — 화면에 섞이면 안 된다(만기 Pinning은 별도 신호).
+            (1045.0, "C", 900.0, 0.90, 0.09, 90_000.0, weekly_thu, ts, 0.5),
+            (1050.0, "C", 800.0, 0.85, 0.08, 80_000.0, weekly_mon, ts, 0.5),
+        ],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
+
+    snap = load_snapshot()
+
+    assert snap.gex_expiry == monthly
+    # 막대는 먼슬리 두 행사가뿐 — 위클리의 거대한 GEX(+90,000/+80,000)가 섞이면 안 된다.
+    assert [(c.strike, c.gex) for c in snap.chain] == [(1045.0, 1_000.0), (1047.5, -400.0)]
+
+
+def test_load_snapshot_omits_gamma_wall_when_top_exposure_is_zero(monkeypatch):
+    """2026-08-05 P0-3 회귀 — OI가 전부 0이면 `gamma_walls()`도 1등을 돌려주지만 그건 월이 아니다.
+
+    관측 루프는 `walls[0][1] > 0`으로 막고 있었는데 COCKPIT은 노출값을 버리고 행사가만 취해
+    가드가 없었다 — 값이 없는 자리에 선을 긋는 것은 `find_gamma_flip()`이 전 구간 0인 곡선에서
+    허수 flip을 냈던 것과 같은 종류의 결함이다.
+    """
+    ts = datetime(2026, 8, 5, 12, 12)
+    expiry = date(2026, 8, 13)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "chain": [
+            (1045.0, "C", 0.0, 0.60, 0.02, 0.0, expiry, ts, 0.5),  # oi=0 -> 노출 0
+            (1047.5, "P", 0.0, 0.62, 0.03, 0.0, expiry, ts, 0.5),
+        ],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
+
+    snap = load_snapshot()
+
+    assert snap.gamma_walls == []
+
+
+def test_load_snapshot_reports_a_single_gamma_wall_matching_the_engine(monkeypatch):
+    """엔진은 `gamma_walls(top_n=1)` — 행사가 창이 ATM±2(5개)뿐이라 3개를 그리면 창의 양 끝을
+    가리키는 것에 가까워지고, 무엇보다 화면의 월과 판단이 쓰는 월이 달라진다."""
+    ts = datetime(2026, 8, 5, 12, 12)
+    expiry = date(2026, 8, 13)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "spot": [(1045.0,)],
+        "chain": [
+            (1040.0, "C", 10.0, 0.60, 0.01, 100.0, expiry, ts, 0.5),
+            (1045.0, "C", 900.0, 0.60, 0.09, 900.0, expiry, ts, 0.5),  # 압도적 1등
+            (1050.0, "P", 20.0, 0.62, 0.02, -200.0, expiry, ts, 0.5),
+        ],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
+
+    snap = load_snapshot()
+
+    assert snap.gamma_walls == [1045.0]
 
 
 def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):

@@ -53,8 +53,7 @@ from mahdi.features.options_intel import (
     calculate_vrp,
     find_gamma_flip,
     gamma_walls,
-    legs_by_expiry,
-    legs_from_chain_rows,
+    signal_book_legs,
     vanna_charm_drift,
     with_computed_charm,
 )
@@ -2540,33 +2539,6 @@ async def poll_investor_flow(
         await asyncio.sleep(delay)
 
 
-def _signal_book_legs(chain_rows: list[dict], today: date) -> tuple[list, "date | None"]:
-    """
-    입력: 체인 스냅샷 행, 잔존만기 계산 기준일.
-    계산: **먼슬리(최근월) 북 하나**의 레그만 골라 (레그, 그 북의 만기)를 돌려준다.
-    해석: 2026-08-04 §2-8 / Fix#5 — 종전에는 `legs_from_chain_rows()`로 세 만기를 평탄화해
-         한 덩어리로 GEX/감마플립을 계산했다. 그런데 v6 §11.4와 자동 리포트 §15 각주는 둘 다
-         *"먼슬리(최근월)가 GEX/감마플립의 주 입력이고 위클리는 핀 리스크 전용"* 이라고 적고
-         있었다 — **코드가 문서와 다르게 동작했다.** 08-04 실측 피해: 08-06 위클리 GEX +90.8B
-         (콜 편중)와 08-13 먼슬리 −51.0B(풋 편중)가 상쇄돼 라이브 GEX가 하루 동안
-         −33.5B ~ +99.1B를 오갔고(양수 233분 / 음수 259분), `_options_flow_score()`가 GEX
-         부호로 회귀/증폭을 가르므로 **신호 부호가 그 상쇄에 좌우됐다.**
-
-         "먼슬리"를 **만기가 가장 먼 북**으로 고르는 이유: `option_analysis_1m`에는 series
-         컬럼이 없다. 폴링 중인 북은 먼슬리 1 + 위클리 2뿐이고 위클리는 늘 먼슬리보다 가까우므로
-         (위클리는 매주 만기, 먼슬리는 월 1회) 최대 만기가 곧 먼슬리다. 월물 만기 주간에
-         이 관계가 뒤집힐 수 있는데(`db_metrics.monthly_book_expiry()` 주석 참고), 그때는
-         먼슬리가 이미 만기 당일이라 `usable_for_black_scholes()`가 걸러 GEX가 0이 된다 —
-         `signal_decisions.gex_expiry`(마이그레이션 023)에 실제 사용 만기를 남기는 이유다.
-    실패 조건: 체인이 비었으면 ([], None).
-    """
-    by_expiry = legs_by_expiry(chain_rows, today)
-    if not by_expiry:
-        return [], None
-    expiry = max(by_expiry)
-    return by_expiry[expiry], expiry
-
-
 def _member_unavailable_reasons(inputs: SignalInputs) -> dict[str, str]:
     """
     입력: 이번 사이클의 SignalInputs.
@@ -2610,7 +2582,7 @@ def _build_signal_inputs(
     """
     입력: DB 커넥션, 이번 사이클의 최신 레짐 상태(RegimeStateMachine.last_state), underlying 라벨,
          (선택) 선물 단축코드 — 주문흐름(OFI) 조회 대상.
-    계산: option_analysis_1m 체인 스냅샷에서 **먼슬리 북만** 뽑아(`_signal_book_legs`) GEX /
+    계산: option_analysis_1m 체인 스냅샷에서 **먼슬리 북만** 뽑아(`signal_book_legs`) GEX /
          Gamma Flip / 감마 월 / Charm을, market_raw_1m 최신 1분봉에서 OFI를,
          investor_flow_1m 최신값으로 외국인 순매수 부호를 구성한다.
          **함께 반환하는 dict는 판단 행에 그대로 남길 체인 입력 관측치**다(마이그레이션 022/023).
@@ -2641,7 +2613,7 @@ def _build_signal_inputs(
     )
     flow = db.latest_investor_flow(conn, underlying)
     gex = gamma_flip = gamma_wall = total_charm = None
-    legs, gex_expiry = _signal_book_legs(chain_rows, now.date()) if chain_rows else ([], None)
+    legs, gex_expiry = signal_book_legs(chain_rows, now.date()) if chain_rows else ([], None)
     if legs and spot is not None:
         gex = calculate_gex(legs, spot)
         gamma_flip = find_gamma_flip(legs, spot)
