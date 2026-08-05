@@ -57,9 +57,15 @@ def _render_cards(cards: list[dict]) -> None:
     """카드 dict(label/value/status/help) 리스트를 st.columns 배지로 렌더링한다 — "3초 룰"
     (스크롤 없이 한눈에 파악)을 위해 `get_health_summary()`의 기존 배지 스타일을 그대로 재사용.
     향후 카드가 늘어나도 이 함수는 그대로고, 호출측 리스트에 dict만 추가하면 된다.
-    `_MAX_BADGES_PER_ROW`를 넘으면 여러 행으로 접는다(2026-08-05 P2-8)."""
-    for row in _chunked(cards, _MAX_BADGES_PER_ROW):
-        for col, card in zip(st.columns(_MAX_BADGES_PER_ROW), row):
+    `_MAX_BADGES_PER_ROW`를 넘으면 여러 행으로 접는다(2026-08-05 P2-8).
+
+    열 개수를 `_MAX_BADGES_PER_ROW`로 **고정하지 않는** 이유: 카드가 그보다 적을 때 고정하면
+    남는 열만큼 카드가 쪼그라든다 — 특히 계좌 폴러 미기동 시의 "계좌 현황: 아직 없음" 1장이
+    화면 폭의 1/6로 찌그러진다(P2-8 최종 점검에서 실측). 상한만 두고, 그 아래면 카드 수에 맞춘다.
+    """
+    per_row = min(len(cards), _MAX_BADGES_PER_ROW) or 1
+    for row in _chunked(cards, per_row):
+        for col, card in zip(st.columns(per_row), row):
             badge = _CARD_BADGE.get(card["status"], st.info)
             with col:
                 badge(f"**{card['label']}**\n\n{card['value']}")
@@ -160,8 +166,11 @@ def render() -> None:
         st.caption(group_name)
         # 2026-08-05(P2-8): 그룹 안에서도 행당 `_MAX_BADGES_PER_ROW`개까지만 펴 각 칸의 폭을
         # 지킨다 — 08-05 인프라 12칸 화면은 한 칸이 폭의 8%라 라벨이 3~4줄로 접혔다.
-        for row in _chunked(checks, _MAX_BADGES_PER_ROW):
-            for col, check in zip(st.columns(_MAX_BADGES_PER_ROW), row):
+        # 열 수를 그룹 크기와 상한 중 작은 쪽으로 잡아, 배지가 상한보다 적은 그룹이 쪼그라들지
+        # 않게 한다(같은 그룹의 행끼리는 열 수가 같아 그리드가 어긋나지 않는다).
+        per_row = min(len(checks), _MAX_BADGES_PER_ROW) or 1
+        for row in _chunked(checks, per_row):
+            for col, check in zip(st.columns(per_row), row):
                 badge = {"ok": col.success, "warning": col.warning}.get(check.status, col.info)
                 badge(f"**{check.label}**\n\n{check.detail}")
 

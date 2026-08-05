@@ -21,8 +21,25 @@
 --   atm_roll_count_today  창이 **실제로 이동한** 횟수. 북(먼슬리/위클리 월·목)이 여러 개라도
 --                         "창이 한 번 움직였다"를 1로 센다 — 로그 줄 수를 북 수로 나누는 방식은
 --                         북 수가 바뀔 때 조용히 틀린다.
+--                         NULL = 아직 아무도 안 셌다(관측 루프가 이 컬럼을 아는 코드로 뜨기 전) —
+--                         0("롤이 없었다")과 다르다. 아래 주석 참고.
 
-ALTER TABLE ws_status ADD COLUMN IF NOT EXISTS atm_roll_count_today INTEGER NOT NULL DEFAULT 0;
+-- **NOT NULL DEFAULT 0을 쓰지 않는 이유**(2026-08-05 최종 점검에서 실측 후 정정):
+-- 처음에는 이웃 `reconnect_count_today`를 따라 `NOT NULL DEFAULT 0`으로 넣었는데, 이 컬럼을
+-- 라이브에 적용한 직후 **아직 구 코드로 돌고 있는 관측 루프**는 이 값을 쓰지 않으므로 DEFAULT 0이
+-- 그대로 남았다. 그 결과 COCKPIT 배지가 그날 실제로 77회 롤한 날에 **"0회"** 를 표시했다 —
+-- 즉 "롤이 없었다"는 거짓말이다. `reconnect_count_today`는 그 값을 소유한 코드가 항상 함께
+-- 기록하므로 DEFAULT가 안전하지만, 이 컬럼은 도입 시점에 그 조건이 성립하지 않는다.
+-- NULL로 두면 배지가 "집계 전"이라 쓴다(`_atm_roll_churn_check`) — 새 루프가 처음 하트비트를
+-- 남기는 순간부터 실제 값이 들어온다. **값을 지어내지 않는다**는 규약이 스키마에도 적용된다.
+--
+-- 아래 두 ALTER는 이 파일의 첫 버전(NOT NULL DEFAULT 0)이 이미 적용된 DB를 되돌리기 위한 것이며,
+-- 둘 다 멱등하다(이미 없으면 무동작). 기존 행에 남은 0을 NULL로 되돌리는 것은 **일회성 운영
+-- 작업**이라 여기 넣지 않는다 — 마이그레이션은 매 기동마다 재실행되므로, 여기서 UPDATE를 하면
+-- 장중 재실행 시 그날 센 값을 지운다.
+ALTER TABLE ws_status ADD COLUMN IF NOT EXISTS atm_roll_count_today INTEGER;
+ALTER TABLE ws_status ALTER COLUMN atm_roll_count_today DROP DEFAULT;
+ALTER TABLE ws_status ALTER COLUMN atm_roll_count_today DROP NOT NULL;
 
 COMMENT ON COLUMN ws_status.atm_roll_count_today IS
     '오늘 ATM±N 행사가 창이 실제로 이동한 횟수(2026-08-05 COCKPIT 육안 점검 P2-12). 롤 1회마다 '

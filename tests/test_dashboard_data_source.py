@@ -958,6 +958,23 @@ def test_atm_roll_churn_check_warns_at_the_observed_08_05_level(monkeypatch):
     assert "히스테리시스" in check.detail
 
 
+def test_atm_roll_churn_check_says_not_counted_yet_instead_of_zero(monkeypatch):
+    """2026-08-05 배포 당일 실측 — 컬럼을 라이브에 넣은 직후 관측 루프는 아직 구 코드였다.
+
+    처음엔 `NOT NULL DEFAULT 0`으로 만들었더니 그날 실제로 77회 롤한 날에 배지가 **"0회"** 를
+    표시했다(= "롤이 없었다"는 거짓말). 컬럼을 nullable로 바꾸고 여기서 "집계 전"이라 쓴다.
+    """
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(None)
+    )
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "info"
+    assert "집계 전" in check.detail
+    assert "0회" not in check.detail
+
+
 def test_atm_roll_churn_check_is_info_without_ws_status(monkeypatch):
     # 관측 루프 미기동 판정은 `_ws_liveness_check`의 몫 — 여기서 중복 경고하지 않는다.
     monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: None)

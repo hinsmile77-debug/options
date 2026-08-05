@@ -889,9 +889,15 @@ def _atm_roll_churn_check(conn, now: datetime) -> HealthCheck:
         return HealthCheck(label, "info", "감지 상태 미기록", group="관측 품질")
     count = status["atm_roll_count_today"]
     if count is None:
-        # 마이그레이션 026 미적용 — 스키마 정합성 배지가 그 사실을 따로 경고하므로 여기서는
-        # 중복 경고하지 않고 "아직 못 센다"만 알린다(값을 0으로 지어내면 "롤이 없었다"가 된다).
-        return HealthCheck(label, "info", "집계 전(마이그레이션 026 적용 전)", group="관측 품질")
+        # 아직 아무도 안 셌다. 원인은 둘 중 하나이고 **화면에서는 구분되지 않는다**:
+        #   (a) 마이그레이션 026 미적용 — 스키마 정합성 배지가 그 사실을 따로 경고한다.
+        #   (b) 컬럼은 있는데 관측 루프가 이 값을 모르는 구 코드로 떠 있다(배포 당일에 실제로 겪음).
+        # 어느 쪽이든 **0으로 지어내면 "롤이 없었다"는 거짓말**이 되므로 "집계 전"만 말한다.
+        return HealthCheck(
+            label, "info",
+            "집계 전 — 이 값을 세는 관측 루프가 아직 안 떴습니다(마이그레이션 026 미적용이거나 구 코드 실행 중)",
+            group="관측 품질",
+        )
     detail = f"{count}회 — 롤마다 창을 벗어난 종목의 1분봉이 끊긴다(Flow Radar 공백의 원인)"
     if count >= _ATM_ROLL_WARNING:
         return HealthCheck(
