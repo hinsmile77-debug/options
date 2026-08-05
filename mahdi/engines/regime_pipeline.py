@@ -52,6 +52,12 @@ _MACRO_STRESS_USDCNH_RECENT_BUCKETS = 24  # USDCNH(5분 주기) z-score 베이�
 _MACRO_SCORE_DAILY_LOOKBACK_DAYS = 5  # macro_score의 USDKRW 추세 판단 — 최근 며칠 방향이면 충분
 _MACRO_SCORE_RECENT_BUCKETS = 12  # macro_score의 USDCNH/ES 추세 판단(5분 주기) — 약 1시간
 
+# 2026-08-05(COCKPIT 육안 점검 P1-4) — 신호 경로에서 매크로 스냅샷에 허용하는 최대 나이.
+# 폴링 주기가 5분(`main.MACRO_SNAPSHOT_POLL_INTERVAL_SECONDS=300`)이므로 15분은 **연속 2회 실패를
+# 견디고 3회째에 끊는** 값이다. 이보다 짧으면 한 번의 조회 실패로 VIX 신호가 사라져 스코어의
+# 분모가 흔들리고, 길게 잡으면 "지금 시장"이라 부를 수 없는 값이 판단에 들어간다.
+MACRO_SNAPSHOT_MAX_AGE_MINUTES = 15
+
 
 class RegimeFeatureBuilder:
     """선물 1분봉 롤링 윈도로 §7.3 6개 피처를 계산한다."""
@@ -204,7 +210,12 @@ def compute_macro_score_proxy(conn, underlying: str) -> float:
         foreign_net, _institution_net, _individual_net = flow
         signals.append(_directional_sign(foreign_net))
 
-    snapshot = db.latest_macro_snapshot(conn)
+    # 2026-08-05(COCKPIT 육안 점검 P1-4) — **신호 경로에서는 신선도 경계를 켠다.**
+    # `latest_macro_snapshot()`은 종전에 시각 조건이 전혀 없어, 폴러가 며칠 죽어 있어도 그때의
+    # VIX 기간구조 부호가 그대로 이 스코어에 들어왔다(그리고 그 사실을 볼 방법이 없었다).
+    # 경계는 여기서만 켜고 COCKPIT은 끈 채 값+시각을 함께 표시한다 —
+    # `latest_underlying_spot()`에서 정한 것과 같은 분업이다(그 docstring 참고).
+    snapshot = db.latest_macro_snapshot(conn, max_age_minutes=MACRO_SNAPSHOT_MAX_AGE_MINUTES)
     if snapshot is not None and snapshot.get("vix_term_structure") is not None:
         signals.append(_directional_sign(snapshot["vix_term_structure"]))
 

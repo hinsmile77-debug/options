@@ -16,7 +16,7 @@ import numpy as np
 from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel
-from mahdi.engines.regime_pipeline import FEATURE_VERSION
+from mahdi.engines.regime_pipeline import FEATURE_VERSION, MACRO_SNAPSHOT_MAX_AGE_MINUTES
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute_gamma_walls, signal_book_legs
 from mahdi.ops import db_metrics
@@ -55,7 +55,17 @@ class DashboardSnapshot:
     regime_prob: dict[RegimeLabel, float]
     higher_tf_regime: RegimeLabel | None
     stability_flag: bool
+    # 2026-08-05(COCKPIT 육안 점검 P1-7, 마이그레이션 025) — `regime_prob`가 학습된 사후확률인가,
+    # `warmup_fallback()`의 one-hot 상수인가. True면 확률 막대를 그리면 안 된다(8개 중 하나가
+    # 100%인 그림은 "확신"으로 읽히는데 실제로는 "확률을 계산한 적이 없다"는 뜻이다).
+    # None = 마이그레이션 025 이전에 적재된 행이라 둘 중 무엇인지 알 수 없음.
+    regime_is_warmup: bool | None
     spot: float
+    # 2026-08-05(COCKPIT 육안 점검 P1-6) — 위 `spot`을 **언제 관측한 값인가**. 화면에 시각 없이
+    # 숫자만 띄우면 장전 전일 종가와 장중 실시간 지수가 구분되지 않고, 같은 화면의 선물 체결가와
+    # 벌어져 있어도 어느 쪽이 낡은 것인지 알 수 없다(08-05 실측: 지수 1,042.85 vs 선물 1046대).
+    # 합성 폴백에서는 None.
+    spot_asof: datetime | None
     # chain/gamma_flip/gamma_walls는 전부 **`gex_expiry` 한 북**에서만 나온다 — 세 북(먼슬리 +
     # 위클리 월·목)을 합산하면 만기별 정보가 서로를 덮기 때문(2026-08-05 P0-2, 아래 `gex_expiry`
     # 주석 참고). 화면에 어느 북인지 반드시 함께 표시해야 하므로 만기를 스냅샷에 싣는다.
@@ -307,6 +317,40 @@ def _cbot_status_check(conn) -> HealthCheck:
     return HealthCheck(label, "ok", f"승인됨 — zn_front={zn_front:.2f}")
 
 
+def _macro_freshness_check(conn, now: datetime) -> HealthCheck:
+    """
+    계산: `macro_snapshot_5m` 최신 행의 나이를 신호 경로와 **같은 임계**
+         (`regime_pipeline.MACRO_SNAPSHOT_MAX_AGE_MINUTES`)로 판정한다.
+    해석: 2026-08-05(COCKPIT 육안 점검 P1-4) — 매크로는 **신선도를 보는 배지가 하나도 없던**
+         유일한 데이터 경로였다. CBOT 배지가 같은 스냅샷을 읽지만 그건 `zn_front_source`가
+         "kis"인지만 보므로, 폴러가 며칠 죽어 있어도 파란불("yfinance 폴백 사용 중")이 그대로 뜬다.
+         임계를 신호 경로와 같은 값으로 두는 이유: 배지가 초록인데 `macro_score()`는 VIX 신호를
+         버리고 있는(또는 그 반대) 상태를 만들지 않기 위함이다 — 배지와 판단이 다른 답을 내면
+         어느 쪽을 믿을지 알 수 없다(`_signal_reach_check`와 같은 규약).
+    실패 조건: 조회 실패는 "조회 실패"(warning). 폴링 이력이 아예 없으면 info.
+    """
+    label = "매크로 스냅샷 신선도"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(timestamp) FROM macro_snapshot_5m")
+            row = cur.fetchone()
+        latest_ts = row[0] if row else None
+    except Exception:
+        conn.rollback()
+        logger.warning("매크로 스냅샷 신선도 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패")
+    if latest_ts is None:
+        return HealthCheck(label, "info", "아직 매크로 스냅샷 폴링 이력 없음")
+    age_minutes = max((now - _as_naive(latest_ts)).total_seconds(), 0.0) / 60.0
+    detail = f"{_as_naive(latest_ts):%m-%d %H:%M} 기준 ({age_minutes:.0f}분 전)"
+    if age_minutes > MACRO_SNAPSHOT_MAX_AGE_MINUTES:
+        return HealthCheck(
+            label, "warning",
+            f"{detail} — 신호 경로가 VIX 기간구조를 버리는 상태(임계 {MACRO_SNAPSHOT_MAX_AGE_MINUTES}분)",
+        )
+    return HealthCheck(label, "ok", detail)
+
+
 def _fossil_data_check(conn, underlying: str, now: datetime) -> HealthCheck:
     label = "화석 데이터(series/symbol 화이트리스트 위반)"
     try:
@@ -341,24 +385,34 @@ def _schema_integrity_check(conn) -> HealthCheck:
          db/migrations/*.sql이 아직 라이브 DB에 적용 안 된 것.
     """
     label = "스키마 정합성(마이그레이션 적용 여부)"
+    # 2026-08-05(P1-7): 대상 테이블을 늘렸다. 종전에는 macro_snapshot_5m 하나만 봤는데,
+    # 마이그레이션 025로 regime_state에도 컬럼이 붙었다 — 미적용이면 레짐 적재가 실패하고
+    # COCKPIT은 조회 실패로 **합성 폴백**에 빠진다(2026-07-21에 010/011로 실제로 겪은 그 사고).
+    # 목록은 각 테이블의 단일 소스(db.*_columns())에서 가져온다.
+    required = {
+        "macro_snapshot_5m": db.macro_snapshot_columns(),
+        "regime_state": db.regime_state_columns(),
+    }
+    missing_by_table: dict[str, list[str]] = {}
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
-                ("macro_snapshot_5m",),
-            )
-            existing = {row[0] for row in cur.fetchall()}
+        for table, columns in required.items():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
+                    (table,),
+                )
+                existing = {row[0] for row in cur.fetchall()}
+            missing = [c for c in columns if c not in existing]
+            if missing:
+                missing_by_table[table] = missing
     except Exception:
         conn.rollback()
         logger.warning("스키마 정합성 점검 조회 실패", exc_info=True)
         return HealthCheck(label, "warning", "조회 실패")
-    missing = [c for c in db.macro_snapshot_columns() if c not in existing]
-    if missing:
-        return HealthCheck(
-            label, "warning",
-            f"macro_snapshot_5m에 없는 컬럼: {', '.join(missing)} — db/migrations 라이브 적용 필요",
-        )
-    return HealthCheck(label, "ok", "macro_snapshot_5m 컬럼 전부 정상")
+    if missing_by_table:
+        detail = "; ".join(f"{table}: {', '.join(cols)}" for table, cols in missing_by_table.items())
+        return HealthCheck(label, "warning", f"없는 컬럼 — {detail} — db/migrations 라이브 적용 필요")
+    return HealthCheck(label, "ok", f"{', '.join(required)} 컬럼 전부 정상")
 
 
 def _regime_stability_check(conn, now: datetime) -> HealthCheck:
@@ -801,6 +855,9 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _futures_freshness_check(conn, underlying, now),
                 _option_chain_leg_balance_check(conn, underlying, now),
                 _cbot_status_check(conn),
+                # 2026-08-05(P1-4) — CBOT 배지 바로 옆. 그 배지는 같은 스냅샷을 읽지만 출처만
+                # 보므로, 폴러가 죽어도 "yfinance 폴백 사용 중"으로 파란불이 그대로 뜬다.
+                _macro_freshness_check(conn, now),
                 _schema_integrity_check(conn),
                 _fossil_data_check(conn, underlying, now),
                 _regime_stability_check(conn, now),
@@ -890,6 +947,21 @@ def get_account_status_view() -> dict | None:
         "daily_pnl_pct": account_state.daily_pnl_pct,
         "weekly_pnl_pct": account_state.weekly_pnl_pct,
         "drawdown_pct": account_state.drawdown_pct,
+        # 2026-08-05(COCKPIT 육안 점검 P1-5) — **비교 기준이 있었는가.**
+        #
+        # `build_account_state()`는 baseline/peak이 없으면 0.0으로 흡수한다(그 docstring: "손익
+        # 없음이 아니라 아직 비교할 과거가 없다는 뜻이지만, 리스크 게이트 관점에서 구분할 필요는
+        # 없다"). **RiskEngine에는 맞는 말이지만 화면에는 틀리다** — 08-05 화면의 일간/주간
+        # +0.00%와 최대낙폭 +0.00%는 "변동 없음"이 아니라 "기준이 없음"이었는데 둘이 구분되지
+        # 않았다. 이 프로젝트가 `atm_straddle_vrp()`에 명문화한 규약("입력이 규약을 만족하지
+        # 않으면 값을 지어내지 말고 None을 낸다")과 어긋난다.
+        #
+        # 여기서 pct 자체를 None으로 바꾸지 않는 이유: 그 값은 RiskEngine과 **같은 함수**가 낸
+        # 것이라 화면이 임의로 손대면 두 곳이 갈린다. 대신 "기준이 있었는가"를 함께 실어
+        # 표시 계층(account_panel)이 판단하게 한다.
+        "has_daily_baseline": day_before_row is not None,
+        "has_weekly_baseline": week_before_row is not None,
+        "has_peak": peak is not None,
     }
 
 
@@ -927,7 +999,9 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         with db.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT timestamp, regime, prob_vector, higher_tf_regime, stability_flag "
+                    # is_warmup(마이그레이션 025, 2026-08-05 P1-7): prob_vector가 학습된 확률인지
+                    # warmup_fallback()의 one-hot 상수인지 — 화면이 그 둘을 같게 그리면 안 된다.
+                    "SELECT timestamp, regime, prob_vector, higher_tf_regime, stability_flag, is_warmup "
                     "FROM regime_state ORDER BY timestamp DESC LIMIT 1"
                 )
                 regime_row = cur.fetchone()
@@ -938,9 +1012,12 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 # 맞아야 하기 때문(datetime.now() 기준이면 지난 데이터를 볼 때 항상 윈도가 텅 빈다).
                 as_of_ts = regime_row[0]
 
-            spot = db.latest_underlying_spot(conn, underlying)
-            if spot is None:
+            # 2026-08-05(P1-6): 값과 **그 관측 시각**을 함께 읽는다 — 화면이 "언제 것인지"를
+            # 표시할 수 있어야 한다(`latest_underlying_spot_row()` docstring 참고).
+            spot_row = db.latest_underlying_spot_row(conn, underlying)
+            if spot_row is None:
                 return None
+            spot, spot_asof = spot_row
 
             chain_rows = db.latest_option_chain(conn, underlying)
             investor_flow = db.latest_investor_flow(conn, underlying)
@@ -1003,7 +1080,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
 
     futures_rows = list(reversed(futures_rows))
     option_rows = list(reversed(option_rows))
-    ts, regime_idx, prob_vector, higher_tf_idx, stability_flag = regime_row
+    ts, regime_idx, prob_vector, higher_tf_idx, stability_flag, is_warmup = regime_row
     regime_prob = {RegimeLabel(i): float(p) for i, p in enumerate(prob_vector)}
 
     today = db.local_now().date()
@@ -1042,7 +1119,10 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         regime_prob=regime_prob,
         higher_tf_regime=RegimeLabel(higher_tf_idx) if higher_tf_idx is not None else None,
         stability_flag=bool(stability_flag),
+        # NULL은 bool()로 뭉개지 않는다 — "모른다"와 "학습된 판정이다"는 다르다.
+        regime_is_warmup=bool(is_warmup) if is_warmup is not None else None,
         spot=spot,
+        spot_asof=spot_asof,
         chain=chain,
         gamma_flip=find_gamma_flip(legs, spot) if legs else None,
         gamma_walls=_gamma_wall_strikes(legs, spot),
@@ -1118,7 +1198,9 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         regime_prob=regime_prob,
         higher_tf_regime=None,
         stability_flag=regime_prob[dominant] >= 0.4,
+        regime_is_warmup=False,  # 합성은 확률이 퍼진 형태라 학습된 판정을 흉내 낸다
         spot=float(spot[-1]),
+        spot_asof=timestamps[-1],
         chain=chain,
         gamma_flip=float(spot[-1] - rng.uniform(-5, 5)),
         gamma_walls=[strikes[6]],  # 라이브와 동일하게 1개(엔진 top_n=1)

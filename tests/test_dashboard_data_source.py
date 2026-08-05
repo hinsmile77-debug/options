@@ -12,6 +12,7 @@ from mahdi.dashboard.data_source import (
     HealthCheck,
     _cbot_status_check,
     _fossil_data_check,
+    _macro_freshness_check,
     _freshness_check,
     _futures_freshness_check,
     _is_trading_hours,
@@ -120,9 +121,15 @@ class _FakeConnection:
         return _FakeCursor(self._responses, self.query_log)
 
 
+_SPOT_TS = datetime(2026, 7, 6, 9, 31)
+
 _BASE_RESPONSES = {
-    "regime": [(datetime(2026, 7, 6, 9, 31), 2, [0.1] * 8, None, False)],
-    "spot": [(1333.77,)],
+    # 마지막 칸은 is_warmup(마이그레이션 025, 2026-08-05 P1-7) — prob_vector가 학습된 확률인지
+    # warmup_fallback()의 one-hot 상수인지. 화면이 그 둘을 같게 그리면 안 된다.
+    "regime": [(_SPOT_TS, 2, [0.1] * 8, None, False, False)],
+    # 2026-08-05(P1-6): `latest_underlying_spot_row()`가 값과 **관측 시각**을 함께 읽는다 —
+    # 화면이 "이 현재가가 언제 것인지"를 표시할 수 있어야 하기 때문(그 함수 docstring 참고).
+    "spot": [(1333.77, _SPOT_TS)],
     "chain": [],
     "futures_symbol": [],
     "futures_symbol_value": None,
@@ -140,7 +147,7 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "chain": [
             (1340.0, "C", 363, 0.9, 0.0047, 1000.0, date(2026, 7, 9), ts, 0.72),
             (1340.0, "P", 200, 0.85, 0.0040, -800.0, date(2026, 7, 9), ts, 0.72),
@@ -165,9 +172,52 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
     assert snap.chain[0].strike == 1340.0
     assert snap.chain[0].gex == pytest.approx(200.0)  # 1000.0 + (-800.0)
     assert snap.gex_expiry == date(2026, 7, 9)
+    # 2026-08-05(P1-6): 값만으로는 장전 전일 종가인지 장중 실시간 지수인지 구분할 수 없다.
+    assert snap.spot_asof == ts
     assert snap.foreign_net == -150.0
     assert snap.institution_net == 250.0
     assert snap.individual_net == -40.0
+
+
+def test_load_snapshot_carries_the_warmup_flag_from_the_regime_row(monkeypatch):
+    """2026-08-05 P1-7 — `RegimeState.is_warmup`은 07-10부터 필드로 있었지만 DB에 저장된 적이 없어
+    COCKPIT이 one-hot 상수와 학습된 사후확률을 구분할 수 없었다(마이그레이션 025)."""
+    ts = datetime(2026, 8, 5, 12, 12)
+    warmup_prob = [0.0] * 8
+    warmup_prob[2] = 1.0
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, warmup_prob, None, False, True)],
+        "spot": [(1042.85, ts)],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
+
+    assert load_snapshot().regime_is_warmup is True
+
+
+def test_load_snapshot_keeps_unknown_warmup_flag_as_none(monkeypatch):
+    """마이그레이션 025 이전 행은 NULL — bool()로 뭉개면 "학습된 판정"이라고 거짓말하게 된다."""
+    ts = datetime(2026, 8, 5, 12, 12)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.125] * 8, None, False, None)],
+        "spot": [(1042.85, ts)],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: ts)
+
+    assert load_snapshot().regime_is_warmup is None
 
 
 def test_load_snapshot_gamma_map_uses_only_the_monthly_book_like_the_engine(monkeypatch):
@@ -181,7 +231,7 @@ def test_load_snapshot_gamma_map_uses_only_the_monthly_book_like_the_engine(monk
     monthly, weekly_thu, weekly_mon = date(2026, 8, 13), date(2026, 8, 6), date(2026, 8, 10)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "chain": [
             (1045.0, "C", 100.0, 0.60, 0.02, 1_000.0, monthly, ts, 0.5),
             (1047.5, "P", 120.0, 0.62, 0.03, -400.0, monthly, ts, 0.5),
@@ -216,7 +266,7 @@ def test_load_snapshot_omits_gamma_wall_when_top_exposure_is_zero(monkeypatch):
     expiry = date(2026, 8, 13)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "chain": [
             (1045.0, "C", 0.0, 0.60, 0.02, 0.0, expiry, ts, 0.5),  # oi=0 -> 노출 0
             (1047.5, "P", 0.0, 0.62, 0.03, 0.0, expiry, ts, 0.5),
@@ -242,8 +292,8 @@ def test_load_snapshot_reports_a_single_gamma_wall_matching_the_engine(monkeypat
     expiry = date(2026, 8, 13)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
-        "spot": [(1045.0,)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "spot": [(1045.0, ts)],
         "chain": [
             (1040.0, "C", 10.0, 0.60, 0.01, 100.0, expiry, ts, 0.5),
             (1045.0, "C", 900.0, 0.60, 0.09, 900.0, expiry, ts, 0.5),  # 압도적 1등
@@ -271,7 +321,7 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
         "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62)],
@@ -306,7 +356,7 @@ def test_load_snapshot_picks_option_flow_symbol_by_windowed_volume_with_determin
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
     }
     conn = _FakeConnection(responses)
 
@@ -334,7 +384,7 @@ def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
         "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None)],
@@ -356,7 +406,7 @@ def test_load_snapshot_reads_expiry_liquidity_per_series(monkeypatch):
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "expiry_liquidity": [
             ("regular", date(2026, 7, 30), 0.041, 220.0, 480.0, 24),
             ("weekly", date(2026, 7, 9), 0.093, 70.0, 140.0, 3),
@@ -384,7 +434,7 @@ def test_load_snapshot_defaults_investor_flow_to_zero_when_not_yet_polled(monkey
     ts = datetime(2026, 7, 6, 9, 31)
     responses = {
         **_BASE_RESPONSES,
-        "regime": [(ts, 2, [0.1] * 8, None, False)],
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
     }
 
     @contextmanager
@@ -503,17 +553,22 @@ class _FakeHealthCursor:
             self._kind, self._value = "one", self._responses.get("futures_latest")
         elif "market_raw_1m" in query and "count(*)" in query:
             self._kind, self._value = "one", self._responses.get("legacy_symbol_count_row", (0,))
+        # 2026-08-05(P1-4): 매크로 신선도 배지는 최신 시각만 본다 — LOCF 분기보다 앞에 둔다.
+        elif "macro_snapshot_5m" in query and "MAX(timestamp)" in query:
+            self._kind, self._value = "one", self._responses.get("macro_max_timestamp", (None,))
+        # 2026-08-05(P1-4): LOCF 쿼리가 timestamp를 맨 앞에 함께 읽으므로 폴백 행도 한 칸 길어졌다
+        # (값의 관측 시각을 호출측이 표시할 수 있어야 한다 — db.latest_macro_snapshot 참고).
         elif "macro_snapshot_5m" in query and "us10y_yield IS NOT NULL" in query:
             self._kind, self._value = "one", self._responses.get("macro_fallback_row")
         elif "macro_snapshot_5m" in query and "usdkrw IS NOT NULL" in query:
             self._kind, self._value = "one", self._responses.get("usdkrw_fallback_row")
         # 2026-07-31: 매크로 항목별 갱신 주기 분리로 zn_front/move_index도 LOCF 대상이 됐다
-        # (값+출처를 같은 행에서 가져오므로 2컬럼 튜플). 이 분기가 없으면 아래 범용 분기가
-        # 13컬럼짜리 macro_row를 돌려줘 언패킹이 깨진다.
+        # (값+출처를 같은 행에서 가져오므로 timestamp 포함 3컬럼 튜플). 이 분기가 없으면 아래
+        # 범용 분기가 13컬럼짜리 macro_row를 돌려줘 언패킹이 깨진다.
         elif "macro_snapshot_5m" in query and "zn_front IS NOT NULL" in query:
-            self._kind, self._value = "one", self._responses.get("zn_fallback_row", (None, None))
+            self._kind, self._value = "one", self._responses.get("zn_fallback_row", (None, None, None))
         elif "macro_snapshot_5m" in query and "move_index IS NOT NULL" in query:
-            self._kind, self._value = "one", self._responses.get("move_fallback_row", (None, None))
+            self._kind, self._value = "one", self._responses.get("move_fallback_row", (None, None, None))
         elif "macro_snapshot_5m" in query:
             self._kind, self._value = "one", self._responses.get("macro_row")
         elif "information_schema.columns" in query:
@@ -778,15 +833,74 @@ def test_cbot_status_check_info_when_zn_front_from_yfinance_fallback():
     assert "108.50" in check.detail
 
 
+# --- _macro_freshness_check (2026-08-05 P1-4) -------------------------------------------------
+#
+# 매크로는 신선도를 보는 배지가 하나도 없던 유일한 데이터 경로였다. CBOT 배지가 같은 스냅샷을
+# 읽지만 `zn_front_source`만 보므로, 폴러가 며칠 죽어 있어도 "yfinance 폴백 사용 중" 파란불이
+# 그대로 뜬다(위 테스트가 정확히 그 상태를 고정하고 있다).
+
+
+def test_macro_freshness_check_ok_within_signal_path_threshold():
+    now = datetime(2026, 8, 5, 12, 12)
+    conn = _FakeHealthConnection({"macro_max_timestamp": (datetime(2026, 8, 5, 12, 5),)})
+
+    check = _macro_freshness_check(conn, now)
+
+    assert check.status == "ok"
+    assert "08-05 12:05" in check.detail
+
+
+def test_macro_freshness_check_warns_when_signal_path_would_drop_the_vix_signal():
+    now = datetime(2026, 8, 5, 12, 12)
+    conn = _FakeHealthConnection({"macro_max_timestamp": (datetime(2026, 8, 5, 11, 50),)})
+
+    check = _macro_freshness_check(conn, now)
+
+    assert check.status == "warning"
+    # 배지와 판단이 같은 임계를 쓴다는 사실이 문구에 드러나야 한다 — 다르면 어느 쪽을 믿을지 모른다.
+    assert "VIX 기간구조" in check.detail
+
+
+def test_macro_freshness_check_is_info_when_never_polled():
+    conn = _FakeHealthConnection({"macro_max_timestamp": (None,)})
+    assert _macro_freshness_check(conn, datetime(2026, 8, 5, 12, 12)).status == "info"
+
+
+def test_macro_freshness_check_handles_query_error():
+    conn = _BrokenHealthConnection()
+    check = _macro_freshness_check(conn, datetime(2026, 8, 5, 12, 12))
+    assert check.status == "warning"
+    assert check.detail == "조회 실패"
+    assert conn.rollback_calls == 1
+
+
 # --- _schema_integrity_check ----------------------------------------------------------------------
 
 def test_schema_integrity_check_ok_when_all_columns_present():
     # 2026-07-21: db.macro_snapshot_columns()(코드가 실제로 쓰는 컬럼 목록)와 라이브 DB의
     # information_schema.columns를 대조 — 전부 있으면 ok.
-    rows = [(c,) for c in db.macro_snapshot_columns()]
+    # 2026-08-05(P1-7): 대상 테이블이 regime_state로 늘었다. 가짜 커서는 테이블 구분 없이 같은
+    # 행 목록을 돌려주므로 두 테이블의 컬럼을 합쳐 넣는다.
+    rows = [(c,) for c in (*db.macro_snapshot_columns(), *db.regime_state_columns())]
     conn = _FakeHealthConnection({"schema_columns_rows": rows})
     check = _schema_integrity_check(conn)
     assert check.status == "ok"
+
+
+def test_schema_integrity_check_warns_when_regime_state_migration_missing():
+    """2026-08-05 P1-7 — 마이그레이션 025(is_warmup) 미적용이면 레짐 적재가 실패하고 COCKPIT은
+    조회 실패로 **합성 폴백**에 빠진다. 010/011로 실제로 겪은 사고와 같은 형태라 배지가 잡아야 한다."""
+    rows = [
+        (c,)
+        for c in (*db.macro_snapshot_columns(), *(c for c in db.regime_state_columns() if c != "is_warmup"))
+    ]
+    conn = _FakeHealthConnection({"schema_columns_rows": rows})
+
+    check = _schema_integrity_check(conn)
+
+    assert check.status == "warning"
+    assert "regime_state" in check.detail
+    assert "is_warmup" in check.detail
 
 
 def test_schema_integrity_check_warns_when_migration_not_applied_live():
@@ -1105,6 +1219,8 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._futures_freshness_check", make_check("futures"))
     monkeypatch.setattr("mahdi.dashboard.data_source._option_chain_leg_balance_check", make_check("leg_balance"))
     monkeypatch.setattr("mahdi.dashboard.data_source._cbot_status_check", make_check("cbot"))
+    # 2026-08-05(P1-4) 매크로 신선도 — CBOT 배지는 출처만 보므로 폴러가 죽어도 파란불이 뜬다
+    monkeypatch.setattr("mahdi.dashboard.data_source._macro_freshness_check", make_check("macro_freshness"))
     monkeypatch.setattr("mahdi.dashboard.data_source._schema_integrity_check", make_check("schema"))
     monkeypatch.setattr("mahdi.dashboard.data_source._fossil_data_check", make_check("fossil"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
@@ -1123,7 +1239,8 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     result = get_health_summary()
 
     assert calls == [
-        "market_halt", "option_chain", "futures", "leg_balance", "cbot", "schema", "fossil",
+        "market_halt", "option_chain", "futures", "leg_balance", "cbot", "macro_freshness",
+        "schema", "fossil",
         "regime", "regime_fit_progress", "shutdown", "rate_limiter",
         "rest_demand", "backoff_headroom", "monthly_coverage", "overrun_count", "ws_liveness",
         "signal_reach",

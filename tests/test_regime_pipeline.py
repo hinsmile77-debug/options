@@ -43,7 +43,7 @@ def test_feature_builder_returns_features_in_declared_order():
 def _no_other_macro_signals(monkeypatch):
     """compute_macro_score_proxy가 foreign_net 외 신호를 전부 '데이터 없음'으로 보게 만든다 —
     개별 신호 하나만 골라 테스트할 때 나머지가 평균에 섞이지 않게 격리한다."""
-    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn: None)
+    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn, **kw: None)
     monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
     monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
     monkeypatch.setattr(db, "recent_es_front_series", lambda conn, limit: [])
@@ -67,11 +67,11 @@ def test_compute_macro_score_proxy_uses_vix_term_structure_sign(monkeypatch):
     monkeypatch.setattr(db, "latest_investor_flow", lambda conn, underlying: None)
 
     # 콘탱고(양수)=위험선호
-    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn: {"vix_term_structure": 0.02})
+    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn, **kw: {"vix_term_structure": 0.02})
     assert regime_pipeline.compute_macro_score_proxy(conn=None, underlying="KOSPI200") == 1.0
 
     # 백워데이션(음수)=위험회피
-    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn: {"vix_term_structure": -0.02})
+    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn, **kw: {"vix_term_structure": -0.02})
     assert regime_pipeline.compute_macro_score_proxy(conn=None, underlying="KOSPI200") == -1.0
 
 
@@ -96,7 +96,7 @@ def test_compute_macro_score_proxy_uses_es_trend_direct(monkeypatch):
 def test_compute_macro_score_proxy_averages_multiple_signals(monkeypatch):
     # foreign_net(+1)·VIX 기간구조 백워데이션(-1)이 섞이면 평균(0.0)이 나와야 한다.
     monkeypatch.setattr(db, "latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
-    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn: {"vix_term_structure": -0.02})
+    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn, **kw: {"vix_term_structure": -0.02})
     monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
     monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
     monkeypatch.setattr(db, "recent_es_front_series", lambda conn, limit: [])
@@ -273,7 +273,7 @@ def _machine_for_logging(monkeypatch) -> RegimeStateMachine:
     monkeypatch.setattr(db, "insert_feature_store", lambda *a, **k: None)
     monkeypatch.setattr(db, "insert_regime_state", lambda *a, **k: None)
     monkeypatch.setattr(db, "latest_investor_flow", lambda conn, underlying: None)
-    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn: None)
+    monkeypatch.setattr(db, "latest_macro_snapshot", lambda conn, **kw: None)
     monkeypatch.setattr(db, "recent_es_front_series", lambda conn, limit: [])
     return machine
 

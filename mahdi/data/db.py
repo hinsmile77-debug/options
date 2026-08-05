@@ -157,9 +157,43 @@ def macro_snapshot_columns() -> tuple[str, ...]:
     return _MACRO_SNAPSHOT_5M_COLUMNS
 
 
-def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
+# 2026-08-05(COCKPIT 육안 점검 P1-7) — `insert_regime_state()`가 쓰는 컬럼 목록.
+# `macro_snapshot_columns()`와 **같은 이유**로 노출한다: 마이그레이션 025(is_warmup)가 라이브 DB에
+# 아직 안 붙었으면 적재는 실패하고 COCKPIT은 조회 실패로 **합성 폴백**에 빠진다 — 2026-07-21에
+# 마이그레이션 010/011로 실제로 겪은 사고 형태다. 그때 만든 배지가 macro_snapshot_5m 한 테이블만
+# 보고 있었기 때문에, 컬럼을 늘린 이번에 대상 테이블도 함께 늘린다.
+_REGIME_STATE_COLUMNS = ("timestamp", "regime", "prob_vector", "higher_tf_regime", "stability_flag", "is_warmup")
+
+
+def regime_state_columns() -> tuple[str, ...]:
+    """해석: `macro_snapshot_columns()`와 동일 — 코드가 실제로 쓰는 컬럼 목록의 단일 소스."""
+    return _REGIME_STATE_COLUMNS
+
+
+# 2026-08-05(COCKPIT 육안 점검 P1-4) — LOCF(forward-fill)가 거슬러 올라갈 수 있는 최대 나이.
+#
+# 종전에는 LOCF 쿼리에 **시각 조건이 아예 없었다**: `WHERE us10y_yield IS NOT NULL ORDER BY
+# timestamp DESC LIMIT 1`. 즉 3주 전 값이라도 그대로 "지금 시점의 매크로 상태"로 실려 나왔고,
+# COCKPIT 표에는 시각 표기조차 없었다. `latest_option_chain()`(2026-08-03)과
+# `latest_expiry_liquidity()`(2026-08-04)에서 **이미 두 번 고친 것과 같은 화석 행 결함**인데
+# 이 경로만 남아 있었다.
+#
+# 4일 근거: LOCF 대상 중 가장 드물게 갱신되는 것이 일봉 항목(us10y_yield/usdkrw, 6시간 주기)이고,
+# 그 원천은 해외주식 일봉 API라 **직전 거래일 값이 최신인 것이 정상**이다. 금~월 사이 주말 공백
+# (3일)에 하루 여유를 더한 값이다. 정상 운영에서는 하루를 넘길 일이 없고, 이 값을 넘겼다는 것은
+# 폴러가 며칠 죽어 있었다는 뜻이므로 값을 이월하는 것보다 비우는 쪽이 정직하다.
+# (연휴가 4일을 넘으면 그 구간엔 값이 비는데, 그때는 장도 안 열려 판단 자체가 없다.)
+_MACRO_LOCF_MAX_AGE_DAYS = 4
+
+
+def latest_macro_snapshot(
+    conn: ConnectionLike, *, as_of: datetime | None = None, max_age_minutes: int | None = None
+) -> dict | None:
     """
+    입력: DB 커넥션, (선택) 기준 시각과 최신 행에 허용할 최대 나이(분).
     계산: 최신 행에 값이 없는 컬럼은 값이 채워진 마지막 행에서 하나 더 가져와 LOCF(forward-fill)한다.
+         LOCF는 `_MACRO_LOCF_MAX_AGE_DAYS`보다 오래된 행까지는 거슬러 올라가지 않는다.
+         LOCF 대상 항목마다 그 값이 실제로 언제 관측된 것인지를 `*_asof`로 함께 돌려준다.
     해석: 대시보드/레짐 피처가 "지금 시점의 매크로 상태"를 한 번에 조회할 수 있게 한다.
          *_source 필드도 함께 반환해 COCKPIT이 "kis"(실제 체결가)와 "yfinance_fallback"(근사치,
          mahdi/data/yfinance_fallback.py 참고)를 구분해 보여줄 수 있게 한다.
@@ -170,8 +204,16 @@ def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
          값과 짝인 `*_source`는 **반드시 같은 행에서** 가져와야 한다 — 값만 이월하고 출처를 놓치면
          "yfinance 폴백인데 출처 미상"으로 표시돼 CBOT 승인 여부 판정이 어긋난다.
          es_front는 여전히 매 사이클 갱신되므로(ES는 macro_score의 실제 입력) LOCF 대상이 아니다.
-    실패 조건: 폴링이 한 번도 안 돌았으면 None.
+
+         2026-08-05(P1-4) — **`max_age_minutes`를 기본값으로 켜지 않는 이유**는
+         `latest_underlying_spot()`과 완전히 같다: COCKPIT은 낡은 값이라도 **그 시각과 함께**
+         보여주는 것이 정직하고(그래서 `*_asof`를 함께 돌려준다), 여기서 None을 돌려주면 화면이
+         "폴링 데이터 없음"이라는 **틀린 이유**를 표시하게 된다. 경계는 **신호 경로에서만 명시적으로
+         켠다** — `regime_pipeline.macro_score()`가 `vix_term_structure`의 부호를 그대로 쓰므로,
+         거기서 낡은 값이 흘러들면 레짐 판단이 며칠 전 시장을 근거로 삼는다.
+    실패 조건: 폴링이 한 번도 안 돌았으면 None. 경계를 켰는데 최신 행이 그보다 오래됐으면 None.
     """
+    reference = as_of or local_now()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, usdkrw, "
@@ -181,29 +223,44 @@ def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
         row = cur.fetchone()
     if row is None:
         return None
+    if max_age_minutes is not None and row[0] is not None:
+        # tzinfo만 떼면 벽시계 숫자는 이미 같은 좌표계다(local_now() docstring의 저장 정책 참고) —
+        # `latest_underlying_spot()`이 쓰는 것과 같은 방식.
+        if reference - row[0].replace(tzinfo=None) > timedelta(minutes=max_age_minutes):
+            return None
     (
         timestamp, vix_front, vix_next, vix_term_structure, usdcnh, us10y_yield, usdkrw,
         zn_front, zn_front_source, es_front, es_front_source, move_index, move_index_source,
     ) = row
 
+    locf_oldest = reference - timedelta(days=_MACRO_LOCF_MAX_AGE_DAYS)
+
     def _locf(columns: tuple[str, ...]) -> tuple:
-        """columns를 한 묶음으로(같은 행에서) 최근 non-null 값을 가져온다 — 값+출처 짝 유지용."""
+        """columns를 한 묶음으로(같은 행에서) 최근 non-null 값 + **그 값의 관측 시각**을 가져온다.
+
+        한 묶음으로 읽는 이유는 값+출처 짝 유지용이고, 시각을 함께 읽는 이유는 호출측이 "이 값이
+        지금 것인지 며칠 전 것인지"를 표시할 수 있어야 하기 때문이다(2026-08-05 P1-4).
+        `locf_oldest`보다 오래된 행은 아예 보지 않는다 — 상세 근거는 `_MACRO_LOCF_MAX_AGE_DAYS`.
+        """
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT {', '.join(columns)} FROM macro_snapshot_5m "
-                f"WHERE {columns[0]} IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+                f"SELECT timestamp, {', '.join(columns)} FROM macro_snapshot_5m "
+                f"WHERE {columns[0]} IS NOT NULL AND timestamp >= %s ORDER BY timestamp DESC LIMIT 1",
+                (locf_oldest,),
             )
             fallback = cur.fetchone()
-        return fallback if fallback else (None,) * len(columns)
+        return fallback if fallback else (None,) * (len(columns) + 1)
 
+    # LOCF를 타지 않은 항목의 관측 시각은 최신 행의 시각 그 자체다.
+    us10y_asof = usdkrw_asof = zn_front_asof = move_index_asof = timestamp
     if us10y_yield is None:
-        (us10y_yield,) = _locf(("us10y_yield",))
+        us10y_asof, us10y_yield = _locf(("us10y_yield",))
     if usdkrw is None:
-        (usdkrw,) = _locf(("usdkrw",))
+        usdkrw_asof, usdkrw = _locf(("usdkrw",))
     if zn_front is None:
-        zn_front, zn_front_source = _locf(("zn_front", "zn_front_source"))
+        zn_front_asof, zn_front, zn_front_source = _locf(("zn_front", "zn_front_source"))
     if move_index is None:
-        move_index, move_index_source = _locf(("move_index", "move_index_source"))
+        move_index_asof, move_index, move_index_source = _locf(("move_index", "move_index_source"))
     return {
         "timestamp": timestamp,
         "vix_front": float(vix_front) if vix_front is not None else None,
@@ -218,6 +275,13 @@ def latest_macro_snapshot(conn: ConnectionLike) -> dict | None:
         "es_front_source": es_front_source,
         "move_index": float(move_index) if move_index is not None else None,
         "move_index_source": move_index_source,
+        # 2026-08-05(P1-4) — LOCF 대상 항목이 **실제로 언제 관측된 값인지**. LOCF를 안 탔으면
+        # `timestamp`와 같고, 값이 아예 없으면 None이다. COCKPIT 매크로 표가 이 값으로
+        # "오늘 것인지 며칠 전 것인지"를 표시한다(종전에는 표에 시각이 하나도 없었다).
+        "us10y_yield_asof": us10y_asof if us10y_yield is not None else None,
+        "usdkrw_asof": usdkrw_asof if usdkrw is not None else None,
+        "zn_front_asof": zn_front_asof if zn_front is not None else None,
+        "move_index_asof": move_index_asof if move_index is not None else None,
     }
 
 
@@ -330,6 +394,10 @@ def latest_underlying_spot(
          빠져 **합성 리플레이(가짜 데이터)를 띄울 위험**이 있다 — 2026-07-21에 실제로 겪은
          사고다. 그래서 경계는 **신호 경로(`_build_signal_inputs`)에서만 명시적으로 켠다.**
          (같은 이유로 `latest_market_microstructure`도 `as_of`를 호출측이 넘긴다.)
+
+         2026-08-05(COCKPIT 육안 점검 P1-6): 위 "그 시각과 함께 보여주는 것은 정직하다"가
+         **실제로는 지켜지지 않고 있었다** — 이 함수가 시각을 버리고 값만 돌려줘서 COCKPIT이
+         쓸 시각 자체가 없었다. 시각이 필요한 호출측은 `latest_underlying_spot_row()`를 쓴다.
     실패 조건: 행이 없거나, 경계를 켰는데 그보다 오래됐으면 None.
     """
     with conn.cursor() as cur:
@@ -349,6 +417,31 @@ def latest_underlying_spot(
             if age > timedelta(minutes=max_age_minutes):
                 return None
     return float(row[0])
+
+
+def latest_underlying_spot_row(conn: ConnectionLike, underlying: str) -> tuple[float, datetime] | None:
+    """
+    입력: 기초자산 라벨.
+    계산: 가장 최근 기초자산 스팟과 **그 관측 시각**을 함께 돌려준다.
+    해석: 2026-08-05(COCKPIT 육안 점검 P1-6) — `latest_underlying_spot()`은 값만 돌려주는데,
+         그 함수의 docstring은 신선도 경계를 기본값으로 켜지 않는 근거로 *"전일 종가를 **그 시각과
+         함께** 보여주는 것은 정직하다"* 를 들고 있었다. **그 시각을 아무도 받을 수 없었다** —
+         08-05 화면의 "기초자산 현재가 1,042.85"에는 시각이 없었고, 같은 화면의 Flow Radar 선물은
+         1046대였다. 두 값이 3p 넘게 벌어져 있는데 어느 쪽이 언제 것인지 화면에서 알 수 없었다.
+         경계 판정은 여전히 `latest_underlying_spot(max_age_minutes=...)`의 몫이다 — 이 함수는
+         "무엇을 언제 봤는가"만 그대로 돌려준다.
+    실패 조건: 행이 없으면 None. 시각 컬럼이 NULL이면(있을 수 없지만 방어) None.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT spot, timestamp FROM underlying_spot_1m WHERE underlying=%s "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (underlying,),
+        )
+        row = cur.fetchone()
+    if not row or row[1] is None:
+        return None
+    return float(row[0]), row[1].replace(tzinfo=None)
 
 
 # 2026-08-04(운영점검보고서 §2-5 / Fix#2) — 미시구조 값의 신선도 경계.
@@ -1048,19 +1141,27 @@ def insert_regime_state(
     prob_vector: list[float],
     higher_tf_regime: int | None,
     stability_flag: bool,
+    is_warmup: bool | None = None,
 ) -> None:
-    """입력: RegimeEngine.predict() 결과를 그대로 매핑."""
+    """
+    입력: RegimeEngine.predict()(또는 warmup_fallback()) 결과를 그대로 매핑.
+    해석: `is_warmup`(마이그레이션 025, 2026-08-05 P1-7)은 **이 행의 prob_vector가 확률인가
+         상수인가**를 가른다. `warmup_fallback()`은 해당 레짐에 1.0을 박은 one-hot을 내므로,
+         이 값 없이는 COCKPIT이 "8개 중 하나를 100% 확신"으로 그리게 된다(08-05 실측).
+         `stability_flag`로는 대신할 수 없다 — 미학습과 "학습됐지만 불안정"을 같은 False로 합친다.
+    """
     row = {
         "timestamp": timestamp,
         "regime": regime,
         "prob_vector": prob_vector,
         "higher_tf_regime": higher_tf_regime,
         "stability_flag": stability_flag,
+        "is_warmup": is_warmup,
     }
     _upsert(
         conn,
         "regime_state",
-        ("timestamp", "regime", "prob_vector", "higher_tf_regime", "stability_flag"),
+        ("timestamp", "regime", "prob_vector", "higher_tf_regime", "stability_flag", "is_warmup"),
         ("timestamp",),
         row,
     )

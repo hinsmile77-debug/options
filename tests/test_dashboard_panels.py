@@ -24,6 +24,48 @@ def test_regime_probability_chart_has_one_bar_per_regime_with_fixed_colors():
     assert bar.marker.color[4] == "#CC79A7"
 
 
+# ===== 2026-08-05 P1-7: 확률 막대와 WARMUP 상수를 같게 그리지 않는다 =====
+
+
+def test_regime_chart_marks_warmup_fallback_as_not_a_probability():
+    """08-05 화면의 "평균회귀 100%"는 확신이 아니라 **확률을 계산한 적이 없다**는 뜻이었다.
+
+    `RegimeEngine.fit()`이 한 번도 실행된 적 없어(feature_store 6,830/8,000행)
+    `warmup_fallback()`이 전일 마감 레짐에 1.0을 박은 one-hot 상수를 냈다.
+    """
+    prob = {r: 0.0 for r in RegimeLabel}
+    prob[RegimeLabel.RANGE_BALANCED] = 1.0
+
+    fig = build_regime_probability_chart(prob, is_warmup=True)
+
+    assert "WARMUP" in fig.layout.title.text
+
+
+def test_regime_chart_says_trained_when_not_warmup():
+    prob = {r: 0.125 for r in RegimeLabel}
+    fig = build_regime_probability_chart(prob, is_warmup=False)
+    assert "사후확률" in fig.layout.title.text
+    assert "WARMUP" not in fig.layout.title.text
+
+
+def test_regime_chart_says_unknown_for_rows_predating_the_migration():
+    # 학습된 판정으로 가정하는 쪽이 더 위험하다 — 모르면 모른다고 쓴다.
+    fig = build_regime_probability_chart({r: 0.125 for r in RegimeLabel}, is_warmup=None)
+    assert "구분 불가" in fig.layout.title.text
+
+
+def test_regime_chart_keeps_the_hundred_percent_label_visible():
+    """08-05 화면에서 **유일하게 의미 있던 100% 막대만** 값 라벨이 안 보였다 —
+    textposition="outside"인 라벨이 x축 범위(0~1) 밖으로 잘려나갔기 때문이다."""
+    prob = {r: 0.0 for r in RegimeLabel}
+    prob[RegimeLabel.RANGE_BALANCED] = 1.0
+
+    fig = build_regime_probability_chart(prob, is_warmup=True)
+
+    assert fig.data[0].cliponaxis is False
+    assert fig.layout.xaxis.range[1] > 1.0  # 라벨이 들어갈 여백
+
+
 def test_gamma_profile_chart_colors_by_sign_not_magnitude():
     strikes = [345, 350, 355]
     gex = [-100.0, 50.0, -20.0]
@@ -224,6 +266,32 @@ def test_gamma_profile_chart_says_unknown_expiry_instead_of_omitting_it():
     # 만기를 생략하면 "전 만기 합산"으로 오독된다 — 08-05 화면이 정확히 그 상태였다.
     fig = build_gamma_profile_chart([], [], spot=1045.0, gamma_flip=None, gamma_walls=[], expiry=None)
     assert "만기 미상" in fig.layout.title.text
+
+
+def test_gamma_profile_chart_draws_the_futures_line_that_moves_the_strike_window():
+    """2026-08-05 P1-6 — 행사가 창은 **선물 체결가**로 굴러가는데 차트의 "현재가"는 지수였다.
+
+    08-05 실측에서 둘이 3p 넘게 벌어져 창이 스팟 위로 치우쳐 보였는데, 선이 하나뿐이라 그것이
+    창 이동 지연인지 두 가격의 차이인지 구분할 수 없었다.
+    """
+    fig = build_gamma_profile_chart(
+        [1040.0, 1045.0, 1050.0], [1.0, 2.0, 3.0],
+        spot=1042.85, gamma_flip=None, gamma_walls=[], expiry=date(2026, 8, 13),
+        futures_price=1046.30,
+    )
+
+    labels = [a.text for a in fig.layout.annotations]
+    assert "지수 현재가" in labels
+    assert "선물(행사가 창 기준)" in labels
+    xs = {s.x0 for s in fig.layout.shapes if s.type == "line"}
+    assert {1042.85, 1046.30} <= xs
+
+
+def test_gamma_profile_chart_omits_the_futures_line_when_unknown():
+    fig = build_gamma_profile_chart(
+        [1045.0], [1.0], spot=1045.0, gamma_flip=None, gamma_walls=[], expiry=None, futures_price=None
+    )
+    assert "선물(행사가 창 기준)" not in [a.text for a in fig.layout.annotations]
 
 
 def test_gamma_profile_chart_labels_a_single_wall_by_name_not_rank():

@@ -32,6 +32,21 @@ def _fallback_labeled(value: float | None, source: str | None, fmt: str) -> str:
     return f"{text} (폴백)" if source == "yfinance_fallback" else text
 
 
+def _aged(text: str, asof, snapshot_ts) -> str:
+    """
+    입력: 이미 서식이 적용된 값 문자열, 그 값의 관측 시각(`*_asof`), 스냅샷 행의 시각.
+    계산: 두 시각의 **날짜가 다르면** 값 뒤에 관측 날짜(MM-DD)를 붙인다.
+    해석: 2026-08-05(P1-4). LOCF(forward-fill)로 실려온 값은 최신 행의 시각과 무관하게 며칠 전
+         것일 수 있는데, 종전 표에는 시각이 **하나도 없어** 그것을 알 방법이 없었다. 같은 날
+         안에서의 이월(일봉 항목이 6시간 주기로 갱신되는 등)은 정상이라 표기하지 않는다 —
+         전부 표기하면 매 행에 날짜가 붙어 정작 며칠 전 값이 눈에 안 띈다.
+    실패 조건: 시각을 모르거나 값이 없으면("-") 그대로 돌려준다.
+    """
+    if text == "-" or asof is None or snapshot_ts is None or asof.date() == snapshot_ts.date():
+        return text
+    return f"{text} ({asof:%m-%d})"
+
+
 def build_macro_snapshot_table(snapshot: dict | None) -> go.Figure:
     """
     입력: mahdi.data.db.latest_macro_snapshot()의 반환값(dict) 또는 None(폴링이 아직 안 돌았음).
@@ -43,30 +58,48 @@ def build_macro_snapshot_table(snapshot: dict | None) -> go.Figure:
          ZN/ES/MOVE도 KIS·yfinance 폴백이 둘 다 실패하면 NULL이므로 에러가 아니다. ZN/ES/MOVE
          값이 yfinance 폴백에서 온 경우(각 *_source == "yfinance_fallback")는 "(폴백)"을 붙여
          실제 체결가와 구분한다.
+
+         2026-08-05(P1-4): **첫 열에 스냅샷 기준 시각을 쓴다.** 종전에는 표에 시각이 하나도 없어
+         폴러가 죽어도 며칠 전 값이 "지금"으로 보였다(그리고 LOCF에 소급 상한도 없었다).
+         LOCF로 실려온 값은 날짜가 다를 때만 뒤에 관측 날짜를 붙인다(`_aged`).
     """
     row = snapshot or {}
+    snapshot_ts = row.get("timestamp")
+    as_of = f"{snapshot_ts:%m-%d %H:%M}" if snapshot_ts is not None else "-"
     vix_front = f"{row['vix_front']:.2f}" if row.get("vix_front") is not None else "-"
     vix_next = f"{row['vix_next']:.2f}" if row.get("vix_next") is not None else "-"
     term_structure = _term_structure_label(row.get("vix_term_structure"))
     usdcnh = f"{row['usdcnh']:.4f}" if row.get("usdcnh") is not None else "-"
-    zn_front = _fallback_labeled(row.get("zn_front"), row.get("zn_front_source"), ".4f")
+    zn_front = _aged(
+        _fallback_labeled(row.get("zn_front"), row.get("zn_front_source"), ".4f"),
+        row.get("zn_front_asof"), snapshot_ts,
+    )
     es_front = _fallback_labeled(row.get("es_front"), row.get("es_front_source"), ".4f")
-    move_index = _fallback_labeled(row.get("move_index"), row.get("move_index_source"), ".2f")
-    us10y = f"{row['us10y_yield']:.2f}%" if row.get("us10y_yield") is not None else "-"
-    usdkrw = f"{row['usdkrw']:.2f}" if row.get("usdkrw") is not None else "-"
+    move_index = _aged(
+        _fallback_labeled(row.get("move_index"), row.get("move_index_source"), ".2f"),
+        row.get("move_index_asof"), snapshot_ts,
+    )
+    us10y = _aged(
+        f"{row['us10y_yield']:.2f}%" if row.get("us10y_yield") is not None else "-",
+        row.get("us10y_yield_asof"), snapshot_ts,
+    )
+    usdkrw = _aged(
+        f"{row['usdkrw']:.2f}" if row.get("usdkrw") is not None else "-",
+        row.get("usdkrw_asof"), snapshot_ts,
+    )
 
     fig = go.Figure(
         go.Table(
             header=dict(
                 values=[
-                    "VIX 근월", "VIX 차근월", "VIX 기간구조", "USDCNH", "ZN(10Y 선물) 근월",
+                    "기준 시각", "VIX 근월", "VIX 차근월", "VIX 기간구조", "USDCNH", "ZN(10Y 선물) 근월",
                     "US10Y(일봉 레벨)", "USDKRW(일봉 레벨)", "ES(S&P500 선물) 근월", "MOVE Index",
                 ],
                 align="center",
             ),
             cells=dict(
                 values=[
-                    [vix_front], [vix_next], [term_structure], [usdcnh], [zn_front],
+                    [as_of], [vix_front], [vix_next], [term_structure], [usdcnh], [zn_front],
                     [us10y], [usdkrw], [es_front], [move_index],
                 ],
                 align="center",

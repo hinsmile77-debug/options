@@ -19,6 +19,9 @@ _POS_GEX_COLOR = "#0072B2"  # 양(+) GEX — 변동성 억제
 _NEUTRAL_COLOR = "#8A8A8A"
 _FLIP_COLOR = "#CC79A7"
 _WALL_COLOR = "#E69F00"
+# 선물 기준선(2026-08-05 P1-6) — Flow Radar의 선물 계열과 같은 파랑 계열을 쓰면 GEX 양(+) 막대와
+# 섞이므로, 어느 시리즈 색과도 겹치지 않는 하늘색을 쓴다(Okabe-Ito 팔레트 내에서 선택).
+_FUTURES_COLOR = "#56B4E9"
 
 
 def build_gamma_profile_chart(
@@ -28,12 +31,22 @@ def build_gamma_profile_chart(
     gamma_flip: float | None,
     gamma_walls: list[float],
     expiry: date | None = None,
+    futures_price: float | None = None,
 ) -> go.Figure:
     """
-    입력: 행사가/행사가별 GEX/스팟/감마플립/감마월 + `expiry`(이 값들이 나온 북의 만기).
-    계산: GEX 막대(부호로 색 구분) + 현재가·감마플립·감마월 수직선. 제목에 만기를 명시한다.
+    입력: 행사가/행사가별 GEX/스팟(지수)/감마플립/감마월 + `expiry`(이 값들이 나온 북의 만기)
+         + `futures_price`(**행사가 창을 굴리는 기준가**인 선물 최근 체결가, 없으면 생략).
+    계산: GEX 막대(부호로 색 구분) + 현재가(지수)·선물·감마플립·감마월 수직선. 제목에 만기를 명시한다.
     해석: `expiry=None`은 "체인이 비어 어느 북인지도 특정 못 함"이다 — 그 경우 제목에
          **"만기 미상"** 을 쓴다(만기를 생략해 "전 만기 합산"으로 오독되게 두지 않는다).
+
+         2026-08-05(P1-6) `futures_price`를 함께 그리는 이유: ATM±2 행사가 창은
+         `main._roll_subscriptions_to_spot()`이 **선물 체결가**로 굴리는데(같은 WS 태스크에서
+         구독을 보내야 하기 때문), 이 차트의 "현재가" 선은 **지수 스팟**이었다. 08-05 실측에서
+         둘이 3p 넘게 벌어져 창이 스팟보다 위로 치우쳐 보였는데, 화면에는 선이 하나뿐이라
+         **그것이 창 이동 지연인지 두 가격의 차이인지 구분할 수 없었다.** 신호 도달률 배지가
+         던지는 질문("행사가 창이 스팟을 따라가고 있는지 확인")을 이 차트에서 답할 수 있게 한다.
+         두 값이 가까우면 선이 겹쳐 보이는데, 그것 자체가 "정상"이라는 정보다.
     """
     colors = [_POS_GEX_COLOR if g >= 0 else _NEG_GEX_COLOR for g in gex_by_strike]
 
@@ -45,7 +58,15 @@ def build_gamma_profile_chart(
             hovertemplate="행사가 %{x}: GEX %{y:,.0f}<extra></extra>",
         )
     )
-    fig.add_vline(x=spot, line_dash="dot", line_color=_NEUTRAL_COLOR, annotation_text="현재가")
+    fig.add_vline(x=spot, line_dash="dot", line_color=_NEUTRAL_COLOR, annotation_text="지수 현재가")
+    if futures_price is not None:
+        fig.add_vline(
+            x=futures_price,
+            line_dash="dashdot",
+            line_color=_FUTURES_COLOR,
+            annotation_text="선물(행사가 창 기준)",
+            annotation_position="bottom right",
+        )
     if gamma_flip is not None:
         fig.add_vline(x=gamma_flip, line_dash="dash", line_color=_FLIP_COLOR, annotation_text="Gamma Flip")
     # gamma_walls는 |Gamma x OI| 노출 내림차순(1번이 가장 강한 Pinning 후보). 2026-08-05(P0-3)부터

@@ -131,11 +131,27 @@ def render() -> None:
 
     col1, col2, col3 = st.columns(3)
     col1.metric("현재 레짐", REGIME_LABEL_KO[snapshot.regime])
-    col2.metric("기초자산 현재가", f"{snapshot.spot:,.2f}")
+    col2.metric("기초자산 현재가(지수)", f"{snapshot.spot:,.2f}")
+    # 2026-08-05(P1-6) — 시각 없는 가격은 검증할 수 없다. 08-05 화면에는 지수 1,042.85와
+    # 선물 1046대가 함께 떠 있었는데 어느 쪽이 언제 것인지 알 방법이 없었다. 장전에는 이 값이
+    # 전일 종가인 것이 정상인데(§2 이상점 8), 그 사실도 시각이 있어야 읽힌다.
+    if snapshot.spot_asof is not None:
+        col2.caption(f"{snapshot.spot_asof:%H:%M:%S} 기준")
     col3.metric("레짐 안정성", "안정" if snapshot.stability_flag else "REGIME_UNSTABLE")
 
     st.subheader("Regime")
-    st.plotly_chart(build_regime_probability_chart(snapshot.regime_prob), width='stretch')
+    # 2026-08-05(P1-7) — warmup 폴백은 확률이 아니라 one-hot 상수다. 그 사실 없이 막대만 그리면
+    # "8개 중 하나를 100% 확신"으로 읽힌다(08-05 화면이 정확히 그 상태였다).
+    st.plotly_chart(
+        build_regime_probability_chart(snapshot.regime_prob, is_warmup=snapshot.regime_is_warmup),
+        width='stretch',
+    )
+    if snapshot.regime_is_warmup:
+        st.caption(
+            "레짐 엔진이 아직 학습되지 않아 v6 §16.1 WARMUP 폴백으로 동작 중입니다 — 위 막대는 "
+            "확률이 아니라 **전일 마감 레짐(또는 갭 z-score 임계 초과 시 그 방향)** 을 그대로 "
+            "표시한 것입니다. 학습 진행률은 위 '레짐 엔진 학습 데이터' 배지를 보세요."
+        )
 
     col_left, col_right = st.columns(2)
     with col_left:
@@ -144,7 +160,12 @@ def render() -> None:
         gex = [c.gex for c in snapshot.chain]
         st.plotly_chart(
             build_gamma_profile_chart(
-                strikes, gex, snapshot.spot, snapshot.gamma_flip, snapshot.gamma_walls, expiry=snapshot.gex_expiry
+                strikes, gex, snapshot.spot, snapshot.gamma_flip, snapshot.gamma_walls,
+                expiry=snapshot.gex_expiry,
+                # 2026-08-05(P1-6) — 행사가 창은 **선물 체결가**로 굴러간다(main._roll_subscriptions_to_spot).
+                # 지수 선 하나만 그리면 창이 치우쳐 보일 때 그것이 창 이동 지연인지 두 가격의 차이인지
+                # 구분할 수 없다. 선물 1분봉 종가가 곧 롤링에 쓰인 그 값이다.
+                futures_price=snapshot.price_series[-1] if snapshot.price_series else None,
             ),
             width='stretch',
         )

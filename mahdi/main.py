@@ -1034,6 +1034,11 @@ async def run_observation_loop(
                     prob_vector=list(state.prob_vector),
                     higher_tf_regime=int(state.higher_tf_regime) if state.higher_tf_regime is not None else None,
                     stability_flag=state.stability_flag,
+                    # 2026-08-05(COCKPIT 육안 점검 P1-7, 마이그레이션 025) — `RegimeState.is_warmup`은
+                    # 2026-07-10부터 필드로 있었지만 여기서 버려져 **DB에 한 번도 저장된 적이 없었다.**
+                    # 그 결과 COCKPIT은 warmup_fallback()의 one-hot 상수를 학습된 사후확률과
+                    # 구분하지 못하고 "평균회귀 100%"로 그렸다.
+                    is_warmup=state.is_warmup,
                 )
 
     await ws_client.listen(handle_message)

@@ -237,6 +237,11 @@ def test_latest_macro_snapshot_returns_row_when_us10y_present():
         "es_front_source": "kis",
         "move_index": 95.30,
         "move_index_source": "yfinance_fallback",
+        # 2026-08-05(P1-4): 최신 행에 값이 다 있으면 LOCF를 안 타므로 관측 시각이 곧 행 시각이다.
+        "us10y_yield_asof": ts,
+        "usdkrw_asof": ts,
+        "zn_front_asof": ts,
+        "move_index_asof": ts,
     }
 
 
@@ -246,17 +251,20 @@ def test_latest_macro_snapshot_forward_fills_us10y_when_null():
     # 5분마다 갱신되므로 별도 폴백 없이 그대로 반환돼야 한다. usdkrw는 이 테스트에서 값이 있어
     # 별도 LOCF 쿼리가 안 나가는 케이스로 둔다(usdkrw 자체의 LOCF는 아래 별도 테스트에서 검증).
     ts = datetime(2026, 7, 10, 8, 10)
+    locf_ts = datetime(2026, 7, 9, 15, 40)  # 전일 일봉으로 채워진 행
     conn = _FakeSequentialConnection(
         # 최신 행: us10y_yield NULL, zn_front는 yfinance 폴백으로 채워진 값
         (ts, 17.55, 17.85, 0.017094, 6.7810, None, 1352.35, 110.30, "yfinance_fallback", 5100.00, "kis", None, None),
-        (4.54,),  # us10y_yield 폴백 쿼리 결과
+        (locf_ts, 4.54),  # us10y_yield 폴백 쿼리 결과(2026-08-05 P1-4부터 관측 시각을 함께 읽는다)
     )
 
     result = db.latest_macro_snapshot(conn)
 
     assert result["us10y_yield"] == 4.54
+    assert result["us10y_yield_asof"] == locf_ts  # 이 값은 어제 것이라는 사실이 함께 나와야 한다
     assert result["vix_front"] == 17.55
     assert result["usdkrw"] == 1352.35
+    assert result["usdkrw_asof"] == ts  # LOCF를 안 탄 항목은 최신 행 시각
     assert result["zn_front"] == 110.30
     assert result["zn_front_source"] == "yfinance_fallback"
 
@@ -266,13 +274,63 @@ def test_latest_macro_snapshot_forward_fills_usdkrw_when_null():
     ts = datetime(2026, 7, 10, 8, 15)
     conn = _FakeSequentialConnection(
         (ts, 17.60, 17.90, 0.017045, 6.7820, 4.54, None, 110.40, "kis", None, None, None, None),
-        (1352.30,),  # usdkrw 폴백 쿼리 결과
+        (datetime(2026, 7, 9, 15, 40), 1352.30),  # usdkrw 폴백 쿼리 결과
     )
 
     result = db.latest_macro_snapshot(conn)
 
     assert result["usdkrw"] == 1352.30
     assert result["us10y_yield"] == 4.54
+
+
+def test_latest_macro_snapshot_locf_does_not_reach_back_without_a_bound():
+    """2026-08-05 P1-4 회귀 — LOCF 쿼리에 **시각 조건이 아예 없었다.**
+
+    `latest_option_chain()`(08-03)·`latest_expiry_liquidity()`(08-04)에서 이미 두 번 고친 화석 행
+    결함인데 이 경로만 남아 있었다: 3주 전 MOVE가 "지금 시점의 매크로 상태"로 실려 나왔다.
+    """
+    ts = datetime(2026, 7, 10, 8, 15)
+    queries: list[tuple] = []
+
+    class _RecordingCursor(_FakeSequentialCursor):
+        def execute(self, query, params=None):
+            queries.append((query, params))
+
+    class _RecordingConnection(_FakeSequentialConnection):
+        def cursor(self):
+            cur = _RecordingCursor([self._queue.pop(0)] if self._queue else [])
+            return cur
+
+    conn = _RecordingConnection(
+        (ts, 17.60, 17.90, 0.017045, 6.7820, None, 1352.30, 110.40, "kis", None, None, None, None),
+        (datetime(2026, 7, 9, 15, 40), 4.54),
+    )
+    db.latest_macro_snapshot(conn, as_of=ts)
+
+    locf_query, params = queries[1]
+    assert "timestamp >= %s" in locf_query
+    assert params == (ts - timedelta(days=db._MACRO_LOCF_MAX_AGE_DAYS),)
+
+
+def test_latest_macro_snapshot_returns_none_when_older_than_max_age():
+    """신호 경로(`regime_pipeline.macro_score`)만 켜는 경계 — 낡은 VIX 부호가 레짐에 흘러들면 안 된다."""
+    ts = datetime(2026, 7, 10, 8, 15)
+    conn = _FakeSequentialConnection(
+        (ts, 17.60, 17.90, 0.017045, 6.7820, 4.54, 1352.30, 110.40, "kis", None, None, None, None)
+    )
+
+    assert db.latest_macro_snapshot(conn, as_of=ts + timedelta(minutes=16), max_age_minutes=15) is None
+
+
+def test_latest_macro_snapshot_keeps_row_within_max_age():
+    ts = datetime(2026, 7, 10, 8, 15)
+    conn = _FakeSequentialConnection(
+        (ts, 17.60, 17.90, 0.017045, 6.7820, 4.54, 1352.30, 110.40, "kis", None, None, None, None)
+    )
+
+    result = db.latest_macro_snapshot(conn, as_of=ts + timedelta(minutes=14), max_age_minutes=15)
+
+    assert result is not None and result["vix_front"] == 17.60
 
 
 def test_insert_underlying_spot_upserts_on_timestamp_underlying():

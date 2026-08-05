@@ -1,4 +1,17 @@
+from datetime import datetime
+
 from mahdi.dashboard.panels.macro_panel import build_macro_snapshot_table
+
+# 2026-08-05(P1-4): 표 맨 앞에 "기준 시각" 열이 추가돼 셀 인덱스가 1씩 밀렸다. 인덱스를 숫자로
+# 흩어놓으면 열이 또 바뀔 때 전부 손대야 하므로 이름으로 고정한다.
+_COL = {
+    "as_of": 0, "vix_front": 1, "vix_next": 2, "term_structure": 3, "usdcnh": 4,
+    "zn_front": 5, "us10y": 6, "usdkrw": 7, "es_front": 8, "move_index": 9,
+}
+
+
+def _cell(fig, name: str) -> str:
+    return fig.data[0].cells.values[_COL[name]][0]
 
 
 def test_build_macro_snapshot_table_shows_contango_when_next_above_front():
@@ -13,18 +26,16 @@ def test_build_macro_snapshot_table_shows_contango_when_next_above_front():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    table = fig.data[0]
-    vix_front, vix_next, term_structure, usdcnh, zn_front, us10y, usdkrw, es_front, move_index = table.cells.values
-    assert vix_front == ["17.50"]
-    assert vix_next == ["17.80"]
-    assert "콘탱고" in term_structure[0]
-    assert term_structure[0].startswith("+")
-    assert usdcnh == ["6.7803"]
-    assert zn_front == ["110.2500"]
-    assert us10y == ["4.54%"]
-    assert usdkrw == ["-"]
-    assert es_front == ["-"]
-    assert move_index == ["-"]
+    assert _cell(fig, "vix_front") == "17.50"
+    assert _cell(fig, "vix_next") == "17.80"
+    assert "콘탱고" in _cell(fig, "term_structure")
+    assert _cell(fig, "term_structure").startswith("+")
+    assert _cell(fig, "usdcnh") == "6.7803"
+    assert _cell(fig, "zn_front") == "110.2500"
+    assert _cell(fig, "us10y") == "4.54%"
+    assert _cell(fig, "usdkrw") == "-"
+    assert _cell(fig, "es_front") == "-"
+    assert _cell(fig, "move_index") == "-"
 
 
 def test_build_macro_snapshot_table_shows_backwardation_when_next_below_front():
@@ -39,7 +50,7 @@ def test_build_macro_snapshot_table_shows_backwardation_when_next_below_front():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    term_structure = fig.data[0].cells.values[2][0]
+    term_structure = _cell(fig, "term_structure")
     assert "백워데이션" in term_structure
     assert term_structure.startswith("-")
 
@@ -48,7 +59,7 @@ def test_build_macro_snapshot_table_handles_none_snapshot():
     fig = build_macro_snapshot_table(None)
 
     values = [v[0] for v in fig.data[0].cells.values]
-    assert values == ["-", "-", "-", "-", "-", "-", "-", "-", "-"]
+    assert values == ["-"] * 10  # 기준 시각 열이 앞에 추가돼 10칸
 
 
 def test_build_macro_snapshot_table_handles_missing_us10y_only():
@@ -64,10 +75,9 @@ def test_build_macro_snapshot_table_handles_missing_us10y_only():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    values = [v[0] for v in fig.data[0].cells.values]
-    assert values[0] == "17.50"
-    assert values[4] == "-"  # zn_front
-    assert values[5] == "-"  # us10y_yield
+    assert _cell(fig, "vix_front") == "17.50"
+    assert _cell(fig, "zn_front") == "-"
+    assert _cell(fig, "us10y") == "-"
 
 
 def test_build_macro_snapshot_table_shows_zn_front_when_cbot_enabled():
@@ -82,7 +92,7 @@ def test_build_macro_snapshot_table_shows_zn_front_when_cbot_enabled():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    zn_front = fig.data[0].cells.values[4][0]
+    zn_front = _cell(fig, "zn_front")
     assert zn_front == "110.2500"
 
 
@@ -101,7 +111,7 @@ def test_build_macro_snapshot_table_labels_yfinance_fallback_zn_front():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    zn_front = fig.data[0].cells.values[4][0]
+    zn_front = _cell(fig, "zn_front")
     assert zn_front == "108.5000 (폴백)"
 
 
@@ -111,7 +121,7 @@ def test_build_macro_snapshot_table_shows_usdkrw_daily_level():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    usdkrw = fig.data[0].cells.values[6][0]
+    usdkrw = _cell(fig, "usdkrw")
     assert usdkrw == "1352.30"
 
 
@@ -120,7 +130,7 @@ def test_build_macro_snapshot_table_shows_es_front_from_kis():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    es_front = fig.data[0].cells.values[7][0]
+    es_front = _cell(fig, "es_front")
     assert es_front == "5123.2500"
 
 
@@ -130,7 +140,7 @@ def test_build_macro_snapshot_table_labels_yfinance_fallback_es_front():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    es_front = fig.data[0].cells.values[7][0]
+    es_front = _cell(fig, "es_front")
     assert es_front == "5100.0000 (폴백)"
 
 
@@ -140,5 +150,48 @@ def test_build_macro_snapshot_table_labels_move_index_as_fallback():
 
     fig = build_macro_snapshot_table(snapshot)
 
-    move_index = fig.data[0].cells.values[8][0]
+    move_index = _cell(fig, "move_index")
     assert move_index == "95.30 (폴백)"
+
+
+# ===== 2026-08-05 P1-4: 표에 시각이 하나도 없었다 =====
+
+
+def test_build_macro_snapshot_table_shows_the_snapshot_timestamp():
+    """폴러가 죽으면 며칠 전 값이 "지금"으로 보였다 — 기준 시각이 없으면 알 방법이 없다."""
+    snapshot = {"timestamp": datetime(2026, 8, 5, 12, 10), "vix_front": 17.90}
+
+    fig = build_macro_snapshot_table(snapshot)
+
+    assert _cell(fig, "as_of") == "08-05 12:10"
+
+
+def test_build_macro_snapshot_table_marks_values_carried_from_an_earlier_day():
+    """LOCF로 실려온 값은 날짜가 다르면 관측 날짜를 함께 쓴다 — 일봉 항목은 전 거래일 값이 정상이지만
+    그 사실이 화면에 보여야 한다."""
+    snapshot = {
+        "timestamp": datetime(2026, 8, 5, 12, 10),
+        "us10y_yield": 4.63,
+        "us10y_yield_asof": datetime(2026, 8, 4, 15, 40),
+        "move_index": 77.56,
+        "move_index_source": "yfinance_fallback",
+        "move_index_asof": datetime(2026, 7, 31, 9, 0),
+    }
+
+    fig = build_macro_snapshot_table(snapshot)
+
+    assert _cell(fig, "us10y") == "4.63% (08-04)"
+    assert _cell(fig, "move_index") == "77.56 (폴백) (07-31)"
+
+
+def test_build_macro_snapshot_table_does_not_mark_same_day_carry_forward():
+    # 같은 날 안에서의 이월(일봉 항목 6시간 주기 등)은 정상 — 전부 표기하면 정작 며칠 전 값이 안 띈다.
+    snapshot = {
+        "timestamp": datetime(2026, 8, 5, 12, 10),
+        "us10y_yield": 4.63,
+        "us10y_yield_asof": datetime(2026, 8, 5, 7, 35),
+    }
+
+    fig = build_macro_snapshot_table(snapshot)
+
+    assert _cell(fig, "us10y") == "4.63%"
