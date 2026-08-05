@@ -187,6 +187,32 @@ OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS = 25.0
 # rows 20 미만이 하나도 안 생겼다면 예산이 안 걸린 것이고, 절반이 얇아졌다면 임계가 너무 낮다.
 OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS = 50.0
 
+# 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 8 / Fix#8) — 장전에는 지수 스팟을 적재하지 않는다.
+#
+# **KOSPI200 지수는 09:00 이전에 체결되지 않는다.** 그런데 `output3.bstp_nmix_prpr`는 장전에도
+# 값을 돌려준다 — **전일 종가**다. 종전에는 그것을 매분 `underlying_spot_1m`에 새 행으로 적재해,
+# 07:31~09:00 약 90분치가 "지금 시장"인 것처럼 쌓였다. 행 자체는 1분 전 것이라 **신선도로는
+# 절대 걸러낼 수 없다**(값이 낡았지 행이 낡은 게 아니다).
+#
+# 08-05 실측: 07:31~09:00 내내 정확히 1000.0300(= 08-04 종가), 09:01에 1042.91로 점프.
+# 즉 **오버나이트 갭 +4.29%를 장전 90분 동안 못 본 채** GEX/감마플립/감마월/VRP를 계산했고,
+# 그 시간대 판단(08:45~09:00, 앙상블 4멤버)이 전부 그 위에서 내려졌다.
+#
+# 더 큰 피해는 레짐 쪽이다. `regime_pipeline.compute_gap_zscore()`(v6 §16.1 WARMUP ②)는
+#   갭 = (오늘 첫 스팟 − 전일 마지막 스팟) / 기대변동폭
+# 인데 **"오늘 첫 스팟"이 곧 전일 종가**라 분자가 항상 0이다. DB 전수 확인 결과 개시 이래
+# **모든 거래일의 갭이 정확히 0.0000**이었다(07-27~08-05 8일 전수). 2026-07-10에 이 함수를
+# 하드코딩 0.0에서 실데이터로 배선했는데, 배선은 됐고 **데이터가 그것을 상수로 만들고 있었다** —
+# 08-05에 찾은 다른 결함들(VRP 미전달, MetaLabelContext 기본값)과 정확히 같은 형태다.
+#
+# 적재를 막으면 장전 조회분은 어디에도 남지 않는다. 그래도 되는 이유: 그 값은 전일 종가이고
+# 전일 마지막 행에 **이미 같은 값이 있다**(중복이지 손실이 아니다).
+#
+# **경계 주의**: 09:00 정각 폴링이 지수 첫 체결보다 앞서면 그 1분은 여전히 전일 종가일 수 있다
+# (08-05가 그랬고, 08-04는 09:00에 이미 실값이었다). 90분 → 최대 1분으로 줄지만 0은 아니다 —
+# 그래서 `compute_gap_zscore()` 자체는 이번에 손대지 않았다([[NEXT_TODO]]).
+MARKET_OPEN_TIME = dtime(9, 0)
+
 # ===== 2026-08-04(고도화#1 규약 A) — 지표성 로그의 포맷 계약 =====
 #
 # `mahdi/ops/log_metrics.py`가 정규식으로 읽는 줄들이다. 08-03에 `rest_client` 쪽에서 이 계약이
@@ -1565,7 +1591,8 @@ async def _catch_up_missed_option_chain_minute(
                     )
                     conn.rollback()
                     continue
-            if latest_spot is not None:
+            # 장전이면 이 값은 전일 종가다 — 근거는 `MARKET_OPEN_TIME` 주석.
+            if latest_spot is not None and catchup_time.time() >= MARKET_OPEN_TIME:
                 try:
                     db.insert_underlying_spot(conn, catchup_time, underlying, latest_spot)
                 except Exception:
@@ -1732,7 +1759,8 @@ async def poll_option_chain(
                         )
                         conn.rollback()
                         continue
-                if latest_spot is not None:
+                # 장전이면 이 값은 전일 종가다 — 근거는 `MARKET_OPEN_TIME` 주석.
+                if latest_spot is not None and poll_time.time() >= MARKET_OPEN_TIME:
                     try:
                         db.insert_underlying_spot(conn, poll_time, underlying, latest_spot)
                     except Exception:
@@ -2574,10 +2602,14 @@ def _build_signal_inputs(
     실패 조건: 없음 — 개별 조회 결과 부재는 SignalInputs 필드의 None으로 흡수된다.
     """
     chain_rows = db.latest_option_chain(conn, underlying)
-    spot = db.latest_underlying_spot(conn, underlying)
-    flow = db.latest_investor_flow(conn, underlying)
-
     now = db.local_now()
+    # 2026-08-05(§2 이상점 8): 신호 경로에서만 신선도 경계를 켠다 —
+    # 장전에는 스팟이 없는 것으로 쳐서(=전일 종가를 쓰지 않아서) GEX/감마플립/VRP가
+    # **틀린 값 대신 미가용**이 된다. 근거는 `db.UNDERLYING_SPOT_MAX_AGE_MINUTES` 주석.
+    spot = db.latest_underlying_spot(
+        conn, underlying, as_of=now, max_age_minutes=db.UNDERLYING_SPOT_MAX_AGE_MINUTES
+    )
+    flow = db.latest_investor_flow(conn, underlying)
     gex = gamma_flip = gamma_wall = total_charm = None
     legs, gex_expiry = _signal_book_legs(chain_rows, now.date()) if chain_rows else ([], None)
     if legs and spot is not None:

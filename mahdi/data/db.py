@@ -302,15 +302,53 @@ def insert_underlying_spot(conn: ConnectionLike, timestamp: datetime, underlying
     _upsert(conn, "underlying_spot_1m", ("timestamp", "underlying", "spot"), ("timestamp", "underlying"), row)
 
 
-def latest_underlying_spot(conn: ConnectionLike, underlying: str) -> float | None:
-    """가장 최근 기초자산 스팟 1건. 폴링 루프가 아직 한 번도 못 돌았으면 None."""
+# 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 8) — 신호 계산에 쓰는 스팟의 신선도 경계.
+# 체인 스냅샷(`CHAIN_SNAPSHOT_MAX_AGE_MINUTES`)·미시구조(`MICROSTRUCTURE_MAX_AGE_MINUTES`)와
+# 같은 원칙이다: **오래된 값을 조용히 들고 오면 "지금 시장"이 아닌 것으로 판단한다.**
+# 스팟만 이 경계가 없었다.
+#
+# 5분인 이유: 스팟은 옵션체인 사이클(60초)마다 갱신되므로 결손 4분을 견디고도 충분하고,
+# GEX/감마플립을 같은 스냅샷에서 계산하는 체인 창과 같은 크기를 쓰는 편이 "이 둘이 같은 시각의
+# 시장을 본다"는 성질을 유지한다.
+UNDERLYING_SPOT_MAX_AGE_MINUTES = 5
+
+
+def latest_underlying_spot(
+    conn: ConnectionLike,
+    underlying: str,
+    *,
+    as_of: datetime | None = None,
+    max_age_minutes: int | None = None,
+) -> float | None:
+    """
+    입력: 기초자산 라벨, (선택) 기준 시각과 최대 허용 나이(분).
+    계산: 가장 최근 기초자산 스팟 1건. 폴링 루프가 아직 한 번도 못 돌았으면 None.
+         `max_age_minutes`를 주면 그보다 오래된 행은 **없는 것으로 친다**(None).
+    해석: 2026-08-05 — 경계를 **기본값으로 켜지 않는** 이유는 COCKPIT 때문이다.
+         대시보드는 장전에도 "기초자산 현재가"를 표시해야 하고(전일 종가를 그 시각과 함께
+         보여주는 것은 정직하다), 여기서 None을 돌려주면 `_load_from_db`가 예외/폴백 경로로
+         빠져 **합성 리플레이(가짜 데이터)를 띄울 위험**이 있다 — 2026-07-21에 실제로 겪은
+         사고다. 그래서 경계는 **신호 경로(`_build_signal_inputs`)에서만 명시적으로 켠다.**
+         (같은 이유로 `latest_market_microstructure`도 `as_of`를 호출측이 넘긴다.)
+    실패 조건: 행이 없거나, 경계를 켰는데 그보다 오래됐으면 None.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT spot FROM underlying_spot_1m WHERE underlying=%s ORDER BY timestamp DESC LIMIT 1",
+            "SELECT spot, timestamp FROM underlying_spot_1m WHERE underlying=%s "
+            "ORDER BY timestamp DESC LIMIT 1",
             (underlying,),
         )
         row = cur.fetchone()
-    return float(row[0]) if row else None
+    if not row:
+        return None
+    if max_age_minutes is not None:
+        reference = as_of or local_now()
+        timestamp = row[1]
+        if timestamp is not None:
+            age = reference - timestamp.replace(tzinfo=None)
+            if age > timedelta(minutes=max_age_minutes):
+                return None
+    return float(row[0])
 
 
 # 2026-08-04(운영점검보고서 §2-5 / Fix#2) — 미시구조 값의 신선도 경계.

@@ -160,6 +160,45 @@ _ENDPOINT_READ_TIMEOUT_SECONDS: dict[str, float] = {
 }
 
 
+# 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 4 후속) — 계측용 엔드포인트 라벨.
+#
+# 종전에는 `url.rsplit("/", 1)[-1]`로 마지막 경로 조각을 그대로 썼는데, 국내 선물옵션 시세
+# (`PATH_FUTUREOPTION_QUOTE`)와 해외선물 시세(`PATH_OVERSEAS_FUTUREOPTION_PRICE`)는 **마지막
+# 조각이 둘 다 `inquire-price`** 다. 그래서 자동 리포트 §9-1의 `inquire-price` 행에는 옵션체인
+# 2,825건과 매크로 폴러의 해외선물 호출(~88건/일)이 **한 행에 섞여** 있었다.
+#
+# 섞이면 무엇이 문제인가: §9-1은 "이 엔드포인트가 오늘 느렸는가"를 재는 표이고, 그 위에
+# `hypotheses.yaml` 2026-08-04-p5의 **자동 대응 규칙**(p95가 2.5초를 이틀 연속 넘으면 위클리
+# 폴링을 격분으로 늘린다)이 얹혀 있다. 해외선물은 CBOT/CME 미신청이라 **항상 실패**하는데,
+# 그 실패 응답의 지연이 옵션체인 p95를 흔들면 **엉뚱한 폴러를 줄이게 된다.**
+#
+# 라벨은 `[\w-]+`만 쓴다 — `log_metrics._REST_LATENCY_ITEM_RE`가 그 문자 집합으로 파싱한다.
+# 전체 경로를 쓰면 슬래시 때문에 파서가 눈이 먼다(08-04 §2-1과 같은 사고).
+#
+# 참고: `log_metrics.classify_endpoint()`(폴러 그룹 역산)는 같은 충돌을 **검사 순서**로 이미
+# 피하고 있다(`overseas-futureoption`을 `inquire-price`보다 먼저 본다) — 그쪽은 정상이다.
+_ENDPOINT_LABEL_OVERRIDES: dict[str, str] = {
+    tr_codes.PATH_OVERSEAS_FUTUREOPTION_PRICE: "overseas-inquire-price",
+}
+
+
+def endpoint_label(url: str) -> str:
+    """
+    입력: 요청 URL(도메인·쿼리스트링 포함 가능).
+    계산: 계측 표에 쓸 짧은 엔드포인트 라벨. 충돌하는 경로만 `_ENDPOINT_LABEL_OVERRIDES`로
+         구분하고, 나머지는 마지막 경로 조각을 그대로 쓴다.
+    해석: 상세 근거는 `_ENDPOINT_LABEL_OVERRIDES` 주석. 새 엔드포인트를 추가할 때 마지막 조각이
+         기존과 겹치면 여기에 항목을 더해야 한다 — 잊었을 때 알려주는 것이
+         `tests/test_broker_rest_client.py`의 라벨 충돌 테스트다(값이 아니라 **관계**를 지킨다).
+    실패 조건: 없음.
+    """
+    path = url.split("?", 1)[0]
+    for endpoint_path, label in _ENDPOINT_LABEL_OVERRIDES.items():
+        if path.endswith(endpoint_path):
+            return label
+    return path.rsplit("/", 1)[-1]
+
+
 def timeout_for_url(url: str) -> httpx.Timeout:
     """
     입력: 요청 URL(도메인 포함, 쿼리스트링은 있어도 되고 없어도 된다).
@@ -415,7 +454,7 @@ class KISRestClient:
         return out
 
     def _record_http_latency(self, url: str, http_seconds: float) -> None:
-        endpoint = url.split("?", 1)[0].rsplit("/", 1)[-1]
+        endpoint = endpoint_label(url)
         with self._http_samples_lock:
             self._http_samples.setdefault(endpoint, []).append(http_seconds)
 
@@ -442,7 +481,7 @@ class KISRestClient:
         logger.info(
             LOG_SLOW_CALL,
             total, pacer_seconds, http_seconds, self._rate_limiter.current_multiplier,
-            method, url.split("?", 1)[0].rsplit("/", 1)[-1],
+            method, endpoint_label(url),
         )
 
     def _send_get(self, url: str, **kwargs) -> httpx.Response:

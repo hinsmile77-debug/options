@@ -637,6 +637,9 @@ def test_poll_option_chain_writes_legs_and_spot_once_per_cycle(monkeypatch):
         "mahdi.main.db.insert_underlying_spot",
         lambda conn, timestamp, underlying, spot: written_spots.append(spot),
     )
+    # 2026-08-05(§2 이상점 8): 스팟 적재에 장중 조건이 생겼다 — 벽시계에 의존하면 이 테스트가
+    # 장전에만 실패하는 시한폭탄이 된다. 시각을 고정한다.
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 5, 10, 0))
 
     async def fake_sleep(seconds):
         raise RuntimeError("stop-loop")
@@ -656,6 +659,50 @@ def test_poll_option_chain_writes_legs_and_spot_once_per_cycle(monkeypatch):
     assert len(rest_client.calls) == 2  # 1개 행사가 x (C, P)
     assert len(written_rows) == 2
     assert written_spots == [1333.77]  # 사이클당 한 번만 적재(레그마다 중복 적재 안 함)
+
+
+def test_poll_option_chain_does_not_store_the_pre_open_spot(monkeypatch):
+    """08-05 §2 이상점 8 — KOSPI200 지수는 09:00 이전에 체결되지 않는데
+    `output3.bstp_nmix_prpr`는 장전에도 **전일 종가**를 돌려준다. 그것을 매분 새 행으로
+    적재하면 07:31~09:00 약 90분치가 "지금 시장"인 것처럼 쌓이고, 행 자체는 1분 전 것이라
+    신선도로는 절대 걸러낼 수 없다.
+
+    08-05 실측: 07:31~09:00 내내 정확히 1000.0300(= 08-04 종가), 09:01에 1042.91로 점프 —
+    오버나이트 갭 +4.29%를 장전 90분 동안 못 본 채 GEX/VRP를 계산했다.
+    """
+    rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
+    written_rows: list[dict] = []
+    written_spots: list[float] = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_option_analysis_1m", lambda conn, row: written_rows.append(row))
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_underlying_spot",
+        lambda conn, timestamp, underlying, spot: written_spots.append(spot),
+    )
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 5, 8, 50))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(
+            poll_option_chain(
+                rest_client,
+                [(_FakeSubscriptionManagerWithStrikes(), "regular")],
+                _FakeMaster(),
+                interval_seconds=1,
+            )
+        )
+
+    assert written_spots == []  # 장전 스팟은 남기지 않는다
+    assert len(written_rows) == 2  # 그릭스/IV는 그대로 적재한다(옵션은 장전에도 호가가 있다)
 
 
 class _FakeConnWithRollback:
@@ -749,6 +796,8 @@ def test_poll_option_chain_retries_once_when_entire_cycle_fails(monkeypatch):
         "mahdi.main.db.insert_underlying_spot",
         lambda conn, timestamp, underlying, spot: written_spots.append(spot),
     )
+    # 2026-08-05(§2 이상점 8): 스팟 적재는 이제 장중 조건부다 — 시각을 고정한다.
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 5, 10, 0))
 
     sleep_calls: list[float] = []
 
@@ -3049,7 +3098,7 @@ def test_build_signal_inputs_computes_gex_and_gamma_flip_from_chain_and_spot(mon
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 350.5)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 350.5)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, -100.0, -200.0))
 
     regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=(1.0,) + (0.0,) * 7)
@@ -3098,7 +3147,7 @@ def _two_book_chain() -> list[dict]:
 
 def _patch_chain(monkeypatch, chain_rows, spot=350.5, micro=None):
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: spot)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: spot)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
     monkeypatch.setattr(
         "mahdi.main.db.latest_market_microstructure", lambda conn, symbol, as_of=None: micro
@@ -3198,7 +3247,7 @@ def test_member_unavailable_reasons_names_the_missing_ingredient():
 
 def test_build_signal_inputs_handles_missing_chain_and_flow_gracefully(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
 
     inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
@@ -3236,7 +3285,7 @@ def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule
     _patch_signal_fusion_cycle_db_defaults(monkeypatch)
     monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
 
     recorded: list[tuple] = []
@@ -3275,7 +3324,7 @@ def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeyp
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 100.0)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
     # 2026-07-28 8차: is_entry일 때 계좌 추적기를 조회하므로, 이 테스트는 "추적기 미준비"
     # 경로로 흘려보내 기존 검증 범위(진입 후보 로깅 자체)를 그대로 유지한다.
@@ -3379,7 +3428,7 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 100.0)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
     monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
     monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
@@ -3429,7 +3478,7 @@ def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 100.0)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
     monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
     monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
@@ -3484,7 +3533,7 @@ def test_poll_signal_fusion_cycle_marks_account_tracker_not_ready(monkeypatch):
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 100.0)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
     monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
 
@@ -3756,7 +3805,7 @@ def test_poll_signal_fusion_cycle_rejects_when_palette_only_says_wait(monkeypatc
          "gex": 0.0, "expiry": date(2026, 8, 13)},
     ]
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 100.0)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
 
     @contextmanager
@@ -3801,7 +3850,7 @@ def test_poll_signal_fusion_cycle_rejects_when_palette_only_says_wait(monkeypatc
 def test_poll_signal_fusion_cycle_records_risk_snapshot_even_when_rejecting(monkeypatch):
     _patch_signal_fusion_cycle_db_defaults(monkeypatch)
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
 
     @contextmanager
@@ -3839,7 +3888,7 @@ def test_poll_signal_fusion_cycle_records_risk_snapshot_even_when_rejecting(monk
 def test_poll_signal_fusion_cycle_risk_snapshot_failure_does_not_break_cycle(monkeypatch):
     _patch_signal_fusion_cycle_db_defaults(monkeypatch)
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
-    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying: None)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: None)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
 
     @contextmanager

@@ -863,3 +863,37 @@ def test_slow_call_line_still_matches_the_ops_parser_after_the_threshold_change(
     rendered = LOG_SLOW_CALL % (4.02, 0.02, 4.00, 1.00, "GET", "inquire-price")
     line = f"2026-08-06 09:20:31,123 INFO:mahdi.broker.rest_client:{rendered}"
     assert _SLOW_CALL_RE.match(line) is not None
+
+
+# ===== 2026-08-05(§2 이상점 4 후속) — 계측 엔드포인트 라벨 충돌 =====
+
+
+def test_domestic_and_overseas_inquire_price_get_distinct_labels():
+    """둘 다 마지막 경로 조각이 `inquire-price`다. 섞이면 §9-1이 옵션체인 2,825건과
+    항상 실패하는 해외선물 호출(~88건/일)을 한 행에 담고, 그 위에 얹힌 자동 대응 규칙
+    (p95 2.5초 이틀 연속 → 위클리 폴링 축소)이 엉뚱한 폴러를 줄이게 된다."""
+    from mahdi.broker.rest_client import endpoint_label
+
+    assert endpoint_label(f"https://x{tr_codes.PATH_FUTUREOPTION_QUOTE}") == "inquire-price"
+    assert endpoint_label(f"https://x{tr_codes.PATH_OVERSEAS_FUTUREOPTION_PRICE}") == "overseas-inquire-price"
+
+
+def test_every_known_endpoint_path_gets_a_unique_label():
+    """새 엔드포인트의 마지막 조각이 기존과 겹치면 여기서 걸린다 — 값이 아니라 **관계**를 지킨다.
+    (Fix#4의 임계-타임아웃 불변식과 같은 방식.)"""
+    from mahdi.broker.rest_client import endpoint_label
+
+    paths = [v for k, v in vars(tr_codes).items() if k.startswith("PATH_") and isinstance(v, str)]
+    labels = [endpoint_label(f"https://x{p}") for p in paths]
+    duplicates = {lab for lab in labels if labels.count(lab) > 1}
+    assert not duplicates, f"라벨이 겹친다: {duplicates} — _ENDPOINT_LABEL_OVERRIDES에 추가할 것"
+
+
+def test_endpoint_label_stays_parseable_by_the_ops_report():
+    r"""`log_metrics._REST_LATENCY_ITEM_RE`가 `[\w-]+`로 읽는다 — 슬래시가 섞이면 파서가 눈이 먼다."""
+    import re
+    from mahdi.broker.rest_client import endpoint_label
+
+    paths = [v for k, v in vars(tr_codes).items() if k.startswith("PATH_") and isinstance(v, str)]
+    for path in paths:
+        assert re.fullmatch(r"[\w-]+", endpoint_label(f"https://x{path}")), path

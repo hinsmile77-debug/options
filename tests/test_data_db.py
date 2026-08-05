@@ -952,3 +952,40 @@ def test_entry_strategies_used_today_skips_rows_without_a_json_array():
 
 def test_entry_strategies_used_today_is_empty_when_no_entries():
     assert db.entry_strategies_used_today(FakeReadConnection([]), date(2026, 8, 6)) == frozenset()
+
+
+# ===== 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 8) — 스팟 신선도 경계 =====
+
+
+def test_latest_underlying_spot_has_no_age_bound_by_default():
+    """기본값은 종전 그대로다 — COCKPIT은 장전에도 전일 종가를 그 시각과 함께 보여줘야 하고,
+    여기서 None을 돌려주면 `_load_from_db`가 합성 리플레이(가짜 데이터)로 빠질 위험이 있다
+    (2026-07-21에 실제로 겪은 사고)."""
+    conn = FakeReadConnection([(1333.77, datetime(2026, 8, 4, 15, 44))])
+
+    assert db.latest_underlying_spot(conn, "KOSPI200") == 1333.77
+
+
+def test_latest_underlying_spot_rejects_a_stale_value_when_the_bound_is_on():
+    """장전에는 마지막 행이 전일 종가(약 17시간 전)다 — 신호 경로는 그것을 쓰면 안 된다."""
+    conn = FakeReadConnection([(1000.03, datetime(2026, 8, 4, 15, 44))])
+
+    result = db.latest_underlying_spot(
+        conn, "KOSPI200", as_of=datetime(2026, 8, 5, 8, 50), max_age_minutes=5
+    )
+    assert result is None
+
+
+def test_latest_underlying_spot_accepts_a_fresh_value_when_the_bound_is_on():
+    conn = FakeReadConnection([(1042.91, datetime(2026, 8, 5, 9, 1))])
+
+    result = db.latest_underlying_spot(
+        conn, "KOSPI200", as_of=datetime(2026, 8, 5, 9, 3), max_age_minutes=5
+    )
+    assert result == 1042.91
+
+
+def test_underlying_spot_bound_matches_the_chain_snapshot_window():
+    """스팟과 체인은 같은 GEX 계산에 함께 들어간다 — 두 창이 어긋나면 서로 다른 시각의
+    시장을 본 값으로 하나의 감마 지형을 그리게 된다."""
+    assert db.UNDERLYING_SPOT_MAX_AGE_MINUTES == db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES
