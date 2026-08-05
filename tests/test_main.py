@@ -4758,3 +4758,149 @@ def test_market_op_ack_db_failure_does_not_break_observation(monkeypatch):
         )
 
     assert liveness.market_op_subscribed_at == datetime(2026, 8, 4, 7, 31, 3)
+
+
+# --- VRP 배선(2026-08-05 운영점검보고서 §2 이상점 1 / Fix#1) --------------------------------
+
+
+def _vrp_chain_row(strike: float, opt: str, expiry: date, *, iv: float, rv: float | None) -> dict:
+    return {"strike": strike, "option_type": opt, "oi": 100.0, "iv": iv, "gamma": 0.02,
+            "gex": 0.0, "expiry": expiry, "timestamp": datetime(2026, 8, 5, 10, 0), "rv_5d": rv}
+
+
+def test_build_signal_inputs_computes_vrp_from_the_monthly_book_only(monkeypatch):
+    """VRP는 GEX와 **같은 북(먼슬리)** 에서 나와야 한다(Fix#5와 같은 이유, v6 §11.4).
+
+    08-05 실측에서 위클리 두 북은 `rv_5d`가 전 행 0이었다 — 섞이면 VRP가 곧 IV가 돼
+    그 분은 항상 극단적 고평가로 판정된다.
+    """
+    chain = [
+        _vrp_chain_row(350.0, "C", _MONTHLY, iv=0.86, rv=0.78),
+        _vrp_chain_row(350.0, "P", _MONTHLY, iv=0.90, rv=0.78),
+        # 위클리는 rv=0(08-05 실측) — 이 값이 새어 들어오면 vrp가 IV 그대로가 된다.
+        _vrp_chain_row(350.0, "C", _WEEKLY, iv=1.18, rv=0.0),
+        _vrp_chain_row(350.0, "P", _WEEKLY, iv=1.18, rv=0.0),
+    ]
+    _patch_chain(monkeypatch, chain, spot=350.5)
+
+    _inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert chain_inputs["gex_expiry"] == _MONTHLY
+    assert chain_inputs["vrp"] == pytest.approx((0.86 + 0.90) / 2 - 0.78)  # = 0.10, 먼슬리 기준
+
+
+def test_build_signal_inputs_leaves_vrp_none_when_it_cannot_be_computed(monkeypatch):
+    """산출 불가는 None으로 남는다 — 0.0으로 채우면 "쟀는데 적정"과 구분되지 않는다.
+    호출측이 팔레트에 넘길 때만 안전한 쪽(fair=관망)으로 폴백한다."""
+    _patch_chain(monkeypatch, [
+        _vrp_chain_row(350.0, "C", _MONTHLY, iv=0.86, rv=None),
+        _vrp_chain_row(350.0, "P", _MONTHLY, iv=0.90, rv=None),
+    ], spot=350.5)
+
+    _inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert chain_inputs["vrp"] is None
+
+
+def test_build_signal_inputs_keeps_vrp_none_when_chain_is_empty(monkeypatch):
+    _patch_chain(monkeypatch, [], spot=350.5)
+
+    _inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert chain_inputs["vrp"] is None
+    assert chain_inputs["gex_expiry"] is None
+
+
+def test_poll_signal_fusion_cycle_passes_vrp_to_the_strategy_palette(monkeypatch):
+    """회귀 방지 §2 이상점 1(Fix#1): `evaluate()`에 vrp를 안 넘기면 기본값 0.0이 쓰이고,
+    그것은 `_vrp_state(0.0, 0.02)` = **항상 "fair"** 를 뜻한다.
+
+    v6 §11.4 매트릭스 3열 중 2열이 전 이력 도달 불가였고, 레짐까지 RANGE_BALANCED 고정이라
+    9칸 중 도달 가능한 칸이 `wait_and_see` 하나뿐이었다 — 08-05에 방향 ±0.692 / 동조 3 /
+    확신도 0.75짜리 HIGH_CONVICTION 6건이 전부 이 셀에서 버려졌다.
+    """
+    from mahdi.fusion.engine import SignalFusionEngine
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    _patch_chain(monkeypatch, [
+        _vrp_chain_row(350.0, "C", _MONTHLY, iv=0.86, rv=0.78),
+        _vrp_chain_row(350.0, "P", _MONTHLY, iv=0.90, rv=0.78),
+    ], spot=350.5)
+
+    captured: list[float] = []
+    real_evaluate = SignalFusionEngine.evaluate
+
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+        captured.append(vrp)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+
+    monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None: recorded.append(chain_inputs or {}),
+    )
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 1:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+    assert captured and captured[0] == pytest.approx(0.10)  # 기본값 0.0이 아니다
+    assert recorded[0]["vrp"] == pytest.approx(0.10)  # 마이그레이션 024 — 판단 행에도 남는다
+
+
+def test_poll_signal_fusion_cycle_falls_back_to_fair_when_vrp_is_unavailable(monkeypatch):
+    """산출 불가일 때 0.0(=fair=관망)으로 떨어지는 것은 **의도된 안전 폴백**이다 —
+    없는 값을 지어내 진입을 만들지 않는다. 구분은 `signal_decisions.vrp`(NULL)가 보존한다."""
+    from mahdi.fusion.engine import SignalFusionEngine
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    _patch_chain(monkeypatch, [], spot=None)
+
+    captured: list[float] = []
+    real_evaluate = SignalFusionEngine.evaluate
+
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+        captured.append(vrp)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+
+    monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None: recorded.append(chain_inputs or {}),
+    )
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 1:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+    assert captured == [0.0]  # 팔레트에는 안전한 쪽
+    assert recorded[0]["vrp"] is None  # 기록에는 "못 쟀다"가 그대로
+

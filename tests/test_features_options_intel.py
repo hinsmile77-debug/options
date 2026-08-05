@@ -7,6 +7,7 @@ import pytest
 from mahdi.features.options_intel import (
     GammaMapEngine,
     OptionLeg,
+    atm_straddle_vrp,
     calculate_gex,
     calculate_vrp,
     find_gamma_flip,
@@ -287,3 +288,82 @@ def test_pin_risk_returns_none_when_there_is_no_exposure():
     legs = [OptionLeg(350, "c", oi=0.0, iv=0.2, t_years=0.01, gamma=0.05)]
     assert pin_risk(legs, spot=350.0) is None
     assert pin_risk([], spot=350.0) is None
+
+
+# ===== 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 1 / Fix#1) — ATM 스트래들 VRP =====
+
+
+def _chain_row(strike: float, opt: str, iv: float, rv: float | None = 0.78) -> dict:
+    return {"strike": strike, "option_type": opt, "iv": iv, "rv_5d": rv}
+
+
+def test_atm_straddle_vrp_averages_call_and_put_at_the_nearest_strike():
+    rows = [_chain_row(1045.0, "C", 0.86), _chain_row(1045.0, "P", 0.90)]
+
+    # mean(0.86, 0.90) - 0.78 = 0.10
+    assert atm_straddle_vrp(rows, spot=1045.4) == pytest.approx(0.10)
+
+
+def test_atm_straddle_vrp_picks_the_strike_nearest_to_spot():
+    rows = [
+        _chain_row(1045.0, "C", 0.86), _chain_row(1045.0, "P", 0.90),
+        _chain_row(1050.0, "C", 0.70), _chain_row(1050.0, "P", 0.72),
+    ]
+
+    assert atm_straddle_vrp(rows, spot=1049.0) == pytest.approx((0.70 + 0.72) / 2 - 0.78)
+
+
+def test_atm_straddle_vrp_breaks_midpoint_ties_deterministically():
+    # 스팟이 두 행사가의 정확한 중점이면 낮은 행사가를 택한다 — 같은 입력에 늘 같은 답이어야
+    # 백테스트와 라이브가 갈리지 않는다.
+    rows = [
+        _chain_row(1045.0, "C", 0.86), _chain_row(1045.0, "P", 0.90),
+        _chain_row(1050.0, "C", 0.70), _chain_row(1050.0, "P", 0.72),
+    ]
+
+    assert atm_straddle_vrp(rows, spot=1047.5) == pytest.approx((0.86 + 0.90) / 2 - 0.78)
+
+
+def test_atm_straddle_vrp_requires_both_call_and_put():
+    """08-05 09:18 실측 재현 — ATM(1047.5)에 콜만 iv>0이었고 그 콜 IV가 0.5423이라
+    VRP가 −0.24("저평가")로 나왔다. 그 값 하나가 팔레트를 `small_strangle_buy`로 보낸다.
+    KIS `hts_ints_vltl`은 행사가 격자에 따라 계통적으로 튀므로(홀수배 0.57~0.63 vs
+    5의 배수 0.87~0.89) 단일 레그로는 행사가 한 칸에 부호가 뒤집힌다."""
+    assert atm_straddle_vrp([_chain_row(1047.5, "C", 0.5423)], spot=1047.1) is None
+    assert atm_straddle_vrp([_chain_row(1047.5, "P", 0.9278)], spot=1047.1) is None
+
+
+def test_atm_straddle_vrp_ignores_legs_with_non_positive_iv():
+    # iv=0은 KIS 미제공이다 — 평균에 넣으면 ATM IV를 절반으로 끌어내린다.
+    rows = [_chain_row(1045.0, "C", 0.0), _chain_row(1045.0, "P", 0.90)]
+    assert atm_straddle_vrp(rows, spot=1045.0) is None
+
+
+def test_atm_straddle_vrp_returns_none_when_realized_vol_is_missing_or_zero():
+    """08-05 실측: 위클리 두 북(08-06/08-10)은 `rv_5d`가 **전 행 0**이었다. 그대로 빼면
+    VRP = IV(1.18까지)가 돼 그 북은 항상 극단적 고평가로 판정된다."""
+    assert atm_straddle_vrp(
+        [_chain_row(1045.0, "C", 0.86, rv=0.0), _chain_row(1045.0, "P", 0.90, rv=0.0)], spot=1045.0
+    ) is None
+    assert atm_straddle_vrp(
+        [_chain_row(1045.0, "C", 0.86, rv=None), _chain_row(1045.0, "P", 0.90, rv=None)], spot=1045.0
+    ) is None
+
+
+def test_atm_straddle_vrp_returns_none_without_spot_or_chain():
+    rows = [_chain_row(1045.0, "C", 0.86), _chain_row(1045.0, "P", 0.90)]
+    assert atm_straddle_vrp(rows, spot=None) is None
+    assert atm_straddle_vrp([], spot=1045.0) is None
+
+
+def test_atm_straddle_vrp_sign_maps_to_palette_columns():
+    """팔레트가 이 부호로 §11.4 매트릭스의 열을 고른다 — 밴드는 ±0.02(2 변동성 포인트)."""
+    from mahdi.fusion.strategy_palette import _vrp_state
+
+    overpriced = atm_straddle_vrp([_chain_row(1045.0, "C", 0.86), _chain_row(1045.0, "P", 0.90)], 1045.0)
+    underpriced = atm_straddle_vrp([_chain_row(1045.0, "C", 0.60), _chain_row(1045.0, "P", 0.62)], 1045.0)
+    fair = atm_straddle_vrp([_chain_row(1045.0, "C", 0.78), _chain_row(1045.0, "P", 0.78)], 1045.0)
+
+    assert _vrp_state(overpriced, 0.02) == "overpriced"
+    assert _vrp_state(underpriced, 0.02) == "underpriced"
+    assert _vrp_state(fair, 0.02) == "fair"

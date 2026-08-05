@@ -328,3 +328,90 @@
     낮아지고 다시 폴링이 느는 되먹임이 생긴다 — 2026-07-08에 페이서를 나눴다가 500 폭주로
     203분을 잃은 전례가 있다. 규칙의 발동은 사람이 한다.
   상태: pending
+
+- id: "2026-08-05-p1-vrp-wiring"
+  구현일: 2026-08-05
+  검증예정일: 2026-08-06
+  가설: "팔레트에 VRP를 실제로 넘기면 `strategy_palette:wait_only`가 급감하고
+        `short_gamma_requires_not_met`이 그 자리를 대신한다"
+  근거: "08-05 §2 이상점 1 — `poll_signal_fusion_cycle()`이 `evaluate(signal_inputs,
+        MetaLabelContext())`로 호출해 `vrp`가 **한 번도 전달된 적이 없었다**(기본값 0.0).
+        `_vrp_state(0.0, 0.02)`는 항상 'fair'라 v6 §11.4 매트릭스 3열 중 2열이 전 이력 도달
+        불가였고, 레짐도 RANGE_BALANCED 고정이라 9칸 중 도달 가능한 칸이 `wait_and_see`
+        하나뿐이었다. 그 결과 08-05 HIGH_CONVICTION 6건(방향 ±0.692, 동조 3, 확신도 0.75)이
+        전부 `wait_only`로 버려졌다.
+        08-05 하루치(09:47 시점)를 배선 후 규칙으로 리플레이한 결과:
+          overpriced 111분 / fair 31분 / underpriced 3분(전부 아티팩트, 아래 주의 참고).
+        RANGE_TIGHT x overpriced = ['limited_premium_sell']는 프리미엄 매도라
+        `short_gamma_requires`(최고신뢰 + positive GEX + 안정레짐) 게이트에 걸리는데,
+        `stability_flag`가 08-05 내내 False였으므로 게이트는 확정적으로 불통과한다."
+  예측:
+    # 주장 지표 — 이 가설이 실제로 주장하는 것(08-05 p4의 실패를 반복하지 않기 위해 맨 앞에 둔다)
+    - metric: db.decisions.reject_reason.strategy_palette:wait_only
+      expect: "< 0.5 x 전일"
+    - metric: db.decisions.reject_reason.strategy_palette:short_gamma_requires_not_met
+      expect: ">= 1"
+    # 배선 자체가 살아 있는가 — NULL만 나오면 계산 경로가 죽은 것이다
+    - metric: db.decisions.vrp.non_null_ratio
+      expect: ">= 0.7"
+    # 안전 — 07-30에 팔레트 오독으로 하루 419건 ENTER가 찍힌 전례가 있다
+    - metric: db.decisions.decision.ENTER
+      expect: "<= 5"
+  주의: |
+    **판정은 위 4개 지표 전부로 한다.** 08-04 p4는 "왕복이 사라진다"고 주장하면서 등록 지표는
+    `chain_age_seconds_max`와 `log_volume.human_lines`였다 — 자기 주장을 검정하지 않는 지표로
+    "확인" 판정이 났고, 실제 왕복률은 36.1% → 42.9%로 **악화**해 있었다. 그 실패를 반복하지
+    않으려고 주장 지표를 맨 앞에 명시한다.
+
+    **ENTER가 나오면 그 자체로 실패가 아니다** — 확인할 것은 "몇 건인가"가 아니라 "그 분의
+    `vrp`가 아티팩트가 아닌가"다. 08-05 리플레이의 underpriced 3분은 전부 아티팩트였다:
+      09:18  ATM(1047.5)에 **콜만** iv>0이었고 그 IV가 0.5423 → VRP −0.24
+             → `atm_straddle_vrp()`가 콜·풋 양쪽을 요구하도록 만든 직접 근거.
+      08:45/08:46  `underlying_spot_1m`이 장 개시 전 stale 스팟(1000.03, 실제 1048.50)이었다.
+             콜·풋이 둘 다 있어 새 가드로도 통과한다 — **이것은 VRP가 아니라 스팟 신선도
+             문제이므로 이번 fix의 범위 밖이다.** 08-46에 STANDARD 확신도가 겹치면 ENTER 1건이
+             날 수 있다. 그 1건이 나오면 정상이고, 5건을 넘으면 다른 원인이 있는 것이다.
+
+    KIS `hts_ints_vltl`이 행사가 격자에 따라 계통적으로 튄다(08-05 먼슬리 실측: 2.5의 홀수배
+    행사가 콜 IV 0.57~0.63 vs 5의 배수 0.87~0.89, 같은 분·같은 북). ATM 콜·풋 평균은 이
+    아티팩트와 풋 스큐를 함께 상쇄하는 교과서적 ATM IV 추정이라 택했다 — **단일 레그로는
+    행사가가 한 칸 옮겨가는 것만으로 VRP 부호가 뒤집힌다.**
+
+    되돌리려면: `main.py`의 `evaluate(..., vrp=...)` 인자만 빼면 08-05 이전과 완전히 같아진다.
+  상태: pending
+
+- id: "2026-08-05-p2-endpoint-timeout"
+  구현일: 2026-08-05
+  검증예정일: 2026-08-06
+  가설: "read 타임아웃을 엔드포인트별로 나누면 계좌잔고/만기유동성 실패가 사라지고
+        옵션체인 사이클 예산은 그대로 지켜진다"
+  근거: "08-05 §2 이상점 3 — 08-04 Fix#8이 read를 10→4초로 낮췄는데 그 값이 `httpx.Client`
+        전역이라 **잔고 폴러까지 함께 조였다.** §9-1 실측: inquire-price p50 0.02초인데
+        inquire-balance는 p50 **0.70초**(35배), 9시 p95 1.77초, 최대 4.34초 — 원래 느린
+        엔드포인트다(계좌·증거금·보유종목 집계 API). 09:19/09:24/09:34 세 사이클이
+        `httpx.ReadTimeout`으로 통째로 날아갔다(개장 후 8사이클 중 3건, 08-04 이전 실패 0건).
+        만기유동성(inquire-asking-price)도 최대 4.00초로 천장에 닿아 2건 실패했다.
+        Fix#8의 근거('60초에 20레그를 도는 사이클에서 한 레그가 10초를 먹으면 밀린다')는
+        호출 1건이 곧 사이클 전체인 폴러에는 성립하지 않는다 — 되돌림이 아니라 범위 축소다."
+  예측:
+    # 주장 지표
+    - metric: log.failures.계좌 잔고 폴링 사이클 실패
+      expect: "0"
+    - metric: log.failures.만기 유동성 폴링 실패
+      expect: "<= 1"
+    # 옵션체인 쪽은 4초를 유지하므로 08-05와 같은 수준이어야 한다(악화하면 범위 축소가 샜다는 뜻)
+    - metric: overrun.count
+      expect: "<= 25"
+    - metric: cycles.missing.unrecovered_count
+      expect: "<= 2"
+  주의: |
+    **`qualitative.read_timeout`은 줄되 0이 되지는 않는다** — 옵션체인(2,800건/일)은 여전히
+    4초 천장을 쓰기 때문이다. 08-05는 21건이었고, 그중 잔고 3건 + 만기유동성 2건이 빠지므로
+    16건 근처가 정상 모양이다. **0건이면 오히려 옵션체인 쪽 타임아웃까지 풀린 것**이니
+    `timeout_for_url()`의 매칭이 너무 넓게 잡혔는지 확인할 것.
+
+    부수 효과 주의: 잔고 조회가 성공하기 시작하면 `risk_gate_state.risk_engine`이
+    "account_tracker_not_ready"에서 실제 평가 결과로 바뀌는 분이 늘어난다 — 그것은 이 fix의
+    의도된 결과이지 새 결함이 아니다.
+  상태: pending
+

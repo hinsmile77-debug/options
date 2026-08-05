@@ -41,6 +41,7 @@ from mahdi.engines.regime_pipeline import RegimeStateMachine
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state, parse_balance_response, snapshot_to_row
 from mahdi.features.options_intel import (
     OptionLeg,
+    atm_straddle_vrp,
     calculate_gex,
     calculate_vrp,
     find_gamma_flip,
@@ -2583,6 +2584,18 @@ def _build_signal_inputs(
     else:
         charm_active = False
 
+    # 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 1 / Fix#1) — 팔레트 열을 정하는 VRP.
+    #
+    # **GEX와 반드시 같은 북(먼슬리)에서 낸다.** 08-04 Fix#5가 GEX/감마플립을 먼슬리 전용으로
+    # 바꾼 것과 같은 이유이고(v6 §11.4), 실무적으로도 위클리는 08-05 실측에서 `rv_5d`가 두 북
+    # 모두 전부 0이라 `atm_straddle_vrp()`가 어차피 None을 낸다 — 그걸 섞으면 "적정" 폴백이
+    # 위클리 데이터 결손 때문에 발생하는 건지 진짜 적정인 건지 구분할 수 없게 된다.
+    #
+    # `legs`가 아니라 `chain_rows`를 넘기는 이유: `OptionLeg`에는 rv 필드가 없다(감마 계산에
+    # 필요한 값만 담는 구조체다). VRP는 iv와 rv가 **같은 스냅샷의 같은 레그**에서 와야 한다.
+    monthly_rows = [row for row in chain_rows if row.get("expiry") == gex_expiry] if gex_expiry else []
+    vrp = atm_straddle_vrp(monthly_rows, spot)
+
     micro = (
         db.latest_market_microstructure(conn, futures_symbol, as_of=now)
         if futures_symbol is not None
@@ -2602,6 +2615,8 @@ def _build_signal_inputs(
             (now - oldest.replace(tzinfo=None)).total_seconds() if oldest is not None else None
         ),
         "gex_expiry": gex_expiry,
+        # 마이그레이션 024. None(산출 불가)과 0.0(IV=RV)은 다르다 — 전자만 fair로 폴백한 분이다.
+        "vrp": vrp,
     }
     signal_inputs = SignalInputs(
         regime_state=regime_state,
@@ -2773,7 +2788,22 @@ async def poll_signal_fusion_cycle(
                 signal_inputs, chain_inputs = _build_signal_inputs(
                     conn, regime_state_machine.last_state, underlying, futures_symbol=futures_symbol
                 )
-                decision = fusion_engine.evaluate(signal_inputs, MetaLabelContext())
+                # 2026-08-05(§2 이상점 1 / Fix#1) — VRP를 실제로 넘긴다.
+                #
+                # 종전에는 인자를 생략해 `evaluate()`의 기본값 0.0이 쓰였고, 그것은
+                # `_vrp_state(0.0, 0.02)` = **항상 "fair"** 를 뜻했다. v6 §11.4 매트릭스 3열 중
+                # 2열이 전 이력 도달 불가였고, 레짐까지 RANGE_BALANCED 고정이라 9칸 중 실제로
+                # 도달 가능한 칸은 `wait_and_see` 하나뿐이었다 — 진입 후보가 구조적으로 나올 수
+                # 없는 상태였다(08-05 HIGH_CONVICTION 6건이 전부 여기서 버려졌다).
+                #
+                # 산출 불가(None)일 때 0.0으로 떨어뜨리는 것은 **의도된 안전 폴백**이다:
+                # 0.0 = fair = `wait_and_see`(관망)라 08-05 이전의 상시 동작과 같고, 없는 값을
+                # 지어내 진입을 만들지 않는다. "못 쟀다"와 "쟀는데 적정이다"의 구분은 팔레트가
+                # 아니라 `signal_decisions.vrp`(NULL vs 0.0)가 보존한다.
+                vrp = chain_inputs.get("vrp")
+                decision = fusion_engine.evaluate(
+                    signal_inputs, MetaLabelContext(), vrp=vrp if vrp is not None else 0.0
+                )
 
                 # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)
                 # 만 봤는데, §11.4 매트릭스의 "fair" 셀에는 관망 지시(wait_and_see/breakout_wait)가

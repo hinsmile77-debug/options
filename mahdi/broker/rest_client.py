@@ -96,7 +96,71 @@ _HTTP_LIMITS = httpx.Limits(max_connections=4, max_keepalive_connections=2, keep
 # **주의**: 이 값을 낮추면 타임아웃 예외가 늘어난다. 그것은 회귀가 아니라 **의도된 교환**이다 —
 # `qualitative.read_timeout` 증가와 `overrun.count` 감소를 반드시 나란히 읽을 것.
 _HTTP_READ_TIMEOUT_SECONDS = 4.0
-_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=3.0, read=_HTTP_READ_TIMEOUT_SECONDS)
+_HTTP_CONNECT_TIMEOUT_SECONDS = 3.0
+_HTTP_WRITE_POOL_TIMEOUT_SECONDS = 10.0
+_HTTP_TIMEOUT = httpx.Timeout(
+    _HTTP_WRITE_POOL_TIMEOUT_SECONDS,
+    connect=_HTTP_CONNECT_TIMEOUT_SECONDS,
+    read=_HTTP_READ_TIMEOUT_SECONDS,
+)
+
+# 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 3 / Fix#2) — read 타임아웃은 **엔드포인트마다
+# 다르다.** 위 4.0초는 `httpx.Client` 하나에 걸리는 전역값이라, 08-04에 옵션체인을 근거로 정한
+# 값이 그날로 **계좌 잔고 폴러를 깨뜨렸다.**
+#
+# 08-05 실측(자동 리포트 §9-1, 고도화#5로 신설된 전수 백분위):
+#   inquire-price   2,825건  p50 0.02초   9시 p95 2.80초
+#   inquire-balance    27건  p50 **0.70초**(35배)  9시 p95 1.77초  최대 4.34초
+# 잔고 조회는 원래부터 느린 엔드포인트다 — 계좌·증거금·보유종목을 한 번에 집계하는 API라
+# 시세 단건 조회와 응답시간 자릿수가 다르다. 4초 천장에 닿아 09:19/09:24/09:34 세 사이클이
+# `httpx.ReadTimeout`으로 통째로 날아갔다(개장 후 8사이클 중 3건 = 37.5%). 08-04 이전 실패 0건.
+#
+# Fix#8의 근거는 *"60초 주기에 20레그를 도는 옵션체인 사이클에서 한 레그가 10초를 잡아먹으면
+# 그 사이클이 이미 밀린다"* 였다. 그 근거는 **호출 1건이 곧 사이클 전체인 폴러에는 성립하지
+# 않는다** — 잔고는 300초 주기 단발 호출이라 10초를 기다려도 다음 사이클을 밀지 않는다.
+# 그래서 Fix#8을 되돌리는 게 아니라 **적용 범위를 원래 근거가 성립하는 곳으로 좁힌다.**
+#
+# 키를 마지막 경로 조각(`inquire-price`)이 아니라 **전체 경로**로 잡는 이유: 국내 선물옵션
+# 시세(PATH_FUTUREOPTION_QUOTE)와 해외선물 시세(PATH_OVERSEAS_FUTUREOPTION_PRICE)는 마지막
+# 조각이 둘 다 `inquire-price`다. 조각으로 키를 잡으면 서로 다른 두 엔드포인트에 같은 타임아웃이
+# 걸린다(같은 이유로 §9-1의 `inquire-price` 행에는 지금 해외선물 호출이 섞여 있다 — 별건).
+#
+# 주문(ORDER/ORDER_MODIFY_CANCEL)에도 10초를 준다. 주문 POST가 타임아웃되면 **주문이 접수됐는지
+# 아닌지를 알 수 없는 상태**가 되고, 그 모호함은 4초를 아껴서 얻을 이득보다 훨씬 비싸다.
+# 지금은 ExecutionEngine이 배선 전이라 실제 호출이 없지만, 배선되는 날 이 값이 4초면 곤란하다.
+_SLOW_ENDPOINT_READ_TIMEOUT_SECONDS = 10.0
+_ENDPOINT_READ_TIMEOUT_SECONDS: dict[str, float] = {
+    # 300초 주기 단발 호출 — 느려도 다음 사이클을 밀지 않는다.
+    tr_codes.PATH_FUTUREOPTION_BALANCE: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
+    # 60초 주기지만 북별 1개(사이클당 11콜, 점유 중앙 9.0초/최대 24.4초 — 리포트 §7)라 여유가 있다.
+    # 08-05에 이 엔드포인트도 4.00초 천장에 닿아 만기유동성 폴링이 2건 실패했다.
+    tr_codes.PATH_FUTUREOPTION_ASKING_PRICE: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
+    # 주문 — 타임아웃 시 접수 여부가 불명확해진다(위 주석).
+    tr_codes.PATH_FUTUREOPTION_ORDER: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
+    tr_codes.PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
+}
+
+
+def timeout_for_url(url: str) -> httpx.Timeout:
+    """
+    입력: 요청 URL(도메인 포함, 쿼리스트링은 있어도 되고 없어도 된다).
+    계산: `_ENDPOINT_READ_TIMEOUT_SECONDS`에 등록된 경로면 그 read 타임아웃을, 아니면 기본값
+         (`_HTTP_READ_TIMEOUT_SECONDS`)을 담은 `httpx.Timeout`을 돌려준다. connect/write/pool은
+         엔드포인트와 무관하게 동일하다 — 느린 것은 **KIS의 응답 생성**이지 연결 수립이 아니다.
+    해석: 상세 근거는 `_ENDPOINT_READ_TIMEOUT_SECONDS` 주석. 매칭은 경로 **suffix**로 한다
+         (URL 앞에 실전/모의 도메인이 붙기 때문). 등록 경로끼리는 서로의 suffix가 아니므로
+         (`/order`와 `/order-rvsecncl`은 끝이 다르다) 순회 순서에 결과가 좌우되지 않는다.
+    실패 조건: 없음 — 모르는 경로는 기본값으로 떨어진다.
+    """
+    path = url.split("?", 1)[0]
+    for endpoint_path, read_seconds in _ENDPOINT_READ_TIMEOUT_SECONDS.items():
+        if path.endswith(endpoint_path):
+            return httpx.Timeout(
+                _HTTP_WRITE_POOL_TIMEOUT_SECONDS,
+                connect=_HTTP_CONNECT_TIMEOUT_SECONDS,
+                read=read_seconds,
+            )
+    return _HTTP_TIMEOUT
 
 # ===== 2026-08-04(운영점검보고서 §2-1 / Fix#1) — 로그 포맷 계약 =====
 #
@@ -355,9 +419,12 @@ class KISRestClient:
         )
 
     def _send_get(self, url: str, **kwargs) -> httpx.Response:
-        """계산: 페이싱 → GET 1회. 소요시간을 페이서/HTTP로 나눠 재고 느리면 남긴다."""
+        """계산: 페이싱 → GET 1회. 소요시간을 페이서/HTTP로 나눠 재고 느리면 남긴다.
+        2026-08-05(Fix#2): read 타임아웃을 엔드포인트별로 건다(`timeout_for_url`). 호출측이
+        `timeout`을 직접 넘겼으면 그것을 존중한다 — 테스트가 타임아웃을 강제할 이음새."""
         pacer_started = time.monotonic()
         self._rate_limiter.wait()
+        kwargs.setdefault("timeout", timeout_for_url(url))
         http_started = time.monotonic()
         try:
             return self._client.get(url, **kwargs)
@@ -392,9 +459,12 @@ class KISRestClient:
         return response.json()
 
     def _post(self, url: str, **kwargs) -> dict:
-        """모든 REST POST 호출의 단일 진입점 — GET과 동일한 공유 레이트리미터를 통과시킨다."""
+        """모든 REST POST 호출의 단일 진입점 — GET과 동일한 공유 레이트리미터를 통과시킨다.
+        2026-08-05(Fix#2): 주문 경로는 read 10초다 — 타임아웃되면 주문 접수 여부가 불명확해진다
+        (`_ENDPOINT_READ_TIMEOUT_SECONDS` 주석)."""
         pacer_started = time.monotonic()
         self._rate_limiter.wait()
+        kwargs.setdefault("timeout", timeout_for_url(url))
         http_started = time.monotonic()
         try:
             response = self._client.post(url, **kwargs)

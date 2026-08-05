@@ -142,8 +142,8 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False)],
         "chain": [
-            (1340.0, "C", 363, 0.9, 0.0047, 1000.0, date(2026, 7, 9), ts),
-            (1340.0, "P", 200, 0.85, 0.0040, -800.0, date(2026, 7, 9), ts),
+            (1340.0, "C", 363, 0.9, 0.0047, 1000.0, date(2026, 7, 9), ts, 0.72),
+            (1340.0, "P", 200, 0.85, 0.0040, -800.0, date(2026, 7, 9), ts, 0.72),
         ],
         "investor_flow": [(-150.0, 250.0, -40.0)],
     }

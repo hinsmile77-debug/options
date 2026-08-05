@@ -372,3 +372,55 @@ def calculate_vrp(iv: float, realized_vol: float) -> float:
     실패 조건: 없음(단순 차분) — realized_vol 추정 윈도우가 짧으면 노이즈에 취약함에 유의.
     """
     return iv - realized_vol
+
+
+def atm_straddle_vrp(chain_rows: Sequence[dict], spot: float | None) -> float | None:
+    """
+    입력: **한 북(만기)** 의 체인 스냅샷 행(`db.latest_option_chain()` 형태 — strike/option_type/
+         iv/rv_5d 키), 기초자산 스팟.
+    계산: 스팟에 가장 가까운 행사가를 ATM으로 잡고, 그 행사가의 **콜과 풋 IV 평균**(ATM 스트래들
+         IV)에서 실현변동성을 뺀다. 즉 `calculate_vrp(mean(iv_call, iv_put), rv)`.
+    해석: 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 1 / Fix#1) — v6 §11.4 매트릭스의 열
+         (저평가/적정/고평가)을 정하는 입력이다. 08-05까지 `SignalFusionEngine.evaluate()`가
+         `vrp` 인자를 받지 못해 **기본값 0.0 = 항상 "적정" 열**이었고, 그 결과 매트릭스 3열 중
+         2열이 전 이력 도달 불가였다.
+
+         **왜 단일 레그가 아니라 콜·풋 평균인가**: 08-05 실측에서 KIS `hts_ints_vltl`이
+         행사가 격자에 따라 계통적으로 튄다 — 먼슬리 북에서 2.5의 홀수배 행사가(1042.5/1047.5/
+         1052.5) 콜 IV가 0.57~0.63인데 5의 배수 행사가(1045/1050) 콜은 0.87~0.89였다(같은 분,
+         같은 북). 이 상태에서 ATM 콜 하나만 쓰면 **행사가가 한 칸 옮겨가는 것만으로 VRP 부호가
+         뒤집힌다.** 실제로 09:18에 콜 단독 IV 0.5423으로 "저평가"(VRP −0.24)가 나왔는데, 그
+         분의 풋은 iv가 없어 제외된 것이었다. 콜·풋 평균은 이 격자 아티팩트와 풋 스큐를 동시에
+         상쇄하는 교과서적 ATM IV 추정이다.
+
+         **왜 콜·풋이 둘 다 있어야만 산출하는가**: 한쪽만 있으면 위의 상쇄가 일어나지 않아
+         평균이 그 한쪽 값 그대로다 — "평균을 냈다"는 형식만 남고 아티팩트는 그대로 통과한다.
+         `find_gamma_flip()`이 `iv=0` 레그 하나에 합계 전체를 NaN으로 오염당하던 것(2026-08-03)과
+         같은 종류의 방어다: **입력이 규약을 만족하지 않으면 값을 지어내지 말고 None을 낸다.**
+    실패 조건: 스팟이 없거나, 체인이 비었거나, ATM 행사가에 유효한(iv>0) 콜·풋이 둘 다 있지
+              않거나, 실현변동성이 없거나 0 이하면 None. rv<=0은 KIS `hist_vltl` 미제공을
+              뜻하며(08-05 위클리 두 북이 전부 0이었다) 그대로 빼면 VRP가 곧 IV가 돼
+              **항상 극단적 고평가**로 나온다.
+    """
+    if spot is None or not chain_rows:
+        return None
+    usable = [
+        row for row in chain_rows
+        if row.get("iv") is not None and float(row["iv"]) > 0.0 and row.get("strike") is not None
+    ]
+    if not usable:
+        return None
+    # 동점(스팟이 두 행사가의 정확한 중점)이면 낮은 행사가를 택한다 — 결정론적 선택.
+    atm_strike = min(usable, key=lambda row: (abs(float(row["strike"]) - spot), float(row["strike"])))["strike"]
+    at_atm = [row for row in usable if float(row["strike"]) == float(atm_strike)]
+    by_type = {str(row["option_type"]).lower(): row for row in at_atm}
+    if "c" not in by_type or "p" not in by_type:
+        return None
+    rvs = [
+        float(row["rv_5d"]) for row in at_atm
+        if row.get("rv_5d") is not None and float(row["rv_5d"]) > 0.0
+    ]
+    if not rvs:
+        return None
+    straddle_iv = (float(by_type["c"]["iv"]) + float(by_type["p"]["iv"])) / 2.0
+    return calculate_vrp(straddle_iv, sum(rvs) / len(rvs))

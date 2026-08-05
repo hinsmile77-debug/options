@@ -706,3 +706,86 @@ def test_slow_call_threshold_ignores_calls_under_five_seconds(caplog):
         client._log_if_slow("GET", "https://x/uapi/inquire-price", pacer_seconds=2.0, http_seconds=2.5)
 
     assert not [r for r in caplog.records if "느린 REST 호출" in r.message]
+
+
+# ===== 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 3 / Fix#2) — 엔드포인트별 read 타임아웃 =====
+
+
+def test_endpoint_read_timeout_table_covers_slow_pollers():
+    """08-04 Fix#8(read 4초)은 옵션체인을 근거로 정했는데 `httpx.Client` 전역이라 잔고 폴러까지
+    깨뜨렸다(08-05 개장 후 8사이클 중 3건 ReadTimeout, 08-04 이전 실패 0건). 근거가 성립하는
+    곳으로 범위를 좁힌 것이 이 표다 — 되돌림이 아니라 범위 축소다."""
+    from mahdi.broker.rest_client import _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS, timeout_for_url
+
+    # 300초 주기 단발 호출 — p50이 옵션체인의 35배(0.70초 vs 0.02초)다.
+    assert timeout_for_url(f"https://x{tr_codes.PATH_FUTUREOPTION_BALANCE}").read == 10.0
+    # 만기유동성(북별 1개) — 08-05에 4.00초 천장에 닿아 2건 실패.
+    assert timeout_for_url(f"https://x{tr_codes.PATH_FUTUREOPTION_ASKING_PRICE}").read == 10.0
+    # 주문 — 타임아웃되면 접수 여부가 불명확해진다.
+    assert timeout_for_url(f"https://x{tr_codes.PATH_FUTUREOPTION_ORDER}").read == 10.0
+    assert timeout_for_url(f"https://x{tr_codes.PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL}").read == 10.0
+    assert _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS == 10.0
+
+
+def test_option_chain_quote_keeps_the_four_second_budget():
+    """Fix#8의 근거가 성립하는 유일한 곳 — 60초 주기에 20레그를 도는 폴러."""
+    from mahdi.broker.rest_client import _HTTP_READ_TIMEOUT_SECONDS, timeout_for_url
+
+    assert timeout_for_url(f"https://x{tr_codes.PATH_FUTUREOPTION_QUOTE}").read == _HTTP_READ_TIMEOUT_SECONDS == 4.0
+    # 수급 폴러는 매분 3콜이고 p95가 0.09초라 기본값으로 충분하다.
+    assert timeout_for_url(f"https://x{tr_codes.PATH_INVESTOR_FLOW_BY_MARKET}").read == 4.0
+
+
+def test_timeout_key_is_full_path_not_last_segment():
+    """국내 선물옵션 시세와 해외선물 시세는 **마지막 경로 조각이 둘 다 `inquire-price`** 다.
+    조각으로 키를 잡으면 서로 다른 엔드포인트가 같은 타임아웃을 공유하게 된다."""
+    from mahdi.broker.rest_client import timeout_for_url
+
+    assert tr_codes.PATH_FUTUREOPTION_QUOTE.rsplit("/", 1)[-1] == "inquire-price"
+    assert tr_codes.PATH_OVERSEAS_FUTUREOPTION_PRICE.rsplit("/", 1)[-1] == "inquire-price"
+    assert tr_codes.PATH_FUTUREOPTION_QUOTE != tr_codes.PATH_OVERSEAS_FUTUREOPTION_PRICE
+    # 등록 경로끼리 서로의 suffix가 아니어야 순회 순서에 결과가 좌우되지 않는다.
+    assert not tr_codes.PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL.endswith(tr_codes.PATH_FUTUREOPTION_ORDER)
+
+
+def test_timeout_for_url_tolerates_query_string():
+    from mahdi.broker.rest_client import timeout_for_url
+
+    assert timeout_for_url(f"https://x{tr_codes.PATH_FUTUREOPTION_BALANCE}?CANO=1").read == 10.0
+
+
+def test_get_balance_actually_sends_the_ten_second_read_timeout():
+    """표만 맞고 요청에 안 실리면 의미가 없다 — 실제 나가는 요청의 타임아웃을 확인한다."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json={"output2": []})
+
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    client.get_balance()
+
+    assert captured["timeout"]["read"] == 10.0
+    assert captured["timeout"]["connect"] == 3.0
+
+
+def test_get_quote_actually_sends_the_four_second_read_timeout():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json={"output1": {}})
+
+    client = KISRestClient(
+        _settings(), _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    client.get_quote("201S03")
+
+    assert captured["timeout"]["read"] == 4.0
+

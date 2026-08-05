@@ -768,7 +768,7 @@ _CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", 
 # 폴링된 북 하나만 남아, 반환된 감마가 어느 만기의 것인지 알 수 없었고 북별 GEX도 볼 수 없었다.
 _CHAIN_SNAPSHOT_SQL = """
     SELECT DISTINCT ON (expiry, strike, option_type)
-        strike, option_type, oi, iv, gamma, gex, expiry, timestamp
+        strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d
     FROM option_analysis_1m
     WHERE underlying=%s
       AND timestamp <= %s
@@ -787,6 +787,13 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
     해석: 반환 dict는 `mahdi.features.options_intel.OptionLeg` 생성에 바로 쓸 수 있는 키를 가진다.
          `latest_option_chain()`(라이브)과 `option_chain_as_of()`(백테스트 리플레이)가 **이 함수를
          공유한다** — 두 경로가 다른 체인을 보면 백테스트 결과를 라이브에 적용할 수 없다.
+
+         2026-08-05(Fix#1): `rv_5d`를 함께 싣는다. `atm_straddle_vrp()`가 v6 §11.4 매트릭스의
+         열(저평가/적정/고평가)을 정하는 데 IV와 **같은 스냅샷의** 실현변동성이 필요하기 때문이다.
+         별도 조회로 빼지 않는 이유는 위의 "라이브와 백테스트가 같은 체인을 본다"는 성질을
+         VRP에도 그대로 물려주기 위해서다 — 다른 경로로 rv를 읽으면 두 경로가 갈린다.
+         `OptionLeg`에는 rv 필드가 없으므로 `legs_from_chain_rows()`는 이 키를 무시한다(키를
+         명시적으로 골라 읽는 구조라 추가해도 안전).
     실패 조건: 조건을 만족하는 행이 없으면 빈 목록(호출측이 GEX/flip을 건너뛴다).
     """
     oldest = as_of - timedelta(minutes=CHAIN_SNAPSHOT_MAX_AGE_MINUTES)
@@ -803,8 +810,11 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
             "gex": float(gex) if gex is not None else 0.0,
             "expiry": expiry,
             "timestamp": timestamp,
+            # None을 0.0으로 바꾸지 않는다 — `atm_straddle_vrp()`가 "rv 없음"을 산출 불가로
+            # 판정해야 하는데, 0.0으로 채우면 "실현변동성이 0"과 구분되지 않는다.
+            "rv_5d": float(rv_5d) if rv_5d is not None else None,
         }
-        for strike, option_type, oi, iv, gamma, gex, expiry, timestamp in rows
+        for strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d in rows
     ]
 
 
@@ -1033,7 +1043,8 @@ def insert_signal_decision(
          거절 사유(있으면), 리스크/신호 게이트 상태 요약(JSONB 직렬화), 실행 모드
          ("ADVISORY"/"CONFIRM"/"AUTO"), (선택) 판단 시점의 옵션 체인 입력
          (`gamma_flip`/`gex`/`chain_leg_count`/`chain_oldest_leg_age_seconds` 키, 마이그레이션 022;
-         `gex_expiry` 키는 마이그레이션 023 — 어느 북으로 GEX를 냈는지, 2026-08-04 §2-8/Fix#5).
+         `gex_expiry` 키는 마이그레이션 023 — 어느 북으로 GEX를 냈는지, 2026-08-04 §2-8/Fix#5;
+         `vrp` 키는 마이그레이션 024 — 팔레트 열을 정한 값, 2026-08-05 §2 이상점 1/Fix#1).
     계산: `signal_decisions`는 `decision_id`가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이
          새 행을 남기는 append-only 로그(§18.2 "거절된 신호도 기록한다")라 단순 INSERT만 한다.
     해석: 2026-08-03 §5-1 — 체인 입력을 판단 행에 함께 남겨야 "신호 도달률"을 사후 집계할 수
@@ -1048,13 +1059,13 @@ def insert_signal_decision(
         cur.execute(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
             "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
-            "chain_oldest_leg_age_seconds, gex_expiry) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "chain_oldest_leg_age_seconds, gex_expiry, vrp) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
                 chain.get("gamma_flip"), chain.get("gex"),
                 chain.get("chain_leg_count"), chain.get("chain_oldest_leg_age_seconds"),
-                chain.get("gex_expiry"),
+                chain.get("gex_expiry"), chain.get("vrp"),
             ),
         )
     conn.commit()
