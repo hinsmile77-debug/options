@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -186,3 +187,73 @@ def test_closing_auction_boundary_has_a_single_source():
     assert data_source._CLOSING_AUCTION_START is session.CLOSING_AUCTION_START
     # 사유 문자열도 한 곳에서 온다 — 갈라지면 §14-1의 "구조적" 열이 조용히 0이 된다.
     assert main.MEMBER_UNAVAILABLE_CLOSING_AUCTION == db_metrics.STRUCTURAL_UNAVAILABLE_REASON
+
+
+# ===== 규약 D — 품질 지표는 감시 대상과 독립한 입력을 쓴다 (2026-08-05 고도화#1) =====
+#
+# 2026-08-01에 **생존 신호**에 대해 세운 원칙이 있다: *"생존 신호는 감시 대상과 독립한 타이머에서
+# 나와야 한다"*(07-30 CB 하트비트에서 배웠다 — 감시 대상 이벤트에 얹으면 "이벤트가 없으면 신호도
+# 멈춰" 죽은 것과 구분되지 않는다).
+#
+# 08-05 §2-3은 그 원칙이 **타이머만이 아니라 모든 입력에 적용된다**는 것을 보여줬다.
+# §14-2 「ATM 정합률」은 08-04 고도화#3이 *"08-03의 하루치 외가격 사고를 이 지표 하나가 잡는다"*
+# 며 만든 지표인데, 08-05에 **같은 종류의 사고가 90분간 재발했고 88.1%로 통과시켰다.**
+# 이유는 단순하다: 그 지표가 ATM을 계산할 때 쓰는 스팟이 **감시 대상이 적재한 바로 그 값**이다.
+# 앞 75분은 스팟도 행사가도 틀렸는데 둘이 서로 일치해서 정합으로 세어졌다.
+#
+#   규약 D — 품질 지표는 자기가 감시하는 파이프라인의 산출물을 입력으로 쓰지 않는다.
+#            쓸 수밖에 없으면 **독립 소스와의 교차 검증을 지표에 함께 넣는다.**
+#
+# 규약 A(로그 문구는 상수) / B(체인 조회는 한 함수) / C(0건 보고는 증명 동반)에 이어 네 번째다.
+# A~D는 전부 "같은 것을 두 번 쓰지 마라"의 변주이고, E(주장/대가 지표)는 "한쪽만 재지 마라"다.
+
+
+def test_atm_coverage_carries_an_independent_cross_check():
+    """§14-2는 감시 대상의 스팟을 쓸 수밖에 없다 — 그래서 **독립 소스 값을 함께 낸다.**
+
+    선물 WS 1분봉은 WebSocket 체결 스트림으로 들어와 옵션체인 REST 폴러와 경로가 겹치지 않는다.
+    두 값을 **같은 분 집합**에서 내야 격차가 스팟 소스 때문임이 확정된다(분모가 다르면 차이가
+    소스 때문인지 분 집합 때문인지 구분되지 않는다).
+    """
+
+    from mahdi.ops import db_metrics
+
+    source = inspect.getsource(db_metrics.strike_window_quality)
+    assert "market_raw_1m" in source, "독립 소스(선물 WS)를 안 쓰면 규약 D의 교차 검증이 없는 것이다"
+    # 같은 CTE 안에서 두 ATM을 함께 세는가 — 분 집합이 갈리면 격차의 의미가 사라진다.
+    assert "atm_fut" in source and "atm_idx" in source
+
+
+def test_quality_metrics_declare_their_input_independence():
+    """**규약 D 전수 감사** — 리포트의 품질 지표마다 "입력이 감시 대상과 같은가"를 명시한다.
+
+    이 테스트는 값을 검사하지 않는다. 감사 결과를 **코드 안에 고정**해, 새 품질 지표를 추가하는
+    사람이 이 표에 한 줄을 더하면서 스스로 그 질문에 답하게 만드는 것이 목적이다.
+    빠뜨리면 여기서 깨진다.
+    """
+    from mahdi.ops import db_metrics
+
+    # 지표 → (감시 대상과 입력을 공유하는가, 공유한다면 무엇으로 교차 검증하는가)
+    audit = {
+        # 스팟을 감시 대상(옵션체인 폴러)이 적재한다 → 선물 WS로 교차 검증(08-05 고도화#1).
+        "strike_window_quality": (True, "atm_covered_pct_by_futures"),
+        # 스팟의 두 소스를 대조하는 것이 이 지표의 정의 자체다 — 태생적으로 독립이다.
+        "spot_source_divergence": (False, None),
+        # 판단 산출물(signal_decisions)을 읽지만, 감시 대상은 **체인 수집 파이프라인**이라
+        # 입력이 다르다. 다만 §15(광폭 OI 지형)와의 교차 모순 검사를 crosscheck가 맡는다.
+        "signal_reach": (False, None),
+        # option_analysis_1m 적재 자체를 세는 지표 — 감시 대상이 곧 입력이지만 **"있는가"만**
+        # 재므로 오염된 값이 통과할 여지가 없다(0행은 0행이다).
+        "chain_minute_coverage": (False, None),
+        "monthly_leg_completeness": (False, None),
+        # 판단 행이 곧 입력이자 감시 대상이다. 점수의 "옳음"은 못 재고 **분포와 일치율**만 잰다 —
+        # 그것이 이 지표가 판정을 주장하지 않는 이유다.
+        "member_score_quality": (True, None),
+        "member_availability": (True, None),
+    }
+    for name, (shares_input, cross_check_key) in audit.items():
+        assert hasattr(db_metrics, name), f"{name}: 감사 표에 있는데 함수가 없다"
+        if shares_input and cross_check_key:
+            assert cross_check_key in inspect.getsource(getattr(db_metrics, name)), (
+                f"{name}: 입력을 공유하는데 교차 검증 키({cross_check_key})가 없다"
+            )

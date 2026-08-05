@@ -61,6 +61,17 @@ class FusionDecision:
     signal_agreement_count: int = 0
     available_member_count: int = 0
     reject_reasons: list[str] = field(default_factory=list)
+    # 2026-08-05(고도화#4) — **앙상블에 들어간 멤버별 점수 그 자체.**
+    #
+    # 여기까지 계산해 놓고 버리고 있었다. 그래서 08-05에 판단이 살아났을 때
+    # (가용 멤버 2 → 4, 확신도 4종, 전이 83회) **그 방향 ±0.692가 어느 멤버에서 왔는지를
+    # DB로 역산할 수 없었다.** `available_member_count` 숫자 하나로는 "몇 개가 살아 있었나"만
+    # 알 뿐 "무엇이 판단을 밀었나"에 답하지 못한다.
+    #
+    # 구체적으로 이 값이 없어서 못 답하는 질문: `OPTIONS_FLOW_GAMMA_WALL_FALLBACK`을 유지할
+    # 것인가(08-04 §7 #1, 사용자 결정 대기). 감마월 폴백이 만든 점수가 방향을 뒤집었는지
+    # 아니면 다른 멤버에 묻혔는지가 갈리는데, 점수가 안 남아 데이터로 답할 수 없다.
+    member_scores: MemberScores | None = None
 
 
 class SignalFusionEngine:
@@ -140,6 +151,7 @@ class SignalFusionEngine:
             signal_agreement_count=conflict.agreement_count,
             available_member_count=conflict.available_member_count,
             reject_reasons=reject_reasons,
+            member_scores=member_scores,
         )
         self._log_shape_transition(decision, member_scores)
         return decision

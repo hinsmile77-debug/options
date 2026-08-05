@@ -408,3 +408,45 @@ def test_spot_divergence_section_refuses_to_set_a_threshold_on_the_basis():
     assert "임계를 걸지 않는다" in rendered
     assert "최장 연속 **15분**" in rendered
     assert "판정은 **지수 정지**로 한다" in rendered
+
+
+# ===== 2026-08-05 고도화#5 — KIS p95 "이틀 연속" 발동 조건 자동 판정 =====
+
+
+def _latency(warnings):
+    return {"rest_latency": {"endpoints": {}, "p95_by_hour": {}, "p95_warn_threshold": 2.5,
+                             "warnings": warnings}}
+
+
+def test_latency_streak_fires_when_the_same_hour_repeats():
+    """08-04 고도화#5가 숫자 보기 전에 적어둔 규칙의 **발동 조건을 자동으로 판정**한다.
+
+    그 전까지 "이틀 연속 같은 시간대"는 어제 리포트와 오늘 리포트를 사람이 손으로 대조해야만
+    확인할 수 있었다 — 대조를 안 하면 규칙은 적어둔 채로 영영 발동하지 않는다.
+    """
+    today = [{"hour": "10", "endpoint": "inquire-price", "p95": 3.76},
+             {"hour": "14", "endpoint": "inquire-price", "p95": 3.90}]
+    prev = dict(_latency([{"hour": "10", "endpoint": "inquire-price", "p95": 2.9}]), date="2026-08-05")
+
+    rendered = "\n".join(report._render_latency_streak(today, prev, 2.5))
+
+    assert "연속 판정 성립: 1개 구간" in rendered
+    assert "10시" in rendered and "14시" not in rendered, "겹치는 시간대만 세야 한다"
+    assert "적용 여부는 사람이 결정" in rendered, "자동 발동은 되먹임을 만든다(07-08에 203분을 잃었다)"
+
+
+def test_latency_streak_is_silent_when_hours_do_not_repeat():
+    today = [{"hour": "14", "endpoint": "inquire-price", "p95": 3.9}]
+    prev = dict(_latency([{"hour": "10", "endpoint": "inquire-price", "p95": 2.9}]), date="2026-08-05")
+
+    rendered = "\n".join(report._render_latency_streak(today, prev, 2.5))
+
+    assert "해당 없음" in rendered
+    assert "연속 판정 성립" not in rendered
+
+
+def test_latency_streak_declines_to_judge_without_yesterday():
+    """전일 계측이 없으면 **판정하지 않는다** — 08-05가 그랬다(§9-1은 08-04 저녁에 생겼다)."""
+    rendered = "\n".join(report._render_latency_streak([{"hour": "10", "endpoint": "x", "p95": 3.0}], None, 2.5))
+
+    assert "연속 판정을 못 한다" in rendered

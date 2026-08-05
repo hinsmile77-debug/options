@@ -2621,9 +2621,29 @@ async def poll_investor_flow(
 MEMBER_UNAVAILABLE_CLOSING_AUCTION = "종가 단일가(연속체결 없음)"
 
 
-def _member_unavailable_reasons(inputs: SignalInputs, now: datetime) -> dict[str, str]:
+def _member_scores_for_record(scores) -> dict[str, float]:
     """
-    입력: 이번 사이클의 SignalInputs, **판단 시각**(필수).
+    입력: `FusionDecision.member_scores`(없으면 빈 dict).
+    계산: 산출된 멤버만 `{이름: 점수}`로 남긴다 — None인 멤버는 키 자체를 빼고,
+         그 사유는 `member_unavailable`이 이미 담는다(두 dict의 키는 서로 배타적이다).
+    해석: 2026-08-05 고도화#4 — 08-05에 판단이 살아났는데(가용 멤버 4, 전이 83회) **방향
+         ±0.692가 어느 멤버에서 왔는지 DB로 역산할 수 없었다.** 가용성만 남기고 점수를 버렸기
+         때문이다. `member_unavailable`과 짝을 이뤄 "누가 살아 있었고 무엇을 말했는가"가 완성된다.
+    실패 조건: 없음.
+    """
+    if scores is None:
+        return {}
+    return {
+        name: float(value)
+        for name in MEMBER_FIELDS
+        if (value := getattr(scores, name, None)) is not None
+    }
+
+
+def _member_unavailable_reasons(inputs: SignalInputs, now: datetime, scores=None) -> dict[str, str]:
+    """
+    입력: 이번 사이클의 SignalInputs, **판단 시각**(필수),
+         (선택) 이미 계산된 `MemberScores` — 없으면 여기서 계산한다.
     계산: 산출되지 **않은** 앙상블 멤버마다 "어느 원재료가 없어서인가"를 한 줄로 남긴다.
     해석: 2026-08-04 고도화#2 — 종전에는 `available_member_count` 숫자 하나뿐이라, 08-04에
          "2개"가 어느 둘인지 알아내려고 사람이 `signal_layer.py`를 읽어 역산해야 했다.
@@ -2636,7 +2656,11 @@ def _member_unavailable_reasons(inputs: SignalInputs, now: datetime) -> dict[str
     # `now`를 기본값 없는 인자로 둔 이유: 기본값을 `db.local_now()`로 두면 이 함수가 **벽시계에
     # 의존**하게 되고, 그러면 15:35 이후에 돌린 테스트만 다른 답을 낸다(실제로 겪었다).
     # 판단 시각은 호출측이 이미 갖고 있는 값이다 — 숨기지 말고 넘긴다.
-    scores = build_member_scores(inputs)
+    #
+    # 2026-08-05 고도화#4: `scores`를 받는 이유는 성능이 아니라 **일관성**이다. 판단 행에 남는
+    # 점수(`member_scores`)와 사유(`member_unavailable`)가 각각 따로 계산되면 둘이 어긋날 수
+    # 있고, 그러면 "점수가 있는데 미가용"이라는 해석 불가능한 행이 생긴다. 같은 계산을 쓴다.
+    scores = build_member_scores(inputs) if scores is None else scores
     reasons: dict[str, str] = {}
     for name in MEMBER_FIELDS:
         if getattr(scores, name) is not None:
@@ -3055,7 +3079,15 @@ async def poll_signal_fusion_cycle(
                     # 사유까지 남기면 다음 회귀는 표 한 줄로 잡힌다.
                     # 2026-08-05 §2-8: 판단 시각을 넘긴다 — 종가 단일가의 OFI 부재를
                     # 장애가 아니라 시장 구조로 기록하기 위함(`mahdi.session`).
-                    "member_unavailable": _member_unavailable_reasons(signal_inputs, poll_time),
+                    # 2026-08-05 고도화#4: 엔진이 쓴 점수를 그대로 넘겨 사유와 점수가 같은
+                    # 계산에서 나오게 한다.
+                    "member_unavailable": _member_unavailable_reasons(
+                        signal_inputs, poll_time, decision.member_scores
+                    ),
+                    # 2026-08-05 고도화#4 — **판단이 무엇에 반응했는가.**
+                    # `member_unavailable`이 "누가 죽었나"라면 이쪽은 "산 멤버가 뭐라고 했나"다.
+                    # 두 dict의 키는 배타적이라 합치면 항상 6멤버가 된다.
+                    "member_scores": _member_scores_for_record(decision.member_scores),
                 }
 
                 # 2026-07-30 Fix#6: halt 상태와 계좌 상태는 진입 여부와 무관하게 매 사이클 구해

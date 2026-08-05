@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 from mahdi.broker.rest_client import SLOW_CALL_LOG_THRESHOLD_SECONDS
 from mahdi.ops import db_metrics as db_metrics_module  # 임계를 리포트에 그대로 인용하기 위함
+from mahdi.ops import crosscheck
+from mahdi.ops import hypotheses as hypotheses_module  # 역할 상수를 같은 곳에서 가져온다
 
 # 전일 대비 델타를 붙일 핵심 지표. (라벨, 지표 경로, 포맷, 개선 방향)
 # 개선 방향: "down"이면 감소가 개선, "up"이면 증가가 개선, None이면 판정하지 않는다.
@@ -113,7 +115,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     lines += _section("7. 버스트 점유 시간", lambda: _render_bursts(metrics))
     lines += _section("8. 연속 지연 에피소드", lambda: _render_stalls(metrics))
     lines += _section("9. 느린 REST 호출 — 페이서 vs HTTP 귀속", lambda: _render_slow_calls(metrics))
-    lines += _section("9-1. KIS 응답시간 — 서비스 품질 지표", lambda: _render_rest_latency(metrics))
+    lines += _section("9-1. KIS 응답시간 — 서비스 품질 지표",
+                      lambda: _render_rest_latency(metrics, previous))
     lines += _section("10. 폴러 실측 위상", lambda: _render_phase(metrics))
     lines += _section("11. 로그 볼륨/정성 항목", lambda: _render_log_volume(metrics))
     if db_metrics:
@@ -125,9 +128,13 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                           lambda: _render_member_availability(db_metrics))
         lines += _section("14-2. 행사가 창 품질 — 수집한 행사가가 스팟을 감쌌는가",
                           lambda: _render_strike_window(db_metrics, metrics))
+        lines += _section("14-3. 판단 품질 — 멤버가 무엇을 말했는가",
+                          lambda: _render_member_scores(db_metrics))
         lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
                           lambda: _render_book_gamma_map(db_metrics, previous))
         lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
+    lines += _section("17. 교차 점검 — 지표끼리 모순되는가",
+                      lambda: _render_crosschecks(metrics, db_metrics))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -335,6 +342,48 @@ def _render_slow_calls(metrics: dict) -> list[str]:
     return out
 
 
+
+def _render_latency_streak(warnings: list[dict], previous: dict | None, threshold) -> list[str]:
+    """2026-08-05 고도화#5 — 사전 대응 규칙의 **발동 조건("이틀 연속 같은 시간대")을 자동 판정**한다.
+
+    08-04 고도화#5가 이 규칙을 숫자 보기 전에 적어뒀는데, 그 발동 조건은 어제 리포트와 오늘
+    리포트를 **사람이 손으로 대조**해야만 확인할 수 있었다. 대조를 안 하면 규칙은 적어둔 채로
+    영영 발동하지 않는다 — 07-30에 "예측치를 못 적겠으면 근거가 부족한 것"이라고 정한 규약이
+    같은 이유로 자동 대조를 얻은 것과 같은 자리다.
+
+    **발동 자체는 여전히 사람이 한다.** 이 함수는 *"조건이 성립했다"* 까지만 말한다 — 지연을
+    보고 폴링을 자동으로 줄이면 되먹임이 생긴다(2026-07-08에 203분을 잃은 그 구조).
+    """
+    prev_warnings = dig(previous or {}, "rest_latency.warnings") or []
+    if not prev_warnings:
+        return [
+            "> 전일 §9-1 계측이 없어 **연속 판정을 못 한다** — 이 규칙은 이틀치가 있어야 성립한다.",
+            "",
+        ]
+
+    def key(w):
+        return (w["hour"], w["endpoint"])
+
+    repeated = sorted(set(map(key, warnings)) & set(map(key, prev_warnings)))
+    prev_date = (previous or {}).get("date", "전일")
+    if not repeated:
+        return [
+            f"> 연속 판정: **해당 없음** — 오늘 넘은 시간대 중 {prev_date}에도 넘은 것이 없다. "
+            "규칙은 발동하지 않는다.",
+            "",
+        ]
+    listed = ", ".join(f"{hour}시 `{endpoint}`" for hour, endpoint in repeated)
+    return [
+        f"- 🔔 **연속 판정 성립: {len(repeated)}개 구간** — {listed} (오늘 + {prev_date} 모두 "
+        f"{threshold}초 초과)",
+        "",
+        "> **사전 대응 규칙의 발동 조건이 충족됐다.** `inquire-price`가 포함돼 있으면 그 시간대에 "
+        "한해 위클리 폴링을 2분 → 4분 격분으로 늘리는 것이 미리 정해둔 조치다. "
+        "**적용 여부는 사람이 결정하고, 결정하면 그 자리에서 `hypotheses.yaml`에 예측치를 적는다.**",
+        "",
+    ]
+
+
 def _render_phase(metrics: dict) -> list[str]:
     rows = [
         [
@@ -381,7 +430,7 @@ def _render_log_volume(metrics: dict) -> list[str]:
     return out
 
 
-def _render_rest_latency(metrics: dict) -> list[str]:
+def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[str]:
     """
     2026-08-04 고도화#5 — §2-6이 밀림의 90%를 KIS 응답 지연으로 귀속시켰는데, 지금까지 그 지연은
     "우리 지표"(밀림 건수)로만 보였다. §9의 `slow_calls`는 임계(5초) 위쪽 꼬리만 보므로
@@ -427,6 +476,7 @@ def _render_rest_latency(metrics: dict) -> list[str]:
             "203분을 잃은 전례가 있다.",
             "",
         ]
+        out += _render_latency_streak(warnings, previous, threshold)
     else:
         out += [f"> ✅ p95가 임계({threshold}초)를 넘은 (시간대, 엔드포인트) 없음.", ""]
     return out
@@ -470,6 +520,47 @@ def _render_member_availability(db: dict) -> list[str]:
     return out
 
 
+def _render_member_scores(db: dict) -> list[str]:
+    """2026-08-05 고도화#4 — 가용성(§14-1)이 "누가 살아 있었나"라면 여기는 "뭐라고 했나"다."""
+    mq = db.get("member_score_quality") or {}
+    if not mq.get("available"):
+        return [f"> 계측 전 — {mq.get('reason', '사유 미상')}.", ""]
+
+    out = _table(
+        ["멤버", "산출 분", "평균 점수", "강세(+)", "약세(−)", "중립(0)"],
+        [
+            [
+                m["member"], f"{m['scored_minutes']:,}", _fmt(m.get("mean"), "{:+.4f}"),
+                f"{m['positive']:,}", f"{m['negative']:,}", f"{m['zero']:,}",
+            ]
+            for m in mq.get("members") or []
+        ],
+    )
+    pairs = mq.get("pairs") or []
+    if pairs:
+        out += _table(
+            ["멤버 쌍", "둘 다 비영인 분", "부호 일치", "일치율"],
+            [
+                [
+                    f"{p['a']} ↔ {p['b']}", f"{p['both_nonzero_minutes']:,}",
+                    f"{p['same_sign_minutes']:,}", _fmt(p.get("same_sign_pct"), "{:.1f}%"),
+                ]
+                for p in pairs
+            ],
+        )
+    out += [
+        "> **일치율이 이 표의 핵심이다.** 멤버가 항상 같은 부호면 앙상블은 **실질 1멤버**이고, "
+        "그때 `available_member_count` 4는 판단이 4개 축을 본다는 뜻이 아니다(가중치를 바꿔도 "
+        "답이 안 바뀐다). 0은 중립이지 동의가 아니므로 **둘 다 비영인 분만** 분모로 센다.",
+        "> 08-05의 `SMALL_TEST` 41건(`conflict_resolution:no_clear_consensus`)이 멤버가 실제로 "
+        "갈렸다는 첫 증거였고, 그중 36건이 14~15시(Charm 경로가 열리는 시각)에 몰려 있었다.",
+        "> **진입이 없어도 잴 수 있는 지표다** — ADVISORY 전용을 이유로 미루면 실거래 전환 "
+        "시점에 비교할 기준선이 없다.",
+        "",
+    ]
+    return out
+
+
 def _render_strike_window(db: dict, metrics: dict) -> list[str]:
     """
     2026-08-04 고도화#3 — §12 커버리지("데이터가 DB에 있는가")와 §14 신호 도달률("판단까지 갔는가")
@@ -482,8 +573,15 @@ def _render_strike_window(db: dict, metrics: dict) -> list[str]:
         out += _table(
             ["지표", "값", "읽는 법"],
             [
-                ["ATM 정합률", f"**{q['atm_covered_pct']:.1f}%**",
+                ["ATM 정합률(지수 기준)", f"**{q['atm_covered_pct']:.1f}%**",
                  "그 분의 ATM이 수집 행사가 안에 있었는가 — **핵심 지표**"],
+                # 2026-08-05 고도화#1 / 규약 D — 같은 지표를 **독립 소스**로 한 번 더 잰다.
+                ["ATM 정합률(선물 기준)",
+                 f"{_fmt(q.get('atm_covered_pct_by_futures'), '{:.1f}%')} "
+                 f"(같은 분 지수 기준 {_fmt(q.get('atm_covered_pct_by_index_same_minutes'), '{:.1f}%')})",
+                 f"독립 소스 교차 검증 — 공통 {q.get('futures_cross_check_minutes', 0):,}분"],
+                ["**소스 간 격차**", f"**{_fmt(q.get('atm_source_gap_pt'), '{:+.1f}pt')}**",
+                 "두 스팟 소스가 만든 판정 차이 — **이것이 규약 D의 결론이다**"],
                 ["창 정합률", f"{q['window_covered_pct']:.1f}%",
                  "설계 창(ATM±2) 전부를 덮었는가 — 100% 밑이 정상(아래 주석)"],
                 ["ATM 이탈 거리", f"중앙 {q['atm_offset_strikes_median']}칸 / 최대 {q['atm_offset_strikes_max']}칸",
@@ -499,6 +597,13 @@ def _render_strike_window(db: dict, metrics: dict) -> list[str]:
             "그 fix가 회귀로 보인다. 판정은 **ATM 정합률과 이탈 거리**로 한다.",
             "> 2026-08-03에 하루치 체인 전체가 스팟에서 5.5% 떨어진 외가격에서 수집됐는데 "
             "먼슬리 커버리지(§12)는 98.8%로 훌륭했다 — **이 표 하나면 그날 바로 잡혔다.**",
+            "> **소스 간 격차가 왜 여기 있는가(2026-08-05 고도화#1 / 규약 D)**: 「ATM 정합률」의 "
+            "스팟은 이 지표가 **감시하는 파이프라인이 적재한 값**이다 — 감시자와 감시 대상이 "
+            "입력을 공유한다. 08-05에 그 결합이 90분짜리 사고를 통과시켰다: 지수가 전일 종가에 "
+            "얼어붙어 **스팟도 행사가도 틀렸는데 둘이 서로 일치해서** 정합으로 세어졌고 지표는 "
+            "88.1%를 냈다. 선물 WS는 완전히 다른 경로로 들어오므로 **격차가 곧 오염의 크기**다 "
+            "(08-04 +4.2pt → 08-05 **+9.4pt**). 어느 쪽이 옳은지는 §16의 스팟 소스 괴리와 함께 "
+            "사람이 읽는다.",
             "",
         ]
     else:
@@ -737,6 +842,32 @@ def _render_spot_divergence(db: dict) -> list[str]:
     return out
 
 
+def _render_crosschecks(metrics: dict, db_metrics: dict | None) -> list[str]:
+    """2026-08-05 고도화#3 — **이미 있는 지표끼리 서로 맞춰본다.**
+
+    08-05 리포트는 §14(감마플립 22분)와 §15(광폭 flip 없음)를 같은 문서에 인쇄해 놓고 서로
+    비교하지 않았다. 둘은 논리적으로 모순이고, 그 모순이 곧 §2-5의 결함이었다 —
+    사람이 22건을 전수 대조하기 전까지 아무도 몰랐다.
+    """
+    findings = crosscheck.evaluate(metrics, db_metrics)
+    if not findings:
+        return [
+            "- 모순 없음 — 오늘은 아래 규칙에서 지표끼리 어긋나지 않았다.",
+            "",
+            "> **「모순 없음」은 「전부 정상」이 아니다.** 이 절은 절과 절 사이만 본다 — "
+            "각 절의 개별 경고는 그대로 읽어야 한다.",
+            "",
+        ]
+    out = [f"- ⚠ **모순 {len(findings)}건**", ""]
+    for f in findings:
+        out += [f"### §{' ↔ §'.join(f.sections)} — {f.summary}", "", f.detail, ""]
+    out += [
+        "> 이 절은 **모순을 지적할 뿐 판정하지 않는다** — 어느 쪽이 틀렸는지는 사람이 정한다.",
+        "",
+    ]
+    return out
+
+
 def _render_hypotheses(results: list[dict]) -> list[str]:
     out: list[str] = []
     # 2026-08-03 §5-4 — 예정일이 지났는데 아직 `상태: pending`인 항목을 **표 위로** 띄운다.
@@ -752,14 +883,44 @@ def _render_hypotheses(results: list[dict]) -> list[str]:
         out += [f"> - `{hid}` (예정일 {due or '미지정'})" for hid, due in overdue]
         out.append("")
 
+    # 2026-08-05 고도화#2(규약 E) — **자기 주장을 검정하지 않는 지표로 받은 합격**을 막는다.
+    # 08-04 `p4`는 "왕복이 사라진다"고 주장하면서 등록 지표가 `chain_age_seconds_max`와
+    # `log_volume.human_lines`였고, 왕복률이 36.1% → 47.5%로 나빠졌는데도 "확인"이 났다.
+    unjudgeable = sorted({r["id"] for r in results if r.get("claim_missing")})
+    if unjudgeable:
+        out += [
+            f"> ⚠ **주장 지표 없음 {len(unjudgeable)}건 — 판정 불가.** 등록된 지표 중 "
+            "`역할: 주장`(그 가설이 실제로 주장하는 것을 재는 지표)이 하나도 없다. "
+            "실측은 사실이지만 **그것으로 가설을 판정하면 08-04 `p4`의 오독이 반복된다.**",
+            "",
+        ]
+        out += [f"> - `{hid}`" for hid in unjudgeable]
+        out.append("")
+
+    cost_missing = sorted({(r["id"], r.get("대가")) for r in results if r.get("cost_missing")})
+    if cost_missing:
+        out += [
+            f"> ⚠ **대가 지표 없음 {len(cost_missing)}건.** 항목이 `대가:`로 트레이드오프를 "
+            "선언해 놓고 그것을 재는 지표(`역할: 대가`)가 없다 — **무엇을 포기했는지 모르는 채 "
+            "개선을 주장하는 상태**다(08-04 Fix#8이 그랬다).",
+            "",
+        ]
+        out += [f"> - `{hid}` — 선언된 대가: {cost or '문구 없음'}" for hid, cost in cost_missing]
+        out.append("")
+
     rows = [
-        [r["id"], r["가설"], r["metric"], _fmt(r.get("actual"), "{}"), r["expect"], r["verdict"]]
+        [
+            r["id"], r["가설"], r["metric"], _fmt(r.get("actual"), "{}"), r["expect"],
+            r.get("역할", hypotheses_module.ROLE_REFERENCE), r["verdict"],
+        ]
         for r in results
     ]
-    out += _table(["id", "가설", "지표", "실측", "예측", "판정"], rows)
+    out += _table(["id", "가설", "지표", "실측", "예측", "역할", "판정"], rows)
     out += [
         "> 판정은 참고값이다 — **`hypotheses.yaml`의 `상태`는 자동으로 바뀌지 않는다.** "
         "사람이 보고서를 쓰면서 손으로 확정한다(자동 판정이 틀렸을 때 조용히 덮이는 것을 막는다).",
+        "> **역할**: `주장`은 그 가설이 실제로 주장하는 것, `대가`는 그 fix가 포기한 것, "
+        "나머지는 `참고`다(2026-08-05 고도화#2 / 규약 E).",
         "",
     ]
     return out

@@ -89,6 +89,7 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
         ("book_gamma_map", book_gamma_map),
         ("wide_oi_landscape", wide_oi_landscape),
         ("member_availability", member_availability),
+        ("member_score_quality", member_score_quality),
         ("strike_window_quality", strike_window_quality),
         ("signal_decisions", _signal_decisions),
         ("signal_reach", signal_reach),
@@ -732,6 +733,49 @@ def strike_window_quality(
         {"underlying": underlying, "target": target, "expiry": expiry,
          "window": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES},
     )
+    # 2026-08-05(고도화#1 / 규약 D) — **같은 지표를 독립 소스로 한 번 더 잰다.**
+    #
+    # 위 계산은 ATM을 `underlying_spot_1m`(REST 지수)에서 낸다. 그런데 그 스팟은 이 지표가
+    # 감시하는 파이프라인(옵션체인 폴러)이 **같은 응답에서 뽑아 적재한 값**이다 — 감시자와
+    # 감시 대상이 입력을 공유한다. 08-05에 그 결합이 90분짜리 사고를 통과시켰다: 지수가 전일
+    # 종가에 얼어붙어 있어 스팟도 행사가도 틀렸는데 **둘이 서로 일치해서** 정합으로 세어졌고,
+    # 지표는 88.1%를 냈다.
+    #
+    # 선물 WS 1분봉은 **완전히 다른 경로**(WebSocket 체결 스트림)로 들어온다. 두 값이 갈리면
+    # 그 차이 자체가 신호다 — 어느 쪽이 옳은지는 이 함수가 정하지 않는다(사람이 §16의 스팟 소스
+    # 괴리와 함께 읽는다).
+    futures_row = _fetchone(
+        conn,
+        """
+        WITH per_minute AS (
+            SELECT round((m.close / %(interval)s)::numeric) * %(interval)s AS atm_fut,
+                   round((s.spot / %(interval)s)::numeric) * %(interval)s AS atm_idx,
+                   array_agg(DISTINCT o.strike) AS strikes
+            FROM option_analysis_1m o
+            JOIN active_futures_symbol f ON f.underlying = o.underlying
+            JOIN market_raw_1m m ON m.timestamp = o.timestamp AND m.symbol = f.symbol
+            JOIN underlying_spot_1m s
+              ON s.underlying = o.underlying AND s.timestamp = o.timestamp
+            WHERE o.underlying=%(underlying)s AND o.timestamp::date=%(target)s
+              AND o.expiry=%(expiry)s AND m.close > 0 AND s.spot > 0
+            GROUP BY o.timestamp, m.close, s.spot
+        )
+        SELECT count(*),
+               count(*) FILTER (WHERE atm_fut = ANY(strikes)),
+               count(*) FILTER (WHERE atm_idx = ANY(strikes))
+        FROM per_minute
+        """,
+        {"interval": interval, "underlying": underlying, "target": target, "expiry": expiry},
+    )
+    # **두 값을 같은 분 집합에서 낸다.** 분모가 다르면 차이가 스팟 소스 때문인지 분 집합 때문인지
+    # 구분되지 않는다 — 선물 1분봉은 WS 체결이 있어야 생기므로 장전 상당 구간이 빠진다.
+    futures_minutes = int(futures_row[0]) if futures_row and futures_row[0] else 0
+    atm_by_futures = atm_by_index_same_minutes = gap = None
+    if futures_minutes:
+        atm_by_futures = round(int(futures_row[1]) / futures_minutes * 100, 1)
+        atm_by_index_same_minutes = round(int(futures_row[2]) / futures_minutes * 100, 1)
+        gap = round(atm_by_futures - atm_by_index_same_minutes, 1)
+
     design_strikes = side * 2 + 1
     median_strikes = float(jitter[0]) if jitter and jitter[0] is not None else None
     return {
@@ -739,6 +783,11 @@ def strike_window_quality(
         "expiry": expiry,
         "minutes": minutes,
         "atm_covered_pct": round(atm_hit / minutes * 100, 1),
+        # 규약 D — 독립 소스(선물 WS) 기준의 같은 지표. `gap`이 이 교차 검증의 결론이다.
+        "atm_covered_pct_by_futures": atm_by_futures,
+        "atm_covered_pct_by_index_same_minutes": atm_by_index_same_minutes,
+        "atm_source_gap_pt": gap,
+        "futures_cross_check_minutes": futures_minutes,
         "window_covered_pct": round(window_hit / minutes * 100, 1),
         "atm_offset_strikes_median": round(offset_median, 2) if offset_median is not None else None,
         "atm_offset_strikes_max": round(offset_max, 2) if offset_max is not None else None,
@@ -748,6 +797,78 @@ def strike_window_quality(
         "width_jitter": round(median_strikes / design_strikes, 2) if median_strikes else None,
         "snapshot_window_minutes": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES,
     }
+
+
+def member_score_quality(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: `risk_gate_state.member_scores`에서 **멤버가 무엇을 말했는가**를 집계한다 —
+         멤버별 산출 분·평균·부호 분포와, 구현된 멤버 **쌍마다 부호가 같았던 비율**.
+    해석: 2026-08-05 고도화#4 — 08-05까지의 모든 관측은 *"판단이 나오는가"* 를 쟀고 그날 답이
+         Yes가 됐다(가용 멤버 4가 409분, 확신도 4종, 전이 83회). **다음 질문은 "그 판단이
+         무엇에 반응하는가"다.**
+
+         **부호 일치율이 핵심이다.** 4멤버가 항상 같은 부호면 앙상블은 실질 1멤버이고,
+         가중 평균은 가중치를 바꿔도 답이 안 바뀐다 — 즉 `available_member_count`가 4라는 것이
+         판단이 4개 축을 본다는 뜻이 아니다. 08-05의 `SMALL_TEST` 41건
+         (`conflict_resolution:no_clear_consensus`)이 **멤버가 실제로 갈렸다는 첫 증거**였고,
+         그중 36건이 14~15시(Charm 경로가 열리는 시각)에 몰려 있었다.
+
+         **진입이 없어도 잴 수 있는 지표다.** ADVISORY 전용을 이유로 미루면 실거래 전환
+         시점에 비교할 기준선이 없다.
+    실패 조건: `member_scores` 키가 없는 날(2026-08-05 고도화#4 이전)은 `{"available": False}`.
+    """
+    rows = _fetchall(
+        conn,
+        "SELECT member, count(*), avg(score), "
+        "       count(*) FILTER (WHERE score > 0), count(*) FILTER (WHERE score < 0), "
+        "       count(*) FILTER (WHERE score = 0) "
+        "FROM signal_decisions, "
+        "     LATERAL jsonb_each_text(risk_gate_state->'member_scores') AS t(member, raw), "
+        "     LATERAL (SELECT raw::double precision AS score) s "
+        "WHERE timestamp::date=%s GROUP BY member",
+        (target,),
+    )
+    if not rows:
+        return {"available": False, "reason": "member_scores 미기록(2026-08-05 고도화#4 이전)"}
+
+    members = [
+        {
+            "member": r[0],
+            "scored_minutes": int(r[1]),
+            "mean": round(float(r[2]), 4) if r[2] is not None else None,
+            "positive": int(r[3]),
+            "negative": int(r[4]),
+            "zero": int(r[5]),
+        }
+        for r in rows
+    ]
+    members.sort(key=lambda m: MEMBER_FIELDS.index(m["member"]) if m["member"] in MEMBER_FIELDS else 99)
+
+    # 쌍별 부호 일치율 — **둘 다 비영(非零)인 분**만 분모로 센다. 0은 "중립"이지 "동의"가
+    # 아니므로, 0을 포함하면 아무 말도 안 한 멤버가 일치율을 부풀린다.
+    pair_rows = _fetchall(
+        conn,
+        "SELECT a.member, b.member, count(*), "
+        "       count(*) FILTER (WHERE sign(a.score) = sign(b.score)) "
+        "FROM signal_decisions d, "
+        "     LATERAL jsonb_each_text(d.risk_gate_state->'member_scores') AS ta(member, raw_a), "
+        "     LATERAL (SELECT ta.member AS member, raw_a::double precision AS score) a, "
+        "     LATERAL jsonb_each_text(d.risk_gate_state->'member_scores') AS tb(member, raw_b), "
+        "     LATERAL (SELECT tb.member AS member, raw_b::double precision AS score) b "
+        "WHERE d.timestamp::date=%s AND a.member < b.member AND a.score <> 0 AND b.score <> 0 "
+        "GROUP BY a.member, b.member ORDER BY a.member, b.member",
+        (target,),
+    )
+    pairs = [
+        {
+            "a": r[0], "b": r[1], "both_nonzero_minutes": int(r[2]),
+            "same_sign_minutes": int(r[3]),
+            "same_sign_pct": round(int(r[3]) / int(r[2]) * 100, 1) if int(r[2]) else None,
+        }
+        for r in pair_rows
+    ]
+    return {"available": True, "members": members, "pairs": pairs}
 
 
 def _signal_decisions(conn: ConnectionLike, target: date) -> list[dict]:

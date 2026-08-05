@@ -203,7 +203,10 @@
       expect: "기동 후 60초 이내 값 존재 (수기 확인)"
   주의: "이 항목의 성공은 '값이 채워진다'이지 '장운영정보가 온다'가 아니다 — 데이터가 0건인 날에도
         구독확립 시각은 있어야 한다. 그게 이 fix의 전부다."
-  상태: untested
+  검정: |
+    2026-08-05 확정 — ws_status.market_op_subscribed_at = 07:30:32(기동 후 32초).
+    08-04에는 fix 커밋(3d51fbf, 07:45)이 기동(07:30) 이후라 untested로 이월했던 항목이다.
+  상태: confirmed
 
 - id: "2026-08-03-p5-rv-ratio-activation"
   구현일: 2026-08-03
@@ -239,7 +242,11 @@
   주의: "**0이 나오면 그것이 곧 실패다** — 08-04와 똑같이 '개선된 것처럼 보이는' 0이다.
         리포트 §11의 계측 감사 줄(⚠ 계측 감사 실패)이 뜨는지도 함께 볼 것.
         read_timeout은 Fix#8로 **늘어나는 것이 정상**이라 이 가설의 지표에서 뺐다."
-  상태: pending
+  검정: |
+    2026-08-05 확정 — remote_protocol_error 9건 / kis_error_response 66건으로 되살아났고 계측 감사도 통과.
+    slow_calls 44건(<100)의 미달은 파서 실명이 아니라 **물리적 상한**이다(read 4초 < 임계 5초) —
+    계약 테스트가 겨눈 대상은 살아났다. 그 임계 결함은 같은 날 8546cf7이 별건으로 닫았다.
+  상태: confirmed
 
 - id: "2026-08-04-p2-ensemble-members"
   구현일: 2026-08-04
@@ -257,7 +264,10 @@
         폴백으로 사는 것이지 flip이 살아나서가 아니다.
         14:00 이전에는 Charm 경로가 꺼져 있으므로(v6 §13.2) **오전에 3, 오후에 4**가 정상 모양이다.
         4가 안 나오면 signal_decisions.risk_gate_state.member_unavailable에 사유가 남아 있다."
-  상태: pending
+  검정: |
+    2026-08-05 확정 — member_count_max 4, 494분 중 409분이 4멤버. 판단 형태 전이 2줄 → 83줄.
+    넉 달 만의 실질 변화이고 gex_expiry도 494분 전부 먼슬리였다(Fix#5 동시 확인).
+  상태: confirmed
 
 - id: "2026-08-04-p3-cycle-budget"
   구현일: 2026-08-04
@@ -275,7 +285,14 @@
   주의: "**이것은 교환이지 순수 개선이 아니다.** rows 20 미만 사이클이 새로 생겨야 정상이고
         (하나도 없으면 예산이 안 걸린 것이다), qualitative.read_timeout도 3건에서 늘어난다 —
         둘 다 회귀가 아니다. 반대로 rows<20이 사이클의 절반을 넘으면 임계가 너무 낮은 것이다."
-  상태: pending
+  검정: |
+    2026-08-05 확정 — 밀림 48 → **0건**, 미회수 결손 5 → 1분. 예고한 '얇은 사이클'도 나타났다(211건).
+    **다만 대가가 예고보다 컸고, 그것을 잴 지표가 없었다**: 먼슬리 레그 10개 미만이 38.2%,
+    옵션체인 0행 분이 4분. 가설 문구는 '(대가로 얇은 사이클이 생긴다)'라고 **대가를 선언해
+    놓고 그것을 재는 예측 지표를 등록하지 않았다** — 이것이 2026-08-05 고도화#2(규약 E)를
+    만든 직접 사례다. 규약 E는 이 항목에 소급 적용하지 않는다(숫자를 본 뒤에 예측을 더하는
+    것은 규약 위반이다). 대가 계측은 08-05 Fix#2·#3으로 신설해 08-06부터 잰다.
+  상태: confirmed
 
 - id: "2026-08-04-p4-atm-hysteresis"
   구현일: 2026-08-04
@@ -294,7 +311,17 @@
   주의: "**보고서 §5의 최초 예측(롤링 ≤60회, 로그 ≤2,800줄)은 리플레이로 반증돼 폐기했다** —
         숫자를 보기 전에 적는다는 규약은 지키되, 배포 전에 검증할 수 있으면 검증하고 정정한다.
         롤링 횟수 자체는 자동 지표에 없으므로 로그의 `ATM 롤링` 건수를 손으로 셀 것(예측 130±20회)."
-  상태: pending
+  검정: |
+    2026-08-05 확정 — chain_age_seconds_max 250초(<=450) 확인. log_volume.human_lines는 리포트가
+    21,176으로 **반증** 판정했으나 그 값의 78%가 트레이스백이었고 실제 사람 로그는 4,599줄로
+    예측치(<=6,500)를 통과한다(08-05 §2-4, Fix#4로 계측 정정 후 재생성해 '확인' 확인).
+    **그럼에도 inconclusive인 이유: 등록된 두 지표 모두 이 가설의 주장(왕복이 사라진다)을
+    검정하지 않는다.** 실측 왕복률은 36.1% → 47.5%로 오히려 나빠졌는데(절대 건수는 70 → 48로
+    줄었다) 그것을 재는 지표가 예측에 없어 §0은 '확인'을 냈다. **자기 주장을 검정하지 않는
+    지표로 받은 합격** — 2026-08-05 고도화#2(규약 E)가 이 실패에서 나왔다.
+    소급해서 atm_rolls.round_trip_pct를 등재하지 않는다(이미 숫자를 봤다). 히스테리시스 유지
+    여부는 NEXT_TODO의 '판정 보류' 항목에서 08-06 ATM 정합률로 결정한다.
+  상태: inconclusive
 
 - id: "2026-08-04-p5-kis-latency-rule"
   구현일: 2026-08-04
@@ -308,6 +335,7 @@
   예측:
     - metric: rest_latency.endpoints.inquire-price.p95
       expect: "수기 판정"
+      역할: 주장
     - metric: rest_latency.warnings
       expect: "수기 판정"
   주의: |
@@ -345,18 +373,23 @@
         RANGE_TIGHT x overpriced = ['limited_premium_sell']는 프리미엄 매도라
         `short_gamma_requires`(최고신뢰 + positive GEX + 안정레짐) 게이트에 걸리는데,
         `stability_flag`가 08-05 내내 False였으므로 게이트는 확정적으로 불통과한다."
+  대가: "팔레트 3열이 열리면 관망만 하던 날에 진입 후보가 생긴다 — 07-30에 팔레트 오독으로 하루 419건이 찍힌 전례가 있다"
   예측:
     # 주장 지표 — 이 가설이 실제로 주장하는 것(08-05 p4의 실패를 반복하지 않기 위해 맨 앞에 둔다)
     - metric: db.decisions.reject_reason.strategy_palette:wait_only
       expect: "< 0.5 x 전일"
+      역할: 주장
     - metric: db.decisions.reject_reason.strategy_palette:short_gamma_requires_not_met
       expect: ">= 1"
+      역할: 주장
     # 배선 자체가 살아 있는가 — NULL만 나오면 계산 경로가 죽은 것이다
     - metric: db.decisions.vrp.non_null_ratio
       expect: ">= 0.7"
+      역할: 참고
     # 안전 — 07-30에 팔레트 오독으로 하루 419건 ENTER가 찍힌 전례가 있다
     - metric: db.decisions.decision.ENTER
       expect: "<= 5"
+      역할: 대가
   주의: |
     **판정은 위 4개 지표 전부로 한다.** 08-04 p4는 "왕복이 사라진다"고 주장하면서 등록 지표는
     `chain_age_seconds_max`와 `log_volume.human_lines`였다 — 자기 주장을 검정하지 않는 지표로
@@ -393,17 +426,22 @@
         만기유동성(inquire-asking-price)도 최대 4.00초로 천장에 닿아 2건 실패했다.
         Fix#8의 근거('60초에 20레그를 도는 사이클에서 한 레그가 10초를 먹으면 밀린다')는
         호출 1건이 곧 사이클 전체인 폴러에는 성립하지 않는다 — 되돌림이 아니라 범위 축소다."
+  대가: "잔고/만기유동성 read를 10초로 되돌리므로 그 폴러가 느린 날 사이클 예산을 더 먹는다(밀림·미회수 결손이 대가다)"
   예측:
     # 주장 지표
     - metric: log.failures.계좌 잔고 폴링 사이클 실패
       expect: "0"
+      역할: 주장
     - metric: log.failures.만기 유동성 폴링 실패
       expect: "<= 1"
+      역할: 주장
     # 옵션체인 쪽은 4초를 유지하므로 08-05와 같은 수준이어야 한다(악화하면 범위 축소가 샜다는 뜻)
     - metric: overrun.count
       expect: "<= 25"
+      역할: 대가
     - metric: cycles.missing.unrecovered_count
       expect: "<= 2"
+      역할: 대가
   주의: |
     **`qualitative.read_timeout`은 줄되 0이 되지는 않는다** — 옵션체인(2,800건/일)은 여전히
     4초 천장을 쓰기 때문이다. 08-05는 21건이었고, 그중 잔고 3건 + 만기유동성 2건이 빠지므로
@@ -429,8 +467,10 @@
     # 주장 지표
     - metric: db.decisions.conviction.HIGH_CONVICTION
       expect: "0"
+      역할: 주장
     - metric: db.decisions.conviction.STANDARD
       expect: "> 전일"
+      역할: 참고
   주의: |
     **HIGH_CONVICTION 0건은 회귀가 아니라 정정이다.** GEX가 음수이고 레짐이 불안정한 날에
     최고 등급이 나오던 것이 결함이었다. GEX가 양수로 돌아서고 `stability_flag`가 True가 되는
@@ -463,8 +503,10 @@
     # 주장 지표 — 되살아났는가
     - metric: slow_calls.count
       expect: ">= 15"
+      역할: 주장
     - metric: qualitative.read_timeout
       expect: "<= slow_calls.count"
+      역할: 참고
   주의: |
     **`slow_calls.count >= qualitative.read_timeout`이 새 불변식이다.** 타임아웃은 이제 임계와
     무관하게 반드시 느린 호출 줄을 남기므로(`_log_if_slow(timed_out=True)`), 타임아웃 건수가
@@ -493,6 +535,7 @@
   예측:
     - metric: db.decisions.distinct_entry_strategies
       expect: "<= 2 (수기 판정)"
+      역할: 주장
   주의: |
     **이 가설은 ENTER가 나기 전까지 공허하게 참이다.** 08-05은 ENTER 0건이었고 p1이 예측하는
     08-06 ENTER도 0~5건이라, 상한이 실제로 걸리려면 **서로 다른 전략으로 3번째 진입**이
@@ -518,12 +561,15 @@
         08-05 실측: 07:31~09:00 내내 정확히 1000.0300(= 08-04 종가), 09:01에 1042.91로 점프.
         오버나이트 갭 +4.29%를 장전 90분 동안 못 본 채 GEX/감마플립/VRP를 계산했고,
         08:45~09:00 구간 판단(앙상블 4멤버)이 전부 그 위에서 내려졌다."
+  대가: "09:00 이전 스팟을 안 쌓으므로 장전 90분 동안 options_flow가 미가용이 된다(틀린 값 대신 미가용을 택한 것이다)"
   예측:
     # 주장 지표
     - metric: db.tables.underlying_spot_1m.rows
       expect: "전일 대비 약 -90행 (감소가 정상)"
+      역할: 주장
     - metric: db.signal_reach.member_availability.options_flow
       expect: "< 전일 (장전 구간이 미가용으로 바뀐다)"
+      역할: 대가
   주의: |
     **행 수 감소를 데이터 유실로 읽지 말 것.** 없어지는 것은 전일 종가의 복제본이고,
     그 값은 전일 마지막 행에 이미 있다. §12 표에서 `underlying_spot_1m`만 줄고
@@ -563,8 +609,10 @@
     # 주장 지표 — 페널티가 실제로 걸리는가
     - metric: db.decisions.conviction_score.15시20분이후_평균
       expect: "직전 구간의 약 0.5배 (수기 판정)"
+      역할: 주장
     - metric: qualitative.event_calendar_not_covered
       expect: "0 (covered_through=2026-08-13이라 아직 범위 안 — 0이 정상)"
+      역할: 참고
   주의: |
     **`event_calendar_not_covered` 0건을 "기계가 죽었다"로도 "살았다"로도 읽지 말 것.**
     `covered_through`가 2026-08-13이라 08-14 전까지는 경고가 안 나는 것이 정상이다.
@@ -605,11 +653,14 @@
     자동 리포트 §14는 이것을 "산출률 4.5% — 행사가 창이 스팟을 따라가는지 확인"이라는
     **정반대 방향의 경고**로 냈다. 그리고 §15의 「광폭 감마플립」은 같은 날 세 북 모두 '없음'
     이었다 — **한 문서 안에서 두 절이 모순된 답을 내는데 아무도 나란히 읽지 않았다.**
+  대가: "레그 범위 밖 flip을 전부 기각하므로 **범위 바로 밖의 진짜 flip도 함께 버린다**(산출률이 0%로 돌아갈 수 있다)"
   예측:
     - metric: db.signal_reach.gamma_flip_out_of_range_count
       expect: "0"
+      역할: 주장
     - metric: db.signal_reach.gamma_flip_pct
       expect: "<= 1"
+      역할: 대가
   주의: |
     **`gamma_flip_pct`가 0%로 돌아가는 것은 실패가 아니다.** 08-04 §2-3이 확정했듯 이 북은
     전 구간에서 GEX 부호가 안 바뀌므로 0%가 정상이고, 08-05의 4.5%는 개선이 아니라 결함이었다.
@@ -634,8 +685,10 @@
   예측:
     - metric: db.chain_minute_coverage.zero_row_count
       expect: ">= 0"
+      역할: 주장
     - metric: qualitative.chain_cycle_empty
       expect: ">= 0"
+      역할: 주장
   주의: |
     **0건을 성공으로 읽지 말 것.** 이 fix는 손실을 줄이는 게 아니라 **보이게** 하는 것이다.
     08-06에 KIS가 안 멈추면 0이 나오는 게 맞고, 그때 확인할 것은 "키가 존재하는가"다 —
@@ -661,8 +714,10 @@
   예측:
     - metric: db.monthly_leg_completeness.below_design_pct
       expect: ">= 0"
+      역할: 주장
     - metric: db.monthly_leg_completeness.below_flip_minimum_count
       expect: ">= 0"
+      역할: 주장
   주의: |
     **이 fix는 값을 좋게 만들지 않는다 — 재기만 한다.** 08-06의 38.2%가 그대로여도 반증이 아니다.
     개선하려면 read 타임아웃/예산/폴링 폭 중 하나를 건드려야 하고, 그것은 08-05 실측이
@@ -684,13 +739,17 @@
     항상 트레이스백을 붙인다(08-03 §2-8의 결정, "예외는 드물다"는 전제 위에 있었다).
     (2) 08-04 Fix#8이 read를 10 → 4초로 낮춰 ReadTimeout을 **일상**으로 만들었다(3건 → 210건, 70배).
     **fix 하나가 다른 fix의 전제를 무너뜨렸는데 그 fix가 전제를 재검토하지 않았다.**
+  대가: "예외 유형당 트레이스백을 3건으로 줄이므로 4번째 이후의 스택은 영영 못 본다(유형·메시지만 남는다)"
   예측:
     - metric: log_volume.traceback_lines
       expect: "<= 1500"
+      역할: 주장
     - metric: log_volume.human_lines
       expect: "<= 6000"
+      역할: 주장
     - metric: qualitative.read_timeout
       expect: ">= 1"
+      역할: 대가
   주의: |
     **`read_timeout`이 0이 되면 그것이 실패다.** 트레이스백을 생략한 줄에도
     `트레이스백 생략 — httpx.ReadTimeout` 마커를 실어 같은 키에 합산하도록 했고, 계약 테스트가
@@ -718,8 +777,10 @@
   예측:
     - metric: db.member_availability.orderflow_ofi_vpin.structural_minutes
       expect: "5 ~ 12"
+      역할: 주장
     - metric: db.member_availability.orderflow_ofi_vpin.available_pct
       expect: ">= 80"
+      역할: 참고
   주의: |
     **멤버를 살리지 않는다.** 단일가 구간에도 OFI는 여전히 없고, 없는 값을 지어내면 08-03의
     허수 감마플립과 같은 종류의 결함이 된다. 이 fix가 바꾸는 것은 **사유 문자열 하나**이고,
@@ -749,8 +810,10 @@
   예측:
     - metric: db.spot_source_divergence.index_frozen_max_run
       expect: "<= 11"
+      역할: 주장
     - metric: db.spot_source_divergence.median_pct
       expect: "0 ~ 0.6"
+      역할: 참고
   주의: |
     **괴리율에 임계를 걸지 않는다.** 보고서 초안은 "0.5% 초과가 2분 연속이면 WARNING"이라고
     적었는데, 08-05 실측에서 정규장 중 괴리 중앙값이 **0.252%**이고 09:01·09:02·09:22·10:32가

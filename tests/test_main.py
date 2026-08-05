@@ -5411,3 +5411,66 @@ def test_the_closing_auction_exception_does_not_resurrect_the_member():
 
     reasons = _member_unavailable_reasons(_ofi_less_inputs(), now=datetime(2026, 8, 5, 15, 40))
     assert "orderflow_ofi_vpin" in reasons, "사유가 남았다는 것은 곧 미가용이라는 뜻이다"
+
+
+# ===== 2026-08-05 고도화#4 — 멤버별 점수 적재 =====
+
+
+def _SignalInputsWithEverything():
+    """구현된 4멤버가 **전부** 점수를 내는 원재료 한 벌.
+
+    (미학습 2멤버 xgboost/lstm은 Phase 3까지 항상 None이라 반드시 사유 쪽에 남는다.)
+    """
+    from mahdi.engines.regime import RegimeLabel, RegimeState
+    from mahdi.fusion.signal_layer import SignalInputs
+
+    return SignalInputs(
+        regime_state=RegimeState(
+            regime=RegimeLabel.TREND_UP_STRONG,
+            prob_vector=(0.6, 0.1, 0.1, 0.05, 0.05, 0.05, 0.03, 0.02),
+            stability_flag=True,
+        ),
+        gex=1.0e9,
+        gamma_wall=1000.0,
+        spot=1010.0,
+        ofi=0.4,
+        foreign_net_flow=1.2e9,
+    )
+
+
+def test_member_scores_and_unavailable_reasons_partition_the_six_members():
+    """두 dict는 **배타적이고 합치면 항상 6멤버**다 — 하나가 비면 다른 하나가 설명한다.
+
+    08-05까지는 가용성만 남기고 점수를 버렸다. 그래서 판단이 살아난 그날(가용 멤버 4가 409분,
+    전이 83회) **방향 ±0.692가 어느 멤버에서 왔는지 DB로 역산할 수 없었다.**
+    """
+    from mahdi.fusion.signal_layer import MEMBER_FIELDS, build_member_scores
+    from mahdi.main import _member_scores_for_record, _member_unavailable_reasons
+
+    inputs = _SignalInputsWithEverything()
+    scores = build_member_scores(inputs)
+    recorded = _member_scores_for_record(scores)
+    reasons = _member_unavailable_reasons(inputs, datetime(2026, 8, 5, 14, 0), scores)
+
+    assert set(recorded) & set(reasons) == set(), "한 멤버가 양쪽에 다 있으면 해석이 불가능하다"
+    assert set(recorded) | set(reasons) == set(MEMBER_FIELDS)
+
+
+def test_member_scores_record_is_empty_when_the_engine_gave_none():
+    """엔진이 점수를 안 넘긴 경로(구버전 호출/테스트 더블)에서도 죽지 않는다."""
+    from mahdi.main import _member_scores_for_record
+
+    assert _member_scores_for_record(None) == {}
+
+
+def test_fusion_decision_carries_the_scores_it_already_computed():
+    """엔진은 이 점수를 **이미 계산하고 있었고 버리고 있었다** — 이제 판단 행까지 흘려보낸다."""
+    from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
+
+    decision = SignalFusionEngine().evaluate(_SignalInputsWithEverything(), MetaLabelContext())
+
+    assert decision.member_scores is not None
+    assert decision.available_member_count == sum(
+        1 for name in ("regime_hmm", "options_flow", "orderflow_ofi_vpin", "flow_position")
+        if getattr(decision.member_scores, name) is not None
+    ), "적재되는 점수와 available_member_count가 같은 계산에서 나와야 한다"

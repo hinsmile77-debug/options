@@ -30,6 +30,33 @@ VERDICT_REFUTED = "반증"
 VERDICT_MANUAL = "수기 판정"
 VERDICT_NO_DATA = "실측 없음"
 
+# 2026-08-05(고도화#2 / 규약 E) — 예측 지표의 **역할**.
+#
+# ## 왜 역할이 필요한가
+#
+# 08-04 `p4`는 *"ATM 히스테리시스로 롤링 왕복이 사라진다"* 고 주장하면서 등록 지표가
+# `chain_age_seconds_max`와 `log_volume.human_lines`였다. 둘 다 **왕복을 재지 않는다.**
+# 그래서 왕복률이 36.1% → 47.5%로 **나빠졌는데도** §0은 "확인"을 냈다. 자기 주장을 검정하지
+# 않는 지표로 받은 합격이다.
+#
+# 그리고 08-04 Fix#8은 **의도적으로 데이터를 버리는** fix였는데(예산 초과 시 레그 포기)
+# 버린 양을 세는 지표가 없었다. 밀림 0건이라는 훌륭한 숫자 뒤에서 먼슬리 북이 38% 확률로
+# 얇아지고 4분이 통째로 사라진 것을 08-05에야 알았다.
+#
+# ## 규약
+#
+#   주장  이 가설이 **실제로 주장하는 것**을 재는 지표. **없으면 판정 불가다.**
+#   대가  그 fix가 **무엇을 포기했는지**를 재는 지표. 항목에 `대가:` 문구가 있으면 필수다.
+#   참고  나머지(부수 확인용). 역할을 안 적으면 참고로 본다.
+#
+# 주장 지표는 *얻은 것*, 대가 지표는 *잃은 것*이다. 규약 A/B/C/D가 "같은 것을 두 번 쓰지
+# 마라"의 변주라면, E는 **"한쪽만 재지 마라"** 다.
+ROLE_CLAIM = "주장"
+ROLE_COST = "대가"
+ROLE_REFERENCE = "참고"
+
+VERDICT_UNJUDGEABLE = "판정 불가"
+
 
 def load(path: Path) -> list[dict]:
     """
@@ -100,7 +127,16 @@ def evaluate(
                 due = date.fromisoformat(due)
             if due is not None and due > target:
                 continue
-            for prediction in entry.get("예측") or []:
+            predictions = entry.get("예측") or []
+            roles = [str(p.get("역할", ROLE_REFERENCE)) for p in predictions]
+            # 2026-08-05 고도화#2 — 주장 지표가 없으면 **그 가설은 판정할 수 없다.**
+            # 실측/예측은 사실이므로 그대로 두고 **판정만** 무효화한다. 여기서 "확인"을
+            # 그대로 두면 08-04 p4의 오독이 그대로 재현된다.
+            claim_missing = ROLE_CLAIM not in roles
+            # 규약 E — `대가:` 문구로 트레이드오프를 선언해 놓고 그것을 재는 지표가 없으면
+            # "무엇을 포기했는지 모르는 채 개선을 주장하는" 상태다.
+            cost_missing = bool(entry.get("대가")) and ROLE_COST not in roles
+            for prediction, role in zip(predictions, roles):
                 path = prediction["metric"]
                 actual = _lookup(metrics, db_metrics, path)
                 expect = str(prediction["expect"])
@@ -111,7 +147,13 @@ def evaluate(
                         "metric": path,
                         "actual": actual,
                         "expect": expect,
-                        "verdict": _verdict(actual, expect),
+                        "역할": role,
+                        "claim_missing": claim_missing,
+                        "cost_missing": cost_missing,
+                        "대가": entry.get("대가"),
+                        "verdict": (
+                            VERDICT_UNJUDGEABLE if claim_missing else _verdict(actual, expect)
+                        ),
                         # 2026-08-03 §5-4: 예정일이 **지난** 채로 아직 pending인 항목.
                         # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에
                         # 섞여 들어가면 놓치기 쉽고 그러면 규약 자체가 무력해진다.

@@ -22,7 +22,10 @@ _DB = {"monthly_coverage": {"coverage_pct": 96.4}}
 def _entry(**overrides) -> dict:
     base = {
         "id": "h1", "구현일": date(2026, 8, 1), "검증예정일": date(2026, 8, 3),
-        "가설": "테스트", "예측": [{"metric": "overrun.count", "expect": "<= 30"}], "상태": "pending",
+        # 2026-08-05 고도화#2: 이 헬퍼의 기본 예측은 **주장 지표**다 — 아래 테스트들은 판정
+        # 로직을 보는 것이라 주장/대가 규약에 걸리면 검증 대상이 흐려진다.
+        "가설": "테스트", "상태": "pending",
+        "예측": [{"metric": "overrun.count", "expect": "<= 30", "역할": hypotheses.ROLE_CLAIM}],
     }
     base.update(overrides)
     return base
@@ -33,14 +36,14 @@ def test_confirms_and_refutes_comparison_expectations():
     assert r["actual"] == 12 and r["verdict"] == hypotheses.VERDICT_CONFIRMED
 
     [r] = hypotheses.evaluate(
-        [_entry(예측=[{"metric": "overrun.count", "expect": "<= 5"}])], date(2026, 8, 3), _METRICS
+        [_entry(예측=[{"metric": "overrun.count", "expect": "<= 5", "역할": hypotheses.ROLE_CLAIM}])], date(2026, 8, 3), _METRICS
     )
     assert r["verdict"] == hypotheses.VERDICT_REFUTED
 
 
 def test_supports_range_expectations():
     [r] = hypotheses.evaluate(
-        [_entry(예측=[{"metric": "poller_phase.만기유동성.mode_second", "expect": "13 ~ 17"}])],
+        [_entry(예측=[{"metric": "poller_phase.만기유동성.mode_second", "expect": "13 ~ 17", "역할": hypotheses.ROLE_CLAIM}])],
         date(2026, 8, 3), _METRICS,
     )
     assert r["verdict"] == hypotheses.VERDICT_CONFIRMED
@@ -48,7 +51,7 @@ def test_supports_range_expectations():
 
 def test_db_prefixed_metrics_resolve_against_db_metrics():
     [r] = hypotheses.evaluate(
-        [_entry(예측=[{"metric": "db.monthly_coverage.coverage_pct", "expect": ">= 95"}])],
+        [_entry(예측=[{"metric": "db.monthly_coverage.coverage_pct", "expect": ">= 95", "역할": hypotheses.ROLE_CLAIM}])],
         date(2026, 8, 3), _METRICS, _DB,
     )
     assert r["actual"] == 96.4 and r["verdict"] == hypotheses.VERDICT_CONFIRMED
@@ -57,14 +60,14 @@ def test_db_prefixed_metrics_resolve_against_db_metrics():
 def test_unparseable_expectation_is_left_for_a_human_not_forced():
     # 억지 자동 판정보다 "수기 판정"으로 남기는 편이 낫다.
     [r] = hypotheses.evaluate(
-        [_entry(예측=[{"metric": "overrun.count", "expect": "15:4x 쯤"}])], date(2026, 8, 3), _METRICS
+        [_entry(예측=[{"metric": "overrun.count", "expect": "15:4x 쯤", "역할": hypotheses.ROLE_CLAIM}])], date(2026, 8, 3), _METRICS
     )
     assert r["verdict"] == hypotheses.VERDICT_MANUAL
 
 
 def test_missing_metric_reports_no_data_instead_of_failing():
     [r] = hypotheses.evaluate(
-        [_entry(예측=[{"metric": "없는.경로", "expect": "<= 1"}])], date(2026, 8, 3), _METRICS
+        [_entry(예측=[{"metric": "없는.경로", "expect": "<= 1", "역할": hypotheses.ROLE_CLAIM}])], date(2026, 8, 3), _METRICS
     )
     assert r["actual"] is None and r["verdict"] == hypotheses.VERDICT_NO_DATA
 
@@ -191,3 +194,83 @@ def test_report_omits_the_callout_when_nothing_is_overdue():
         }],
     )
     assert "확정 대기" not in out
+
+
+# ===== 2026-08-05 고도화#2 / 규약 E — 주장 지표·대가 지표 =====
+
+
+def _role_entry(predictions, **extra):
+    base = {
+        "id": "x", "가설": "h", "검증예정일": date(2026, 8, 6),
+        "예측": predictions, "상태": "pending",
+    }
+    base.update(extra)
+    return base
+
+
+def test_a_hypothesis_without_a_claim_metric_cannot_be_judged():
+    """**이 테스트가 08-04 `p4`의 실패를 재현한다.**
+
+    p4는 "ATM 히스테리시스로 롤링 왕복이 사라진다"고 주장하면서 등록 지표가
+    `chain_age_seconds_max`와 `log_volume.human_lines`였다 — 둘 다 왕복을 재지 않는다.
+    왕복률은 36.1% → 47.5%로 **나빠졌는데도** §0은 "확인"을 냈다.
+    자기 주장을 검정하지 않는 지표로 받은 합격이다.
+    """
+    entry = _role_entry([{"metric": "a.b", "expect": "<= 10"}])  # 역할 없음 = 참고
+    rows = hypotheses.evaluate([entry], date(2026, 8, 6), {"a": {"b": 5}})
+
+    assert rows[0]["claim_missing"] is True
+    assert rows[0]["verdict"] == hypotheses.VERDICT_UNJUDGEABLE, (
+        "실측이 예측을 만족해도 주장 지표가 없으면 '확인'을 내면 안 된다"
+    )
+    assert rows[0]["actual"] == 5, "실측은 사실이므로 그대로 남긴다 — 무효화하는 것은 판정뿐이다"
+
+
+def test_a_claim_metric_restores_normal_judgement():
+    entry = _role_entry([{"metric": "a.b", "expect": "<= 10", "역할": hypotheses.ROLE_CLAIM}])
+    rows = hypotheses.evaluate([entry], date(2026, 8, 6), {"a": {"b": 5}})
+
+    assert rows[0]["claim_missing"] is False
+    assert rows[0]["verdict"] == hypotheses.VERDICT_CONFIRMED
+
+
+def test_declaring_a_cost_without_measuring_it_is_flagged():
+    """규약 E — 08-04 Fix#8은 "(대가로 얇은 사이클이 생긴다)"라고 **선언해 놓고** 그것을 재는
+    지표를 등록하지 않았다. 밀림 0건이라는 훌륭한 숫자 뒤에서 먼슬리 북이 38% 확률로
+    얇아지고 4분이 통째로 사라진 것을 다음날에야 알았다.
+    """
+    entry = _role_entry(
+        [{"metric": "a.b", "expect": "<= 10", "역할": hypotheses.ROLE_CLAIM}],
+        대가="얇은 사이클이 생긴다",
+    )
+    rows = hypotheses.evaluate([entry], date(2026, 8, 6), {"a": {"b": 5}})
+
+    assert rows[0]["cost_missing"] is True
+    # 대가 미등록은 판정을 막지는 않는다 — 주장은 검정됐다. 경고만 띄운다.
+    assert rows[0]["verdict"] == hypotheses.VERDICT_CONFIRMED
+
+
+def test_a_registered_cost_metric_clears_the_flag():
+    entry = _role_entry(
+        [
+            {"metric": "a.b", "expect": "<= 10", "역할": hypotheses.ROLE_CLAIM},
+            {"metric": "a.c", "expect": ">= 0", "역할": hypotheses.ROLE_COST},
+        ],
+        대가="얇은 사이클이 생긴다",
+    )
+    rows = hypotheses.evaluate([entry], date(2026, 8, 6), {"a": {"b": 5, "c": 1}})
+
+    assert all(r["cost_missing"] is False for r in rows)
+
+
+def test_every_pending_hypothesis_in_the_repo_has_a_claim_metric():
+    """규약 E를 **실제 파일에** 강제한다 — 새 가설을 주장 지표 없이 등재하면 여기서 깨진다."""
+    entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
+    pending = [e for e in entries if str(e.get("상태", "")).lower() == "pending"]
+    assert pending, "pending이 하나도 없으면 이 테스트가 아무것도 안 지킨다"
+
+    for entry in pending:
+        roles = [str(p.get("역할", hypotheses.ROLE_REFERENCE)) for p in entry.get("예측") or []]
+        assert hypotheses.ROLE_CLAIM in roles, f"{entry['id']}: 주장 지표가 없다"
+        if entry.get("대가"):
+            assert hypotheses.ROLE_COST in roles, f"{entry['id']}: 대가를 선언하고 안 쟀다"
