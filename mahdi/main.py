@@ -865,14 +865,26 @@ async def run_observation_loop(
         ack = KISWebSocketClient.parse_subscription_ack(message)
         if ack is None:
             return
-        if ack.succeeded:
+        if ack.succeeded and ack.is_unsubscribe:
+            # 2026-08-05(§2 이상점 7 / Fix#6): 해제 응답을 "구독 확립"으로 적고 있었다
+            # (08-05 하루 1,218줄). ATM 롤링 때마다 나므로 로그의 상당 부분이 사실과 반대였다.
+            logger.info("WS 구독 해제 확인: %s %s — %s", ack.tr_id, ack.tr_key, ack.message)
+        elif ack.succeeded:
             logger.info("WS 구독 확립: %s %s — %s", ack.tr_id, ack.tr_key, ack.message)
         else:
             logger.warning(
                 "WS 구독 실패: %s %s — rt_cd=%s %s %s", ack.tr_id, ack.tr_key,
                 ack.rt_cd, ack.msg_code, ack.message,
             )
-        if ack.tr_id == tr_codes.WS_TR_MARKET_OPERATION_INFO and ack.succeeded and ws_liveness is not None:
+        # `not ack.is_unsubscribe`(2026-08-05 Fix#6): 이 값은 CB 감지의 **생존 신호**다 —
+        # 해제 응답으로 갱신되면 "구독이 살아 있다"는 증거가 거꾸로 만들어진다. 지금은
+        # H0UNMKO0을 해제하는 경로가 없어 잠복 상태지만, 생기는 날 조용히 틀린다.
+        if (
+            ack.tr_id == tr_codes.WS_TR_MARKET_OPERATION_INFO
+            and ack.succeeded
+            and not ack.is_unsubscribe
+            and ws_liveness is not None
+        ):
             subscribed_at = db.local_now()
             ws_liveness.market_op_subscribed_at = subscribed_at
             # 2026-08-04(COCKPIT 육안 점검): **여기서 DB에 즉시 쓴다.** 하트비트(300초)에만 맡기면
@@ -2846,11 +2858,22 @@ async def poll_signal_fusion_cycle(
                 # 2026-08-05(§2 이상점 2 / Fix#3) — 메타 라벨 입력도 실데이터로 채운다.
                 # 종전의 `MetaLabelContext()`는 전 필드가 "페널티 없음"이라
                 # `gamma_regime_stable=True`가 확신도를 한 등급 부풀렸다(근거는 함수 주석).
+                # 2026-08-05(§2 이상점 6 / Fix#5) — 하루 전략 상한을 실제로 걸리게 한다.
+                # 종전에는 이 인자도 생략돼 항상 `frozenset()`이었고, v6 §11.4의 "하루 우선
+                # 전략군 2개 이하" 상한이 전 이력 무력이었다(`db.entry_strategies_used_today`
+                # 주석 참고). 조회 실패가 판단 자체를 막지 않도록 이 한 줄만 별도로 감싼다 —
+                # 상한은 안전장치이지 판단의 전제가 아니다.
+                try:
+                    already_used_today = db.entry_strategies_used_today(conn, poll_time.date())
+                except Exception:
+                    logger.warning("오늘 사용 전략 조회 실패 — 이번 사이클은 상한 없이 진행", exc_info=True)
+                    already_used_today = frozenset()
                 vrp = chain_inputs.get("vrp")
                 decision = fusion_engine.evaluate(
                     signal_inputs,
                     _build_meta_label_context(signal_inputs),
                     vrp=vrp if vrp is not None else 0.0,
+                    already_used_strategies_today=already_used_today,
                 )
 
                 # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)

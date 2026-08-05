@@ -56,6 +56,23 @@ class SubscriptionAck:
     def succeeded(self) -> bool:
         return self.rt_cd == "0"
 
+    @property
+    def is_unsubscribe(self) -> bool:
+        """
+        계산: 이 응답이 **구독 해제** 요청에 대한 것인지. KIS는 등록/해제를 같은 형태의 제어
+             메시지로 돌려주고 둘을 가르는 필드가 따로 없어 `msg1`로 구분한다
+             (2026-08-05 실측: `SUBSCRIBE SUCCESS` / `UNSUBSCRIBE SUCCESS` 두 값뿐).
+        해석: 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 7 / Fix#6). 종전에는 이 구분이
+             없어 `mahdi.main`이 **해제 응답까지 "WS 구독 확립"으로 기록**했다(08-05 하루
+             1,218줄). 문구만의 문제가 아니다 — 같은 분기가
+             `ws_status.market_op_subscribed_at`(CB 감지 생존 신호)도 갱신하므로,
+             H0UNMKO0을 해제하는 경로가 생기는 순간 **해제가 구독 성립으로 기록된다.**
+             지금은 그 경로가 없어(08-05 실측 H0UNMKO0은 SUBSCRIBE 1건뿐) 잠복 상태다.
+        실패 조건: 없음 — KIS가 문구를 바꾸면 False로 떨어진다. 그 경우 동작은 2026-08-05
+                  이전과 같아지므로(전부 구독으로 취급) 안전한 방향의 기본값이다.
+        """
+        return self.message.strip().upper().startswith("UNSUBSCRIBE")
+
 
 class ApprovalKeyIssuer:
     """WS 접속키(approval_key) 발급 — REST 엔드포인트를 통해서만 발급 가능."""

@@ -126,13 +126,29 @@ def enforce_daily_strategy_cap(
     """
     입력: select_strategies()가 반환한 허용 목록, 오늘 이미 사용한 전략 집합, 하루 상한
          (`strategy_gates.max_priority_strategies_per_regime_day`).
-    계산: 오늘 이미 쓴 전략(연속 사용)을 우선 포함하고, 남는 슬롯을 새 전략으로 채운다
+    계산: 오늘 이미 쓴 전략(연속 사용)은 상한과 무관하게 통과시키고, **새 전략은 남은 슬롯
+         (`cap - len(already_used_today)`)만큼만** 통과시킨다
          (v6 §11.4 "하루 레짐당 우선 전략군 2개 이하로 제한 — 다각화는 전략 수가 아니라
          알파 원천의 다각화").
+
+    2026-08-05(운영점검보고서 2026-08-05 §2 이상점 6 / Fix#5) — **상한이 하루 누적으로
+    걸리지 않고 있었다.** 종전 구현은 `(continuing + fresh)[:cap]`이라 **이번 호출의 목록
+    길이**만 잘랐다. 그런데 `select_strategies()`가 반환하는 §11.4 매트릭스 셀은 전부
+    원소 1개짜리다 — 즉 `[:2]`가 1개짜리 리스트를 자르는 일은 **한 번도 없었고**, 상한은
+    호출 결과에 아무 영향을 주지 못했다.
+
+    구체적으로: 오늘 이미 A·B 두 전략을 썼고(상한 도달) 이번 분에 C가 허용되면,
+    종전 구현은 `continuing=[] / fresh=[C]` → `[C][:2] = [C]`로 **세 번째 전략을 통과**시켰다.
+    이제는 남은 슬롯이 0이라 `[]`가 되어 실제로 막힌다.
+
+    연속 사용(`continuing`)을 상한에서 제외하는 이유: 이미 쓴 전략을 계속하는 것은 **새로운
+    알파 원천을 추가하는 행위가 아니다.** §11.4가 제한하려는 것은 "하루에 벌여놓는 전략군의
+    가짓수"이지 기존 포지션의 유지가 아니다.
     실패 조건: cap이 0 이하면 빈 목록(신규/기존 전략 모두 차단).
     """
     if cap <= 0:
         return []
     continuing = [s for s in allowed_strategies if s in already_used_today]
-    fresh = [s for s in allowed_strategies if s not in already_used_today]
-    return (continuing + fresh)[:cap]
+    remaining_slots = max(cap - len(already_used_today), 0)
+    fresh = [s for s in allowed_strategies if s not in already_used_today][:remaining_slots]
+    return continuing + fresh

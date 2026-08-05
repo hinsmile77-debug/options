@@ -160,3 +160,32 @@ def test_subscribe_and_unsubscribe_are_logged(caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert any("WS 구독 요청" in m for m in messages)
     assert any("WS 구독 해제" in m for m in messages)
+
+
+# ===== 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 7 / Fix#6) — 등록/해제 구분 =====
+
+
+def test_subscription_ack_distinguishes_unsubscribe_from_subscribe():
+    """KIS는 등록/해제를 같은 형태로 돌려주고 둘을 가르는 필드가 없다 — msg1로 구분한다
+    (2026-08-05 실측: `SUBSCRIBE SUCCESS` 1,249건 / `UNSUBSCRIBE SUCCESS` 1,218건)."""
+    def _ack(msg1: str):
+        return KISWebSocketClient.parse_subscription_ack(
+            {
+                "header": {"tr_id": "H0IOCNT0", "tr_key": "C01608A24"},
+                "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": msg1},
+            }
+        )
+
+    assert _ack("UNSUBSCRIBE SUCCESS").is_unsubscribe is True
+    assert _ack("SUBSCRIBE SUCCESS").is_unsubscribe is False
+    # 둘 다 rt_cd=0이다 — succeeded만으로는 절대 구분되지 않는다.
+    assert _ack("UNSUBSCRIBE SUCCESS").succeeded is True
+
+
+def test_subscription_ack_unknown_wording_falls_back_to_subscribe():
+    """KIS가 문구를 바꾸면 False로 떨어진다 — 그 경우 동작은 2026-08-05 이전과 같아지므로
+    (전부 구독으로 취급) 안전한 방향의 기본값이다."""
+    ack = KISWebSocketClient.parse_subscription_ack(
+        {"header": {"tr_id": "H0IOCNT0"}, "body": {"rt_cd": "0", "msg1": "OK"}}
+    )
+    assert ack.is_unsubscribe is False

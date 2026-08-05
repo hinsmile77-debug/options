@@ -5017,3 +5017,152 @@ def test_poll_signal_fusion_cycle_passes_real_meta_label_context(monkeypatch):
 
     # regime_state가 None이므로 stability_flag를 모른다 → 안정으로 치지 않는다.
     assert captured and captured[0].gamma_regime_stable is False
+
+
+# --- 하루 전략 상한 배선(2026-08-05 §2 이상점 6 / Fix#5) -------------------------------------
+
+
+def _spy_evaluate(monkeypatch, captured: list):
+    from mahdi.fusion.engine import SignalFusionEngine
+
+    real_evaluate = SignalFusionEngine.evaluate
+
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+        captured.append(already_used_strategies_today)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+
+    monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
+
+
+def _run_one_fusion_cycle(monkeypatch, recorded: list):
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None: recorded.append(risk_gate_state),
+    )
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
+
+    async def fake_sleep(seconds):
+        if len(recorded) >= 1:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(_FakeRegimeStateMachineWithLastState(None), interval_seconds=60))
+
+
+def test_poll_signal_fusion_cycle_passes_todays_used_strategies(monkeypatch):
+    """회귀 방지 §2 이상점 6(Fix#5): 이 인자가 안 넘어가면 v6 §11.4의 하루 전략 상한이
+    전 이력 무력이다. ADVISORY라 실손실이 없을 뿐, "안전장치는 죽었는지 알 수 있어야 한다"는
+    §5-4 원칙에 어긋난다."""
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    _patch_chain(monkeypatch, [], spot=None)
+    monkeypatch.setattr(
+        "mahdi.main.db.entry_strategies_used_today",
+        lambda conn, on_date: frozenset({"atm_long"}),
+    )
+    captured: list = []
+    _spy_evaluate(monkeypatch, captured)
+
+    _run_one_fusion_cycle(monkeypatch, [])
+
+    assert captured == [frozenset({"atm_long"})]
+
+
+def test_poll_signal_fusion_cycle_survives_used_strategy_lookup_failure(monkeypatch):
+    """상한은 안전장치이지 판단의 전제가 아니다 — 조회가 깨져도 판단은 계속돼야 한다."""
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    _patch_chain(monkeypatch, [], spot=None)
+
+    def boom(conn, on_date):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("mahdi.main.db.entry_strategies_used_today", boom)
+    captured: list = []
+    _spy_evaluate(monkeypatch, captured)
+
+    recorded: list = []
+    _run_one_fusion_cycle(monkeypatch, recorded)
+
+    assert captured == [frozenset()]  # 상한 없이 진행
+    assert len(recorded) == 1  # 판단 자체는 기록됐다
+
+
+# --- WS 등록/해제 응답 구분(2026-08-05 §2 이상점 7 / Fix#6) ----------------------------------
+
+
+def _run_loop_with_ack(monkeypatch, ack_json: str, liveness):
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([ack_json]))
+    manager = RollingSubscriptionManager(ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 9, 20, 1))
+
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [manager], FakeRestClient(spot=350.0), futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+                ws_liveness=liveness,
+            )
+        )
+
+
+def test_unsubscribe_ack_is_not_logged_as_a_subscription(monkeypatch, caplog):
+    """08-05 하루 1,218줄이 해제 응답인데 "WS 구독 확립"으로 적혀 있었다 —
+    ATM 롤링마다 나오므로 로그의 상당 부분이 사실과 반대였다."""
+    ack = json.dumps(
+        {
+            "header": {"tr_id": "H0IOCNT0", "tr_key": "C01608A24"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "UNSUBSCRIBE SUCCESS"},
+        }
+    )
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        _run_loop_with_ack(monkeypatch, ack, mahdi_main.WsLiveness())
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("WS 구독 해제 확인" in m for m in messages)
+    assert not any("WS 구독 확립" in m for m in messages)
+
+
+def test_subscribe_ack_still_logs_as_a_subscription(monkeypatch, caplog):
+    ack = json.dumps(
+        {
+            "header": {"tr_id": "H0IOCNT0", "tr_key": "C01608A24"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }
+    )
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        _run_loop_with_ack(monkeypatch, ack, mahdi_main.WsLiveness())
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("WS 구독 확립" in m for m in messages)
+    assert not any("WS 구독 해제 확인" in m for m in messages)
+
+
+def test_market_op_unsubscribe_does_not_forge_a_liveness_signal(monkeypatch):
+    """`market_op_subscribed_at`은 CB 감지의 **생존 신호**다 — 해제 응답으로 갱신되면
+    "구독이 살아 있다"는 증거가 거꾸로 만들어진다. 지금은 H0UNMKO0을 해제하는 경로가 없어
+    잠복 상태지만(08-05 실측 SUBSCRIBE 1건뿐), 생기는 날 조용히 틀린다."""
+    ack = json.dumps(
+        {
+            "header": {"tr_id": tr_codes.WS_TR_MARKET_OPERATION_INFO, "tr_key": "005930"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "UNSUBSCRIBE SUCCESS"},
+        }
+    )
+    liveness = mahdi_main.WsLiveness()
+    _run_loop_with_ack(monkeypatch, ack, liveness)
+
+    assert liveness.market_op_subscribed_at is None

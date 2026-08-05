@@ -51,19 +51,36 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 - [ ] **로그 볼륨 100~300줄 예상**(사람이 읽는 줄의 4~10%). **1,000줄을 넘으면 임계를 3.5초로**
       올린다 — 단 4.0초 미만은 유지해야 한다(불변식 테스트가 막는다).
 
+### Fix#5 (하루 전략 상한) / Fix#6 (WS 등록·해제 구분)
+
+- [ ] **`WS 구독 확립` 줄 수 ≈ `WS 구독 요청` 줄 수**, `WS 구독 해제 확인` ≈ `WS 구독 해제`.
+      08-05에는 확립 1,249 / 해제확인 0줄이었다(해제 1,218건이 전부 "확립"으로 기록됨).
+      자동 리포트가 파싱하지 않는 줄이라 **수기 확인**이다.
+- [ ] **하루 distinct 진입 전략 ≤ 2** — `hypotheses.yaml` 2026-08-05-p5.
+      **ENTER가 3회 이상, 그것도 서로 다른 전략으로 나기 전까지는 공허하게 참이다** —
+      "확인"이 떠도 상한이 동작한다는 증거가 아니다. 판정 근거는 단위테스트에 있다.
+- [ ] `오늘 사용 전략 조회 실패` WARNING이 뜨는지 — 뜨면 DB 조회 쪽 문제이지 판단 문제가
+      아니다(그 사이클은 상한 없이 진행된다).
+
 ## [MW0601] 2026-08-05 신규 발견 — 아직 안 고친 것
 
 - [x] **(2026-08-05 구현) `MetaLabelContext()` 전 필드 기본값 — Fix#3.**
       `gamma_regime_stable`을 `GEX>=0 & stability_flag`로 배선(`_build_meta_label_context()`).
       **`event_proximity_minutes`는 여전히 None** — 매크로 이벤트 캘린더 소스가 프로젝트에
       없다. 이것만은 "사실"이 아니라 **미지**이므로 아래에 별도 항목으로 남긴다.
-- [ ] **`already_used_strategies_today` 미전달** (08-05 §2 이상점 6, P2) —
-      `enforce_daily_strategy_cap`(하루 2개 제한)이 전 이력 무효. ADVISORY라 드러나지 않을 뿐,
-      "안전장치는 죽었는지 알 수 있어야 한다"는 §5-4 원칙 위반이다.
+- [x] **(2026-08-05 구현) `already_used_strategies_today` 미전달 — Fix#5.**
+      `db.entry_strategies_used_today()` 신설 + 배선. **구현 중 더 근본적인 결함이 나왔다**:
+      `enforce_daily_strategy_cap`이 `(continuing+fresh)[:cap]`으로 이번 호출의 길이만 잘랐는데
+      §11.4 매트릭스 셀이 전부 1개짜리라 `[:2]`가 자를 일이 없었다 — 인자를 제대로 넘겼어도
+      상한은 무력이었다. 남은 슬롯(`cap - len(already_used)`) 계산으로 정정.
 - [x] **(2026-08-05 구현) slow-call 임계 > read 타임아웃 — Fix#4.**
       임계 5.0 → 3.0초 + 타임아웃은 임계와 무관하게 무조건 로깅 + **불변식 테스트**로
       `임계 < min(모든 read 타임아웃)`을 기계적으로 강제
       (`test_slow_call_threshold_must_stay_below_every_read_timeout`).
+- [x] **(2026-08-05 구현) WS UNSUBSCRIBE ACK를 "구독 확립"으로 기록 — Fix#6.**
+      `SubscriptionAck.is_unsubscribe`(msg1 접두사 판정) 신설. 문구뿐 아니라
+      **`ws_status.market_op_subscribed_at`(CB 감지 생존 신호)이 해제 응답으로 갱신되던
+      잠복 결함**도 함께 닫았다.
 - [ ] **`_record_http_latency()`가 국내/해외 `inquire-price`를 한 행에 섞는다** (P2) —
       둘 다 마지막 경로 조각이 `inquire-price`다. §9-1의 `inquire-price` 행에 매크로 호출
       (~88건/일, 약 3%)이 섞여 있다. `timeout_for_url()`은 전체 경로로 키를 잡아 이미

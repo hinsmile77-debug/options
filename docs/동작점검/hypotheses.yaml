@@ -480,3 +480,28 @@
     임계와 타임아웃 중 어느 쪽을 바꿔도 테스트가 깨진다. 08-04의 실수는 **둘을 각각 옳게 바꾸고
     그 사이의 관계를 아무도 안 본 것**이었다(2026-08-05 고도화#3의 국소 적용).
   상태: pending
+
+- id: "2026-08-05-p5-daily-strategy-cap"
+  구현일: 2026-08-05
+  검증예정일: 2026-08-06
+  가설: "하루에 진입한 distinct 전략 수가 상한(2)을 넘지 않는다"
+  근거: "08-05 §2 이상점 6 — `evaluate()`의 `already_used_strategies_today`가 한 번도 전달된
+        적이 없어 항상 frozenset()이었고, v6 §11.4 '하루 우선 전략군 2개 이하' 상한이 전 이력
+        무력이었다. 게다가 `enforce_daily_strategy_cap` 자체가 `(continuing+fresh)[:cap]`으로
+        **이번 호출의 목록 길이**만 잘랐는데, §11.4 매트릭스 셀은 전부 원소 1개짜리라
+        `[:2]`가 자를 일이 한 번도 없었다 — 오늘 이미 A·B를 썼어도 세 번째 C가 통과했다."
+  예측:
+    - metric: db.decisions.distinct_entry_strategies
+      expect: "<= 2 (수기 판정)"
+  주의: |
+    **이 가설은 ENTER가 나기 전까지 공허하게 참이다.** 08-05은 ENTER 0건이었고 p1이 예측하는
+    08-06 ENTER도 0~5건이라, 상한이 실제로 걸리려면 **서로 다른 전략으로 3번째 진입**이
+    나와야 한다. 즉 08-06에 "확인"이 떠도 그것이 상한이 동작한다는 증거는 아니다 —
+    회귀를 막는 불변식으로 등재해 두는 것이고, 판정 근거는 단위테스트
+    (`test_daily_cap_blocks_a_third_fresh_strategy_once_the_cap_is_reached`)에 있다.
+
+    **알려진 한계**: `already_used_today`의 출처가 `signal_decisions`(권고된 진입)이지
+    체결이 아니다. `trade_history`가 0행이라 그것 말고 셀 것이 없다 — 실주문 경로가 배선되면
+    출처를 `trade_history`로 옮겨야 하고, 그 전까지 권고와 체결이 갈리는 순간 이 집합은
+    사실과 달라진다.
+  상태: pending

@@ -105,3 +105,48 @@ def test_non_entry_strategies_are_all_actually_produced_by_the_matrix():
     produced = set(select_strategies(RegimeLabel.RANGE_BALANCED, vrp=0.0).allowed_strategies)
     produced |= set(select_strategies(RegimeLabel.VOL_COMPRESSION, vrp=0.0).allowed_strategies)
     assert NON_ENTRY_STRATEGIES == produced
+
+
+# --- 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 6 / Fix#5): 하루 상한이 실제로 걸리는가 ---
+
+
+def test_daily_cap_blocks_a_third_fresh_strategy_once_the_cap_is_reached():
+    """**이것이 08-05까지 안 걸리던 경우다.**
+
+    종전 구현은 `(continuing + fresh)[:cap]`이라 **이번 호출의 목록 길이**만 잘랐다.
+    그런데 §11.4 매트릭스 셀은 전부 원소 1개짜리라 `[:2]`가 자를 일이 없었다 —
+    오늘 이미 A·B를 썼어도 세 번째 전략 C가 그대로 통과했다.
+    """
+    result = enforce_daily_strategy_cap(
+        ["small_strangle_buy"], already_used_today=frozenset({"atm_long", "debit_spread"}), cap=2
+    )
+    assert result == []
+
+
+def test_daily_cap_always_allows_continuing_an_already_used_strategy():
+    """연속 사용은 새 알파 원천을 추가하는 행위가 아니다 — 상한에 걸리면 안 된다."""
+    result = enforce_daily_strategy_cap(
+        ["atm_long"], already_used_today=frozenset({"atm_long", "debit_spread"}), cap=2
+    )
+    assert result == ["atm_long"]
+
+
+def test_daily_cap_leaves_room_for_exactly_the_unused_slots():
+    result = enforce_daily_strategy_cap(
+        ["fresh_a", "fresh_b"], already_used_today=frozenset({"used_c"}), cap=2
+    )
+    assert result == ["fresh_a"]  # 남은 슬롯 1개
+
+
+def test_daily_cap_is_a_noop_when_nothing_used_yet():
+    result = enforce_daily_strategy_cap(["atm_long"], already_used_today=frozenset(), cap=2)
+    assert result == ["atm_long"]
+
+
+def test_matrix_cells_are_single_strategy_which_is_why_the_old_cap_never_bound():
+    """상한이 무력이었던 **구조적 이유**를 고정한다 — 셀이 1개짜리라 길이 자르기로는 못 막는다.
+    나중에 셀이 여러 전략을 담게 되면 이 테스트가 깨지고, 그때 상한 설계를 다시 봐야 한다."""
+    for regime in (RegimeLabel.TREND_UP_STRONG, RegimeLabel.RANGE_BALANCED,
+                   RegimeLabel.VOL_EXPANSION, RegimeLabel.VOL_COMPRESSION):
+        for vrp in (-0.05, 0.0, 0.1):
+            assert len(select_strategies(regime, vrp).allowed_strategies) <= 1

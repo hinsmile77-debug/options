@@ -913,3 +913,42 @@ def test_mark_market_op_subscribed_touches_only_its_own_column():
     assert "UPDATE ws_status SET market_op_subscribed_at=%s" in query
     assert "updated_at" not in query and "connected_since" not in query
     assert conn.committed is True
+
+
+# ===== 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 6 / Fix#5) — 오늘 사용한 전략 =====
+
+
+def test_entry_strategies_used_today_returns_distinct_names():
+    conn = FakeReadConnection([("atm_long",), ("debit_spread",)])
+
+    result = db.entry_strategies_used_today(conn, date(2026, 8, 6))
+
+    assert result == frozenset({"atm_long", "debit_spread"})
+    assert conn.store["params"] == (date(2026, 8, 6),)
+
+
+def test_entry_strategies_used_today_counts_entries_not_allowances():
+    """허용(`allowed_strategies`)이 아니라 진입(`entry_strategies`)을 세야 한다.
+
+    허용을 세면 `wait_and_see`가 열려 있던 분까지 "전략을 썼다"로 계수돼 상한이 장 시작
+    몇 분 만에 소진된다.
+    """
+    conn = FakeReadConnection([])
+    db.entry_strategies_used_today(conn, date(2026, 8, 6))
+
+    query = conn.store["query"]
+    assert "risk_gate_state->'entry_strategies'" in query
+    assert "decision = 'ENTER'" in query
+    assert "allowed_strategies" not in query
+
+
+def test_entry_strategies_used_today_skips_rows_without_a_json_array():
+    """구버전 기록(키 없음/배열 아님)이 오늘 판단을 죽이면 안 된다 — SQL에서 걸러낸다."""
+    conn = FakeReadConnection([])
+    db.entry_strategies_used_today(conn, date(2026, 8, 6))
+
+    assert "jsonb_typeof(risk_gate_state->'entry_strategies') = 'array'" in conn.store["query"]
+
+
+def test_entry_strategies_used_today_is_empty_when_no_entries():
+    assert db.entry_strategies_used_today(FakeReadConnection([]), date(2026, 8, 6)) == frozenset()

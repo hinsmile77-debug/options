@@ -1071,6 +1071,44 @@ def insert_signal_decision(
     conn.commit()
 
 
+def entry_strategies_used_today(conn: ConnectionLike, on_date: date) -> frozenset[str]:
+    """
+    입력: DB 커넥션, 기준 날짜(보통 `local_now().date()`).
+    계산: 그날 `decision='ENTER'`로 기록된 판단 행들의 `risk_gate_state.entry_strategies`를
+         모아 **중복 없는 전략 이름 집합**으로 돌려준다.
+    해석: 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 6 / Fix#5) —
+         `SignalFusionEngine.evaluate()`의 `already_used_strategies_today` 인자가 **한 번도
+         전달된 적이 없어** 항상 `frozenset()`이었다. 그 결과 v6 §11.4의 "하루 레짐당 우선
+         전략군 2개 이하" 상한(`enforce_daily_strategy_cap`)이 전 이력 무력이었다.
+         지금은 ADVISORY라 실손실이 없지만, **"안전장치는 죽었는지 알 수 있어야 한다"**는
+         §5-4 원칙에 어긋난다(07-30 CB 하트비트에서 같은 종류의 문제를 겪었다).
+
+         **`allowed_strategies`가 아니라 `entry_strategies`를 세는 이유**: 허용은 "이 셀이
+         열려 있다"이고 사용은 "실제로 들어갔다"이다. 허용을 세면 `wait_and_see`가 열려 있던
+         분까지 "전략을 썼다"로 계수돼 상한이 장 시작 몇 분 만에 소진된다.
+         `entry_strategies`는 `entry_strategies()`가 관망 계열을 걸러낸 뒤의 목록이다.
+
+         **알려진 한계(실행 배선 시 교체할 것)**: 지금 이 값의 출처는 `signal_decisions`,
+         즉 **"권고된 진입"**이지 체결이 아니다. `trade_history`가 0행이라 그것 말고 셀 것이
+         없다. 실주문 경로가 배선되면 출처를 `trade_history`로 옮겨야 한다 — 권고와 체결이
+         갈리기 시작하는 순간부터 이 집합은 사실과 달라진다.
+    실패 조건: 그날 ENTER가 없으면 빈 frozenset. `entry_strategies` 키가 없거나 배열이 아닌
+              행(구버전 기록)은 조용히 건너뛴다 — 과거 기록 때문에 오늘 판단이 죽으면 안 된다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT jsonb_array_elements_text(risk_gate_state->'entry_strategies')
+            FROM signal_decisions
+            WHERE timestamp::date = %s
+              AND decision = 'ENTER'
+              AND jsonb_typeof(risk_gate_state->'entry_strategies') = 'array'
+            """,
+            (on_date,),
+        )
+        return frozenset(row[0] for row in cur.fetchall() if row[0])
+
+
 def insert_risk_snapshot(
     conn: ConnectionLike,
     timestamp: datetime,
