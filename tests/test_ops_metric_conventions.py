@@ -142,3 +142,47 @@ def test_strike_window_design_matches_the_live_poller():
 
     assert db_metrics.STRIKE_WINDOW_EACH_SIDE == main.STRIKES_EACH_SIDE
     assert db_metrics.KOSPI200_STRIKE_INTERVAL == main.KOSPI200_OPTION_STRIKE_INTERVAL
+
+
+def test_design_leg_counts_are_derived_from_the_live_poller():
+    """2026-08-05 §2-7 — 설계 레그 수 상수가 관측 루프의 실제 구독 폭과 같아야 한다.
+
+    `ops`는 `mahdi.main`을 import하지 않는다(관측 계층이 오케스트레이터를 끌고 오면 안 된다).
+    그 대가로 상수가 양쪽에 존재하게 되므로, **갈라지지 않는 것은 이 테스트가 지킨다** —
+    `log_metrics`가 순수 파서로 남으면서 계약 테스트로 묶이는 것과 같은 구조다.
+
+    갈라지면 "먼슬리 레그 완전성"(§12)이 조용히 틀린 분모로 계산된다: 예컨대 `STRIKES_EACH_SIDE`를
+    2 → 3으로 넓히면 설계값은 14인데 상수가 10에 머물러 **미달 분이 0으로 보고된다.**
+    """
+    from mahdi import main
+    from mahdi.ops import db_metrics
+
+    strikes = 2 * main.STRIKES_EACH_SIDE + 1
+    assert db_metrics.MONTHLY_LEGS_PER_CYCLE_DESIGN == strikes * 2
+    # 한 사이클 = 먼슬리 1북 + 위클리 1북(격분, OPTION_CHAIN_SLOW_SERIES_PHASE로 짝/홀 분리).
+    assert len(main.OPTION_CHAIN_SLOW_SERIES_PHASE) == main.OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES
+    assert db_metrics.CHAIN_LEGS_PER_CYCLE_DESIGN == strikes * 2 * 2
+
+
+def test_gamma_flip_minimum_legs_is_shared_not_copied():
+    """§12의 "BS 최소 미달 분"은 `find_gamma_flip`이 실제로 쓰는 임계와 같아야 한다."""
+    from mahdi.features import options_intel
+    from mahdi.ops import db_metrics
+
+    assert db_metrics.GAMMA_FLIP_MIN_LEGS is options_intel.GAMMA_FLIP_MIN_LEGS
+
+
+def test_closing_auction_boundary_has_a_single_source():
+    """규약 B — 종가 단일가 경계를 아는 곳은 `mahdi.session` 하나여야 한다(2026-08-05 §2-8).
+
+    08-05까지 이 지식은 **화면에만** 있었다(`dashboard/data_source._CLOSING_AUCTION_START`).
+    그래서 판단 경로는 15:36~15:44에 `orderflow_ofi_vpin`이 죽는 것을 "데이터 없음"으로만
+    기록했고, 장애와 시장 구조가 구분되지 않았다.
+    """
+    from mahdi import main, session
+    from mahdi.dashboard import data_source
+    from mahdi.ops import db_metrics
+
+    assert data_source._CLOSING_AUCTION_START is session.CLOSING_AUCTION_START
+    # 사유 문자열도 한 곳에서 온다 — 갈라지면 §14-1의 "구조적" 열이 조용히 0이 된다.
+    assert main.MEMBER_UNAVAILABLE_CLOSING_AUCTION == db_metrics.STRUCTURAL_UNAVAILABLE_REASON

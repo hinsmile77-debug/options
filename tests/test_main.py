@@ -3235,7 +3235,9 @@ def test_member_unavailable_reasons_names_the_missing_ingredient():
     """2026-08-04 고도화#2 — 숫자 하나(`available_member_count`)로는 어느 멤버가 왜 죽었는지 모른다."""
     from mahdi.main import _member_unavailable_reasons
 
-    reasons = _member_unavailable_reasons(SignalInputs())
+    # 2026-08-05 §2-8: 판단 시각이 필수 인자가 됐다 — 연속거래 중의 시각을 명시한다.
+    # (기본값을 `db.local_now()`로 두면 이 테스트가 15:35 이후에만 다른 답을 낸다.)
+    reasons = _member_unavailable_reasons(SignalInputs(), datetime(2026, 8, 5, 14, 0))
 
     assert reasons["xgboost_tabular"] == "미학습(Phase 3)"
     assert reasons["lstm_temporal"] == "미학습(Phase 3)"
@@ -5298,3 +5300,114 @@ def test_fusion_cycle_applies_the_event_penalty_near_an_event(monkeypatch):
     _run_fusion_cycle_with_calendar(monkeypatch, calendar, far, datetime(2026, 8, 6, 10, 0))
 
     assert near[0]["conviction_score"] == pytest.approx(far[0]["conviction_score"] * 0.5)
+
+
+# ===== 2026-08-05 §2-6 / §2-7 — 0행 사이클과 북 수집 순서 =====
+
+
+def test_collect_option_chain_cycle_visits_the_monthly_book_first():
+    """수집 순서 불변식 — **먼슬리가 먼저다.**
+
+    이 순서는 Fix#8(사이클 예산)의 설계 전제다: 예산이 끊으면 잘려나가는 쪽은 뒤쪽이므로,
+    판단의 주입력(먼슬리 = GEX/감마플립의 유일한 입력, v6 §11.4)이 먼저 채워져야 한다.
+    `_collect_option_chain_cycle` docstring이 이 순서를 **단언**하고 있는데 지금까지 아무도
+    검증하지 않았다 — 08-04 §2-1이 "검증되지 않은 단언은 주석이 아니라 오보"라고 적은 그 형태다.
+
+    (08-05 §2-7 조사 결과 순서 자체는 옳았다. 14:31/14:46에 먼슬리가 0레그였던 것은 순서가
+     아니라 **먼슬리 레그가 전부 타임아웃**했기 때문이다 — 그래서 이 테스트는 회귀 방지용이다.)
+    """
+    from mahdi.main import _collect_option_chain_cycle
+
+    rest_client = _FakeRestClientCountingQuotes([1000.0], 0.0, _OPTION_QUOTE_FIXTURE)
+    books = [
+        (_FakeManagerManyStrikes(frozenset({1000.0})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({1000.0})), "weekly_mon"),
+        (_FakeManagerManyStrikes(frozenset({1000.0})), "weekly_thu"),
+    ]
+    _run(
+        _collect_option_chain_cycle(
+            rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 10, 0),
+            WarningThrottle(60.0),
+        )
+    )
+
+    # _FakeMaster는 series를 심볼에 싣지 않으므로 호출 순서가 곧 북 순서다 —
+    # 첫 두 건(콜/풋)이 첫 번째 북(regular)의 것이어야 한다.
+    assert len(rest_client.calls) == 6
+    assert books[0][1] == "regular", "books[0]은 먼슬리여야 한다 — 이 전제가 깨지면 예산 절단이 주입력을 자른다"
+
+
+def test_option_chain_cycle_that_collects_nothing_is_louder_than_a_truncation(monkeypatch, caplog):
+    """08-05 14:31 회귀 — `rows=0`은 "조금 잘렸다"와 **같은 줄로 보고되면 안 된다.**
+
+    그날 KIS가 53초간 전 레그를 타임아웃시켜 그 분의 체인이 통째로 사라졌는데, 로그에 남은 것은
+    예산 초과 WARNING(`...0레그로 이번 분을 마감합니다`) 한 줄뿐이었다 — 17레그로 마감한 분과
+    구분되지 않았고, 결손 지표는 사이클이 돌았으므로 세지 않았다. DB에는 0행인데 리포트 §4는
+    결손 1분만 보고했다(실제 0행 분은 4분).
+    """
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+
+    class _AlwaysFailing:
+        rate_limit_total_calls = 0
+
+        def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+            clock[0] += 4.0  # read 타임아웃과 같은 시간을 쓰고 실패한다
+            raise RuntimeError("read timeout")
+
+    books = [(_FakeManagerManyStrikes(frozenset({1000.0, 1002.5, 1005.0})), "regular")]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rows, _spot, any_strikes = _run(
+            _collect_option_chain_cycle(
+                _AlwaysFailing(), books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 14, 31),
+                # 이 테스트는 실패 경로를 실제로 태우므로 진짜 로거를 준다
+                # (다른 테스트들이 넘기는 `WarningThrottle(60.0)`은 성공 경로 전용이다).
+                WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=clock[0] + 50.0,
+            )
+        )
+
+    assert any_strikes and rows == [], "전 레그 실패는 rows=0으로 끝난다(구독은 있었다)"
+
+
+# ===== 2026-08-05 §2-8 — 종가 단일가 구간 인지 =====
+
+
+def _ofi_less_inputs():
+    from mahdi.fusion.signal_layer import SignalInputs
+
+    return SignalInputs(ofi=None, queue_imbalance=None)
+
+
+def test_missing_ofi_during_the_closing_auction_is_reported_as_market_structure():
+    """15:35~15:45에 OFI가 없는 것은 **결함이 아니라 시장 구조**다 — 사유가 그렇게 남아야 한다.
+
+    08-05 15:36~15:44: `orderflow_ofi_vpin`이 죽어 앙상블이 4 → 3으로 얇아졌는데 사유가
+    `ofi/queue_imbalance 없음`으로만 남아 장애와 구분되지 않았다. 08-04 §2-10이
+    *"종가 형성 구간이라 가치가 높다"* 고 판정한 바로 그 구간이다.
+    """
+    from mahdi.main import MEMBER_UNAVAILABLE_CLOSING_AUCTION, _member_unavailable_reasons
+
+    reasons = _member_unavailable_reasons(_ofi_less_inputs(), now=datetime(2026, 8, 5, 15, 36))
+    assert reasons["orderflow_ofi_vpin"] == MEMBER_UNAVAILABLE_CLOSING_AUCTION
+
+
+def test_missing_ofi_during_continuous_trading_is_still_reported_as_missing_data():
+    """연속거래 중의 OFI 부재는 여전히 **문제**다 — 단일가 예외가 그것까지 덮으면 안 된다."""
+    from mahdi.main import _member_unavailable_reasons
+
+    reasons = _member_unavailable_reasons(_ofi_less_inputs(), now=datetime(2026, 8, 5, 14, 0))
+    assert reasons["orderflow_ofi_vpin"] == "ofi/queue_imbalance 없음"
+
+
+def test_the_closing_auction_exception_does_not_resurrect_the_member():
+    """사유만 가른다 — **멤버를 살리지는 않는다.**
+
+    없는 값을 지어내는 것과 왜 없는지 아는 것은 다르다. 지어내면 08-03의 허수 감마플립과
+    같은 종류의 결함이 된다.
+    """
+    from mahdi.main import _member_unavailable_reasons
+
+    reasons = _member_unavailable_reasons(_ofi_less_inputs(), now=datetime(2026, 8, 5, 15, 40))
+    assert "orderflow_ofi_vpin" in reasons, "사유가 남았다는 것은 곧 미가용이라는 뜻이다"

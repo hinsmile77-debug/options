@@ -27,6 +27,40 @@ _CALL_PUT_SIGN = {"c": 1.0, "p": -1.0}
 # 지금까지 산출 실패가 조용했던 것이 §2-1 버그가 넉 달간 안 보인 직접적 원인이다.
 GAMMA_FLIP_MIN_LEGS = 6
 
+# 2026-08-05(운영점검보고서 §2-5) — 감마플립을 **수집한 행사가 범위 안**으로 가둔다.
+#
+# 08-05에 flip이 처음으로 0%를 벗어나 22분(4.5%) 산출됐는데 **21건이 수집 행사가 창 밖**이었고,
+# 그 21건의 `flip / spot` 비율이 전부 0.95~0.99에 몰려 있었다 — 탐색 그리드의 왼쪽 끝 근처다.
+# 원인은 그리드와 레그의 폭이 10배 차이난다는 것이다: 그리드는 스팟 ±5%(스팟 1040이면 104포인트)
+# 인데 실제 수집 레그는 ATM±2 = 5행사가 = **폭 10포인트**다. 그리드의 90%에는 레그가 하나도 없고,
+# 그 구간에서 모든 레그의 BS 감마는 0으로 수렴해 `gex_at(S)`가 부동소수 잔여만 남는다 —
+# 부호가 아무 이유 없이 바뀌고, 그 첫 교차점이 그리드 왼쪽 끝 근처에서 잡힌다.
+#
+# **그리드를 좁히지 않는 이유**: 탐색 범위를 레그 폭으로 줄이면 "이 북엔 flip이 탐색 범위 밖에
+# 있다"와 "탐색을 안 해봤다"를 구분할 수 없게 된다. 그리드는 그대로 두고 **판정만** 가둔다.
+#
+# 08-04에 고친 허수 flip(`v_prev == 0`이면 그리드 왼쪽 끝 반환)과 **같은 자리에서 다른 경로로
+# 재발한 것**이다. 그래서 이번엔 조용히 None으로 떨어뜨리지 않고 마커 로그를 남긴다 —
+# `log_metrics._QUALITATIVE_MARKERS`에 등록돼 리포트 §11에 매일 건수로 찍힌다.
+#
+# **경계를 [min(strike), max(strike)]로 딱 자르지 않는 이유**: 최외곽 행사가 바로 바깥에도
+# 그 행사가 레그의 감마는 여전히 실재한다. 실제로 이 저장소의 기존 테스트 구성
+# (행사가 340/350/360, 스팟 350, iv 0.18, 잔존 0.05년)의 진짜 flip은 **338.25**로 최저 행사가에서
+# 1.75포인트 아래인데, 그 지점의 1σ 이동폭은 약 14포인트라 340 레그의 감마가 충분히 살아 있다 —
+# 잡음이 아니라 정당한 flip이다. 그래서 **행사가 간격 단위의 허용치**를 둔다.
+#
+# 허용치를 "행사가 간격"으로 잡은 이유는 그것이 **데이터에서 자기교정되는 유일한 척도**이기
+# 때문이다(포인트 상수로 두면 KOSPI200과 다른 기초자산에서 의미가 달라진다). 두 사례의 분리도:
+#   - 위 테스트 구성: 간격 10, 이탈 1.75  → **0.18간격** (통과)
+#   - 08-05 실측 21건: 간격 2.5, 이탈 최소 11.2 ~ 최대 86.3 → **4.5~34.5간격** (기각)
+# 1.0간격은 이 둘 사이 어디에 둬도 판정이 같은 넓은 구간의 보수적인 쪽 끝이다.
+GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS = 1.0
+
+LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE = (
+    "감마플립 기각(레그 범위 밖) — flip %.2f, 수집 행사가 %.2f~%.2f(허용 ±%.2f), 스팟 %.2f. "
+    "탐색 그리드(스팟 ±%.0f%%)가 레그 범위 밖에서 주운 부호 전환이다"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class OptionLeg:
@@ -249,6 +283,9 @@ def find_gamma_flip(
     실패 조건: 사용 가능한 레그가 GAMMA_FLIP_MIN_LEGS 미만이면 None + WARNING. 그리드 전 구간에서
               부호가 바뀌지 않으면 None(flip 레벨이 탐색 범위 밖 — 정상적인 결과이므로 로그 없음).
               그리드 값에 NaN이 남아 있으면(방어) 그 구간은 건너뛰고, 전 구간이 NaN이면 None + WARNING.
+              **부호 전환을 찾았더라도 그 레벨이 수집 행사가 범위 [min(strike), max(strike)] 밖이면
+              None + WARNING**(2026-08-05 §2-5) — 레그가 없는 구간의 GEX(S)는 외삽이고, 거기서
+              주운 부호 전환은 수치 잡음이다. 상세 근거는 `LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE` 주석.
 
     2026-08-03(§2-1) 이전 버전은 RuntimeWarning을 억제하면서 주석에 *"값 계산 자체는 정상,
     numpy가 nan/inf를 반환할 뿐이고 그 지점은 그대로 GEX 부호 비교에 들어가 flip 계산에 영향
@@ -300,6 +337,21 @@ def find_gamma_flip(
     if all(v == 0 for _i, v in finite):
         return None
 
+    # 2026-08-05(§2-5) — 판정 경계는 그리드가 아니라 **수집한 행사가 범위 ± 1행사가 간격**이다.
+    # `usable`(BS 계산 가능 레그)에서 뽑는다: 계산에서 배제된 레그는 GEX(S) 곡선에 기여하지
+    # 않으므로 그 행사가까지 "관측했다"고 볼 수 없다.
+    # 간격은 상수로 두지 않고 **그 스냅샷의 실제 행사가에서 추론한다**(최소 양의 간격) —
+    # 위클리/먼슬리·기초자산마다 다르고, 절단된 사이클에서는 수집 행사가가 듬성해질 수 있다.
+    strikes = sorted({leg.strike for leg in usable})
+    leg_lo, leg_hi = strikes[0], strikes[-1]
+    interval = min((b - a for a, b in zip(strikes, strikes[1:])), default=0.0)
+    tolerance = interval * GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS
+
+    # 범위 밖 교차가 **범위 안 교차를 가리지 않도록** 그리드를 끝까지 훑는다. 왼쪽 끝의 수치
+    # 잡음에서 교차가 하나 잡혔다고 거기서 멈추면, 레그 범위 안의 진짜 전환을 놓친다.
+    # 로그는 호출당 최대 1줄 — 기각이 여러 번이어도 첫 건만 대표로 남긴다(레그가 없는 구간은
+    # 부호가 여러 번 튈 수 있고, 그것을 전부 남기면 §2-4에서 본 로그 폭증을 새로 만든다).
+    rejected: tuple[float, ...] | None = None
     last_nonzero: tuple[int, float] | None = None
     for i_cur, v_cur in finite:
         if v_cur == 0:
@@ -307,8 +359,15 @@ def find_gamma_flip(
         if last_nonzero is not None and last_nonzero[1] * v_cur < 0:
             i_prev, v_prev = last_nonzero
             frac = v_prev / (v_prev - v_cur)
-            return grid[i_prev] + frac * (grid[i_cur] - grid[i_prev])
+            flip = grid[i_prev] + frac * (grid[i_cur] - grid[i_prev])
+            if leg_lo - tolerance <= flip <= leg_hi + tolerance:
+                return flip
+            if rejected is None:
+                rejected = (flip, leg_lo, leg_hi, tolerance, spot, search_pct * 100)
         last_nonzero = (i_cur, v_cur)
+
+    if rejected is not None:
+        logger.warning(LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE, *rejected)
     return None
 
 

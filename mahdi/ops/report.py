@@ -107,7 +107,7 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     lines += _section("1. 한눈에 (전일 대비)", lambda: _render_headline(metrics, previous))
     lines += _section("2. 시간대별 사이클/밀림", lambda: _render_by_hour(metrics))
     lines += _section("3. 시작분 mod10 — 폴러 충돌", lambda: _render_by_mod10(metrics))
-    lines += _section("4. 결손 분", lambda: _render_missing(metrics))
+    lines += _section("4. 결손 분 — 로그 기준과 DB 기준", lambda: _render_missing(metrics, db_metrics))
     lines += _section("5. REST 수요/응답", lambda: _render_rest(metrics))
     lines += _section("6. 백오프", lambda: _render_backoff(metrics))
     lines += _section("7. 버스트 점유 시간", lambda: _render_bursts(metrics))
@@ -181,18 +181,54 @@ def _render_by_mod10(metrics: dict) -> list[str]:
     return out
 
 
-def _render_missing(metrics: dict) -> list[str]:
+def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
+    """2026-08-05 §2-6 — 결손을 **로그 축과 DB 축 두 줄로** 낸다.
+
+    로그 축은 *"사이클이 돌았는가"* 를, DB 축은 *"그 분에 행이 남았는가"* 를 잰다. 08-05에는
+    전자가 1분, 후자가 4분이었다 — 사이클이 정상 실행되고도 `rows=0`으로 끝난 분(14:31, KIS가
+    53초간 전 레그 타임아웃)을 로그 축은 구조적으로 못 본다. **두 값의 차이 자체가 신호다.**
+    """
     missing = dig(metrics, "cycles.missing") or {}
+    log_count = missing.get("count", 0)
     out = [
-        f"- 결손 **{missing.get('count', 0)}분** (홀수분 {missing.get('odd', 0)} / "
+        f"- **로그 기준** 결손 **{log_count}분** (홀수분 {missing.get('odd', 0)} / "
         f"짝수분 {missing.get('even', 0)})",
         f"- 캐치업 회수 **{missing.get('recovered_by_catchup', 0)}분** → "
         f"미회수 **{missing.get('unrecovered_count', 0)}분**",
-        "",
     ]
     listed = missing.get("list") or []
     if listed:
-        out += ["```", " ".join(listed), "```", ""]
+        out += ["", "```", " ".join(listed), "```"]
+
+    coverage = (db_metrics or {}).get("chain_minute_coverage") or {}
+    if not coverage.get("available"):
+        out += ["", "> DB 기준 0행 분은 DB 집계가 있을 때만 나온다.", ""]
+        return out
+
+    zero_count = coverage["zero_row_count"]
+    out += [
+        "",
+        f"- **DB 기준** 옵션체인 0행 **{zero_count}분** "
+        f"(관측 구간 {coverage['span_minutes']:,}분 중 행이 있는 분 {coverage['minutes_with_rows']:,})",
+    ]
+    if coverage["zero_row_minutes"]:
+        out += ["", "```", " ".join(coverage["zero_row_minutes"]), "```"]
+    if coverage["over_design_count"]:
+        over = ", ".join(f"{t}({n}행)" for t, n in coverage["over_design_minutes"])
+        out += [
+            "",
+            f"- ⚠ 설계 상한({db_metrics_module.CHAIN_LEGS_PER_CYCLE_DESIGN}행) 초과 "
+            f"**{coverage['over_design_count']}분** — {over}. "
+            "한 사이클의 행이 **이웃 분 라벨로 들어갔다**는 뜻이고, 0행 분과 같은 사건의 반대쪽이다.",
+        ]
+    if zero_count != log_count:
+        out += [
+            "",
+            f"- ⚠ **두 축이 어긋난다 — 로그 {log_count}분 vs DB {zero_count}분.** "
+            "로그 축은 *사이클이 돌았는가*, DB 축은 *행이 남았는가*를 잰다. "
+            "`rows=0`으로 끝난 사이클(전 레그 실패/예산 소진)은 로그 축에 안 잡힌다(§2-6).",
+        ]
+    out.append("")
     return out
 
 
@@ -317,12 +353,27 @@ def _render_phase(metrics: dict) -> list[str]:
 
 def _render_log_volume(metrics: dict) -> list[str]:
     lv = metrics.get("log_volume") or {}
+    total = lv.get("total_lines", 0)
+    httpx_lines = lv.get("httpx_lines", 0)
+    human = lv.get("human_lines", 0)
+    tb = lv.get("traceback_lines", 0)
     out = [
-        f"- 총 **{lv.get('total_bytes', 0) / 1048576:.2f}MB** / {lv.get('total_lines', 0):,}줄 — "
+        f"- 총 **{lv.get('total_bytes', 0) / 1048576:.2f}MB** / {total:,}줄 — "
         f"httpx {lv.get('httpx_bytes', 0) / 1048576:.2f}MB({_fmt(lv.get('httpx_pct'), '{:.1f}')}%), "
-        f"**사람이 읽는 줄 {lv.get('human_lines', 0):,}줄**",
+        f"**사람이 읽는 줄 {human:,}줄**",
+        # 2026-08-05 §2-4 — 항등식을 눈으로 확인할 수 있게 찍는다. 08-05에는 이 줄이 없어
+        # 트레이스백 16,577줄이 `human_lines`에 섞였고, 그 값으로 가설 p4가 **거짓 반증**됐다.
+        f"- 줄 구성: httpx **{httpx_lines:,}** + 사람 **{human:,}** + "
+        f"트레이스백 **{tb:,}** = **{httpx_lines + human + tb:,}**"
+        + ("" if httpx_lines + human + tb == total else f" ⚠ 총계 {total:,}과 불일치"),
         "",
     ]
+    if total and tb / total > 0.25:
+        out += [
+            f"- ⚠ 트레이스백이 로그의 **{tb / total * 100:.0f}%** — 반복 예외가 표본 상한을 "
+            "넘겨 새는지 확인할 것(`logutil.TRACEBACK_SAMPLES_PER_EXCEPTION_TYPE`).",
+            "",
+        ]
     out += _table(["레벨", "건수"], [[k, str(v)] for k, v in (lv.get("by_level") or {}).items()])
     out += _table(["정성 항목", "건수"], [[k, str(v)] for k, v in (metrics.get("qualitative") or {}).items()])
     out += _render_parser_audit(metrics)
@@ -386,24 +437,37 @@ def _render_member_availability(db: dict) -> list[str]:
     ma = db.get("member_availability") or {}
     if not ma.get("available"):
         return [f"> 계측 전 — {ma.get('reason', '사유 미상')}.", ""]
+    members = ma.get("members") or []
     out = _table(
-        ["멤버", "가용 분", "가용률", "미가용 대표 사유"],
+        # 2026-08-05 §2-8 — "구조적" 열은 시장 구조상 불가피한 미가용(종가 단일가)이다.
+        # 가용률에서 빼지 않고 **나란히** 둔다: 빼면 전일 대비 델타의 의미가 조용히 바뀐다.
+        ["멤버", "가용 분", "가용률", "그중 구조적", "미가용 대표 사유"],
         [
             [
                 m["member"] + ("" if m["implemented"] else " *(미구현)*"),
                 f"{m['available_minutes']:,}",
                 f"{m['available_pct']:.1f}%",
+                f"{m.get('structural_minutes', 0):,}",
                 m["top_unavailable_reason"] or "—",
             ]
-            for m in ma.get("members") or []
+            for m in members
         ],
     )
-    return out + [
+    out += [
         f"> 분모 {ma.get('minutes', 0):,}분. 사유는 판단 시점에 `risk_gate_state.member_unavailable`로 "
         "남긴 값이다 — 2026-08-04에는 이 표가 없어 사람이 `signal_layer.py`를 읽어 역산했고, "
         "그 역산 끝에 `orderflow_ofi_vpin`이 **데이터가 있는데도** 죽어 있다는 것이 나왔다(§2-5).",
-        "",
     ]
+    structural_total = sum(m.get("structural_minutes", 0) for m in members)
+    if structural_total:
+        out.append(
+            "> **구조적 미가용은 결함이 아니다** — 종가 단일가(15:35~15:45)에는 연속 체결이 없어 "
+            "WS 1분봉이 안 만들어지고 OFI도 없다. 08-05에는 이 구분이 없어 9분이 가용률에 녹아들었고, "
+            "**08-04 §2-10이 '가치가 높다'고 판정한 종가 형성 구간에서 앙상블이 4→3으로 얇아지는 것이 "
+            "안 보였다.** 이 값이 9분보다 크게 늘면 단일가 밖에서도 체결이 끊긴 것이다."
+        )
+    out.append("")
+    return out
 
 
 def _render_strike_window(db: dict, metrics: dict) -> list[str]:
@@ -511,6 +575,22 @@ def _render_db_tables(db: dict) -> list[str]:
             "커버리지 95.0%→90.5%).",
             "",
         ]
+    # 2026-08-05 §2-7 — 커버리지 바로 아래에 둔다. 커버리지는 "그 분에 행이 있는가"만 보고
+    # **몇 개인지는 안 본다**. 08-05는 커버리지 98.8%인데 레그 10개 미만이 38.2%였다.
+    legs = db.get("monthly_leg_completeness") or {}
+    if legs.get("available"):
+        out += [
+            f"- **먼슬리 레그 완전성**: 설계 {legs['design_legs']}레그 미만 "
+            f"**{legs['below_design_count']:,}분 / {legs['minutes']:,}분 "
+            f"({legs['below_design_pct']}%)** · 중앙 {_fmt(legs.get('legs_median'), '{:.0f}')}레그 "
+            f"· 최소 {legs.get('legs_min')}레그 · "
+            f"BS 최소({db_metrics_module.GAMMA_FLIP_MIN_LEGS}) 미달 "
+            f"**{legs['below_flip_minimum_count']:,}분**",
+            "> 커버리지가 *데이터가 있는가*라면 이것은 **판단 주입력의 두께**다. 먼슬리는 "
+            "GEX/감마플립의 유일한 입력이므로(v6 §11.4, 08-04 Fix#5) 레그가 얇아지면 커버리지가 "
+            "100%라도 신호가 얇아진다. BS 최소 미달 분은 감마플립을 **산출 시도조차 못 한 분**이다.",
+            "",
+        ]
     return out
 
 
@@ -569,6 +649,17 @@ def _render_signal_reach(db: dict) -> list[str]:
                 f"< {db_metrics_module.SIGNAL_REACH_WARNINGS['gamma_flip_pct_min']}%",
             ],
             [
+                # 2026-08-05 §2-5 — 산출률 위/아래에 나란히 둔다. 산출률만 보면 "올라갔으니
+                # 좋아졌다"로 읽히는데, 08-05의 4.5%는 22건 중 21건이 여기 걸리는 값이었다.
+                "그중 수집 행사가 범위 밖",
+                (
+                    "검사 불가(마이그레이션 023 미적용?)"
+                    if reach.get("gamma_flip_out_of_range_count") is None
+                    else f"{reach['gamma_flip_out_of_range_count']:,}건"
+                ),
+                "> 0 (불변식 — 0이어야 한다)",
+            ],
+            [
                 "체인 스냅샷 레그 수",
                 f"중앙 {_fmt(reach.get('chain_leg_median'), '{:.0f}')} / "
                 f"최대 {_fmt(reach.get('chain_leg_max'), '{:,.0f}')}",
@@ -617,6 +708,30 @@ def _render_db_misc(db: dict) -> list[str]:
     out += [
         f"- `rate_limiter_status_history` {rl.get('rows', 0):,}행 / 밀림 **{rl.get('overrun_rows', 0)}건** / "
         f"최대 배율 {_fmt(rl.get('max_multiplier'), '{:.2f}')}배",
+        "",
+    ]
+    out += _render_spot_divergence(db)
+    return out
+
+
+def _render_spot_divergence(db: dict) -> list[str]:
+    """2026-08-05 §2-3 / Fix#6 — 스팟의 두 독립 소스를 대조한 결과."""
+    sd = db.get("spot_source_divergence") or {}
+    if not sd.get("available"):
+        return [f"> 스팟 소스 대조 불가 — {sd.get('reason', '사유 미상')}.", ""]
+    out = [
+        f"- **스팟 소스 괴리**(지수 REST vs 선물 WS `{sd['futures_symbol']}`, {sd['minutes']:,}분 공통): "
+        f"중앙 **{_fmt(sd.get('median_pct'), '{:.3f}')}%** / 최대 **{_fmt(sd.get('max_pct'), '{:.3f}')}%**",
+        f"- **지수 정지**(직전 분과 같은 값인데 선물은 움직인 분): 총 **{sd['index_frozen_minutes']}분** / "
+        f"최장 연속 **{sd['index_frozen_max_run']}분**",
+        "",
+        "> **괴리율에는 임계를 걸지 않는다** — 선물 베이시스는 실재하는 경제량이라 정규장 중 "
+        "0.2~0.9%는 정상이다(08-05 중앙 0.252%). 보고서가 처음 적었던 '0.5% 2분 연속' 규칙은 "
+        "그날 09:01·09:02·09:22·10:32에 오경보를 냈을 것이다. **정상 범위를 모르는 상태에서 임계를 "
+        "먼저 정하면 그 임계가 곧 결론이 된다** — 며칠 쌓아 사람이 정한다.",
+        "> 판정은 **지수 정지**로 한다. 08-05에 지수가 전일 종가 1000.03에 75분간 얼어붙은 채 "
+        "선물은 1048까지 가 있었고(4.8% 괴리, 15분 공통), 신호 층은 그 얼어붙은 값으로 GEX를 "
+        "계산했다. **두 소스가 어긋난 채 갔는데 아무도 비교하지 않았다.**",
         "",
     ]
     return out

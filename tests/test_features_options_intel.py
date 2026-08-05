@@ -190,6 +190,84 @@ def test_find_gamma_flip_out_of_range_is_silent(caplog):
     assert not caplog.records
 
 
+# ===== 2026-08-05 §2-5 — 레그 범위 밖 감마플립 =====
+#
+# 08-05에 flip이 처음으로 0%를 벗어나 22분 산출됐는데 **21건이 수집 행사가 창 밖**이었다.
+# 아래 세 테스트는 그 사건의 세 국면을 각각 고정한다: 기각 / 정당한 경계 통과 / 가림 방지.
+
+
+def _iv_jitter_legs(top_call_oi: float = 400, extra_top_strike: bool = False) -> list[OptionLeg]:
+    """08-05 실측 모양 — **행사가별 IV 지터**가 레그 범위 밖에 허수 부호 전환을 만든다.
+
+    잔존만기가 짧으면(만기 임박) 감마는 행사가에서 급격히 꺼지므로, 레그 범위에서 멀어질수록
+    **IV가 높은 레그**가 곡선을 지배한다(고IV일수록 감마 꼬리가 두껍다). 그 레그의 콜/풋 순
+    포지션이 북 전체와 반대면 레그가 하나도 없는 구간에서 GEX 부호가 뒤집힌다.
+
+    이것이 가상의 시나리오가 아닌 이유: KIS `hts_ints_vltl`은 행사가 격자에 따라 계통적으로
+    튄다(08-05 `e02fae8` 실측 — 같은 분·같은 북에서 2.5의 홀수배 콜 0.57~0.63 vs 5의 배수
+    0.87~0.89). 즉 **측정 지터가 만든 부호 전환**이지 시장 구조가 아니다.
+    """
+    legs = [
+        OptionLeg(strike=1042.5, option_type="c", oi=3000, iv=1.4, t_years=0.004, gamma=0.0),
+        OptionLeg(strike=1042.5, option_type="p", oi=10, iv=1.4, t_years=0.004, gamma=0.0),
+    ]
+    for strike, call_oi, put_oi in [
+        (1045.0, 30, 500), (1047.5, 60, 900), (1050.0, 40, 300), (1052.5, top_call_oi, 80),
+    ]:
+        legs += [
+            OptionLeg(strike=strike, option_type="c", oi=call_oi, iv=0.55, t_years=0.004, gamma=0.0),
+            OptionLeg(strike=strike, option_type="p", oi=put_oi, iv=0.55, t_years=0.004, gamma=0.0),
+        ]
+    if extra_top_strike:
+        # 레그 범위를 위로 넓혀 두 번째 교차(1060.86)를 허용 구간 안으로 들인다.
+        legs += [
+            OptionLeg(strike=1062.5, option_type="c", oi=1, iv=0.55, t_years=0.004, gamma=0.0),
+            OptionLeg(strike=1062.5, option_type="p", oi=1, iv=0.55, t_years=0.004, gamma=0.0),
+        ]
+    return legs
+
+
+def test_find_gamma_flip_rejects_a_crossing_far_outside_the_collected_strikes(caplog):
+    """수집 행사가 1042.5~1052.5(허용 ±2.5)인데 교차는 1031.9와 1060.86 — 둘 다 밖이다.
+
+    08-05 실측에서는 이 경로가 하루 22건 중 21건을 만들었고, 그 21건의 `flip / spot`이 전부
+    0.95~0.99에 몰려 있었다(= 탐색 그리드 가장자리). 08-04에 고친 허수 flip과 **같은 자리에서
+    다른 경로로 재발한 것**이라 조용히 None으로 떨어뜨리지 않고 마커를 남긴다.
+    """
+    assert find_gamma_flip(_iv_jitter_legs(), spot=1048.0) is None
+    assert any("감마플립 기각(레그 범위 밖)" in r.message for r in caplog.records), (
+        "기각은 반드시 로그로 드러나야 한다 — 조용한 기각은 08-03 §2-1의 재현이다"
+    )
+    assert sum("감마플립 기각" in r.message for r in caplog.records) == 1, (
+        "레그 없는 구간은 부호가 여러 번 튈 수 있다 — 호출당 1줄로 묶어 §2-4의 로그 폭증을 만들지 않는다"
+    )
+
+
+def test_find_gamma_flip_allows_a_crossing_just_outside_the_collected_strikes(caplog):
+    """최외곽 행사가 **바로 바깥**은 기각하지 않는다 — 거기엔 그 레그의 감마가 실재한다.
+
+    행사가 340/350/360(간격 10)의 진짜 flip은 338.25로 최저 행사가에서 1.75포인트 아래인데,
+    그 지점의 1σ 이동폭은 약 14포인트라 340 레그의 감마가 충분히 살아 있다. 허용치를
+    **행사가 간격 단위**로 잡은 것이 이 구분을 만든다(0.18간격 통과 vs 08-05의 4.5~34.5간격 기각).
+    경계를 [min, max]로 딱 자르면 이 정당한 flip이 사라진다.
+    """
+    flip = find_gamma_flip(_flip_legs(), spot=350)
+    assert flip is not None and 335 < flip < 340
+    assert not caplog.records, "정당한 경계 통과에는 로그를 남기지 않는다"
+
+
+def test_find_gamma_flip_skips_an_out_of_range_crossing_to_find_an_in_range_one(caplog):
+    """범위 밖 교차가 **범위 안 교차를 가려선 안 된다** — 그리드를 끝까지 훑는다.
+
+    같은 곡선에 교차가 1031.9(밖)와 1060.86(안) 둘 있다. 왼쪽 끝에서 첫 교차를 만났다고
+    거기서 멈추면(=기각하고 None 반환) 진짜 flip을 놓친다. 이 테스트가 없으면 "범위 밖이면
+    None"이라는 순진한 구현이 통과해 버린다.
+    """
+    flip = find_gamma_flip(_iv_jitter_legs(extra_top_strike=True), spot=1048.0)
+    assert flip is not None and 1055 < flip < 1065
+    assert not caplog.records, "범위 안 flip을 찾았으면 기각 로그를 남기지 않는다"
+
+
 def test_usable_for_black_scholes_requires_positive_iv_time_strike():
     assert usable_for_black_scholes(OptionLeg(strike=350, option_type="c", oi=1, iv=0.18, t_years=0.05, gamma=0.0))
     assert not usable_for_black_scholes(OptionLeg(strike=350, option_type="c", oi=1, iv=0.0, t_years=0.05, gamma=0.0))

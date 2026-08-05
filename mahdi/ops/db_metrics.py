@@ -13,12 +13,30 @@ from datetime import date
 
 from mahdi.data import db
 from mahdi.data.db import ConnectionLike
+from mahdi.features.options_intel import (
+    GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS,
+    GAMMA_FLIP_MIN_LEGS,
+)
 from mahdi.fusion.signal_layer import IMPLEMENTED_MEMBER_FIELDS, MEMBER_FIELDS
 
 logger = logging.getLogger("mahdi.ops.db_metrics")
 
 # HMM 학습에 필요한 최소 샘플(scripts/fit_regime_engine.DEFAULT_MIN_SAMPLES와 같은 값).
 HMM_MIN_SAMPLES = 8000
+
+# 2026-08-05(§2-6 / §2-7) — 한 사이클이 **설계상** 수집해야 하는 레그 수.
+#
+# `mahdi.main`을 import하지 않고 여기 다시 적는 이유는 `log_metrics`가 순수 파서로 남는 것과
+# 같다 — `ops`는 관측 계층이고 오케스트레이터에 의존하면 리포트가 라이브 코드를 끌고 온다.
+# 대신 **두 값이 갈라지지 않는 것은 계약 테스트가 지킨다**
+# (`tests/test_ops_metric_conventions.py`가 `main.STRIKES_EACH_SIDE`에서 재계산해 대조한다).
+# 값을 여기서 바꾸면 그 테스트가 깨진다 — 그것이 요점이다.
+MONTHLY_LEGS_PER_CYCLE_DESIGN = 10  # (ATM±2 = 5행사가) x 콜/풋
+CHAIN_LEGS_PER_CYCLE_DESIGN = 20  # 먼슬리 10 + 위클리 1북 10(격분)
+
+# 2026-08-05(§2-8) — "시장 구조상 불가피한 미가용" 사유. `main.MEMBER_UNAVAILABLE_CLOSING_AUCTION`과
+# 같은 문자열이어야 §14-1이 그 분들을 분리해 낼 수 있다(계약 테스트가 지킨다).
+STRUCTURAL_UNAVAILABLE_REASON = "종가 단일가(연속체결 없음)"
 
 # 하루치 적재량을 볼 테이블 — (테이블, 시각 컬럼, 비고).
 _DAILY_TABLES: list[tuple[str, str, str]] = [
@@ -64,6 +82,9 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
             logger.warning("DB 지표 집계 실패: monthly_coverage", exc_info=True)
     for key, fn in (
         ("tables", _tables),
+        ("chain_minute_coverage", chain_minute_coverage),
+        ("monthly_leg_completeness", monthly_leg_completeness),
+        ("spot_source_divergence", spot_source_divergence),
         ("book_coverage", _book_coverage),
         ("book_gamma_map", book_gamma_map),
         ("wide_oi_landscape", wide_oi_landscape),
@@ -155,6 +176,182 @@ def observed_span_minutes(conn: ConnectionLike, target: date, underlying: str = 
     if not row or row[0] is None:
         return None
     return int((row[1] - row[0]).total_seconds() // 60) + 1
+
+
+def chain_minute_coverage(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 옵션체인 폴러가 돈 구간(`observed_span_minutes`와 같은 첫~끝) 안에서
+         **`option_analysis_1m`에 행이 한 줄도 없는 분**을 센다.
+    해석: 2026-08-05 §2-6 — 리포트 §4의 결손 지표는 **로그(사이클이 돌았는가)** 한 축뿐이라
+         "사이클은 정상 실행됐는데 데이터가 0행"인 분을 **구조적으로 못 본다.**
+         08-05 실측: 로그 기준 결손 1분(10:04)인데 DB 기준 0행 분은 **4분**
+         (10:04 / 10:54 / 12:57 / 14:31)이었다. 14:31은 KIS가 53초간 전 레그를 타임아웃시켜
+         `rows=0`으로 마감한 분이고(예산 초과 WARNING은 떴다), 10:54·12:57은 사이클이 `rows=19`를
+         남겼는데 그 행이 **인접 분 타임스탬프로 적재된** 분이다(12:56이 22행 = 설계 상한 초과).
+         **두 축의 값이 다르면 그 차이 자체가 신호다** — 리포트가 나란히 찍어 사람이 보게 한다.
+    실패 조건: 그날 행이 없으면 `{"available": False}`.
+    """
+    row = _fetchone(
+        conn,
+        "SELECT min(date_trunc('minute', timestamp)), max(date_trunc('minute', timestamp)), "
+        "       count(DISTINCT date_trunc('minute', timestamp)) "
+        "FROM option_analysis_1m WHERE underlying=%s AND timestamp::date=%s",
+        (underlying, target),
+    )
+    if not row or row[0] is None:
+        return {"available": False}
+
+    first, last, with_rows = row[0], row[1], int(row[2])
+    span = int((last - first).total_seconds() // 60) + 1
+
+    missing = _fetchall(
+        conn,
+        "SELECT to_char(m.t, 'HH24:MI') FROM generate_series(%s, %s, interval '1 minute') AS m(t) "
+        "LEFT JOIN (SELECT DISTINCT date_trunc('minute', timestamp) AS t FROM option_analysis_1m "
+        "           WHERE underlying=%s AND timestamp::date=%s) h ON h.t = m.t "
+        "WHERE h.t IS NULL ORDER BY m.t",
+        (first, last, underlying, target),
+    )
+    # 설계 상한(북 x 행사가 x 2)을 넘는 분 — 한 사이클의 행이 이웃 분 라벨로 들어갔다는 증거다.
+    # 이것을 함께 내는 이유: 0행 분과 **같은 사건의 반대쪽 절반**이라 따로 보면 원인을 못 찾는다.
+    over = _fetchall(
+        conn,
+        "SELECT to_char(t, 'HH24:MI'), n FROM ("
+        "  SELECT date_trunc('minute', timestamp) AS t, count(*) AS n FROM option_analysis_1m "
+        "  WHERE underlying=%s AND timestamp::date=%s GROUP BY 1"
+        ") q WHERE n > %s ORDER BY t",
+        (underlying, target, CHAIN_LEGS_PER_CYCLE_DESIGN),
+    )
+    return {
+        "available": True,
+        "span_minutes": span,
+        "minutes_with_rows": with_rows,
+        "zero_row_minutes": [r[0] for r in missing],
+        "zero_row_count": len(missing),
+        "over_design_minutes": [[r[0], int(r[1])] for r in over],
+        "over_design_count": len(over),
+    }
+
+
+def spot_source_divergence(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 스팟의 **두 독립 소스**를 분 단위로 대조한다 —
+         (A) `underlying_spot_1m.spot`: 옵션 조회에 얹혀 오는 KOSPI200 **지수**(REST).
+         (B) `market_raw_1m.close`: 구독 중인 최근월 **선물** 1분봉 종가(WS).
+         괴리율과, **지수가 얼어붙은 채 선물만 움직인 분 수**를 낸다.
+    해석: 2026-08-05 §2-3 — 08-05 07:31~09:00에 (A)가 전일 종가 1000.03에 **75분간 고정**돼
+         있는 동안 (B)는 1048까지 가 있었다. 두 값이 **48포인트(4.8%) 어긋난 채 15분을 갔는데
+         아무도 비교하지 않았다.** ATM 롤링은 (B)를 보고 08:46에 옳게 움직였고, 신호 층은 (A)를
+         써서 GEX를 스팟 1000.03 / 행사가 1042.5~1052.5로 계산했다.
+
+         **괴리율에 임계를 걸지 않는다.** 08-05 실측으로 정규장 중 괴리는 0.5~0.9%가 정상이고
+         (선물 베이시스는 실재하는 경제량이다), 보고서가 처음 적었던 "0.5% 2분 연속" 규칙은
+         09:01·09:02·09:22·10:32에 오경보를 냈을 것이다. **정상 범위를 모르는 상태에서 임계를
+         먼저 정하면 그 임계가 곧 결론이 된다** — 며칠 값을 쌓아 사람이 정한다.
+
+         대신 `index_frozen_minutes`는 애매하지 않다: 지수가 **직전 분과 완전히 같은 값**인데
+         선물은 움직인 분이다. 베이시스로는 설명되지 않는다(08-05 기준 그 값이 곧 사고다).
+    실패 조건: 선물 심볼이나 어느 한쪽 데이터가 없으면 `{"available": False}`.
+    """
+    symbol_row = _fetchone(
+        conn, "SELECT symbol FROM active_futures_symbol WHERE underlying=%s", (underlying,)
+    )
+    if not symbol_row or not symbol_row[0]:
+        return {"available": False, "reason": "active_futures_symbol 없음"}
+
+    row = _fetchone(
+        conn,
+        "WITH j AS ("
+        "  SELECT s.timestamp AS t, s.spot AS idx, m.close AS fut, "
+        "         lag(s.spot) OVER (ORDER BY s.timestamp) AS prev_idx, "
+        "         lag(m.close) OVER (ORDER BY s.timestamp) AS prev_fut "
+        "  FROM underlying_spot_1m s JOIN market_raw_1m m "
+        "    ON m.timestamp = s.timestamp AND m.symbol = %s "
+        "  WHERE s.timestamp::date = %s AND s.underlying = %s AND s.spot > 0"
+        "), f AS ("
+        "  SELECT t, (prev_idx = idx AND prev_fut IS DISTINCT FROM fut) AS frozen FROM j"
+        "), g AS ("
+        # 연속 구간(gaps-and-islands) — row_number 차이가 같으면 같은 덩어리다.
+        "  SELECT frozen, row_number() OVER (ORDER BY t) "
+        "         - row_number() OVER (PARTITION BY frozen ORDER BY t) AS grp FROM f"
+        ") "
+        "SELECT (SELECT count(*) FROM j), "
+        "       (SELECT max(abs(idx - fut) / idx * 100) FROM j), "
+        "       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(idx - fut) / idx * 100) FROM j), "
+        "       (SELECT count(*) FROM f WHERE frozen), "
+        "       COALESCE((SELECT max(n) FROM ("
+        "           SELECT count(*) AS n FROM g WHERE frozen GROUP BY grp) q), 0)",
+        (symbol_row[0], target, underlying),
+    )
+    minutes = int(row[0]) if row and row[0] is not None else 0
+    if not minutes:
+        return {"available": False, "reason": "지수/선물 공통 분 없음"}
+
+    return {
+        "available": True,
+        "futures_symbol": symbol_row[0],
+        "minutes": minutes,
+        "max_pct": round(float(row[1]), 3) if row[1] is not None else None,
+        "median_pct": round(float(row[2]), 3) if row[2] is not None else None,
+        "index_frozen_minutes": int(row[3]),
+        # 총 건수보다 **연속 길이**가 판별력이 있다. 08-04(정상일)도 총 27분은 얼어 있는데
+        # (지수는 옵션 조회에 얹혀 오므로 한 사이클 실패하면 값이 반복된다) 그것은 흩어진
+        # 1~2분이다. 08-05의 사고는 **한 덩어리 16분**이었다.
+        "index_frozen_max_run": int(row[4]),
+    }
+
+
+def monthly_leg_completeness(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 먼슬리(최근월) 북의 **분당 레그 수** 분포 — 설계값 미달/전무인 분 수.
+    해석: 2026-08-05 §2-7 — §12의 먼슬리 커버리지는 *"그 분에 먼슬리 행이 있는가"* 만 보고
+         **몇 개인지는 안 본다.** 08-05 실측: 커버리지 98.8%인데 레그 10개 미만이 489분 중
+         **187분(38.2%)**, 0개인 분이 2개(14:31 / 14:46)였다. 먼슬리는 GEX/감마플립의 유일한
+         입력이므로(v6 §11.4, 08-04 Fix#5) 이 값이 곧 **판단 주입력의 두께**다.
+         커버리지와 반드시 나란히 읽는다 — 07-31 §5-5 원칙의 세 번째 재발 지점이다.
+    실패 조건: 먼슬리 만기를 못 찾거나 행이 없으면 `{"available": False}`.
+    """
+    expiry = monthly_book_expiry(conn, target, underlying)
+    if expiry is None:
+        return {"available": False}
+
+    row = _fetchone(
+        conn,
+        "SELECT count(*), "
+        "       count(*) FILTER (WHERE n < %s), "
+        "       count(*) FILTER (WHERE n < %s), "
+        "       percentile_cont(0.5) WITHIN GROUP (ORDER BY n), min(n) "
+        "FROM (SELECT date_trunc('minute', timestamp) AS t, count(*) AS n "
+        "      FROM option_analysis_1m WHERE underlying=%s AND timestamp::date=%s AND expiry=%s "
+        "      GROUP BY 1) q",
+        (
+            MONTHLY_LEGS_PER_CYCLE_DESIGN,
+            GAMMA_FLIP_MIN_LEGS,
+            underlying,
+            target,
+            expiry,
+        ),
+    )
+    minutes = int(row[0]) if row else 0
+    if not minutes:
+        return {"available": False}
+
+    below_design = int(row[1])
+    return {
+        "available": True,
+        "expiry": expiry,
+        "minutes": minutes,
+        "design_legs": MONTHLY_LEGS_PER_CYCLE_DESIGN,
+        "below_design_count": below_design,
+        "below_design_pct": round(below_design / minutes * 100, 1),
+        # BS 계산 자체가 불가능해지는 선 — 이 아래면 감마플립은 산출 시도조차 못 한다.
+        "below_flip_minimum_count": int(row[2]),
+        "legs_median": float(row[3]) if row[3] is not None else None,
+        "legs_min": int(row[4]) if row[4] is not None else None,
+    }
 
 
 def monthly_book_coverage(
@@ -421,12 +618,18 @@ def member_availability(conn: ConnectionLike, target: date) -> dict:
         by_reason = unavailable.get(name, {})
         dead_minutes = sum(by_reason.values())
         top_reason = max(by_reason.items(), key=lambda kv: kv[1])[0] if by_reason else None
+        # 2026-08-05 §2-8 — 시장 구조상 불가피한 미가용은 **가용률과 분리해서** 낸다.
+        # 섞어두면 08-05처럼 종가 단일가 9분이 `orderflow_ofi_vpin` 83.0%에 녹아들어
+        # "이 멤버는 원래 좀 죽는다"로 읽힌다. 분자에서 빼지 않고 열을 따로 두는 이유는
+        # 가용률의 정의를 조용히 바꾸지 않기 위해서다(전일 대비 델타가 의미를 잃는다).
+        structural = by_reason.get(STRUCTURAL_UNAVAILABLE_REASON, 0)
         members.append(
             {
                 "member": name,
                 "available_minutes": minutes - dead_minutes,
                 "available_pct": round((minutes - dead_minutes) / minutes * 100, 1),
                 "top_unavailable_reason": top_reason,
+                "structural_minutes": structural,
                 "implemented": name in IMPLEMENTED_MEMBER_FIELDS,
             }
         )
@@ -577,12 +780,70 @@ SIGNAL_REACH_WARNINGS = {
     # 이제 구현 여부를 아는 쪽(`fusion.signal_layer`)에서 가져온다. 하드코딩하지 않는다.
     "member_count_max_min": len(IMPLEMENTED_MEMBER_FIELDS),
     # 탐색 범위 밖이라 정상적으로 못 구하는 분이 있으므로 100%를 요구하지 않는다.
+    #
+    # 2026-08-05(§2-5) 경고: **이 임계는 "낮으면 나쁘다"를 전제하는데 그 전제가 이 북에서는
+    # 거짓이다.** 08-04 §2-3이 확정했듯 먼슬리 북은 전 구간에서 GEX 부호가 안 바뀌므로
+    # 산출률 0%가 정상이고, 08-05에 4.5%로 "올라온" 22건은 21건이 레그 범위 밖 허수였다.
+    # 그래서 이 경고 문구는 더 이상 "행사가 창을 확인하라"고 말하지 않는다 —
+    # 판정은 아래 `gamma_flip_out_of_range_count`(불변식, 0이어야 한다)로 한다.
     "gamma_flip_pct_min": 80.0,
     # db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES에 여유(1.5배)를 더한 값 — 넘으면 경계가 깨진 것이다.
     # 2026-08-04 Fix#6b로 창이 10분 → 5분이 됐으므로 임계도 함께 내려간다(상수에서 파생시켜
     # 두 값이 갈라지지 않게 한다 — 08-04 §2-1이 하드코딩된 임계 문자열로 겪은 문제와 같은 종류).
     "chain_age_seconds_max": db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60 * 1.5,
 }
+
+
+def _gamma_flip_out_of_range_count(conn: ConnectionLike, target: date) -> int | None:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 적재된 감마플립 중 **그 판단이 실제로 본 체인의 행사가 범위 밖**인 건수.
+         범위는 판단 시각 기준 `db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES` 창 안에서, 그 판단이 쓴
+         북(`gex_expiry`)의 행사가 min/max다 — **라이브 판단이 본 것과 같은 창·같은 북**이다.
+         허용치도 `find_gamma_flip()`과 **같은 규칙**(행사가 간격 x
+         `GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS`)을 쓴다. 두 곳이 다른 경계를 쓰면 이
+         불변식은 **정상적으로 통과한 flip을 위반으로 신고한다** — 규약 B(같은 것은 한 곳에서)의
+         정신을 SQL 쪽에도 적용한 것이다. SQL에서 간격은 균등 격자를 가정해
+         (max-min)/(행사가 수-1)로 낸다(파이썬 쪽 최소 간격과 균등 격자에서 일치한다).
+    해석: **불변식이다. 0이 아니면 2026-08-05 Fix#1이 뚫린 것이다.**
+         `find_gamma_flip()`이 레그 범위 밖 flip을 기각하므로 정상 상태에서는 0이 나온다.
+         08-05 실측(fix 이전)으로는 22건 중 **21건**이 여기 걸린다.
+    실패 조건: `gex_expiry`(마이그레이션 023) 부재 등으로 조회가 실패하면 None —
+              **0이 아니라 None이다.** 0으로 돌려주면 "검사했고 깨끗했다"와 "검사 못 했다"가
+              같은 값이 되고, 그것이 08-04 §2-1이 겪은 실패(계측이 꺼졌는데 개선으로 보임)다.
+    """
+    try:
+        row = _fetchone(
+            conn,
+            "SELECT count(*) FROM signal_decisions d "
+            "JOIN LATERAL ("
+            "    SELECT min(o.strike) AS lo, max(o.strike) AS hi, "
+            "           count(DISTINCT o.strike) AS n "
+            "    FROM option_analysis_1m o "
+            "    WHERE o.expiry = d.gex_expiry "
+            "      AND o.timestamp <= d.timestamp "
+            "      AND o.timestamp > d.timestamp - make_interval(mins => %s)"
+            ") w ON TRUE "
+            "CROSS JOIN LATERAL ("
+            "    SELECT CASE WHEN w.n > 1 THEN (w.hi - w.lo) / (w.n - 1) ELSE 0 END * %s AS tol"
+            ") t "
+            "WHERE d.timestamp::date = %s AND d.gamma_flip IS NOT NULL "
+            "  AND d.gex_expiry IS NOT NULL AND w.lo IS NOT NULL "
+            "  AND (d.gamma_flip < w.lo - t.tol OR d.gamma_flip > w.hi + t.tol)",
+            (
+                db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES,
+                GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS,
+                target,
+            ),
+        )
+    except Exception:
+        conn.rollback()
+        logger.warning(
+            "감마플립 범위 밖 건수 집계 실패 — 마이그레이션 023(gex_expiry) 적용 전일 수 있다",
+            exc_info=True,
+        )
+        return None
+    return int(row[0]) if row else 0
 
 
 def signal_reach(conn: ConnectionLike, target: date) -> dict:
@@ -631,6 +892,7 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
         "chain_age_seconds_median": float(row[5]) if row[5] is not None else None,
         "chain_age_seconds_max": float(row[6]) if row[6] is not None else None,
     }
+    out["gamma_flip_out_of_range_count"] = _gamma_flip_out_of_range_count(conn, target)
 
     warnings: list[str] = []
     if member_max < SIGNAL_REACH_WARNINGS["member_count_max_min"]:
@@ -638,7 +900,19 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
             f"앙상블 최대 가용 멤버 {member_max}개 — options_flow가 한 번도 활성화되지 않았다"
         )
     if flip_pct < SIGNAL_REACH_WARNINGS["gamma_flip_pct_min"]:
-        warnings.append(f"감마플립 산출률 {flip_pct}% — 행사가 창이 스팟을 따라가고 있는지 확인")
+        warnings.append(
+            f"감마플립 산출률 {flip_pct}% — 이 북에서는 0%가 정상일 수 있다"
+            "(08-04 §2-3: 전 구간 단조). 판정은 아래 범위 밖 건수로 한다"
+        )
+    out_of_range = out["gamma_flip_out_of_range_count"]
+    if out_of_range is None:
+        # "검사 못 했다"를 조용히 넘기지 않는다 — 이 침묵이 08-04 §2-1의 본체였다.
+        warnings.append("감마플립 범위 밖 검사 불가 — 마이그레이션 023 적용 여부를 확인할 것")
+    elif out_of_range:
+        warnings.append(
+            f"감마플립 {out_of_range}건이 수집 행사가 범위 밖이다 — 2026-08-05 Fix#1이 뚫렸다"
+            "(레그 없는 구간의 외삽에서 주운 부호 전환일 수 있다)"
+        )
     age_max = out["chain_age_seconds_max"]
     if age_max is not None and age_max > SIGNAL_REACH_WARNINGS["chain_age_seconds_max"]:
         warnings.append(

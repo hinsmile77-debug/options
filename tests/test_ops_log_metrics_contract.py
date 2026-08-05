@@ -41,7 +41,8 @@ import pytest
 
 from mahdi import main
 from mahdi.broker import rest_client
-from mahdi.ops import log_metrics
+from mahdi.features import options_intel
+from mahdi.ops import db_metrics, log_metrics
 
 TARGET = date(2026, 8, 5)
 _TS = "2026-08-05 10:11:12,345"
@@ -295,3 +296,160 @@ def test_event_calendar_marker_survives_the_parser_audit():
     token = log_metrics._PARSER_AUDIT_TOKENS["event_calendar_not_covered"]
     # 감사 토큰은 포맷이 바뀌어도 살아남을 만큼 짧아야 하고, 실제 줄에 들어 있어야 한다.
     assert token in main.LOG_EVENT_CALENDAR_NOT_COVERED
+
+
+# ===== 감마플립 레그 범위 기각 (2026-08-05 §2-5 / Fix#1) =====
+
+
+def test_gamma_flip_out_of_leg_range_line_is_counted():
+    """기각 건수가 §11에 매일 찍혀야 "flip이 왜 안 나오는가"를 사후에 답할 수 있다.
+
+    08-05에는 반대 방향의 침묵이 사고였다 — flip 22건이 **적재됐고** 그중 21건이 레그 범위
+    밖이었는데, 그 사실을 드러내는 계측이 없어 자동 리포트 §14는 "산출률 4.5%, 행사가 창이
+    스팟을 따라가는지 확인"이라는 **정반대 방향의 경고**를 냈다.
+    """
+    line = _emit(
+        "mahdi.features.options_intel", "WARNING",
+        options_intel.LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE,
+        956.18, 1042.5, 1052.5, 2.5, 1000.03, 5.0,
+    )
+    metrics = _parse(line)
+
+    assert metrics["qualitative"]["gamma_flip_out_of_leg_range"] == 1
+
+
+def test_gamma_flip_rejection_marker_is_a_prefix_of_the_emitted_format():
+    """마커는 포맷 상수에서 파생돼야 한다(규약 A) — 문구를 바꾸면 이 테스트가 깨진다."""
+    marker = log_metrics._QUALITATIVE_MARKERS["gamma_flip_out_of_leg_range"]
+    assert marker in options_intel.LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE
+
+
+def test_gamma_flip_rejection_survives_the_parser_audit():
+    """감사 토큰은 엄격 마커보다 **짧아야** 침묵을 잡는다(규약 C)."""
+    token = log_metrics._PARSER_AUDIT_TOKENS["gamma_flip_out_of_leg_range"]
+    strict = log_metrics._QUALITATIVE_MARKERS["gamma_flip_out_of_leg_range"]
+    assert token in options_intel.LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE
+    assert len(token) < len(strict), "감사 토큰이 엄격 마커만큼 길면 같이 눈이 먼다"
+
+
+def test_gamma_flip_rejection_counter_and_db_invariant_are_different_questions():
+    """로그 마커(기각된 것)와 §14 불변식(적재된 것 중 범위 밖)은 **서로를 대체하지 못한다.**
+
+    로그 0건은 "기각할 것이 없었다"이지 "flip이 건강하다"가 아니다. 두 계측이 같은 상수
+    (`GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS`)를 공유해야 경계가 갈라지지 않는다 —
+    갈라지면 §14가 **정상 통과한 flip을 위반으로 신고한다**.
+    """
+    assert (
+        db_metrics.GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS
+        is options_intel.GAMMA_FLIP_LEG_RANGE_TOLERANCE_INTERVALS
+    )
+
+
+# ===== 0행 사이클 (2026-08-05 §2-6 / Fix#2) =====
+
+
+def test_empty_chain_cycle_line_is_counted():
+    """`rows=0`으로 끝난 사이클은 결손 지표(로그 기준)가 세지 않는 **유일한 손실 유형**이다.
+
+    08-05 14:31: KIS가 53초간 전 레그를 타임아웃시켜 그 분의 체인이 통째로 사라졌는데,
+    사이클은 정상 실행됐으므로 `cycles.missing`에 안 잡혔다 — DB에는 0행인데 §4는 결손 1분만
+    보고했다(실제 0행 분 4분). 이 마커가 그 구멍을 메운다.
+    """
+    line = _emit("mahdi.main", "ERROR", main.LOG_CHAIN_CYCLE_EMPTY, 20, 53.14, "안 함")
+    metrics = _parse(line)
+
+    assert metrics["qualitative"]["chain_cycle_empty"] == 1
+
+
+def test_empty_chain_cycle_is_distinguishable_from_a_partial_truncation():
+    """"조금 잘렸다"와 "통째로 날아갔다"가 같은 줄로 보고되면 안 된다 — 08-05의 실제 실패다."""
+    truncated = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 3, 17)
+    wiped = _emit("mahdi.main", "ERROR", main.LOG_CHAIN_CYCLE_EMPTY, 20, 53.14, "안 함")
+    metrics = _parse(truncated, wiped)
+
+    assert metrics["qualitative"]["chain_cycle_empty"] == 1, "전멸만 세어야 한다"
+    assert metrics["budget_exceeded"]["count"] == 1, (
+        "예산 초과는 절단 줄에서만 센다 — 두 계측이 독립이어야 "
+        "'예산이 걸렸는가'와 '데이터가 남았는가'를 따로 물을 수 있다"
+    )
+
+
+def test_empty_chain_cycle_survives_the_parser_audit():
+    token = log_metrics._PARSER_AUDIT_TOKENS["chain_cycle_empty"]
+    strict = log_metrics._QUALITATIVE_MARKERS["chain_cycle_empty"]
+    assert token in main.LOG_CHAIN_CYCLE_EMPTY
+    assert len(token) < len(strict)
+
+
+# ===== 로그 줄 구성 항등식 / 트레이스백 표본 (2026-08-05 §2-4 / Fix#4) =====
+
+
+_TRACEBACK_BODY = [
+    "Traceback (most recent call last):",
+    r'  File "C:\a\httpx\_transports\default.py", line 101, in map_httpcore_exceptions',
+    "    yield",
+    "httpx.ReadTimeout: The read operation timed out",
+]
+
+
+def test_traceback_body_is_not_counted_as_a_human_line():
+    """**08-05의 거짓 반증을 재현하는 테스트다.**
+
+    종전 `human_lines`는 httpx가 아닌 모든 줄을 셌다. 그래서 트레이스백 본문
+    (`  File "...", line 101, in ...`)이 "사람이 읽는 줄"이 됐고, 08-05에 21,176줄 중
+    16,577줄(78%)이 그것이었다. 자동 리포트 §0은 그 값으로 `2026-08-04-p4`를 반증 판정했는데
+    **실측 4,599줄은 예측치(<=6,500)를 통과했다** — 08-04 Fix#6의 성공이 실패로 보고된 것이다.
+    """
+    record = _emit("mahdi.main", "WARNING", "%s", "옵션 체인 폴링 실패: C01608A15")
+    metrics = _parse(record, *_TRACEBACK_BODY)
+
+    assert metrics["log_volume"]["human_lines"] == 1, "레코드 한 줄만 사람 로그다"
+    assert metrics["log_volume"]["traceback_lines"] == 4
+
+
+def test_log_line_composition_is_an_identity():
+    """`총계 = httpx + 사람 + 트레이스백`. 리포트 §11이 이 셋을 나란히 찍는 근거다.
+
+    08-05에 이 줄만 있었으면 트레이스백 폭증이 `human_lines` 반증으로 둔갑한 것이 즉시 보였다.
+    """
+    lines = [
+        _emit("httpx", "INFO", "HTTP Request: GET %s \"HTTP/1.1 200 OK\"", "https://x/y"),
+        _emit("mahdi.main", "WARNING", "%s", "옵션 체인 폴링 실패: C01608A15"),
+        *_TRACEBACK_BODY,
+    ]
+    lv = _parse(*lines)["log_volume"]
+
+    assert lv["httpx_lines"] + lv["human_lines"] + lv["traceback_lines"] == lv["total_lines"]
+    assert (lv["httpx_lines"], lv["human_lines"], lv["traceback_lines"]) == (1, 1, 4)
+
+
+def test_exception_summarised_without_a_traceback_still_counts_into_its_type():
+    """트레이스백을 생략해도 **유형별 카운터는 살아 있어야 한다.**
+
+    이것이 08-04 §2-1의 핵심 교훈이다: 로그 형태를 바꾼 커밋이 자기 계측을 껐고, 리포트는
+    그것을 "개선"으로 표시했다. Fix#4는 트레이스백을 줄이는 fix이므로 **같은 함정 위를 지난다.**
+    """
+    line = _emit(
+        "mahdi.main", "WARNING", main.LOG_KIS_FAILURE_TRACEBACK_OMITTED,
+        "옵션 체인 폴링 실패: C01608A15", "The read operation timed out", "httpx.ReadTimeout", 42,
+    )
+    assert _parse(line)["qualitative"]["read_timeout"] == 1
+
+
+def test_a_summarised_exception_is_not_double_counted_with_a_traceback_tail():
+    """요약 마커와 트레이스백 마지막 줄이 겹치면 한 사건이 두 번 세어진다 — 겹치면 안 된다."""
+    summarised = _emit(
+        "mahdi.main", "WARNING", main.LOG_KIS_FAILURE_TRACEBACK_OMITTED,
+        "옵션 체인 폴링 실패: X", "timed out", "httpx.ReadTimeout", 42,
+    )
+    tail = "httpx.ReadTimeout: The read operation timed out"
+
+    assert _parse(summarised)["qualitative"]["read_timeout"] == 1
+    assert _parse(tail)["qualitative"]["read_timeout"] == 1
+    assert _parse(summarised, tail)["qualitative"]["read_timeout"] == 2, "각각 1건씩, 두 사건이다"
+
+
+def test_traceback_omitted_marker_is_derived_from_the_emit_format():
+    """규약 A — 파서의 마커가 emit 측 포맷에서 실제로 나오는 문자열이어야 한다."""
+    rendered = main.LOG_KIS_FAILURE_TRACEBACK_OMITTED % ("msg", "exc", "httpx.ReadTimeout", 1)
+    assert log_metrics._TRACEBACK_OMITTED_MARKER + "httpx.ReadTimeout" in rendered

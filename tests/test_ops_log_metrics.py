@@ -183,8 +183,19 @@ def test_failure_types_are_grouped_by_kind(metrics):
 
 
 def test_log_volume_separates_httpx_from_human_lines(metrics):
+    """2026-08-05 §2-4 — 줄을 **세 갈래**로 가른다: httpx / 사람 로그 / 트레이스백 본문.
+
+    종전에는 `human_lines = total - httpx`였고 트레이스백 본문이 전부 "사람이 읽는 줄"로
+    셌다. 08-05에 그 정의가 21,176줄 중 16,577줄(78%)을 사람 로그로 만들었고, 자동 리포트
+    §0은 그 값으로 가설 `2026-08-04-p4`를 **반증 판정했다** — 실측 4,599줄은 예측치(<=6,500)를
+    통과했으므로 거짓 반증이었다.
+    """
     lv = metrics["log_volume"]
-    assert lv["total_lines"] == lv["human_lines"] + 13  # httpx 13줄
+    assert lv["httpx_lines"] == 13
+    assert lv["traceback_lines"] == 12  # 트레이스백 3건 x 4줄
+    assert lv["human_lines"] == 15
+    # 항등식 — 리포트 §11이 이 셋을 나란히 찍는 근거다.
+    assert lv["httpx_lines"] + lv["human_lines"] + lv["traceback_lines"] == lv["total_lines"]
     assert 0 < lv["httpx_pct"] < 100
 
 

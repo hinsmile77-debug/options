@@ -1,6 +1,6 @@
 import logging
 
-from mahdi.logutil import WarningThrottle
+from mahdi.logutil import TracebackBudget, WarningThrottle
 
 
 class _FakeClock:
@@ -83,3 +83,49 @@ def test_exc_info_is_forwarded():
         # exc_info=True를 넘겼을 때 예외 없이 그대로 동작하는지만 확인(로그 포맷터가 실제로
         # traceback을 렌더링하는 건 표준 logging 책임이라 여기선 호출이 깨지지 않는지가 핵심).
         throttle.warning("cat_exc", "예외 발생", exc_info=True)
+
+
+# ===== TracebackBudget (2026-08-05 §2-4 / Fix#4) =====
+
+
+class _Boom(RuntimeError):
+    pass
+
+
+def test_traceback_budget_allows_a_few_samples_then_stops():
+    """예외 유형당 표본 N건까지만 트레이스백을 허용한다.
+
+    08-05: ReadTimeout 210건 x 78.9줄 = 16,577줄이 로그의 49%를 차지했고, 그 값이
+    `human_lines`에 섞여 가설 `2026-08-04-p4`를 **거짓 반증**시켰다. 210번째 트레이스백이
+    3번째보다 알려주는 것은 없다.
+    """
+    budget = TracebackBudget(samples_per_type=3)
+    decisions = [budget.take(_Boom("x")) for _ in range(5)]
+
+    assert [keep for keep, _ in decisions] == [True, True, True, False, False]
+    assert [nth for _, nth in decisions] == [1, 2, 3, 4, 5], "누적 건수는 표본을 다 쓴 뒤에도 센다"
+
+
+def test_traceback_budget_counts_each_exception_type_separately():
+    """유형별로 따로 센다 — 흔한 예외가 드문 예외의 표본을 잡아먹으면 안 된다.
+
+    이것이 없으면 ReadTimeout 210건이 상한을 다 써버려, 그날 처음 나타난 새 예외의
+    트레이스백이 **한 번도 안 남는다.** 원인 추적이 필요한 쪽은 정확히 그 새 예외다.
+    """
+    budget = TracebackBudget(samples_per_type=1)
+
+    assert budget.take(_Boom("a"))[0] is True
+    assert budget.take(_Boom("b"))[0] is False
+    assert budget.take(ValueError("c"))[0] is True, "다른 유형은 자기 표본을 그대로 갖는다"
+
+
+def test_traceback_budget_type_name_matches_the_traceback_tail():
+    """유형 표기가 트레이스백 마지막 줄과 같아야 집계가 유형을 잃지 않는다.
+
+    `log_metrics._EXCEPTION_PREFIXES`는 `httpx.ReadTimeout` 표기로 세므로, 트레이스백을
+    생략한 요약 줄도 같은 문자열을 실어야 한다(08-04 §2-1 재발 방지).
+    """
+    import httpx
+
+    assert TracebackBudget.type_name(httpx.ReadTimeout("t")) == "httpx.ReadTimeout"
+    assert TracebackBudget.type_name(ValueError("v")) == "builtins.ValueError"

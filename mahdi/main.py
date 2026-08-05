@@ -71,7 +71,8 @@ from mahdi.fusion.signal_layer import (
     build_member_scores,
 )
 from mahdi.fusion.strategy_palette import entry_strategies
-from mahdi.logutil import WarningThrottle
+from mahdi import session
+from mahdi.logutil import TracebackBudget, WarningThrottle
 from mahdi.risk.circuit_breaker import MarketConditions
 from mahdi.risk.engine import RiskEngine
 from mahdi.risk.market_halt import MarketHaltMonitor, MarketOperationStatus, SIDECAR_CODES, MKOP_CLS_LABELS
@@ -246,6 +247,31 @@ LOG_CHAIN_BUDGET_EXCEEDED = (
     "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
     "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8)"
 )
+# 2026-08-05(운영점검보고서 §2-6) — 사이클은 정상 실행됐는데 **행이 한 줄도 안 남은** 분.
+#
+# 08-05 14:31이 그랬다: KIS가 53초간 전 레그를 타임아웃시켜 `rows=0`으로 끝났는데, 로그에 남은
+# 것은 `LOG_CHAIN_BUDGET_EXCEEDED`(...0레그로 이번 분을 마감합니다) 한 줄뿐이었다. 그 줄은
+# **17레그로 마감한 분과 같은 레벨·같은 모양**이라 "조금 잘렸다"와 "통째로 날아갔다"가 구분되지
+# 않았고, 결손 지표(로그 기준)는 사이클이 돌았으므로 이 분을 세지 않았다 — DB에는 0행인데
+# 리포트 §4는 결손 1분만 보고했다.
+#
+# 재시도 경로의 `옵션 체인 폴링 재시도도 실패`로는 못 잡는다: 그 경로는 **예산이 남아 있을 때만**
+# 진입하는데, 전 레그가 타임아웃되는 날은 정의상 예산이 이미 소진돼 있다.
+LOG_CHAIN_CYCLE_EMPTY = (
+    "옵션체인 이번 분 전멸 — 수집 %d레그 중 적재 0행(예산 %.1f초 소진, 재시도 %s). "
+    "이 분은 GEX/감마플립 입력이 없다"
+)
+# 2026-08-05(§2-4) — 트레이스백 표본을 다 쓴 뒤의 요약 줄.
+#
+# `트레이스백 생략 — <유형>` 부분이 계약이다. `log_metrics`가 이 마커로 유형별 건수를 계속
+# 세므로(트레이스백이 사라져도 카운터가 안 죽는다), **문구를 바꾸면 계약 테스트가 깨진다.**
+# 마커를 이 형태로 고른 이유: 트레이스백 마지막 줄(`httpx.ReadTimeout: ...`)과 **겹치지 않아야**
+# 한 사건이 두 번 세어지지 않는다 — `_HANDLED_EXCEPTION_MARKERS`가 부분문자열로 매칭하기 때문이다.
+LOG_KIS_FAILURE_TRACEBACK_OMITTED = "%s — %s (트레이스백 생략 — %s, 오늘 %d번째)"
+
+# 프로세스 수명 = 하루(07:30 기동 → 15:45 종료). 상세 근거는 `logutil.TracebackBudget`.
+_TRACEBACK_BUDGET = TracebackBudget()
+
 LOG_ATM_ROLL = "ATM 롤링: 스팟 %.2f — 행사가 %s → %s"
 LOG_REST_LATENCY = "REST 응답시간(%.0f초 창): %s"
 
@@ -1769,6 +1795,14 @@ async def poll_option_chain(
             collect_seconds += time.monotonic() - retry_started
             if not rows:
                 logger.warning("옵션 체인 폴링 재시도도 실패 — 이번 사이클 포기")
+        if not rows:
+            # 2026-08-05 §2-6 — 예산 소진으로 재시도조차 못 한 경로가 여기로 떨어진다.
+            # ERROR인 이유: 이 분은 판단의 주입력이 통째로 없고, 결손 지표(로그 기준)에는
+            # 사이클이 돌았으므로 안 잡힌다. 상세 근거는 `LOG_CHAIN_CYCLE_EMPTY` 주석.
+            logger.error(
+                LOG_CHAIN_CYCLE_EMPTY,
+                own_calls_expected, collect_seconds, "함" if retried else "안 함",
+            )
         calls_after = getattr(rest_client, "rate_limit_total_calls", None)
         if calls_before is None or calls_after is None:
             other_poller_calls: int | None = None
@@ -2177,7 +2211,16 @@ def _log_kis_call_failure(
     if isinstance(exc, httpx.HTTPStatusError):
         fmt, args, exc_info = "%s — %s", (message, exc.response.text), False
     else:
-        fmt, args, exc_info = "%s", (message,), True
+        keep, nth = _TRACEBACK_BUDGET.take(exc)
+        if keep:
+            fmt, args, exc_info = "%s", (message,), True
+        else:
+            # 2026-08-05 §2-4 — 표본을 다 썼다. 트레이스백 대신 **유형·메시지·누적 건수**를
+            # 한 줄로 남긴다. 유형 표기가 트레이스백 마지막 줄과 같아야 집계가 유형을 잃지
+            # 않는다(상세 근거는 `TracebackBudget.type_name`).
+            fmt = LOG_KIS_FAILURE_TRACEBACK_OMITTED
+            args = (message, exc, TracebackBudget.type_name(exc), nth)
+            exc_info = False
     if throttle is not None and category is not None:
         throttle.warning(category, fmt, *args, exc_info=exc_info)
     else:
@@ -2568,16 +2611,31 @@ async def poll_investor_flow(
         await asyncio.sleep(delay)
 
 
-def _member_unavailable_reasons(inputs: SignalInputs) -> dict[str, str]:
+# 2026-08-05(§2-8) — 종가 단일가 구간의 OFI 부재 사유.
+#
+# 08-05 15:36~15:44에 `orderflow_ofi_vpin`이 죽어 앙상블이 4 → 3으로 얇아졌는데, 사유가
+# `ofi/queue_imbalance 없음`으로만 남아 **장애와 구분되지 않았다.** 원인은 결함이 아니라 시장
+# 구조다(연속 체결이 없으니 WS 1분봉이 안 만들어진다 — `mahdi.session` 참고).
+#
+# 사유만 가른다. **멤버를 살리지는 않는다** — 없는 값을 지어내는 것과 왜 없는지 아는 것은 다르다.
+MEMBER_UNAVAILABLE_CLOSING_AUCTION = "종가 단일가(연속체결 없음)"
+
+
+def _member_unavailable_reasons(inputs: SignalInputs, now: datetime) -> dict[str, str]:
     """
-    입력: 이번 사이클의 SignalInputs.
+    입력: 이번 사이클의 SignalInputs, **판단 시각**(필수).
     계산: 산출되지 **않은** 앙상블 멤버마다 "어느 원재료가 없어서인가"를 한 줄로 남긴다.
     해석: 2026-08-04 고도화#2 — 종전에는 `available_member_count` 숫자 하나뿐이라, 08-04에
          "2개"가 어느 둘인지 알아내려고 사람이 `signal_layer.py`를 읽어 역산해야 했다.
          그리고 그 역산 끝에 `orderflow_ofi_vpin`이 **데이터가 있는데도** 죽어 있다는 것이
          나왔다(§2-5). 사유를 남겨두면 다음에는 판단 행 조회 한 번으로 끝난다.
+         2026-08-05(§2-8): OFI 부재는 **장애와 시장 구조**를 가른다 — 상세 근거는
+         `MEMBER_UNAVAILABLE_CLOSING_AUCTION` 주석.
     실패 조건: 없음 — 가용한 멤버는 키 자체가 없다(빈 dict = 전 멤버 가용).
     """
+    # `now`를 기본값 없는 인자로 둔 이유: 기본값을 `db.local_now()`로 두면 이 함수가 **벽시계에
+    # 의존**하게 되고, 그러면 15:35 이후에 돌린 테스트만 다른 답을 낸다(실제로 겪었다).
+    # 판단 시각은 호출측이 이미 갖고 있는 값이다 — 숨기지 말고 넘긴다.
     scores = build_member_scores(inputs)
     reasons: dict[str, str] = {}
     for name in MEMBER_FIELDS:
@@ -2596,7 +2654,12 @@ def _member_unavailable_reasons(inputs: SignalInputs) -> dict[str, str]:
             ]
             reasons[name] = f"입력 없음: {', '.join(missing)}" if missing else "성분 전부 부호 0"
         elif name == "orderflow_ofi_vpin":
-            reasons[name] = "ofi/queue_imbalance 없음" if inputs.ofi is None else "ofi 부호 0"
+            if inputs.ofi is not None:
+                reasons[name] = "ofi 부호 0"
+            elif session.is_closing_auction(now):
+                reasons[name] = MEMBER_UNAVAILABLE_CLOSING_AUCTION
+            else:
+                reasons[name] = "ofi/queue_imbalance 없음"
         elif name == "flow_position":
             reasons[name] = "foreign_net_flow 없음" if inputs.foreign_net_flow is None else "순매수 부호 0"
         else:
@@ -2990,7 +3053,9 @@ async def poll_signal_fusion_cycle(
                     # 08-04까지는 `available_member_count`(=2) 한 숫자뿐이라, 그게 어느 멤버인지
                     # 알려면 사람이 코드를 읽어 역산해야 했다(이 보고서가 실제로 그렇게 만들어졌다).
                     # 사유까지 남기면 다음 회귀는 표 한 줄로 잡힌다.
-                    "member_unavailable": _member_unavailable_reasons(signal_inputs),
+                    # 2026-08-05 §2-8: 판단 시각을 넘긴다 — 종가 단일가의 OFI 부재를
+                    # 장애가 아니라 시장 구조로 기록하기 위함(`mahdi.session`).
+                    "member_unavailable": _member_unavailable_reasons(signal_inputs, poll_time),
                 }
 
                 # 2026-07-30 Fix#6: halt 상태와 계좌 상태는 진입 여부와 무관하게 매 사이클 구해

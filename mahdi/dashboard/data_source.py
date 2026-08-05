@@ -20,6 +20,7 @@ from mahdi.engines.regime_pipeline import FEATURE_VERSION, MACRO_SNAPSHOT_MAX_AG
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute_gamma_walls, signal_book_legs
 from mahdi.ops import db_metrics
+from mahdi import session
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
 
@@ -177,7 +178,11 @@ _STALE_DATA_THRESHOLD_SECONDS = 300.0
 # 이것은 2026-07-31 §2-2에서 CB 하트비트로 배운 것과 같은 실수다 — **정상을 이상으로 표시하면
 # 진짜 이상을 못 알아본다.** 단일가 구간에서는 결손 나이를 `now`가 아니라 이 시각 기준으로 재서,
 # "단일가 진입 전부터 이미 끊겨 있었나"만 판정한다(14:00에 멈춘 경우는 여전히 경고).
-_CLOSING_AUCTION_START = dtime(15, 35)
+#
+# 2026-08-05(§2-8): 이 상수는 **`mahdi.session`으로 옮겼다.** 08-05에 같은 사실이 필요한 곳이
+# 하나 더 나왔는데(판단 경로의 `orderflow_ofi_vpin` 미가용 사유) 그때까지 이 지식은 화면에만
+# 있었다 — 규약 B(같은 것은 한 곳에서)의 적용이다. 이름은 하위 호환을 위해 유지한다.
+_CLOSING_AUCTION_START = session.CLOSING_AUCTION_START
 
 
 def _is_trading_hours(now: datetime) -> bool:

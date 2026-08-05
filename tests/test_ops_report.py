@@ -320,3 +320,91 @@ def test_strike_window_section_says_not_measured_yet_when_the_book_is_unknown():
         {"strike_window_quality": {"available": False, "reason": "만기유동성 미적재"}}, {}
     ))
     assert "계측 전" in out and "만기유동성 미적재" in out
+
+
+# ===== 2026-08-05 Fix#2 / #4 / #5 / #6 렌더러 =====
+
+
+def test_missing_section_flags_the_gap_between_the_log_axis_and_the_db_axis():
+    """§2-6 — 로그 축(사이클이 돌았는가)과 DB 축(행이 남았는가)이 다르면 그 차이가 신호다.
+
+    08-05: 로그 기준 결손 1분(10:04)인데 DB 기준 0행은 4분이었다. `rows=0`으로 끝난 사이클
+    (14:31, KIS가 53초간 전 레그 타임아웃)은 로그 축이 구조적으로 못 본다.
+    """
+    metrics = {"cycles": {"missing": {"count": 1, "odd": 0, "even": 1, "list": ["10:04"],
+                                      "recovered_by_catchup": 0, "unrecovered_count": 1}}}
+    db = {"chain_minute_coverage": {
+        "available": True, "span_minutes": 494, "minutes_with_rows": 490,
+        "zero_row_minutes": ["10:04", "10:54", "12:57", "14:31"], "zero_row_count": 4,
+        "over_design_minutes": [["10:03", 24], ["12:56", 22]], "over_design_count": 2,
+    }}
+    rendered = "\n".join(report._render_missing(metrics, db))
+
+    assert "로그 1분 vs DB 4분" in rendered
+    assert "14:31" in rendered
+    assert "설계 상한" in rendered and "10:03(24행)" in rendered
+
+
+def test_missing_section_is_quiet_when_both_axes_agree():
+    """오탐 방지 — 두 축이 같으면 경고를 내지 않는다."""
+    metrics = {"cycles": {"missing": {"count": 0, "odd": 0, "even": 0, "list": [],
+                                      "recovered_by_catchup": 0, "unrecovered_count": 0}}}
+    db = {"chain_minute_coverage": {
+        "available": True, "span_minutes": 400, "minutes_with_rows": 400,
+        "zero_row_minutes": [], "zero_row_count": 0,
+        "over_design_minutes": [], "over_design_count": 0,
+    }}
+    rendered = "\n".join(report._render_missing(metrics, db))
+
+    assert "두 축이 어긋난다" not in rendered
+    assert "설계 상한" not in rendered
+
+
+def test_log_volume_prints_the_line_composition_identity():
+    """§2-4 — `총계 = httpx + 사람 + 트레이스백`을 눈으로 확인할 수 있어야 한다.
+
+    08-05에 이 줄이 없어 트레이스백 16,577줄이 `human_lines`에 섞였고, 그 값으로 가설
+    `2026-08-04-p4`가 **거짓 반증**됐다(실측 4,599줄은 예측치 <=6,500을 통과했다).
+    """
+    metrics = {"log_volume": {
+        "total_bytes": 4_444_444, "total_lines": 33737, "httpx_bytes": 2_650_000,
+        "httpx_pct": 62.4, "human_lines": 4599, "traceback_lines": 16577,
+        "httpx_lines": 12561, "by_level": {"INFO": 1},
+    }}
+    rendered = "\n".join(report._render_log_volume(metrics))
+
+    assert "httpx **12,561** + 사람 **4,599** + 트레이스백 **16,577** = **33,737**" in rendered
+    assert "총계" not in rendered.split("줄 구성")[1].split("\n")[0], "항등식이 맞으면 불일치 문구가 없어야 한다"
+    assert "트레이스백이 로그의 **49%**" in rendered
+
+
+def test_member_availability_separates_structural_unavailability():
+    """§2-8 — 종가 단일가의 미가용은 결함이 아니다. 가용률에 녹이지 않고 열을 따로 둔다."""
+    db = {"member_availability": {
+        "available": True, "minutes": 494,
+        "members": [{"member": "orderflow_ofi_vpin", "available_minutes": 410,
+                     "available_pct": 83.0, "top_unavailable_reason": "종가 단일가(연속체결 없음)",
+                     "structural_minutes": 9, "implemented": True}],
+    }}
+    rendered = "\n".join(report._render_member_availability(db))
+
+    assert "그중 구조적" in rendered
+    assert "구조적 미가용은 결함이 아니다" in rendered
+
+
+def test_spot_divergence_section_refuses_to_set_a_threshold_on_the_basis():
+    """§2-3 / Fix#6 — 괴리율에는 임계를 걸지 않는다(선물 베이시스는 실재하는 경제량이다).
+
+    보고서가 처음 적었던 "0.5% 2분 연속" 규칙은 08-05 실측에서 정상 베이시스 구간
+    (09:01·09:02·09:22·10:32)에 오경보를 냈을 것이다. 판정은 **지수 정지**로 한다.
+    """
+    db = {"spot_source_divergence": {
+        "available": True, "futures_symbol": "A01609", "minutes": 405,
+        "max_pct": 5.002, "median_pct": 0.252,
+        "index_frozen_minutes": 27, "index_frozen_max_run": 15,
+    }}
+    rendered = "\n".join(report._render_spot_divergence(db))
+
+    assert "임계를 걸지 않는다" in rendered
+    assert "최장 연속 **15분**" in rendered
+    assert "판정은 **지수 정지**로 한다" in rendered

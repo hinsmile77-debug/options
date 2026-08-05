@@ -84,6 +84,18 @@ _BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 수집 예산\([\d.]+초\) 초과 — 남은 (\d+)레그를 포기하고 (\d+)레그로"
 )
 _LEVEL_RE = re.compile(_TS + r" (INFO|WARNING|ERROR|CRITICAL|DEBUG):(\S+?):")
+
+# 2026-08-05(§2-4) — **로그 레코드 한 줄**을 가리는 기준.
+#
+# 종전 `human_lines`는 httpx가 아닌 **모든 줄**을 셌다. 그래서 트레이스백 본문의
+# `  File "...", line 101, in map_httpcore_exceptions` 한 줄 한 줄이 "사람이 읽는 줄"로 집계됐고,
+# 08-05에 21,176줄 중 16,577줄(78%)이 그것이었다 — 그 값으로 자동 리포트 §0이 가설 `p4`를
+# **반증 판정했는데 실측 4,599줄은 예측치(<=6,500)를 통과했다.** 08-04 Fix#6의 성공이
+# 트레이스백에 묻혀 실패로 보고된 것이다.
+#
+# 판정 규칙이 이렇게 단순한 이유: 파이썬 `logging`은 레코드마다 타임스탬프를 찍고, 트레이스백
+# 본문은 **레코드에 딸린 여러 줄**이라 타임스탬프가 없다. 형식이 아니라 구조가 만드는 구분이다.
+_RECORD_START_RE = re.compile(_TS)
 _FAILURE_RE = re.compile(_TS + r" WARNING:mahdi\.main:(.+?(?:실패|끊김))")
 
 # 정성 카운트 — 줄의 **접두사**로 센다. 부분 문자열 포함으로 세면 트레이스백 한 사건이 여러 줄에
@@ -103,6 +115,17 @@ _QUALITATIVE_MARKERS = {
     # 포맷 원본: `mahdi.main.LOG_EVENT_CALENDAR_NOT_COVERED`
     # (계약은 tests/test_ops_log_metrics_contract.py가 지킨다 — 이 모듈은 순수 파서로 남긴다.)
     "event_calendar_not_covered": "이벤트 캘린더 미기입",
+    # 2026-08-05(§2-5) — 감마플립이 수집 행사가 범위 밖이라 기각된 건수.
+    # **이 값이 0이라고 안심하지 말 것**: 0은 "기각할 것이 없었다"이지 "flip이 잘 나온다"가
+    # 아니다. 반드시 §14의 `gamma_flip_out_of_range_count`(DB 기준 불변식)와 나란히 읽는다 —
+    # 로그 마커는 기각된 것을, DB 불변식은 **기각을 통과해 적재된 것 중 범위 밖인 것**을 센다.
+    # 후자가 0이 아니면 이 fix가 뚫린 것이다.
+    # 포맷 원본: `mahdi.features.options_intel.LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE`
+    "gamma_flip_out_of_leg_range": "감마플립 기각(레그 범위 밖)",
+    # 2026-08-05(§2-6) — 사이클은 돌았는데 적재 0행인 분. **결손 지표(로그 기준)가 세지 않는
+    # 유일한 손실 유형**이라 여기서 따로 센다. DB 축(`db.chain_minute_coverage`)과 나란히 읽는다.
+    # 포맷 원본: `mahdi.main.LOG_CHAIN_CYCLE_EMPTY`
+    "chain_cycle_empty": "옵션체인 이번 분 전멸",
 }
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
@@ -128,6 +151,14 @@ _EXCEPTION_PREFIXES = {
 _HANDLED_EXCEPTION_MARKERS = {
     "remote_protocol_error": "커넥션 재사용 실패(RemoteProtocolError)",
 }
+
+# 2026-08-05(§2-4) — 트레이스백 표본 소진 후의 요약 줄을 **원래 유형 키에 합산**하기 위한 마커.
+# 뒤에 `_EXCEPTION_PREFIXES`의 유형명이 그대로 붙는다(`트레이스백 생략 — httpx.ReadTimeout`).
+#
+# 트레이스백 마지막 줄(`httpx.ReadTimeout: ...`)과 **겹치지 않는 형태**여야 한다 —
+# `_EXCEPTION_PREFIXES`는 접두사로, 이쪽은 부분문자열로 세므로 겹치면 한 사건이 두 번 세어진다.
+# 포맷 원본: `mahdi.main.LOG_KIS_FAILURE_TRACEBACK_OMITTED`
+_TRACEBACK_OMITTED_MARKER = "트레이스백 생략 — "
 
 # KIS가 rt_cd/msg_cd를 실은 에러 응답(대개 HTTP 500). 2026-08-03 §2-8이 트레이스백을 떼면서
 # `http_status_error`(트레이스백 기반)가 죽었으므로, 지금 로그 모양 그대로에서 다시 센다:
@@ -155,6 +186,10 @@ _PARSER_AUDIT_TOKENS = {
     "connect_error": "ConnectError",
     "kis_error_response": _KIS_ERROR_BODY_TOKEN,
     "event_calendar_not_covered": "이벤트 캘린더",
+    # 엄격 마커는 "감마플립 기각(레그 범위 밖)"이다 — 괄호 안 문구를 바꾸면 엄격 파서가 0이
+    # 되는데, 이 짧은 토큰이 그 침묵을 ⚠로 드러낸다.
+    "gamma_flip_out_of_leg_range": "감마플립 기각",
+    "chain_cycle_empty": "이번 분 전멸",
 }
 
 
@@ -248,6 +283,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     httpx_bytes = 0
     total_lines = 0
     human_lines = 0
+    traceback_lines = 0
 
     for line in lines:
         raw = line.encode("utf-8")
@@ -256,8 +292,13 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         is_httpx = "INFO:httpx:" in line
         if is_httpx:
             httpx_bytes += len(raw) + 1
-        else:
+        elif _RECORD_START_RE.match(line):
             human_lines += 1
+        else:
+            # 트레이스백 본문(및 로거가 남긴 여러 줄 레코드의 2번째 줄 이후).
+            # 0으로 만들지 않고 **분리해서 함께 보고한다** — 없애면 "트레이스백이 줄었다"와
+            # "세는 것을 그만뒀다"가 구분되지 않는다(§2-4의 교훈은 정확히 그 구분에 관한 것이다).
+            traceback_lines += 1
 
         for key, marker in _QUALITATIVE_MARKERS.items():
             if marker in line:
@@ -267,6 +308,12 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
                 qualitative[key] += 1
         for key, marker in _HANDLED_EXCEPTION_MARKERS.items():
             if marker in line:
+                qualitative[key] += 1
+        # 2026-08-05(§2-4) — 트레이스백 표본을 다 써서 한 줄로 요약된 예외.
+        # 마커를 `_EXCEPTION_PREFIXES`의 유형명에서 **생성**하므로 유형이 늘어도 자동으로 따라온다
+        # (규약 A의 정신 — 같은 사실을 두 곳에 적지 않는다).
+        for key, prefix in _EXCEPTION_PREFIXES.items():
+            if _TRACEBACK_OMITTED_MARKER + prefix in line:
                 qualitative[key] += 1
         for key, token in _PARSER_AUDIT_TOKENS.items():
             if token in line:
@@ -412,6 +459,11 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "httpx_bytes": httpx_bytes,
             "httpx_pct": round(httpx_bytes / total_bytes * 100, 1) if total_bytes else None,
             "human_lines": human_lines,
+            # 2026-08-05 §2-4 — `total_lines = httpx_lines + human_lines + traceback_lines`가
+            # 항등식으로 성립한다. 리포트 §11이 이 셋을 나란히 찍으므로 어느 축이 부풀었는지
+            # 한 줄로 보인다(08-05에는 그 줄이 없어 트레이스백 폭증이 `human_lines` 반증으로 둔갑했다).
+            "traceback_lines": traceback_lines,
+            "httpx_lines": total_lines - human_lines - traceback_lines,
             "by_level": dict(levels),
         },
         "qualitative": dict(qualitative),
