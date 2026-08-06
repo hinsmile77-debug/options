@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from mahdi.ops import report
 
 _TODAY = {
@@ -450,3 +452,43 @@ def test_latency_streak_declines_to_judge_without_yesterday():
     rendered = "\n".join(report._render_latency_streak([{"hour": "10", "endpoint": "x", "p95": 3.0}], None, 2.5))
 
     assert "연속 판정을 못 한다" in rendered
+
+
+# ===== 2026-08-06 §3-1 / Fix#3 — 「경로 없음」 배너와 리스트 절 색인 =====
+
+
+def test_dead_metric_paths_get_their_own_banner_above_the_table():
+    """표 안의 한 줄이면 08-06처럼 28행 중에 묻힌다 — 가장 위로 올린다."""
+    from mahdi.ops import hypotheses, report
+
+    results = hypotheses.evaluate(
+        [{
+            "id": "h-dead", "가설": "죽은 경로", "상태": "pending", "검증예정일": date(2026, 8, 6),
+            "예측": [{"metric": "db.없는절.값", "expect": ">= 0", "역할": hypotheses.ROLE_CLAIM}],
+        }],
+        date(2026, 8, 6), {"overrun": {"count": 0}}, {"decisions": {"total": 1}},
+    )
+    rendered = "\n".join(report._render_hypotheses(results))
+    assert "경로 없음 1건" in rendered
+    assert "db.없는절.값" in rendered
+    # 배너가 표보다 위에 있어야 한다.
+    assert rendered.index("경로 없음 1건") < rendered.index("| id |")
+
+
+def test_dig_indexes_a_list_section_by_its_natural_key():
+    """`db.tables.underlying_spot_1m.rows` — 08-05 p6이 적었고 영원히 None이던 경로다."""
+    from mahdi.ops.report import dig
+
+    metrics = {"tables": [
+        {"table": "option_analysis_1m", "rows": 9069},
+        {"table": "underlying_spot_1m", "rows": 384},
+    ]}
+    assert dig(metrics, "tables.underlying_spot_1m.rows") == 384
+    assert dig(metrics, "tables.없는테이블.rows") is None
+
+
+def test_dig_list_indexing_does_not_swallow_scalars():
+    from mahdi.ops.report import dig
+
+    assert dig({"a": 1}, "a.b") is None
+    assert dig({"a": [1, 2, 3]}, "a.b") is None

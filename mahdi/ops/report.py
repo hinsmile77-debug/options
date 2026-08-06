@@ -28,6 +28,11 @@ HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
     ("최대 밀림", "overrun.max_seconds", "{:.1f}초", "down"),
     ("결손 분(회수 전)", "cycles.missing.count", "{:,.0f}분", "down"),
     ("결손 분(회수 후)", "cycles.missing.unrecovered_count", "{:,.0f}분", "down"),
+    # 2026-08-06 §3-5 / Fix#6 — 위 두 줄에서 **미가동분을 떼어 따로 세운다.**
+    # 08-06에 결손 21분 중 20분이 프로세스 정지 구간이었는데, 이 표는 `▲20 ⚠`을 냈고
+    # 그 숫자를 인프라 악화로 읽으면 틀린다. 인프라 결손은 실제로 1분이었다.
+    ("└ 인프라 결손", "cycles.missing.infra_count", "{:,.0f}분", "down"),
+    ("└ 관측 루프 미가동", "cycles.missing.downtime_count", "{:,.0f}분", "down"),
     ("결손 회수", "catchups.count", "{:,.0f}건", None),
     ("비200 응답", "rest.non_200.count", "{:,.0f}건", "down"),
     ("백오프 최대 배율", "backoff.max_multiplier", "{:.2f}배", "down"),
@@ -36,14 +41,55 @@ HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
 ]
 
 
+# 2026-08-06 §3-1 / Fix#3 — **리스트 절을 자연 키로 색인한다.**
+#
+# 08-05 `p6`이 적은 경로는 `db.tables.underlying_spot_1m.rows`였다. `db.tables`는 표를 그리기
+# 위한 **리스트**라 그 경로는 영원히 None이었고, 그 가설은 주장 지표를 못 받은 채 하루를 갔다.
+# 사람이 그렇게 적는 것이 자연스럽다 — 리포트에 `underlying_spot_1m`이라는 행이 실제로 있고,
+# 그 행에 `rows` 칸이 있다. 리스트인지 dict인지는 렌더링 사정이지 지표의 의미가 아니다.
+#
+# 그래서 리스트 노드를 만나면 각 원소에서 아래 필드 중 하나를 찾아 키로 쓴다. 후보를 좁게
+# 두는 이유: 아무 문자열 필드나 키로 삼으면 서로 다른 두 행이 같은 이름을 갖는 순간 조용히
+# 첫 행이 이긴다. 여기 있는 것은 전부 그 절 안에서 유일한 식별자다.
+_LIST_INDEX_FIELDS = ("table", "member", "id", "name")
+
+
 def dig(metrics: dict, path: str) -> Any:
-    """`"cycles.missing.count"` 같은 점 표기 경로로 중첩 dict를 꺼낸다(없으면 None)."""
+    """`"cycles.missing.count"` 같은 점 표기 경로로 중첩 구조를 꺼낸다(없으면 None).
+
+    dict는 키로, **dict의 리스트는 자연 키(`_LIST_INDEX_FIELDS`)로** 색인한다.
+    """
     node: Any = metrics
     for key in path.split("."):
-        if not isinstance(node, dict) or key not in node:
-            return None
-        node = node[key]
+        if isinstance(node, dict):
+            if key not in node:
+                return None
+            node = node[key]
+            continue
+        if isinstance(node, list):
+            match = _index_list(node, key)
+            if match is None:
+                return None
+            node = match
+            continue
+        return None
     return node
+
+
+def _hhmmss(seconds_of_day: float) -> str:
+    total = int(seconds_of_day)
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _index_list(rows: list, key: str) -> Any:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for field in _LIST_INDEX_FIELDS:
+            value = row.get(field)
+            if value is not None and str(value) == key:
+                return row
+    return None
 
 
 def _fmt(value: Any, spec: str) -> str:
@@ -197,15 +243,34 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
     """
     missing = dig(metrics, "cycles.missing") or {}
     log_count = missing.get("count", 0)
+    downtime = missing.get("downtime_count", 0)
+    infra = missing.get("infra_count", 0)
+    recovered = missing.get("recovered_by_catchup", 0)
     out = [
         f"- **로그 기준** 결손 **{log_count}분** (홀수분 {missing.get('odd', 0)} / "
         f"짝수분 {missing.get('even', 0)})",
-        f"- 캐치업 회수 **{missing.get('recovered_by_catchup', 0)}분** → "
-        f"미회수 **{missing.get('unrecovered_count', 0)}분**",
+        # 2026-08-06 §3-5 / Fix#6 — **세 축으로 가른다.**
+        # 08-06 §1은 `결손 분 21분 ▲20 ⚠`을 냈고, 그것을 인프라 악화로 읽으면 틀린다:
+        # 20분이 프로세스 정지 구간이고 사이클이 돌면서 놓친 것은 1분뿐이었다.
+        f"- 내역: **미가동 {downtime}분** · **인프라 결손 {infra}분** · 회수 {recovered}분",
     ]
-    listed = missing.get("list") or []
-    if listed:
-        out += ["", "```", " ".join(listed), "```"]
+    if downtime:
+        out.append(
+            f"> ⚠ **{downtime}분은 관측 루프가 아예 안 돌던 구간**이다(재기동 사이). "
+            "인프라가 나빠진 것이 아니라 시스템이 꺼져 있었다 — 이 둘을 같은 분모로 섞으면 "
+            "「결손 ▲20 ⚠」이 인프라 회귀로 오독된다. 정지 자체는 §11의 프로세스 기동 횟수와 "
+            "함께 읽을 것."
+        )
+    down_listed = missing.get("downtime_list") or []
+    if down_listed:
+        out += ["", "미가동:", "```", " ".join(down_listed), "```"]
+    infra_listed = missing.get("infra_list") or []
+    if infra_listed:
+        out += ["", "인프라 결손:", "```", " ".join(infra_listed), "```"]
+    if not down_listed and not infra_listed:
+        listed = missing.get("list") or []
+        if listed:
+            out += ["", "```", " ".join(listed), "```"]
 
     coverage = (db_metrics or {}).get("chain_minute_coverage") or {}
     if not coverage.get("available"):
@@ -423,10 +488,70 @@ def _render_log_volume(metrics: dict) -> list[str]:
             "넘겨 새는지 확인할 것(`logutil.TRACEBACK_SAMPLES_PER_EXCEPTION_TYPE`).",
             "",
         ]
+    # 2026-08-06 §3-3 / Fix#4 — 그날 프로세스가 몇 번 떴는가.
+    # `오늘 N번째` 트레이스백 카운터는 **프로세스 단위**라, 재기동이 있으면 되감긴다(08-06에는
+    # 세 번 떠서 같은 번호가 로그에 두 번 나왔다). 이 줄이 없으면 그 사실이 안 보인다.
+    starts = metrics.get("process_starts") or []
+    if len(starts) > 1:
+        out += [
+            f"- ⚠ **관측 루프가 오늘 {len(starts)}번 떴다** "
+            f"({', '.join(_hhmmss(s) for s in starts)}) — `오늘 N번째` 카운터가 "
+            f"{len(starts) - 1}번 되감겼고, 트레이스백 표본도 프로세스마다 새로 열렸다. "
+            "재기동 구간은 §4의 「미가동」과 함께 읽을 것.",
+            "",
+        ]
+
     out += _table(["레벨", "건수"], [[k, str(v)] for k, v in (lv.get("by_level") or {}).items()])
-    out += _table(["정성 항목", "건수"], [[k, str(v)] for k, v in (metrics.get("qualitative") or {}).items()])
+
+    # 2026-08-06 §3-2 / Fix#4 — 「줄」과 「억제」를 나란히 낸다.
+    # 08-06 실측: `read_timeout` 126건으로 보고됐지만 실제는 205건이었다(WarningThrottle이
+    # 81건의 줄을 통째로 삼켰고, 그 숫자는 `(최근 60초간 M건 추가 억제됨)`에만 남아 있었다).
+    suppressed = metrics.get("qualitative_suppressed") or {}
+    qual_rows = []
+    for key, total_count in (metrics.get("qualitative") or {}).items():
+        hidden = suppressed.get(key, 0)
+        qual_rows.append([
+            key, str(total_count),
+            f"{total_count - hidden:,} + {hidden:,}" if hidden else "—",
+        ])
+    out += _table(["정성 항목", "건수", "줄 + 억제"], qual_rows)
+    if suppressed:
+        out += [
+            "> 「줄 + 억제」의 뒤쪽은 **로그에 줄이 아예 안 남은** 건수다(`WarningThrottle`이 60초 "
+            "창당 1건만 남긴다). 건수 열은 둘의 합이다 — 08-06까지는 앞쪽만 세어 "
+            "`read_timeout`을 실제의 61%로 보고했다. 억제분은 그 요약을 실은 줄의 예외 유형에 "
+            "합산한 **근사**다(창이 60초라 유형이 바뀌는 경우는 드물다).",
+            "",
+        ]
     out += _render_parser_audit(metrics)
-    out += _table(["실패 유형", "건수"], [[k, str(v)] for k, v in (metrics.get("failures") or {}).items()])
+    # 2026-08-06 §3-4 / Fix#5 — 실패를 **원인 축으로** 갈라 낸다.
+    # 08-06에 `만기 유동성 폴링 실패 7건`이 08-05 `p2`를 반증했는데, 7건이 전부 EGW00201이고
+    # ReadTimeout 기인은 0건이었다 — 그 가설의 주장은 오히려 맞았고 지표가 그것을 못 봤다.
+    by_cause = metrics.get("failures_by_cause") or {}
+    causes = sorted({c for row in by_cause.values() for c in row})
+    if by_cause and causes:
+        out += _table(
+            ["실패 유형", "총계", *causes],
+            [
+                [kind, str(total), *[str(by_cause.get(kind, {}).get(c, 0) or "—") for c in causes]]
+                for kind, total in (metrics.get("failures") or {}).items()
+            ],
+        )
+        other_total = sum(row.get("other", 0) for row in by_cause.values())
+        grand_total = sum((metrics.get("failures") or {}).values())
+        out += [
+            "> **주장이 원인을 말하면 지표도 원인으로 잘려야 한다**(규약 E의 다음 칸). "
+            "총계만 보면 08-06처럼 «맞은 fix가 반증으로» 나온다.",
+            f"> `other` **{other_total}건 / {grand_total}건** — 트레이스백이 살아 있는 예외는 "
+            "실패 줄에 유형이 안 실려 여기로 떨어진다(예산이 유형당 3건이라 정상 범위는 10건 "
+            "안쪽이다). 크게 늘면 분류를 늘릴 때다.",
+            "",
+        ]
+    else:
+        out += _table(
+            ["실패 유형", "건수"],
+            [[k, str(v)] for k, v in (metrics.get("failures") or {}).items()],
+        )
     return out
 
 
@@ -721,6 +846,7 @@ def _render_db_judgement(db: dict) -> list[str]:
         "(1~2종이면 판단이 사실상 고정 출력이다)",
         "",
     ]
+    out += _render_entry_cutoff(db)
     out += _table(
         ["레짐", "오늘", "전체 이력", "영업일"],
         [[r["regime"], f"{r['today']:,}", f"{r['total']:,}", str(r["days"])]
@@ -736,6 +862,38 @@ def _render_db_judgement(db: dict) -> list[str]:
         ["피처", "중립값 탈출 비율"],
         [[k, _fmt(v, "{:.1f}%")] for k, v in (fs.get("non_neutral_pct") or {}).items()],
     )
+    return out
+
+
+def _render_entry_cutoff(db: dict) -> list[str]:
+    """2026-08-06 §2-2 / Fix#1 — v6 §4.2 「14:50 신규 진입 컷오프」의 **불변식**을 낸다.
+
+    이 절이 다른 절과 다른 점: 여기 나오는 숫자는 시장이 아니라 **우리 코드**를 잰다.
+    `enter_after_cutoff`가 0이 아닌 날은 시장이 특이한 날이 아니라 게이트가 빠진 날이다.
+    """
+    cutoff = (db.get("decisions") or {}).get("entry_cutoff")
+    if not cutoff:
+        return []
+    violated = cutoff.get("enter_after_cutoff") or 0
+    after_flat = cutoff.get("enter_after_forced_flat") or 0
+    blocked = cutoff.get("blocked_count") or 0
+    out = [
+        f"- **진입 컷오프({cutoff.get('cutoff_time')})**: 차단 **{blocked}분** · "
+        f"컷오프 이후 ENTER **{violated}건**(그중 강제 평탄화 {cutoff.get('forced_flat_time')} 이후 "
+        f"**{after_flat}건**)",
+    ]
+    if violated:
+        out.append(
+            f"> ⛔ **불변식 위반** — v6 §4.2는 {cutoff.get('cutoff_time')} 이후 신규 진입을 금지한다. "
+            "이 값이 0이 아니면 게이트가 빠진 것이다(2026-08-06 실측 21건 / 평탄화 이후 18건이 "
+            "이 fix를 만든 사건이다)."
+        )
+    else:
+        out.append(
+            "> 0이 정상이다. **진입 후보가 없어서 0인 것과 게이트가 막아서 0인 것은 다르다** — "
+            "앞의 「차단 N분」이 그 구분이다(N이 0이면 그 시간대에 애초에 진입 신호가 없었다)."
+        )
+    out.append("")
     return out
 
 
@@ -909,6 +1067,26 @@ def _render_hypotheses(results: list[dict]) -> list[str]:
             "",
         ]
         out += [f"> - `{hid}`" for hid in unjudgeable]
+        out.append("")
+
+    # 2026-08-06 §3-1 / Fix#3 — **경로가 존재하지 않는 지표.** 표 안에서는 "실측 없음" 한 줄과
+    # 구별되지 않아, 08-05 예측 13건 중 6건이 주장 지표를 통째로 잃은 채 하루를 갔다. 그중
+    # `p1`의 대가 지표는 12배 초과(ENTER 예측 ≤5에 62건)였고 아무도 자동으로 알아채지 못했다.
+    # **가장 위로 올린다** — 이것은 "오늘 값이 없다"가 아니라 "yaml이 틀렸다"이고, 고치기 전까지
+    # 그 가설은 영원히 검정되지 않는다.
+    dead = sorted({(r["id"], r["metric"], r.get("역할", "")) for r in results if r.get("path_dead")})
+    if dead:
+        out += [
+            f"> ⛔ **경로 없음 {len(dead)}건 — 이 지표는 오늘이 아니라 *영원히* 안 나온다.** "
+            "자동 집계에 그런 경로가 없다(오타이거나 구조가 바뀐 것). **`hypotheses.yaml`을 "
+            "고치기 전까지 그 가설은 검정되지 않는다** — 08-06에 이 구분이 없어 6건이 "
+            "「실측 없음」에 묻혔다.",
+            "",
+        ]
+        out += [
+            f"> - `{hid}` — `{metric}`" + (f" (역할: {role})" if role else "")
+            for hid, metric, role in dead
+        ]
         out.append("")
 
     cost_missing = sorted({(r["id"], r.get("대가")) for r in results if r.get("cost_missing")})

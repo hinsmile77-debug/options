@@ -160,6 +160,36 @@ _HANDLED_EXCEPTION_MARKERS = {
 # 포맷 원본: `mahdi.main.LOG_KIS_FAILURE_TRACEBACK_OMITTED`
 _TRACEBACK_OMITTED_MARKER = "트레이스백 생략 — "
 
+# 2026-08-06(§3-2 / Fix#4) — **로그에 줄이 안 남은 예외를 세어 넣는다.**
+#
+# 08-06 실측: `qualitative.read_timeout` 126건, 실제 205건. **39%가 집계에서 사라졌다.**
+#
+# 원인은 `main._log_kis_call_failure()`의 호출 순서다:
+#
+#     keep, nth = _TRACEBACK_BUDGET.take(exc)   # 카운터는 여기서 무조건 올라간다
+#     ...
+#     throttle.warning(category, fmt, *args)    # 60초 창에 걸리면 줄이 통째로 사라진다
+#
+# `WarningThrottle`이 같은 카테고리를 창당 1건만 남기므로 81건이 카운터만 올리고 줄은 안 남았다.
+# **완전 소실은 아니었다** — 다음 로그에 `(최근 60초간 M건 추가 억제됨)`이 붙고 08-06에 그런 줄이
+# 53건 있었다. 그 M을 **아무도 안 읽고 있었을 뿐이다.**
+#
+# 그래서 로그 포맷을 바꾸지 않고 집계만 고친다(저위험 쪽을 골랐다). 억제된 건수는 그 요약을
+# 실은 줄의 예외 유형에 합산한다 — 창이 60초라 그 안에서 유형이 바뀌는 경우는 드물고, 유형을
+# 모르는 채 버리는 것보다 낫다. **다만 합산분은 `qualitative_suppressed`에 따로도 남긴다**:
+# 근사가 섞였다는 사실 자체가 보이지 않으면 그 근사가 곧 사실로 굳는다.
+# 포맷 원본: `mahdi.logutil.WarningThrottle.warning`
+_THROTTLE_SUPPRESSED_RE = re.compile(r"최근 \d+초간 (\d+)건 추가 억제됨")
+
+# 프로세스 기동 표식 — 이 줄은 프로세스당 정확히 한 번 나온다.
+# 포맷 원본: `mahdi.main._log_startup_gap_since_last_run`
+#
+# 2026-08-06(§3-3 / Fix#4, §3-5 / Fix#6): 08-06에 프로세스가 **세 번** 떴고, 그래서
+#   (1) `오늘 N번째` 트레이스백 카운터가 두 번 되감겨 같은 번호가 로그에 두 번 나왔고,
+#   (2) 결손 21분 중 20분이 "프로세스가 아예 안 돌던 구간"인데 인프라 결손으로 집계됐다.
+# 이 표식을 세면 두 문제 모두 리포트에서 보인다.
+_PROCESS_START_MARKER = "직전 정상 기동"
+
 # KIS가 rt_cd/msg_cd를 실은 에러 응답(대개 HTTP 500). 2026-08-03 §2-8이 트레이스백을 떼면서
 # `http_status_error`(트레이스백 기반)가 죽었으므로, 지금 로그 모양 그대로에서 다시 센다:
 #   WARNING:mahdi.main:옵션 체인 폴링 실패: C01608875 — {"rt_cd":"1","msg_cd":"EGW00201",...}
@@ -191,6 +221,55 @@ _PARSER_AUDIT_TOKENS = {
     "gamma_flip_out_of_leg_range": "감마플립 기각",
     "chain_cycle_empty": "이번 분 전멸",
 }
+
+
+# ===== 2026-08-06 §3-4 / Fix#5 — 실패의 **원인** =====
+#
+# 08-05 `p2`는 *"read 타임아웃을 엔드포인트별로 나누면 실패가 사라진다"* 고 주장하면서
+# `failures.만기 유동성 폴링 실패 <= 1`을 주장 지표로 걸었다. 08-06 실측 7건 → **자동 판정 반증.**
+#
+# 그런데 그 7건의 원인은 **전부 EGW00201(레이트리밋)이었고 ReadTimeout 기인은 0건이었다.**
+# 가설의 주장은 오히려 맞았는데, 지표가 원인을 안 갈라 그것을 볼 수 없었다.
+#
+# 규약 E("한쪽만 재지 마라")의 다음 칸이 이것이다: **주장 지표는 주장과 같은 축으로 잘려야 한다.**
+# 원인을 주장하는 fix는 원인별 지표로 검정해야 한다.
+#
+# 분류 순서가 곧 우선순위다 — 한 줄에 여러 단서가 있으면 **더 구체적인 것**이 이긴다
+# (EGW00201은 `"rt_cd"` 응답의 한 종류이므로 먼저 본다).
+FAILURE_CAUSE_EGW00201 = "egw00201"          # 우리 페이서가 KIS 초당 한도를 건드렸다
+FAILURE_CAUSE_KIS_ERROR = "kis_error"        # 그 외 rt_cd 에러 응답(계좌 미신청 등)
+FAILURE_CAUSE_OTHER = "other"                # 위 어디에도 안 걸림 — 늘어나면 분류를 늘릴 때다
+
+_EGW00201_TOKEN = "EGW00201"
+
+# KIS 응답 중에는 **`rt_cd`에 따옴표가 없는 것**이 있다. 해외선물 시세 오류가 그렇다:
+#   {rt_cd:"1","msg1":"CME SUB거래소 신청 계좌가 아닙니다.","msg_cd":"EGW00552"}
+# `_KIS_ERROR_BODY_TOKEN`('"rt_cd"')만 보면 ES 조회 실패 9건/일이 통째로 `other`로 떨어져
+# "분류를 늘릴 때"라는 신호를 거짓으로 울린다(2026-08-06 첫 실측에서 실제로 그랬다 — other 11건
+# 중 9건이 이것이었다). `msg_cd`는 그 응답들이 공통으로 싣는 필드다.
+_KIS_ERROR_CODE_TOKEN = "msg_cd"
+
+
+def classify_failure_cause(line: str) -> str:
+    """
+    입력: `_FAILURE_RE`가 잡은 실패 로그 한 줄.
+    반환: 원인 키(`egw00201` / `kis_error` / `read_timeout` 등 예외 유형 / `other`).
+    해석: 예외 유형 키는 `_EXCEPTION_PREFIXES`에서 그대로 가져온다 — 유형이 늘어도 자동으로
+         따라오고, 다른 절(`qualitative`)과 **같은 이름**을 쓰므로 두 축을 교차해 읽을 수 있다.
+    한계(알고 남긴다): **트레이스백이 살아 있는 예외는 `other`로 떨어진다.** 그때 실패 줄에는
+         메시지만 있고 예외 유형은 다음 줄(트레이스백 마지막 줄)에 있기 때문이다. 예산이
+         유형당 프로세스당 3건이므로 하루 최대 10건 안쪽이고(08-06 실측 3건), `other`가 그보다
+         크게 늘면 그것 자체가 "분류를 늘릴 때"라는 신호다 — 리포트가 그 비율을 함께 낸다.
+    """
+    if _EGW00201_TOKEN in line:
+        return FAILURE_CAUSE_EGW00201
+    for key, prefix in _EXCEPTION_PREFIXES.items():
+        # 처리된 예외는 `트레이스백 생략 — httpx.ReadTimeout` 형태로 한 줄에 실린다.
+        if _TRACEBACK_OMITTED_MARKER + prefix in line:
+            return key
+    if _KIS_ERROR_BODY_TOKEN in line or _KIS_ERROR_CODE_TOKEN in line:
+        return FAILURE_CAUSE_KIS_ERROR
+    return FAILURE_CAUSE_OTHER
 
 
 def classify_endpoint(url: str) -> str:
@@ -277,6 +356,11 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     failures: collections.Counter = collections.Counter()
     levels: collections.Counter = collections.Counter()
     qualitative: collections.Counter = collections.Counter()
+    # 2026-08-06 Fix#4 — 위 카운터에 **합산된** 억제분을 따로도 남긴다(근사가 섞였다는 사실을
+    # 지운 채 총계만 내면 그 근사가 곧 사실로 굳는다).
+    qualitative_suppressed: collections.Counter = collections.Counter()
+    process_starts: list[float] = []
+    failures_by_cause: dict[str, collections.Counter] = {}
     audit_loose: collections.Counter = collections.Counter()
     overrun_seconds: list[float] = []
     total_bytes = 0
@@ -315,6 +399,17 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         for key, prefix in _EXCEPTION_PREFIXES.items():
             if _TRACEBACK_OMITTED_MARKER + prefix in line:
                 qualitative[key] += 1
+                # 2026-08-06 Fix#4 — 이 줄이 "그동안 억제된 M건"을 함께 실었으면 그 M도 센다.
+                # 억제된 건들은 로그에 줄이 아예 없어, 이 숫자가 유일한 흔적이다.
+                m = _THROTTLE_SUPPRESSED_RE.search(line)
+                if m:
+                    extra = int(m.group(1))
+                    qualitative[key] += extra
+                    qualitative_suppressed[key] += extra
+        if _PROCESS_START_MARKER in line:
+            started = _RECORD_START_RE.match(line)
+            if started:
+                process_starts.append(_seconds_of_day(started))
         for key, token in _PARSER_AUDIT_TOKENS.items():
             if token in line:
                 audit_loose[key] += 1
@@ -414,7 +509,12 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         m = _FAILURE_RE.match(line)
         if m:
             # "옵션 체인 폴링 실패: B01608875 — {...}" → 종목/응답을 떼고 유형만 센다.
-            failures[m.group(6).split(":")[0].strip()] += 1
+            kind = m.group(6).split(":")[0].strip()
+            failures[kind] += 1
+            # 2026-08-06 §3-4 / Fix#5 — **원인별로도 센다.** 상세 근거는 `classify_failure_cause`.
+            failures_by_cause.setdefault(kind, collections.Counter())[
+                classify_failure_cause(line)
+            ] += 1
             # 2026-08-04 §2-1: `http_status_error`(트레이스백 기반)를 대체하는 계측.
             if _KIS_ERROR_BODY_TOKEN in line:
                 qualitative["kis_error_response"] += 1
@@ -438,7 +538,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     )
     return {
         "date": target.isoformat(),
-        "cycles": _cycle_metrics(cycles, calls, catchups),
+        "cycles": _cycle_metrics(cycles, calls, catchups, process_starts),
         "rest": _rest_metrics(calls),
         "backoff": _backoff_metrics(backoff_events, cycles),
         "bursts": _burst_metrics(calls),
@@ -467,8 +567,20 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "by_level": dict(levels),
         },
         "qualitative": dict(qualitative),
+        # 2026-08-06 Fix#4 — 위 `qualitative`에 합산된 "줄이 안 남은" 건수. 리포트 §11이
+        # `줄 N + 억제 M = 총계`로 나란히 찍는다. 08-06 실측: read_timeout 124 + 81 = 205건
+        # (그날 리포트는 126건만 냈다 — 실제의 61%).
+        "qualitative_suppressed": dict(qualitative_suppressed),
+        # 2026-08-06 Fix#4/#6 — 그날 프로세스가 몇 번 떴는가(자정 기준 초).
+        "process_starts": process_starts,
         "parser_audit": _parser_audit(strict_counts, audit_loose),
         "failures": dict(failures.most_common()),
+        # 2026-08-06 §3-4 / Fix#5 — 같은 실패를 **원인 축으로** 한 번 더 접는다.
+        # `failures`(총계)를 그대로 두는 이유: 기존 가설이 그 경로를 지목하고 있고, 총계와
+        # 원인별 합이 갈리면 `crosscheck`가 그것을 잡는다.
+        "failures_by_cause": {
+            kind: dict(causes.most_common()) for kind, causes in failures_by_cause.items()
+        },
         "overrun": {
             "count": len(overrun_seconds),
             "max_seconds": round(max(overrun_seconds), 1) if overrun_seconds else 0.0,
@@ -586,9 +698,18 @@ def _parser_audit(strict: dict[str, int], loose: collections.Counter) -> dict:
     return {"blind": blind, "loose_counts": dict(loose)}
 
 
-def _cycle_metrics(cycles: list[dict], calls: list[tuple[float, str, str]], catchups: list[dict]) -> dict:
+def _cycle_metrics(
+    cycles: list[dict],
+    calls: list[tuple[float, str, str]],
+    catchups: list[dict],
+    process_starts: list[float] | None = None,
+) -> dict:
     if not cycles:
-        return {"count": 0, "by_hour": [], "by_mod10": [], "missing": {"count": 0, "list": []}}
+        return {
+            "count": 0, "by_hour": [], "by_mod10": [],
+            "missing": {"count": 0, "list": [], "downtime_count": 0, "infra_count": 0},
+        }
+    process_starts = process_starts or []
 
     call_times = [c[0] for c in calls]
     for cycle in cycles:
@@ -641,6 +762,10 @@ def _cycle_metrics(cycles: list[dict], calls: list[tuple[float, str, str]], catc
             missing.append(label)
         t += 60
     recovered = {c["minute"] for c in catchups}
+    # 2026-08-06 §3-5 / Fix#6 — 결손을 **세 축**으로 가른다.
+    downtime = _downtime_minutes(cycles, process_starts)
+    downtime_missing = [m for m in missing if m in downtime]
+    infra_missing = [m for m in missing if m not in downtime and m not in recovered]
     unrecovered = [m for m in missing if m not in recovered]
     return {
         "count": len(cycles),
@@ -658,8 +783,49 @@ def _cycle_metrics(cycles: list[dict], calls: list[tuple[float, str, str]], catc
             "list": missing,
             "recovered_by_catchup": len(missing) - len(unrecovered),
             "unrecovered_count": len(unrecovered),
+            # 2026-08-06 §3-5 / Fix#6 — **관측 루프가 아예 안 돌던 분.**
+            #
+            # 08-06 리포트 §1은 `결손 분 21분 ▲20 ⚠`을 냈고, 그 숫자를 인프라 악화로 읽으면
+            # 틀린다: 21분 중 **20분이 10:04~10:23 프로세스 정지 구간**이고 사이클이 돌면서
+            # 놓친 것은 13:19 1분뿐이었다. 가동 시간과 결손을 같은 분모로 섞으면
+            # "인프라가 나빠졌다"와 "시스템이 꺼져 있었다"가 구분되지 않는다.
+            #
+            # `2026-08-05-p2`의 대가 지표가 이 때문에 「반증」으로 나왔다 — 그 fix와 인과가 없다.
+            "downtime_count": len(downtime_missing),
+            "downtime_list": downtime_missing,
+            # 루프는 돌았는데 그 분의 사이클이 없던 분 = **진짜 인프라 결손**(회수분 제외).
+            "infra_count": len(infra_missing),
+            "infra_list": infra_missing,
         },
     }
+
+
+def _downtime_minutes(cycles: list[dict], process_starts: list[float]) -> set[str]:
+    """
+    입력: 사이클 목록(시작 시각 오름차순), 프로세스 기동 시각 목록.
+    반환: **관측 루프가 안 돌던 분** 라벨 집합.
+    계산: 재기동 시각 T마다 [T 직전의 마지막 사이클, T 이후 첫 사이클] 사이를 공백으로 본다.
+         기동 자체에 걸리는 시간(마스터파일 다운로드·WS 구독)도 데이터가 없는 시간이므로
+         **첫 사이클까지**를 공백에 넣는다 — 08-06 10:23:25 기동의 첫 사이클은 10:24였다.
+    해석: 그날 **첫** 기동은 건너뛴다 — 그 앞은 애초에 관측 대상이 아니다(장전 07:30 이전).
+    실패 조건: 기동 표식이 없는 구버전 로그면 빈 집합 — 종전과 똑같이 전부 인프라 결손으로
+              집계된다(지어내지 않는다).
+    """
+    if not process_starts or not cycles:
+        return set()
+    cycle_starts = sorted(c["start"] for c in cycles)
+    out: set[str] = set()
+    for started in sorted(process_starts):
+        idx = bisect.bisect_left(cycle_starts, started)
+        if idx == 0:
+            continue  # 그날 첫 기동
+        gap_from = cycle_starts[idx - 1]
+        gap_to = cycle_starts[idx] if idx < len(cycle_starts) else started
+        t = gap_from + 60
+        while t < gap_to:
+            out.add(_hhmm(t))
+            t += 60
+    return out
 
 
 def _rest_metrics(calls: list[tuple[float, str, str]]) -> dict:

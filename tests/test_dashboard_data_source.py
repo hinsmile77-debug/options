@@ -9,6 +9,7 @@ from mahdi.dashboard.data_source import (
     FLOW_RADAR_WINDOW_MINUTES,
     _rest_demand_check,
     _backoff_headroom_check,
+    _entry_cutoff_check,
     _monthly_coverage_check,
     _overrun_count_check,
     HealthCheck,
@@ -1384,6 +1385,8 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._atm_roll_churn_check", make_check("atm_roll"))
     # 2026-08-03(§5-1) 신호 도달률 — 커버리지가 답하지 못하는 "판단까지 갔는가"
     monkeypatch.setattr("mahdi.dashboard.data_source._signal_reach_check", make_check("signal_reach"))
+    # 2026-08-06(§2-2 / Fix#1) 진입 컷오프 — 진입이 없는 이유를 화면이 설명한다
+    monkeypatch.setattr("mahdi.dashboard.data_source._entry_cutoff_check", make_check("entry_cutoff"))
 
     result = get_health_summary()
 
@@ -1394,6 +1397,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
         "rest_demand", "backoff_headroom", "monthly_coverage", "overrun_count", "ws_liveness",
         "atm_roll",
         "signal_reach",
+        "entry_cutoff",
     ]
     assert [c.label for c in result] == calls
 
@@ -1810,3 +1814,65 @@ def test_market_halt_badge_shows_subscription_time_when_established(monkeypatch)
     # 장운영정보 데이터가 0건이어도 구독확립 시각은 있어야 한다 — 그게 이 fix의 전부다.
     assert "구독확립 07:31:04" in check.detail
     assert "장운영정보 수신 이력 없음" in check.detail
+
+
+# ===== 2026-08-06 §2-2 / Fix#1 — 진입 컷오프 배지 =====
+
+
+def _decisions(enter_after_cutoff=0, blocked=0, enters=0, total=474):
+    return {
+        "total": total,
+        "decision": {"ENTER": enters, "REJECT": total - enters},
+        "entry_cutoff": {
+            "cutoff_time": "14:50", "forced_flat_time": "15:10",
+            "blocked_count": blocked, "enter_after_cutoff": enter_after_cutoff,
+            "enter_after_forced_flat": max(0, enter_after_cutoff - 3),
+        },
+    }
+
+
+def test_entry_cutoff_badge_warns_when_the_invariant_is_violated(monkeypatch):
+    """08-06 실측(컷오프 이후 21건)이 화면에 노란불로 뜬다.
+
+    빨간불이 아닌 이유: 이 배지가 잡는 것은 시장 이상이 아니라 **우리 코드의 회귀**다.
+    """
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.decisions",
+        lambda conn, d: _decisions(enter_after_cutoff=21, enters=62),
+    )
+    check = _entry_cutoff_check(object(), datetime(2026, 8, 6, 15, 45))
+    assert check.status == "warning"
+    assert "21건" in check.detail
+    assert check.group == "판단"
+
+
+def test_entry_cutoff_badge_explains_why_there_are_no_entries_after_cutoff(monkeypatch):
+    """컷오프 이후의 "진입 0건"이 신호 사망인지 규칙인지 화면에서 구분돼야 한다."""
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.decisions",
+        lambda conn, d: _decisions(blocked=7, enters=40),
+    )
+    check = _entry_cutoff_check(object(), datetime(2026, 8, 6, 15, 0))
+    assert check.status == "info"
+    assert "신규 진입 금지" in check.detail
+    assert "7분" in check.detail
+
+
+def test_entry_cutoff_badge_is_ok_before_the_cutoff(monkeypatch):
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.decisions",
+        lambda conn, d: _decisions(enters=12),
+    )
+    check = _entry_cutoff_check(object(), datetime(2026, 8, 6, 10, 0))
+    assert check.status == "ok"
+    assert "12건" in check.detail
+
+
+def test_entry_cutoff_badge_says_not_yet_instead_of_inventing_a_number(monkeypatch):
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db_metrics.decisions",
+        lambda conn, d: {"total": 0, "decision": {}, "entry_cutoff": {}},
+    )
+    check = _entry_cutoff_check(object(), datetime(2026, 8, 6, 10, 0))
+    assert check.status == "info"
+    assert "집계 전" in check.detail

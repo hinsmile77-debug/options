@@ -10,7 +10,9 @@ Signal Fusion이 만든 진입 후보를 sizing/limits/circuit_breaker 세 모�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, time as dtime
 
+from mahdi import session
 from mahdi.config.settings import get_risk_limits
 from mahdi.risk.circuit_breaker import CircuitBreaker, CircuitBreakerDecision, CircuitBreakerState, MarketConditions
 from mahdi.risk.limits import AccountState, check_limits
@@ -43,13 +45,22 @@ class RiskEngine:
         portfolio_greeks_limits: dict | None = None,
         current_portfolio_greeks: dict | None = None,
         market_halted: bool = False,
+        now: datetime | dtime | None = None,
     ) -> RiskDecision:
         """
         입력: 사이징 입력, 계좌 상태, 전략 ID, 시장 상태, market_halted(2026-07-29 신규 — KRX
               서킷브레이커/거래정지가 실시간으로 발동 중인지, mahdi.risk.market_halt.
               MarketHaltMonitor 기준. 이 모듈 내부의 CircuitBreaker와는 별개 개념이라 별도
-              파라미터로 받는다 — market_conditions에 섞지 않는 이유는 아래 참고).
-        계산: (0) market_halted가 True면 다른 무엇도 보지 않고 즉시 전량 거부한다 — 거래소
+              파라미터로 받는다 — market_conditions에 섞지 않는 이유는 아래 참고),
+              now(2026-08-06 §2-2 / Fix#1 신규 — 판단 시각. v6 §4.2 「14:50 신규 진입 컷오프」를
+              평가하기 위해 받는다. `None`이면 시각 게이트를 건너뛴다 — 시각과 무관한 한도만
+              보고 싶은 기존 호출측/테스트를 깨지 않기 위함이고, **라이브 경로는 반드시 넘긴다**
+              (`tests/test_main.py`가 그것을 강제한다)).
+        계산: (0a) `now`가 신규 진입 컷오프(14:50) 이후면 다른 무엇도 보지 않고 즉시 전량 거부.
+              **`market_halted`보다도 앞에 둔다** — 거래소가 열려 있든 닫혀 있든 이 시각 이후의
+              신규 진입은 v6 §4.2가 금지한 것이고, 뒤에 두면 halt 상태에 따라 거부 사유가
+              바뀌어 `signal_decisions.reject_reason` 시계열이 흔들린다.
+              (0b) market_halted가 True면 다른 무엇도 보지 않고 즉시 전량 거부한다 — 거래소
               자체가 정지된 상태에서는 사이징/한도 계산이 무의미하다.
               (1) Circuit Breaker 평가 — HALTED면 즉시 전량 거부 사유에 추가.
               (2) 한도 체계(§12.2) 점검 — 위반이 있으면 그 사유도 전부 추가.
@@ -66,7 +77,13 @@ class RiskEngine:
         실패 조건: Circuit Breaker HALTED와 한도 위반이 동시에 있어도 둘 다
               reject_reasons에 남겨 signal_decisions.reject_reason 로그가
               원인을 온전히 담도록 한다(§18.2).
+              단 컷오프/halt는 예외다 — 둘 다 "그 무엇도 볼 필요가 없다"는 뜻이므로 단독으로 낸다.
         """
+        # 2026-08-06 Fix#1 — v6 §4.2 신규 진입 컷오프. 08-06에 이 게이트가 없어 14:50 이후
+        # ENTER 21건(그중 15:10 강제 평탄화 이후 18건)이 나왔다. 상세 근거는 `mahdi.session`.
+        if now is not None and session.is_after_entry_cutoff(now):
+            return RiskDecision(approved=False, approved_size=0.0, reject_reasons=["entry_cutoff"])
+
         if market_halted:
             return RiskDecision(approved=False, approved_size=0.0, reject_reasons=["market_halt"])
 

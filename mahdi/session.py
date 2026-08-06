@@ -47,6 +47,63 @@ TRADING_DAY_END = dtime(15, 45)
 # 재확인했다 — `orderflow_ofi_vpin`이 정확히 15:36부터 미가용으로 떨어졌다(15:35 봉이 마지막).
 CLOSING_AUCTION_START = dtime(15, 35)
 
+# 신규 진입 컷오프 / 강제 평탄화 — v6 §4.2 "운영 헌법" (2026-08-06 §2-2 / Fix#1).
+#
+# ## 왜 이 두 값이 같은 모듈에 있는가
+#
+# v6 §4.2는 이 둘을 **한 표에 나란히** 적어뒀다:
+#
+#     | 신규 진입 컷오프 | 14:50 이후 신규 진입 금지 |
+#     | 강제 평탄화       | 15:10 이전 완료 (운영 헌법) |
+#
+# 두 값은 독립적이지 않다. 컷오프가 평탄화보다 **뒤에** 있으면 청산할 수 없는 포지션이
+# 생긴다 — 15:30에 진입한 것을 15:10이 청산할 방법은 없다. 그래서 두 값을 한자리에 두고
+# `tests/test_session.py`가 `NEW_ENTRY_CUTOFF < FORCED_FLAT_TIME`을 기계적으로 강제한다.
+#
+# ## 2026-08-06에 실제로 벌어진 일
+#
+# 청산 쪽 15:10은 `execution/exit_stack.py`에 구현돼 있었다(`is_forced_flat_time`).
+# **진입 쪽 14:50은 설계 문서에만 있고 코드 어디에도 없었다** — `RiskEngine.evaluate_entry()`에
+# 시각 인자 자체가 없었다. 그날 실측:
+#
+#     14:50 초과 ENTER  21건
+#     15:10 초과 ENTER  18건 (마지막 15:30)
+#
+# 08-05까지 팔레트가 전량 `wait_only`라 ENTER가 0건이었고, 08-05 `p1`(VRP 배선)이 팔레트를
+# 연 **첫날 바로** 드러났다. 막힌 경로 뒤의 게이트는 검정된 적이 없다 — 08-03 §2-1의
+# 감마플립 사건(넉 달간 존재하지 않는 것을 "개선"했다)과 같은 형태다.
+#
+# ## 확신도 페널티로는 대신할 수 없다
+#
+# 같은 날 이벤트 캘린더(08-05 `p7`)가 15:21~15:35 확신도를 0.638 → 0.213(0.33배)으로 깎았는데도
+# 그 구간에서 SMALL_TEST ENTER가 10분 연속 나왔다. **가중치를 낮추는 것과 금지하는 것은 다르다.**
+NEW_ENTRY_CUTOFF = dtime(14, 50)
+FORCED_FLAT_TIME = dtime(15, 10)
+
+
+def is_after_entry_cutoff(now) -> bool:
+    """입력: datetime(또는 time). 반환: 신규 진입이 금지된 시각인가(v6 §4.2).
+
+    경계는 **초과**(`>`)가 아니라 **이상**(`>=`)이다 — "14:50 이후 신규 진입 금지"의 자연스러운
+    독해이고, 14:50:00 정각 판단을 통과시키면 그 한 건만 규칙 밖에 놓인다.
+
+    상한을 두지 않는 이유는 `is_closing_auction()`과 같다 — 장 마감 이후는 어차피 관측 대상이
+    아니고, 막아두면 종료가 늦어진 사이클이 "진입 가능"으로 잘못 분류된다.
+    """
+    moment = now.time() if hasattr(now, "time") else now
+    return moment >= NEW_ENTRY_CUTOFF
+
+
+def is_forced_flat_time(now) -> bool:
+    """입력: datetime(또는 time). 반환: 강제 평탄화 시각을 지났는가(v6 §13.3, 해제 불가).
+
+    `execution/exit_stack.MarketStructureState.is_forced_flat_time`에 넣을 값을 여기서 만든다 —
+    라이브 루프가 실행 엔진에 배선되는 시점(Phase 2)에 그 필드를 손으로 채우게 두면 15:10이
+    두 번째 장소에 적히고, 그 순간 이 모듈의 존재 이유가 사라진다.
+    """
+    moment = now.time() if hasattr(now, "time") else now
+    return moment >= FORCED_FLAT_TIME
+
 
 def is_closing_auction(now) -> bool:
     """입력: datetime(또는 time). 반환: 종가 단일가 구간인가.

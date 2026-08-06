@@ -215,3 +215,214 @@ def test_resolve_target_date_and_previous_business_day():
     assert log_metrics.resolve_target_date(None, datetime(2026, 8, 1, 15, 0)) == date(2026, 8, 1)
     # 월요일(08-03)의 직전 영업일은 일/토를 건너뛴 금요일(07-31)이다.
     assert log_metrics.previous_business_day(date(2026, 8, 3)) == TARGET
+
+
+# ===== 2026-08-06 §3-2·§3-3 / Fix#4 — 억제된 예외와 프로세스 재기동 =====
+#
+# 08-06 실측: `qualitative.read_timeout` 126건으로 보고됐지만 실제는 205건이었다(39% 소실).
+
+
+def _parse(lines: list[str]) -> dict:
+    from mahdi.ops import log_metrics
+
+    return log_metrics.parse_day(lines, date(2026, 8, 6))
+
+
+def test_throttle_suppressed_exceptions_are_counted_into_their_type():
+    """`WarningThrottle`이 삼킨 줄은 이 숫자에만 흔적이 남는다 — 그것을 읽는다."""
+    parsed = _parse([
+        "2026-08-06 10:00:11,455 WARNING:mahdi.main:옵션 체인 폴링 실패: B01608992 — "
+        "The read operation timed out (트레이스백 생략 — httpx.ReadTimeout, 오늘 15번째)",
+        "2026-08-06 10:01:11,455 WARNING:mahdi.main:옵션 체인 폴링 실패: C01608992 — "
+        "The read operation timed out (트레이스백 생략 — httpx.ReadTimeout, 오늘 22번째) "
+        "(최근 60초간 6건 추가 억제됨)",
+    ])
+    # 줄 2건 + 억제 6건 = 8건
+    assert parsed["qualitative"]["read_timeout"] == 8
+    assert parsed["qualitative_suppressed"]["read_timeout"] == 6
+
+
+def test_a_line_without_a_suppression_summary_adds_nothing_extra():
+    parsed = _parse([
+        "2026-08-06 10:00:11,455 WARNING:mahdi.main:옵션 체인 폴링 실패: B01608992 — "
+        "The read operation timed out (트레이스백 생략 — httpx.ReadTimeout, 오늘 15번째)",
+    ])
+    assert parsed["qualitative"]["read_timeout"] == 1
+    assert parsed["qualitative_suppressed"].get("read_timeout", 0) == 0
+
+
+def test_suppression_is_attributed_per_exception_type():
+    parsed = _parse([
+        "2026-08-06 10:00:11,455 WARNING:mahdi.main:투자자 수급 폴링 실패: OP01 — x "
+        "(트레이스백 생략 — httpx.ConnectError, 오늘 2번째) (최근 60초간 3건 추가 억제됨)",
+        "2026-08-06 10:02:11,455 WARNING:mahdi.main:옵션 체인 폴링 실패: B0 — y "
+        "(트레이스백 생략 — httpx.ReadTimeout, 오늘 9번째) (최근 60초간 4건 추가 억제됨)",
+    ])
+    assert parsed["qualitative"]["connect_error"] == 4
+    assert parsed["qualitative"]["read_timeout"] == 5
+
+
+def test_process_starts_are_counted():
+    """08-06에 프로세스가 세 번 떴고, 그 사실을 아는 지표가 하나도 없었다."""
+    parsed = _parse([
+        "2026-08-06 07:31:04,000 INFO:mahdi.main:직전 정상 기동: 2026-08-05 07:30:00 (24.0시간 전)",
+        "2026-08-06 08:23:46,681 INFO:mahdi.main:직전 정상 기동: 2026-08-06 07:31:04 (0.9시간 전)",
+        "2026-08-06 10:23:25,471 INFO:mahdi.main:직전 정상 기동: 2026-08-06 08:23:46 (2.0시간 전)",
+    ])
+    assert len(parsed["process_starts"]) == 3
+    assert parsed["process_starts"][0] == 7 * 3600 + 31 * 60 + 4
+
+
+def test_first_ever_start_is_also_counted():
+    """마커 파일이 없는 최초 실행도 프로세스 기동이다 — 같은 문구로 시작한다."""
+    parsed = _parse([
+        "2026-08-06 07:31:04,000 INFO:mahdi.main:직전 정상 기동 기록 없음(최초 실행 또는 마커 파일 삭제됨)",
+    ])
+    assert len(parsed["process_starts"]) == 1
+
+
+# ===== 2026-08-06 §3-4 / Fix#5 — 실패의 원인 축 =====
+
+
+def test_failures_are_split_by_cause():
+    """08-06 실측 재현 — 만기유동성 실패 7건이 전부 EGW00201이고 ReadTimeout은 0건이었다."""
+    parsed = _parse([
+        '2026-08-06 07:31:31,023 WARNING:mahdi.main:만기 유동성 폴링 실패: B01608A21 — '
+        '{"rt_cd":"1","msg1":"초당 거래건수를 초과하였습니다.","msg_cd":"EGW00201"}',
+        '2026-08-06 09:05:39,047 WARNING:mahdi.main:만기 유동성 폴링 실패: B09F9WA10 — '
+        '{"rt_cd":"1","msg1":"초당 거래건수를 초과하였습니다.","msg_cd":"EGW00201"}',
+    ])
+    assert parsed["failures"]["만기 유동성 폴링 실패"] == 2
+    assert parsed["failures_by_cause"]["만기 유동성 폴링 실패"] == {"egw00201": 2}
+
+
+def test_read_timeout_failures_are_attributed_to_read_timeout():
+    parsed = _parse([
+        "2026-08-06 10:35:34,074 WARNING:mahdi.main:만기 유동성 만기확인 조회 실패: B09F9W985 — "
+        "The read operation timed out (트레이스백 생략 — httpx.ReadTimeout, 오늘 20번째)",
+    ])
+    assert parsed["failures_by_cause"]["만기 유동성 만기확인 조회 실패"] == {"read_timeout": 1}
+
+
+def test_non_ratelimit_kis_errors_are_their_own_cause():
+    """CBOT 미신청 같은 계정 권한 문제는 레이트리밋과 조치가 전혀 다르다."""
+    parsed = _parse([
+        '2026-08-06 15:37:00,000 WARNING:mahdi.main:ZN(10년 국채선물) 근월물 조회 실패: ZNU26 — '
+        '{"rt_cd":"1","msg_cd":"EGW00552","msg1":"CBOT SUB거래소 신청 계좌가 아닙니다."}',
+    ])
+    assert parsed["failures_by_cause"]["ZN(10년 국채선물) 근월물 조회 실패"] == {"kis_error": 1}
+
+
+def test_cause_totals_match_the_failure_totals():
+    """총계와 원인별 합이 갈리면 둘 중 하나가 거짓말이다."""
+    parsed = _parse([
+        '2026-08-06 07:31:31,023 WARNING:mahdi.main:만기 유동성 폴링 실패: B0 — {"rt_cd":"1","msg_cd":"EGW00201"}',
+        "2026-08-06 10:35:34,074 WARNING:mahdi.main:만기 유동성 폴링 실패: B1 — x "
+        "(트레이스백 생략 — httpx.ReadTimeout, 오늘 2번째)",
+        "2026-08-06 11:35:34,074 WARNING:mahdi.main:만기 유동성 폴링 실패: B2 — 알 수 없는 무언가",
+    ])
+    for kind, total in parsed["failures"].items():
+        assert sum(parsed["failures_by_cause"][kind].values()) == total
+
+
+def test_a_failure_without_any_clue_falls_back_to_other():
+    """트레이스백이 살아 있는 예외는 여기로 떨어진다 — 알고 남긴 한계다."""
+    parsed = _parse([
+        "2026-08-06 11:35:34,074 WARNING:mahdi.main:투자자 수급 폴링 실패: OP01",
+    ])
+    assert parsed["failures_by_cause"]["투자자 수급 폴링 실패"] == {"other": 1}
+
+
+def test_egw00201_wins_over_the_generic_kis_error_classification():
+    """EGW00201은 rt_cd 응답의 한 종류다 — 더 구체적인 쪽이 이겨야 조치가 갈린다."""
+    line = '2026-08-06 07:31:31,023 WARNING:mahdi.main:x 실패: B0 — {"rt_cd":"1","msg_cd":"EGW00201"}'
+    assert log_metrics.classify_failure_cause(line) == log_metrics.FAILURE_CAUSE_EGW00201
+
+
+# ===== 2026-08-06 §3-5 / Fix#6 — 「미가동」과 「인프라 결손」을 가른다 =====
+
+
+def _cycle_line(hhmm: str, rows: int = 20) -> str:
+    # 초 자리를 20으로 두는 이유: 사이클의 **시작 시각**은 이 줄의 시각에서 소요(19.17초)를 뺀
+    # 값이라, 초가 그보다 작으면 앞 분으로 넘어간다(파서의 정의를 그대로 따라간다).
+    return (
+        f"2026-08-06 {hhmm}:20,000 INFO:mahdi.main:옵션체인 사이클 소요 분해: "
+        f"REST수집 19.03초 + DB적재 0.11초 + 상태기록 0.03초 + 기타 0.00초 "
+        f"(rows={rows}, 밀림=0.0초, 타폴러동시호출추정=0건)"
+    )
+
+
+def test_the_2026_08_06_outage_is_attributed_to_downtime_not_infrastructure():
+    """실제 사건 재현 — 10:03 마지막 사이클, 10:23:25 재기동, 10:24 첫 사이클.
+
+    그날 리포트는 `결손 21분 ▲20 ⚠`을 냈고 그 숫자를 인프라 악화로 읽으면 틀린다.
+    """
+    parsed = _parse([
+        _cycle_line("10:01"), _cycle_line("10:02"), _cycle_line("10:03"),
+        "2026-08-06 10:23:25,471 INFO:mahdi.main:직전 정상 기동: 2026-08-06 08:23:46 (2.0시간 전)",
+        _cycle_line("10:24"), _cycle_line("10:25"),
+    ])
+    missing = parsed["cycles"]["missing"]
+    assert missing["count"] == 20  # 10:04 ~ 10:23
+    assert missing["downtime_count"] == 20
+    assert missing["infra_count"] == 0
+
+
+def test_a_missing_minute_while_the_loop_was_running_stays_infrastructure():
+    """루프가 도는 중에 놓친 분은 진짜 인프라 결손이다 — 08-06의 13:19가 그 한 건이었다."""
+    parsed = _parse([_cycle_line("13:17"), _cycle_line("13:18"), _cycle_line("13:20")])
+    missing = parsed["cycles"]["missing"]
+    assert missing["count"] == 1
+    assert missing["downtime_count"] == 0
+    assert missing["infra_count"] == 1
+
+
+def test_downtime_and_infrastructure_gaps_coexist():
+    parsed = _parse([
+        _cycle_line("10:01"), _cycle_line("10:03"),   # 10:02 = 루프가 돌던 중의 결손
+        "2026-08-06 10:05:30,000 INFO:mahdi.main:직전 정상 기동: 2026-08-06 08:23:46 (2.0시간 전)",
+        _cycle_line("10:06"),                          # 10:04~10:05 = 재기동 사이 공백
+    ])
+    missing = parsed["cycles"]["missing"]
+    assert missing["infra_list"] == ["10:02"]
+    assert missing["downtime_list"] == ["10:04", "10:05"]
+    assert missing["downtime_count"] + missing["infra_count"] == missing["count"]
+
+
+def test_the_first_start_of_the_day_creates_no_downtime():
+    """그날 첫 기동 앞은 애초에 관측 대상이 아니다 — 장전 07:30 이전이다."""
+    parsed = _parse([
+        "2026-08-06 07:31:04,000 INFO:mahdi.main:직전 정상 기동: 2026-08-05 07:30:00 (24.0시간 전)",
+        _cycle_line("07:32"), _cycle_line("07:34"),
+    ])
+    assert parsed["cycles"]["missing"]["downtime_count"] == 0
+    assert parsed["cycles"]["missing"]["infra_count"] == 1  # 07:33
+
+
+def test_a_log_without_start_markers_behaves_exactly_as_before():
+    """구버전 로그에서는 종전대로 전부 인프라 결손이다 — 지어내지 않는다."""
+    parsed = _parse([_cycle_line("13:17"), _cycle_line("13:20")])
+    missing = parsed["cycles"]["missing"]
+    assert missing["downtime_count"] == 0
+    assert missing["infra_count"] == 2
+
+
+def test_recovered_minutes_are_not_counted_as_infrastructure_gaps():
+    """회수된 분은 이미 메워졌다 — 세 축의 합이 총계를 넘으면 안 된다."""
+    parsed = _parse([
+        _cycle_line("13:17"), _cycle_line("13:20"),
+        "2026-08-06 13:20:30,000 INFO:mahdi.main:옵션체인 결손 회수: 13:18 분을 먼슬리 10레그로 채움(밀린 사이클 13:19)",
+    ])
+    missing = parsed["cycles"]["missing"]
+    assert missing["recovered_by_catchup"] == 1
+    assert missing["infra_count"] == 1  # 13:19만 남는다
+    assert missing["downtime_count"] + missing["infra_count"] + missing["recovered_by_catchup"] == missing["count"]
+
+
+def test_kis_error_bodies_without_quoted_rt_cd_are_still_kis_errors():
+    """해외선물 오류 응답은 `rt_cd`에 따옴표가 없다 — 그것 때문에 하루 9건이 `other`로 샜다."""
+    parsed = _parse([
+        '2026-08-06 15:37:00,000 WARNING:mahdi.main:ES(E-mini S&P500) 근월물 조회 실패: ESU26 — '
+        '{rt_cd:"1","msg1":"CME SUB거래소 신청 계좌가 아닙니다.","msg_cd":"EGW00552"}',
+    ])
+    assert parsed["failures_by_cause"]["ES(E-mini S&P500) 근월물 조회 실패"] == {"kis_error": 1}

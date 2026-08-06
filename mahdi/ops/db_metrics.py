@@ -44,6 +44,11 @@ STRUCTURAL_UNAVAILABLE_REASON = "종가 단일가(연속체결 없음)"
 # 문자열 일치는 `tests/test_ops_metric_conventions.py`가 기계적으로 지킨다.
 STRUCTURAL_UNAVAILABLE_REASONS = frozenset({STRUCTURAL_UNAVAILABLE_REASON, "장전(스팟 미적재)"})
 
+# 2026-08-06(§2-2 / Fix#1) — v6 §4.2 신규 진입 컷오프로 막힌 판단의 사유.
+# `main._REJECT_REASON_ENTRY_CUTOFF`·`RiskEngine`이 내는 문자열과 **같아야** 이 지표가 그 분들을
+# 세어낸다(`tests/test_ops_metric_conventions.py`가 세 곳의 일치를 기계적으로 지킨다).
+ENTRY_CUTOFF_REJECT_REASON = "entry_cutoff"
+
 # 하루치 적재량을 볼 테이블 — (테이블, 시각 컬럼, 비고).
 _DAILY_TABLES: list[tuple[str, str, str]] = [
     ("option_analysis_1m", "timestamp", "옵션체인 그릭스"),
@@ -98,12 +103,18 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
         ("member_score_quality", member_score_quality),
         ("strike_window_quality", strike_window_quality),
         ("signal_decisions", _signal_decisions),
+        # 2026-08-06 Fix#3 — 위 리스트는 표를 그리기 위한 것이고, 이쪽은 **가설이 지목할 수 있는**
+        # 축별 dict다(`db.decisions.…`). 둘은 같은 테이블을 다르게 접은 것이라 값이 갈리면
+        # `crosscheck`가 잡는다.
+        ("decisions", decisions),
         ("signal_reach", signal_reach),
         ("risk_gate_distinct", _risk_gate_distinct),
         ("regime", _regime),
         ("feature_store", _feature_store),
         ("macro", _macro),
         ("market_halt", _market_halt),
+        # 2026-08-06 Fix#3 — `2026-08-03-p4`가 지목했지만 존재하지 않던 절.
+        ("ws_status", _ws_status),
         ("remaining_processes", _remaining_processes),
         ("rate_limiter", _rate_limiter),
     ):
@@ -687,7 +698,15 @@ def member_availability(conn: ConnectionLike, target: date) -> dict:
                 "implemented": name in IMPLEMENTED_MEMBER_FIELDS,
             }
         )
-    return {"available": True, "minutes": minutes, "members": members}
+    # 2026-08-06 §3-1 / Fix#3 — **멤버 이름으로 바로 지목할 수 있게** 펼쳐 둔다.
+    # 08-05 `p12`가 적은 경로는 `db.member_availability.orderflow_ofi_vpin.structural_minutes`였고,
+    # 실제 구조는 `…members`(리스트)라 그 가설은 주장 지표를 하나도 못 받았다. 표를 그리는 쪽은
+    # 순서가 필요하니 리스트를 남기고, 지목하는 쪽을 위해 같은 dict를 이름으로도 건다
+    # (`MEMBER_FIELDS`는 available/minutes/members와 겹치지 않는다 —
+    # `tests/test_ops_db_metrics.py`가 그 불변식을 지킨다).
+    out: dict = {"available": True, "minutes": minutes, "members": members}
+    out.update({entry["member"]: entry for entry in members})
+    return out
 
 
 # 설계상 한 북이 유지하는 편측 행사가 수(`main.STRIKES_EACH_SIDE`). 여기에 두는 이유는
@@ -938,6 +957,101 @@ def _signal_decisions(conn: ConnectionLike, target: date) -> list[dict]:
     return [
         {"decision": d, "conviction": c, "reject_reason": r, "count": int(n)} for d, c, r, n in rows
     ]
+
+
+# ===== 2026-08-06 §3-1 / Fix#3 — 사람이 자연스럽게 적는 판단 지표 경로 =====
+#
+# `_signal_decisions()`는 **표를 그리기 위한** 리스트다(decision x conviction x reject_reason의
+# 교차 집계). 그것만 있으면 가설 하나를 검정하기 위해 리스트를 순회해 합산해야 하는데,
+# 08-05에 사람이 `hypotheses.yaml`에 실제로 적은 것은 이런 경로였다:
+#
+#     db.decisions.reject_reason.strategy_palette:wait_only
+#     db.decisions.conviction.HIGH_CONVICTION
+#     db.decisions.decision.ENTER
+#     db.decisions.vrp.non_null_ratio
+#     db.decisions.distinct_entry_strategies
+#
+# **그중 어느 것도 존재하지 않았다.** 13건 중 6건이 주장 지표를 하나도 못 받고 하루를 갔다.
+# 경로를 사람에게 맞추는 편이 사람을 경로에 맞추는 것보다 낫다 — 위 다섯 개를 전부 여기서 만든다.
+def decisions(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 그날 `signal_decisions`를 축별로 접어 dict로 낸다 — decision/conviction/reject_reason
+         각각의 건수, `vrp` 채움 비율, 진입 전략 분포, 그리고 **진입 컷오프 불변식**(§14).
+    해석: `enter_after_cutoff`/`enter_after_forced_flat`은 v6 §4.2를 어긴 판단의 수다.
+         **0이어야 하는 불변식**이지 "낮으면 좋은 지표"가 아니다 — 08-06 실측은 21/18이었고,
+         그 값이 0이 아닌 날은 게이트가 빠진 것이지 시장이 특이한 것이 아니다.
+    실패 조건: 컬럼(`vrp`)이나 jsonb 키가 없는 과거 날짜에서도 죽지 않는다 — 없는 축은 키가
+              빠지는 게 아니라 0/None으로 남는다(키가 사라지면 그 경로를 쓰는 가설이 다시
+              「경로 없음」이 된다 — 이 함수가 고치려던 바로 그 문제다).
+    """
+    total_row = _fetchone(
+        conn, "SELECT count(*) FROM signal_decisions WHERE timestamp::date=%s", (target,)
+    )
+    total = int(total_row[0]) if total_row else 0
+
+    def _counts(column: str) -> dict[str, int]:
+        # column은 아래 세 호출부에서만 오는 고정 리터럴이다(사용자 입력 아님).
+        rows = _fetchall(
+            conn,
+            f"SELECT {column}, count(*) FROM signal_decisions"
+            f" WHERE timestamp::date=%s AND {column} IS NOT NULL GROUP BY 1",
+            (target,),
+        )
+        return {str(k): int(n) for k, n in rows}
+
+    vrp_row = _fetchone(
+        conn,
+        "SELECT count(vrp) FROM signal_decisions WHERE timestamp::date=%s",
+        (target,),
+    )
+    vrp_non_null = int(vrp_row[0]) if vrp_row else 0
+
+    strategy_rows = _fetchall(
+        conn,
+        "SELECT s, count(*) FROM signal_decisions, "
+        "LATERAL jsonb_array_elements_text(risk_gate_state->'entry_strategies') s "
+        "WHERE timestamp::date=%s AND decision='ENTER' GROUP BY 1 ORDER BY 2 DESC",
+        (target,),
+    )
+    entry_strategies = {str(s): int(n) for s, n in strategy_rows}
+
+    # 컷오프 불변식 — `decision='ENTER'`인데 시각이 컷오프/평탄화를 넘긴 분.
+    cutoff_row = _fetchone(
+        conn,
+        "SELECT "
+        " count(*) FILTER (WHERE decision='ENTER' AND timestamp::time >= %s),"
+        " count(*) FILTER (WHERE decision='ENTER' AND timestamp::time >= %s),"
+        " count(*) FILTER (WHERE reject_reason=%s)"
+        " FROM signal_decisions WHERE timestamp::date=%s",
+        (session.NEW_ENTRY_CUTOFF, session.FORCED_FLAT_TIME, ENTRY_CUTOFF_REJECT_REASON, target),
+    )
+    after_cutoff, after_flat, blocked = (
+        (int(cutoff_row[0]), int(cutoff_row[1]), int(cutoff_row[2])) if cutoff_row else (0, 0, 0)
+    )
+
+    return {
+        "total": total,
+        "decision": _counts("decision"),
+        "conviction": _counts("conviction"),
+        "reject_reason": _counts("reject_reason"),
+        "vrp": {
+            "non_null": vrp_non_null,
+            "non_null_ratio": round(vrp_non_null / total, 3) if total else None,
+        },
+        "entry_strategies": entry_strategies,
+        "distinct_entry_strategies": len(entry_strategies),
+        # 2026-08-06 Fix#1 — v6 §4.2 진입 컷오프. `blocked`는 *진입할 뻔했는데 막힌* 분이고
+        # `enter_after_*`는 *막지 못한* 분이다. 둘을 함께 봐야 "게이트가 걸렸다"와 "진입 후보가
+        # 애초에 없었다"가 구분된다.
+        "entry_cutoff": {
+            "cutoff_time": session.NEW_ENTRY_CUTOFF.strftime("%H:%M"),
+            "forced_flat_time": session.FORCED_FLAT_TIME.strftime("%H:%M"),
+            "blocked_count": blocked,
+            "enter_after_cutoff": after_cutoff,
+            "enter_after_forced_flat": after_flat,
+        },
+    }
 
 
 # ===== 2026-08-03 §5-1 — "신호 도달률" =====
@@ -1202,6 +1316,38 @@ def _market_halt(conn: ConnectionLike, _target: date) -> dict:
     return {
         "updated_at": row[0].strftime("%H:%M:%S") if row[0] else None,
         "last_message_at": row[1].strftime("%H:%M:%S") if row[1] else None,
+    }
+
+
+def _ws_status(conn: ConnectionLike, _target: date) -> dict:
+    """WS 구독/연결 상태 싱글턴 — `2026-08-03-p4`가 지목한 `market_op_subscribed_at`이 여기 있다.
+
+    2026-08-06 §3-1 / Fix#3에 붙여 만든 절이다. 그 가설은 `db.ws_status.market_op_subscribed_at`을
+    예측 지표로 걸었는데 **집계에 `ws_status` 절 자체가 없었다** — 08-05에 사람이 DB를 직접
+    조회해 손으로 확정했고, 자동 대조는 그 값을 한 번도 본 적이 없다. 경로를 사람에게 맞춘다.
+    """
+    row = _fetchone(
+        conn,
+        "SELECT updated_at, connected_since, last_message_at, reconnect_count_today,"
+        " market_op_subscribed_at, atm_roll_count_today FROM ws_status LIMIT 1",
+    )
+    if not row:
+        return {
+            "updated_at": None, "connected_since": None, "last_message_at": None,
+            "reconnect_count_today": None, "market_op_subscribed_at": None,
+            "atm_roll_count_today": None,
+        }
+
+    def _hms(value):
+        return value.strftime("%H:%M:%S") if value else None
+
+    return {
+        "updated_at": _hms(row[0]),
+        "connected_since": _hms(row[1]),
+        "last_message_at": _hms(row[2]),
+        "reconnect_count_today": int(row[3]) if row[3] is not None else None,
+        "market_op_subscribed_at": _hms(row[4]),
+        "atm_roll_count_today": int(row[5]) if row[5] is not None else None,
     }
 
 

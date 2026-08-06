@@ -65,11 +65,93 @@ def test_unparseable_expectation_is_left_for_a_human_not_forced():
     assert r["verdict"] == hypotheses.VERDICT_MANUAL
 
 
-def test_missing_metric_reports_no_data_instead_of_failing():
+def test_missing_leaf_reports_no_data_instead_of_failing():
+    """**부모 절은 있는데 그날 그 잎이 없는** 경우 — 정상일 수 있다. 내일 다시 본다."""
     [r] = hypotheses.evaluate(
-        [_entry(예측=[{"metric": "없는.경로", "expect": "<= 1", "역할": hypotheses.ROLE_CLAIM}])], date(2026, 8, 3), _METRICS
+        [_entry(예측=[{"metric": "overrun.없는키", "expect": "<= 1", "역할": hypotheses.ROLE_CLAIM}])],
+        date(2026, 8, 3), _METRICS,
     )
-    assert r["actual"] is None and r["verdict"] == hypotheses.VERDICT_NO_DATA
+    assert r["actual"] is None
+    assert r["verdict"] == hypotheses.VERDICT_NO_DATA
+    assert r["path_dead"] is False
+
+
+# ===== 2026-08-06 §3-1 / Fix#3 — 「경로 없음」과 「실측 없음」을 가른다 =====
+#
+# 08-05 예측 13건 중 6건이 존재하지 않는 경로를 지목했고, 전부 「실측 없음」으로 표시돼
+# 28행짜리 표의 조용한 한 줄이 됐다. 그래서 `p1`의 **대가 지표 12배 초과**(ENTER 예측 ≤5에
+# 실측 62건)를 아무도 자동으로 알아채지 못했다. 둘은 조치가 다르다:
+#   실측 없음  그날 값이 안 나왔다 → 내일 다시 본다
+#   경로 없음  **영원히** 안 나온다 → yaml을 고쳐야 한다
+
+
+def test_a_nonexistent_section_is_reported_as_a_dead_path():
+    [r] = hypotheses.evaluate(
+        [_entry(예측=[{"metric": "없는절.어떤키", "expect": "<= 1", "역할": hypotheses.ROLE_CLAIM}])],
+        date(2026, 8, 3), _METRICS,
+    )
+    assert r["verdict"] == hypotheses.VERDICT_PATH_DEAD
+    assert r["path_dead"] is True
+
+
+def test_the_2026_08_05_paths_that_died_silently_are_now_flagged():
+    """08-05가 실제로 적었던 경로들 — 그날 전부 「실측 없음」이었다."""
+    dead_for_real = [
+        "db.decisions.decision.ENTER",                              # `db.decisions` 절이 없던 시절
+        "db.member_availability.orderflow_ofi_vpin.available_pct",  # 멤버가 키가 아니라 리스트 원소
+        "db.tables.underlying_spot_1m.rows",                        # `db.tables`가 리스트
+    ]
+    for metric in dead_for_real:
+        [r] = hypotheses.evaluate(
+            [_entry(예측=[{"metric": metric, "expect": ">= 0", "역할": hypotheses.ROLE_CLAIM}])],
+            date(2026, 8, 3), _METRICS, {"monthly_coverage": {"coverage_pct": 96.4}},
+        )
+        assert r["verdict"] == hypotheses.VERDICT_PATH_DEAD, metric
+
+
+def test_those_same_paths_resolve_once_the_sections_exist():
+    """Fix#3의 나머지 절반 — **경로를 사람에게 맞춘다.** 세 경로 모두 이제 값을 낸다."""
+    db = {
+        "decisions": {"decision": {"ENTER": 62}},
+        "member_availability": {
+            "members": [{"member": "orderflow_ofi_vpin", "available_pct": 82.3}],
+            "orderflow_ofi_vpin": {"member": "orderflow_ofi_vpin", "available_pct": 82.3},
+        },
+        "tables": [{"table": "underlying_spot_1m", "rows": 384}],
+    }
+    expected = {
+        "db.decisions.decision.ENTER": 62,
+        "db.member_availability.orderflow_ofi_vpin.available_pct": 82.3,
+        "db.tables.underlying_spot_1m.rows": 384,
+    }
+    for metric, value in expected.items():
+        [r] = hypotheses.evaluate(
+            [_entry(예측=[{"metric": metric, "expect": ">= 0", "역할": hypotheses.ROLE_CLAIM}])],
+            date(2026, 8, 3), _METRICS, db,
+        )
+        assert r["actual"] == value, metric
+        assert r["path_dead"] is False
+
+
+def test_a_day_with_no_metrics_at_all_does_not_flag_every_path_as_dead():
+    """DB가 통째로 죽은 날 전 경로가 「경로 없음」으로 뜨면 진짜 오타가 그 소음에 묻힌다 —
+    이 fix가 고치려던 바로 그 실패 형태다."""
+    [r] = hypotheses.evaluate(
+        [_entry(예측=[{"metric": "db.decisions.decision.ENTER", "expect": ">= 0", "역할": hypotheses.ROLE_CLAIM}])],
+        date(2026, 8, 3), None, None,
+    )
+    assert r["verdict"] == hypotheses.VERDICT_NO_DATA
+    assert r["path_dead"] is False
+
+
+def test_path_exists_uses_the_parent_not_the_leaf():
+    """잎은 데이터 의존, 부모는 구조 — 이 구분이 판별의 전부다."""
+    db = {"decisions": {"reject_reason": {}}}
+    assert hypotheses.path_exists(None, db, "db.decisions.reject_reason.wait_only") is True
+    assert hypotheses.path_exists(None, db, "db.decisions.없는축.wait_only") is False
+    # 마디가 하나뿐인 경로는 그 자체가 절 이름이다.
+    assert hypotheses.path_exists(None, db, "db.decisions") is True
+    assert hypotheses.path_exists(None, db, "db.없는절") is False
 
 
 def test_only_pending_entries_are_evaluated():
@@ -124,28 +206,83 @@ _METRIC_ROOTS = {
     "cycles", "rest", "backoff", "bursts", "stalls", "slow_calls", "rest_latency",
     "atm_rolls", "budget_exceeded", "catchups", "poller_phase", "log_volume",
     "qualitative", "parser_audit", "failures", "overrun",
+    # 2026-08-06 Fix#4/#5/#6 — 억제된 예외, 프로세스 기동 시각, 실패의 원인 축.
+    "qualitative_suppressed", "process_starts", "failures_by_cause",
 }
 
 
-def test_every_repository_metric_path_starts_at_a_real_report_section():
-    """지표 경로의 **첫 마디**가 자동 리포트의 실제 절 이름인지 본다.
+# DB 지표 쪽 최상위 절 — `mahdi.ops.db_metrics.collect()`가 만드는 키들.
+#
+# 2026-08-06(§3-1 / Fix#3) — **아래 `db.` 면제가 뚫려 있던 구멍이다.** 08-06 아침 커밋이 위
+# 테스트를 만들면서 `if not metric.startswith("db.")`로 DB 경로를 통째로 비켜갔고, 그날 죽어
+# 있던 경로 12개는 **전부 `db.`로 시작했다**. 예측 13건 중 6건이 주장 지표를 하나도 못 받았다.
+_DB_METRIC_ROOTS = {
+    "monthly_coverage", "tables", "chain_minute_coverage", "monthly_leg_completeness",
+    "spot_source_divergence", "book_coverage", "book_gamma_map", "wide_oi_landscape",
+    "member_availability", "member_score_quality", "strike_window_quality",
+    "signal_decisions", "decisions", "signal_reach", "risk_gate_distinct", "regime",
+    "feature_store", "macro", "market_halt", "ws_status", "remaining_processes", "rate_limiter",
+}
 
-    `db.` 접두사는 DB 지표 쪽으로 갈라지므로(`hypotheses._lookup`) 여기서는 로그 지표만 본다.
+
+def test_db_metric_roots_match_what_collect_actually_produces():
+    """위 집합이 `db_metrics.collect()`의 실제 키와 갈라지면 이 테스트가 무의미해진다.
+
+    `collect()`는 DB가 필요해 여기서 못 돌리므로 **소스에 적힌 키 목록**을 읽어 대조한다 —
+    키가 추가/삭제될 때 이 테스트가 먼저 깨지는 것이 요점이다.
+    """
+    import inspect
+    import re
+
+    from mahdi.ops import db_metrics
+
+    source = inspect.getsource(db_metrics.collect)
+    declared = set(re.findall(r'\(\s*"([a-z_]+)"\s*,\s*[\w.]+\s*\)', source))
+    declared.add("monthly_coverage")  # elapsed_minutes가 있을 때만 붙는 예외 경로
+    assert declared == _DB_METRIC_ROOTS, (
+        f"db_metrics.collect()의 절 목록이 바뀌었다: 추가 {declared - _DB_METRIC_ROOTS} / "
+        f"삭제 {_DB_METRIC_ROOTS - declared}"
+    )
+
+
+def test_every_repository_metric_path_starts_at_a_real_report_section():
+    """지표 경로의 **첫 마디**가 자동 집계의 실제 절 이름인지 본다 — **`db.`도 포함해서.**
+
     전체 경로를 검사하지 않는 이유는 하위 키가 그날 데이터에 따라 없을 수 있기 때문이다 —
-    없는 것과 **틀린 것**은 다르고, 이 테스트가 잡아야 하는 것은 후자다.
+    없는 것과 **틀린 것**은 다르고, 이 테스트가 잡아야 하는 것은 후자다. 그 판별(부모 컨테이너가
+    해석되는가)은 런타임에 `hypotheses.path_exists()`가 하고 리포트 §0이 「경로 없음」으로 낸다.
     """
     entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
-    wrong = [
-        (entry["id"], prediction["metric"])
-        for entry in entries
-        for prediction in entry["예측"]
-        if not str(prediction["metric"]).startswith("db.")
-        and str(prediction["metric"]).split(".")[0] not in _METRIC_ROOTS
-    ]
+    wrong = []
+    for entry in entries:
+        for prediction in entry["예측"]:
+            metric = str(prediction["metric"])
+            if metric.startswith("db."):
+                root, roots = metric[3:].split(".")[0], _DB_METRIC_ROOTS
+            else:
+                root, roots = metric.split(".")[0], _METRIC_ROOTS
+            if root not in roots:
+                wrong.append((entry["id"], metric))
     assert not wrong, (
-        f"자동 리포트에 없는 절에서 시작하는 지표 경로: {wrong} — "
-        "이런 경로는 조용히 '실측 없음'이 되어 그 가설을 검정 불가로 만든다"
+        f"자동 집계에 없는 절에서 시작하는 지표 경로: {wrong} — "
+        "이런 경로는 그 가설을 영원히 검정 불가로 만든다"
     )
+
+
+def test_the_2026_08_05_dead_paths_would_now_be_caught():
+    """회귀 방지 — 08-05에 실제로 죽어 있던 경로들이 지금 규칙에 걸리는지 본다.
+
+    이 테스트가 통과하는 것만으로는 부족하다(그 경로들은 이미 고쳐졌다). 요점은 **규칙이
+    그것을 잡을 수 있는가**이고, 그래서 문자열을 직접 넣어 본다.
+    """
+    dead = [
+        "db.decisions_typo.reject_reason",       # 절 이름 오타
+        "db.tables_by_name.underlying_spot_1m",  # 존재하지 않는 절
+        "log.failures.만기 유동성 폴링 실패",      # 08-05 p2의 실제 오타(모듈명을 절로 착각)
+    ]
+    for metric in dead:
+        root = metric[3:].split(".")[0] if metric.startswith("db.") else metric.split(".")[0]
+        assert root not in _METRIC_ROOTS and root not in _DB_METRIC_ROOTS, metric
 
 
 @pytest.mark.parametrize(

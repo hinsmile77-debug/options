@@ -204,6 +204,46 @@ def test_closing_auction_boundary_has_a_single_source():
     assert main.MEMBER_UNAVAILABLE_PREOPEN in db_metrics.STRUCTURAL_UNAVAILABLE_REASONS
 
 
+def test_entry_cutoff_is_known_in_exactly_one_place(monkeypatch):
+    """규약 B — 진입 컷오프(14:50)와 그 사유 문자열의 단일 출처 (2026-08-06 §2-2 / Fix#1).
+
+    08-06에 이 지식은 **설계 문서에만** 있었다. v6 §4.2가 `14:50 이후 신규 진입 금지`를 명문으로
+    적어뒀는데 코드 어디에도 없어서 그날 21건이 통과했다. 이제 세 층이 이것을 안다:
+
+        판단(`main`) · 리스크(`RiskEngine`) · 지표(`ops.db_metrics`)
+
+    셋이 **같은 상수와 같은 사유 문자열**을 써야 §13의 불변식이 실제로 그 분들을 센다.
+    """
+    from mahdi import main, session
+    from mahdi.ops import db_metrics
+    from mahdi.risk.engine import RiskEngine
+    from mahdi.risk.limits import AccountState
+    from mahdi.risk.sizing import PositionSizingInput
+    from mahdi.risk.circuit_breaker import MarketConditions
+
+    # 사유 문자열 — 갈라지면 §13이 0을 내면서 "게이트가 잘 돈다"고 말한다.
+    assert main._REJECT_REASON_ENTRY_CUTOFF == db_metrics.ENTRY_CUTOFF_REJECT_REASON
+
+    # 리스크 엔진이 내는 사유도 같은 문자열인지 — 상수 비교가 아니라 **실제 반환값**으로 본다.
+    decision = RiskEngine().evaluate_entry(
+        PositionSizingInput(
+            base_size=1.0, regime_confidence=1.0, signal_quality=1.0, target_vol=0.01,
+            realized_vol=0.01, liquidity_score=1.0, drawdown_pct=0.0,
+            portfolio_capacity_remaining_pct=1.0,
+        ),
+        AccountState(
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0, drawdown_pct=0.0, same_direction_positions=0
+        ),
+        "any_strategy",
+        MarketConditions(),
+        now=session.NEW_ENTRY_CUTOFF,
+    )
+    assert decision.reject_reasons == [db_metrics.ENTRY_CUTOFF_REJECT_REASON]
+
+    # 시각 자체는 `mahdi.session`에서만 온다 — 어느 모듈도 14:50을 자기 리터럴로 들지 않는다.
+    assert session.NEW_ENTRY_CUTOFF < session.FORCED_FLAT_TIME
+
+
 # ===== 규약 D — 품질 지표는 감시 대상과 독립한 입력을 쓴다 (2026-08-05 고도화#1) =====
 #
 # 2026-08-01에 **생존 신호**에 대해 세운 원칙이 있다: *"생존 신호는 감시 대상과 독립한 타이머에서

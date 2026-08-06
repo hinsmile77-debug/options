@@ -19,6 +19,12 @@ echo [%date% %time%] ===== Mahdi 장전 기동 시작 ===== >> "%LOG_FILE%"
 
 cd /d "%PROJECT_DIR%"
 
+REM 2026-08-06(§2-1 / Fix#2): 워치독에게 "지금 기동 중"이라고 알린다.
+REM 이 표식이 없으면 1분 주기 워치독이 **기동 중인 루프를 다시 기동한다** — 아래 Docker 대기가
+REM 최대 180초라 그 사이 생존 신호는 늙은 채로(또는 없는 채로) 남아 있기 때문이다.
+REM 표식의 내용은 아무도 읽지 않는다(mtime만 본다) — cmd.exe의 날짜 문자열은 로케일을 탄다.
+echo startup > "%PROJECT_DIR%\logs\.startup_in_progress"
+
 REM 2026-07-22 이상점 대응(운영점검보고서 2026-07-22 §1-1): 어제(07-21) 08:15에 수동으로 뜬
 REM COCKPIT/관측 루프가 그날 15:45 자동 종료 실패 이후에도 밤새 좀비로 남아, 오늘 아침까지
 REM 그 사이 커밋된 새 코드(종료 신뢰성 배지 등)를 하나도 못 읽은 채 에러를 반복했다.
@@ -117,6 +123,10 @@ REM 누적됐던 원인) — 이제 Python이 그 파일을 직접 소유하므�
 REM stderr(로깅 설정이 끝나기 전 극초반 크래시 등 로깅으로 못 잡는 것)만 별도의 회전 없는
 REM 크래시 전용 로그로 남긴다.
 start "Mahdi Observation Loop" cmd /k "cd /d %PROJECT_DIR% && uv run python -m mahdi.main 2>>logs\observation_loop_crash.log"
+
+REM 2026-08-06 Fix#2 — 기동이 끝났으므로 워치독의 판정 보류를 푼다. 관측 루프는 방금 떴고
+REM 첫 생존 신호를 곧(수십 초 안에) 쓴다. 임계가 180초라 그 사이는 여유가 있다.
+del /q "%PROJECT_DIR%\logs\.startup_in_progress" 2>nul
 
 echo [%date% %time%] ===== 기동 스크립트 종료 (창들은 계속 실행 중) ===== >> "%LOG_FILE%"
 

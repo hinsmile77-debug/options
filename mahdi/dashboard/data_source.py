@@ -828,6 +828,46 @@ def _signal_reach_check(conn, now: datetime) -> HealthCheck:
     return HealthCheck(label, "ok", detail, group="관측 품질")
 
 
+def _entry_cutoff_check(conn, now: datetime) -> HealthCheck:
+    """
+    해석: 2026-08-06 §2-2 / Fix#1 — **진입이 없는 이유를 화면이 설명해야 한다.**
+         14:50을 넘기면 v6 §4.2에 따라 신규 진입이 금지되는데, 배지가 없으면 그 시각 이후의
+         "진입 0건"이 신호가 죽은 것인지 규칙이 걸린 것인지 화면에서 구분되지 않는다.
+         `enter_after_cutoff`는 **0이어야 하는 불변식**이다 — 08-06에는 21건이었다(게이트가
+         코드에 없었다). 0이 아니면 빨간 신호가 아니라 노란불로 낸다: 이 배지가 잡는 것은
+         시장 이상이 아니라 **우리 코드의 회귀**다.
+    실패 조건: 판단 이력이 없으면 "집계 전"(info) — 지어내지 않는다.
+    """
+    label = "진입 컷오프(14:50)"
+    try:
+        stats = db_metrics.decisions(conn, now.date())
+    except Exception:
+        conn.rollback()
+        logger.warning("진입 컷오프 점검 조회 실패", exc_info=True)
+        return HealthCheck(label, "warning", "조회 실패", group="판단")
+    if not stats.get("total"):
+        return HealthCheck(label, "info", "집계 전(오늘 판단 이력 없음)", group="판단")
+    cutoff = stats["entry_cutoff"]
+    violated = cutoff["enter_after_cutoff"]
+    if violated:
+        return HealthCheck(
+            label, "warning",
+            f"컷오프 이후 ENTER {violated}건 — 게이트 회귀"
+            f"(그중 강제 평탄화 이후 {cutoff['enter_after_forced_flat']}건)",
+            group="판단",
+        )
+    if session.is_after_entry_cutoff(now):
+        return HealthCheck(
+            label, "info",
+            f"컷오프 경과 — 신규 진입 금지 중(오늘 {cutoff['blocked_count']}분 차단)",
+            group="판단",
+        )
+    return HealthCheck(
+        label, "ok", f"{cutoff['cutoff_time']}까지 진입 가능 · 오늘 ENTER {stats['decision'].get('ENTER', 0)}건",
+        group="판단",
+    )
+
+
 def _overrun_count_check(conn, now: datetime) -> HealthCheck:
     """당일 누적 스케줄 밀림 — 다음날 로그를 뒤지지 않고 그날 바로 악화를 본다."""
     label = "스케줄 밀림(당일 누적)"
@@ -971,6 +1011,8 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 # 2026-08-03(§5-1) — 커버리지 바로 아래 칸. 08-03에 커버리지 98.8%인 날
                 # 감마플립 산출률은 0%였다(데이터는 DB에 있었지만 판단까지 가지 않았다).
                 _signal_reach_check(conn, now),
+                # 2026-08-06(§2-2 / Fix#1) — 진입이 없는 이유를 화면이 설명하게 한다.
+                _entry_cutoff_check(conn, now),
             ]
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)

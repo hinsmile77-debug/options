@@ -20,6 +20,7 @@ from mahdi.features.options_intel import OptionLeg, calculate_gex, legs_from_cha
 from mahdi.features.orderflow import calculate_vpin
 from mahdi.fusion.signal_layer import SignalInputs, build_member_scores
 from mahdi.logutil import WarningThrottle
+from mahdi.risk.engine import RiskEngine
 from mahdi.risk.market_halt import MarketHaltMonitor
 import mahdi.main as mahdi_main
 from mahdi.main import (
@@ -3273,10 +3274,15 @@ class _FakeRegimeStateMachineWithLastState:
 def _patch_signal_fusion_cycle_db_defaults(monkeypatch):
     """2026-07-30(운영점검 §4 Fix#4/#6): poll_signal_fusion_cycle이 이제 **진입 여부와 무관하게**
     매 사이클 거래정지 상태와 계좌 스냅샷을 조회하고 risk_snapshots를 남긴다 — 그 기본 스텁을
-    한 곳에 모은다(개별 테스트는 이 호출 뒤에 필요한 것만 다시 덮어쓰면 된다)."""
+    한 곳에 모은다(개별 테스트는 이 호출 뒤에 필요한 것만 다시 덮어쓰면 된다).
+
+    2026-08-06(§2-2 / Fix#1): **시각도 여기서 고정한다.** 진입 컷오프(14:50)가 생긴 뒤로
+    `local_now()`를 안 막으면 *테스트를 오후에 돌렸는지에 따라* ENTER가 REJECT로 바뀐다 —
+    실행 시각에 따라 결과가 달라지는 테스트는 회귀를 못 잡는다. 10:00은 컷오프 한참 전이다."""
     monkeypatch.setattr("mahdi.main.db.latest_market_halt_state", lambda conn: None)
     monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
     monkeypatch.setattr("mahdi.main.db.insert_risk_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 0))
 
 
 def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule(monkeypatch):
@@ -3439,6 +3445,8 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     # 2026-07-29: is_entry 경로에서 RiskEngine.evaluate_entry에 market_halted를 넘기려고
     # latest_market_halt_state를 조회한다 — 이 테스트는 정상(halt 이력 없음) 케이스만 검증한다.
     monkeypatch.setattr("mahdi.main.db.latest_market_halt_state", lambda conn: None)
+    # 2026-08-06 Fix#1 — 컷오프 이전 시각 고정(안 그러면 오후에 돌릴 때 REJECT가 된다).
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 0))
 
     @contextmanager
     def fake_get_connection(settings=None):
@@ -3474,7 +3482,141 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     assert risk_gate_state["risk_engine"]["approved_size"] > 0
 
 
+# ===== 2026-08-06 §2-2 / Fix#1 — v6 §4.2 신규 진입 컷오프의 라이브 배선 =====
+#
+# 위 테스트와 **입력이 완전히 같고 시각만 다르다.** 그것이 이 게이트가 하는 일의 전부다.
+
+
+def _run_signal_fusion_at(monkeypatch, now: datetime) -> list[tuple]:
+    """진입 후보가 확실히 나오는 입력으로 한 사이클을 돌려 기록된 판단을 돌려준다."""
+    chain_rows = [
+        {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
+         "gex": 0.0, "expiry": date(2026, 8, 13)},
+    ]
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before", lambda conn, before: _BASELINE_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.max_account_balance_ever", lambda conn: 110.0)
+    monkeypatch.setattr("mahdi.main.db.daily_trade_counts_by_strategy", lambda conn, day: {})
+    monkeypatch.setattr("mahdi.main.db.latest_market_halt_state", lambda conn: None)
+    monkeypatch.setattr("mahdi.main.db.insert_risk_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: now)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+            (decision, reject_reason, risk_gate_state)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.TREND_UP_STRONG] = 1.0
+    regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple(prob_vector))
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(
+            _FakeRegimeStateMachineWithLastState(regime_state), interval_seconds=60
+        ))
+    return recorded
+
+
+def test_poll_signal_fusion_cycle_blocks_entry_after_the_cutoff(monkeypatch):
+    """08-06 15:30에 실제로 기록된 ENTER가 이제 `entry_cutoff` REJECT가 된다.
+
+    `decision` 컬럼까지 바뀌어야 하는 이유: 그 컬럼은 팔레트 결과만 보고 정해지고 리스크
+    엔진 결과는 `risk_gate_state`에만 들어간다 — 08-06 ENTER 62건은 전부
+    `risk_engine.approved=true`였다. 엔진에만 게이트를 두면 표가 안 바뀐다.
+    """
+    recorded = _run_signal_fusion_at(monkeypatch, datetime(2026, 8, 6, 15, 30))
+    assert len(recorded) == 1
+    decision, reject_reason, _ = recorded[0]
+    assert decision == "REJECT"
+    assert reject_reason == "entry_cutoff"
+
+
+def test_poll_signal_fusion_cycle_allows_entry_just_before_the_cutoff(monkeypatch):
+    """같은 입력, 14:49 — 컷오프는 시각 말고 아무것도 바꾸지 않는다."""
+    recorded = _run_signal_fusion_at(monkeypatch, datetime(2026, 8, 6, 14, 49))
+    assert len(recorded) == 1
+    decision, reject_reason, _ = recorded[0]
+    assert decision == "ENTER"
+    assert reject_reason is None
+
+
+def test_entry_cutoff_does_not_overwrite_an_existing_reject_reason(monkeypatch):
+    """이미 거부된 판단의 사유는 덮지 않는다.
+
+    덮으면 `entry_cutoff` 건수가 *"진입할 뻔했는데 막힌 분"* 이 아니라 *"컷오프 이후의 모든 분"*
+    이 되어, 팔레트 상태에 따라 요동치는 숫자가 된다 — 그러면 검정할 수 없다.
+    """
+    # 진입 후보가 없는 입력(체인 없음) — 컷오프 이후여도 사유는 팔레트/메타라벨 쪽이어야 한다.
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 15, 30))
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: None)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+            (decision, reject_reason)
+        ),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(
+            _FakeRegimeStateMachineWithLastState(None), interval_seconds=60
+        ))
+
+    assert len(recorded) == 1
+    assert recorded[0][0] == "REJECT"
+    assert recorded[0][1] != "entry_cutoff"  # 후보가 없던 쪽은 원래 사유 그대로
+
+
+def test_risk_engine_also_receives_the_decision_time(monkeypatch):
+    """이중 방어 — 판단 층이 이미 막았어도 엔진 호출에 `now`가 실려야 한다.
+
+    비어 있으면 Phase 2에서 실행 엔진이 이 호출을 복사해 갈 때 시각 게이트가 조용히 빠진다.
+    """
+    seen: dict = {}
+    real_evaluate = RiskEngine.evaluate_entry
+
+    def spy(self, *args, **kwargs):
+        seen.update(kwargs)
+        return real_evaluate(self, *args, **kwargs)
+
+    monkeypatch.setattr(RiskEngine, "evaluate_entry", spy)
+    _run_signal_fusion_at(monkeypatch, datetime(2026, 8, 6, 10, 0))
+    assert seen.get("now") == datetime(2026, 8, 6, 10, 0)
+
+
 def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
+    # 2026-08-06 Fix#1 — 컷오프 이전 시각으로 고정(위 헬퍼와 같은 이유. 이 테스트는 halt 쪽을
+    # 보려고 헬퍼를 안 쓰고 직접 스텁을 깐다).
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 0))
     chain_rows = [
         {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
          "gex": 0.0, "expiry": date(2026, 8, 13)},
@@ -5474,3 +5616,59 @@ def test_fusion_decision_carries_the_scores_it_already_computed():
         1 for name in ("regime_hmm", "options_flow", "orderflow_ofi_vpin", "flow_position")
         if getattr(decision.member_scores, name) is not None
     ), "적재되는 점수와 available_member_count가 같은 계산에서 나와야 한다"
+
+
+# ===== 2026-08-06 §2-1 / Fix#2 — 관측 루프 생존 신호 =====
+
+
+def test_poll_process_heartbeat_writes_a_fresh_file(tmp_path, monkeypatch):
+    """이 파일의 나이가 곧 "이벤트 루프가 마지막으로 스케줄을 돌린 시각"이다."""
+    from mahdi import liveness
+    import mahdi.main as main_module
+
+    monkeypatch.setattr(main_module, "LOG_DIR", tmp_path)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 4))
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(main_module.poll_process_heartbeat(interval_seconds=30))
+
+    beat = liveness.read_heartbeat(liveness.heartbeat_path(tmp_path))
+    assert beat["at"] == datetime(2026, 8, 6, 10, 4)
+    assert beat["beats"] == 1
+
+
+def test_poll_process_heartbeat_survives_a_write_failure(tmp_path, monkeypatch):
+    """생존 신호를 못 썼다고 관측이 멈추면 안 된다 — 못 쓰면 파일이 늙고 워치독이 그것을 본다."""
+    import mahdi.main as main_module
+
+    monkeypatch.setattr(main_module, "LOG_DIR", tmp_path)
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 4))
+    monkeypatch.setattr(
+        "mahdi.main.liveness.write_heartbeat",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("디스크 가득")),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    # write_heartbeat이 내부에서 삼키는 계약이므로, 여기서 터지면 그 계약이 깨진 것이다.
+    with pytest.raises(OSError):
+        _run(main_module.poll_process_heartbeat(interval_seconds=30))
+
+
+def test_main_registers_the_process_heartbeat_task():
+    """gather 목록에서 빠지면 이 fix 전체가 조용히 없는 것과 같다.
+
+    소스를 읽어 확인하는 이유: `main()`은 KIS 연결부터 시작해 테스트에서 통째로 돌릴 수 없다.
+    """
+    import inspect
+
+    import mahdi.main as main_module
+
+    source = inspect.getsource(main_module.main)
+    assert "poll_process_heartbeat()" in source

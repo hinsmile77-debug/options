@@ -1,3 +1,5 @@
+from datetime import datetime, time as dtime, timedelta
+
 from mahdi.risk.circuit_breaker import CircuitBreakerState, MarketConditions
 from mahdi.risk.engine import RiskEngine
 from mahdi.risk.limits import AccountState
@@ -158,3 +160,84 @@ def test_unconfigured_portfolio_greeks_check_surfaced_on_approval():
     )
     assert decision.approved
     assert "portfolio_greeks" in decision.unconfigured_checks
+
+
+# ===== 2026-08-06 §2-2 / Fix#1 — v6 §4.2 신규 진입 컷오프(14:50) =====
+#
+# 08-06 실측: 14:50 초과 ENTER 21건, 그중 15:10 강제 평탄화 이후 18건(마지막 15:30).
+# 청산 쪽 15:10은 `execution/exit_stack.py`에 있었는데 진입 쪽 게이트는 코드에 없었다.
+
+
+def test_entry_after_cutoff_is_rejected_before_anything_else():
+    """컷오프는 `market_halted`보다도 앞이다 — halt 상태에 따라 사유가 바뀌면 안 된다.
+
+    사유가 흔들리면 `signal_decisions.reject_reason` 시계열로 이 게이트를 셀 수 없다.
+    """
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    decision = engine.evaluate_entry(
+        _sizing_input(), _account(daily_pnl_pct=-0.03), "vrp_harvest", _market(),
+        market_halted=True, now=dtime(15, 30),
+    )
+    assert not decision.approved
+    assert decision.approved_size == 0.0
+    assert decision.reject_reasons == ["entry_cutoff"]
+    # 내부 CircuitBreaker를 건드리지 않았는지 — market_halt와 같은 계약이다.
+    assert engine.circuit_breaker.state == CircuitBreakerState.NORMAL
+
+
+def test_entry_at_cutoff_boundary_is_rejected():
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    assert engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(), now=dtime(14, 50)
+    ).reject_reasons == ["entry_cutoff"]
+
+
+def test_entry_before_cutoff_falls_through_to_normal_evaluation():
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    decision = engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(), now=dtime(14, 49)
+    )
+    assert decision.approved
+    assert decision.approved_size > 0
+
+
+def test_entry_cutoff_accepts_datetime():
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    decision = engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(),
+        now=datetime(2026, 8, 6, 15, 11),
+    )
+    assert decision.reject_reasons == ["entry_cutoff"]
+
+
+def test_omitting_now_skips_the_time_gate():
+    """`now=None`은 시각 게이트를 건너뛴다 — 기존 호출측/백테스트를 깨지 않기 위한 계약이다.
+
+    **라이브 경로가 이 기본값에 기대면 안 된다**: `tests/test_main.py`가 관측 루프에서
+    `now`가 실제로 넘어가는지 별도로 강제한다.
+    """
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    assert engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market()
+    ).approved
+
+
+def test_cutoff_uses_the_session_module_constant():
+    """규약 B — 14:50을 아는 곳은 `mahdi.session` 하나다.
+
+    엔진이 자기 상수를 따로 들면 08-06의 재발이다(같은 사실이 두 곳에 적히면 갈라진다).
+    """
+    from mahdi import session
+
+    engine = RiskEngine(risk_limits=_RISK_LIMITS)
+    just_before = (
+        datetime(2026, 8, 6).replace(
+            hour=session.NEW_ENTRY_CUTOFF.hour, minute=session.NEW_ENTRY_CUTOFF.minute
+        ) - timedelta(minutes=1)
+    )
+    assert engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(), now=just_before
+    ).approved
+    assert engine.evaluate_entry(
+        _sizing_input(), _account(), "vrp_harvest", _market(), now=session.NEW_ENTRY_CUTOFF
+    ).reject_reasons == ["entry_cutoff"]

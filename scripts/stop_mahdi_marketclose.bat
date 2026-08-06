@@ -23,6 +23,12 @@ REM 명명 규약과 무관하게 잡힌다. -ne $PID로 이 powershell 프로�
 REM 커맨드라인 문자열 자체에 검색어가 들어있어 자기 자신이 매칭되는 것을 막기 위함).
 powershell -NoProfile -Command "$procs = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.CommandLine -like '*mahdi.main*' -or $_.CommandLine -like '*mahdi/dashboard/app.py*') }; foreach ($p in $procs) { Write-Output ('커맨드라인 매칭 fallback 종료: PID {0} - {1}' -f $p.ProcessId, $p.CommandLine); Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; if (-not $procs) { Write-Output '커맨드라인 매칭 fallback: 잔존 프로세스 없음' }" >> "%LOG_FILE%" 2>&1
 
+REM 2026-08-06(§2-1 / Fix#2): 생존 신호를 지운다.
+REM 관측 루프는 taskkill로 죽으므로 정리 코드를 못 돈다 — 파일이 남으면 장마감 이후 내내
+REM "N초째 갱신 없음"으로 보인다. 감시 창(~15:45) 밖이라 알림이 뜨지는 않지만, 다음날 아침
+REM 창이 열리는 07:40에 **어제 것이 늙은 채로** 판정 대상이 된다.
+del /q "%PROJECT_DIR%\logs\.observation_loop_heartbeat.json" 2>nul
+
 cd /d "%PROJECT_DIR%"
 uv run python scripts\log_marketclose_stop.py
 

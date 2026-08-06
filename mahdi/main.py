@@ -71,7 +71,7 @@ from mahdi.fusion.signal_layer import (
     build_member_scores,
 )
 from mahdi.fusion.strategy_palette import entry_strategies
-from mahdi import session
+from mahdi import liveness, session
 from mahdi.logutil import TracebackBudget, WarningThrottle
 from mahdi.risk.circuit_breaker import MarketConditions
 from mahdi.risk.engine import RiskEngine
@@ -365,6 +365,13 @@ class WsLiveness:
 SIGNAL_FUSION_POLL_INTERVAL_SECONDS = 60.0
 SIGNAL_FUSION_PHASE_OFFSET_SECONDS = 10.0
 _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason VARCHAR(50)
+
+# 2026-08-06 §2-2 / Fix#1 — v6 §4.2 신규 진입 컷오프(14:50)로 막힌 판단의 사유.
+#
+# 값 자체가 계약이다: 자동 리포트(§13 판단 표)와 COCKPIT 배지, 그리고 `hypotheses.yaml`의
+# 검정 지표가 이 문자열을 센다. `RiskEngine`이 내는 사유(`entry_cutoff`)와 **같은 문자열**을
+# 쓰는 이유는 08-04 §2-1의 교훈이다 — 같은 사건을 두 이름으로 부르면 집계가 유형을 잃는다.
+_REJECT_REASON_ENTRY_CUTOFF = "entry_cutoff"
 
 # 2026-07-28 8차 — 계좌 손익/포지션 상태 추적기 라이브 배선(get_balance() 실측 필드 매핑은
 # [[DECISION_LOG]] 2026-07-28 7차 항목 참고). 이 폴러는 다른 REST 폴러와 동일하게 KIS API를
@@ -1603,6 +1610,30 @@ async def poll_ws_heartbeat(
                 )
         except Exception:
             logger.warning("WS 하트비트 기록 실패 — 관측 자체에는 영향 없음", exc_info=True)
+        await asyncio.sleep(interval_seconds)
+
+
+async def poll_process_heartbeat(
+    interval_seconds: float = liveness.HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """
+    계산: `interval_seconds`마다 `logs/.observation_loop_heartbeat.json`에 PID와 현재 시각을
+         남긴다. 워치독(`scripts/watchdog_observation_loop.py`)이 그 파일의 나이만 보고
+         **관측 루프가 살아 있는지** 판정한다(2026-08-06 §2-1 / Fix#2).
+    해석: 이 파일의 나이는 *"이벤트 루프가 마지막으로 스케줄을 돌린 시각"* 이다 — DB도 KIS도
+         거치지 않는다. 08-06 10:04에 프로세스가 흔적 없이 사라졌을 때 그 사실을 아는 주체가
+         하나도 없었고, 사람이 16분 뒤 화면을 보고 알았다.
+         **다른 하트비트(WS/CB)와 달리 DB에 쓰지 않는 이유**: DB가 죽어도 이 신호는 살아야
+         한다. 관측 루프가 죽는 것과 DB가 죽는 것은 다른 사건이고, 조치도 다르다.
+    실패 조건: 쓰기 실패는 `liveness.write_heartbeat()` 안에서 삼킨다 — 생존 신호를 못 썼다고
+              관측이 멈추면 본말이 뒤집힌다. 못 쓰면 파일이 늙고, 워치독이 그것을 본다.
+    """
+    beats = 0
+    while True:
+        beats += 1
+        liveness.write_heartbeat(
+            liveness.heartbeat_path(LOG_DIR), db.local_now(), beats=beats
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -3102,7 +3133,26 @@ async def poll_signal_fusion_cycle(
                 # entry_strategies()로 관망 계열을 걸러낸 뒤 남는 게 있을 때만 진입으로 본다.
                 entry_candidates = entry_strategies(decision.allowed_strategies)
                 is_entry = decision.trade_permission != TradePermission.NO_TRADE and bool(entry_candidates)
-                if decision.reject_reasons:
+
+                # 2026-08-06 §2-2 / Fix#1 — v6 §4.2 신규 진입 컷오프(14:50).
+                #
+                # **`RiskEngine`에만 게이트를 두면 이 표는 안 바뀐다.** `decision` 컬럼은 팔레트
+                # 결과(`is_entry`)만 보고 정해지고 리스크 엔진 결과는 `risk_gate_state`에만
+                # 들어가기 때문이다 — 08-06의 ENTER 62건은 전부 `risk_engine.approved=true`였다.
+                # 그래서 판단 층에도 같은 경계를 둔다(엔진 쪽은 Phase 2 실행 경로를 위한 이중
+                # 방어이고, 두 곳 모두 `mahdi.session` 한 상수를 읽는다).
+                #
+                # **이미 거부된 판단의 사유는 덮지 않는다** — `is_entry`가 True였을 때만 사유를
+                # `entry_cutoff`로 바꾼다. 그래야 이 사유의 건수가 정확히 *"진입할 뻔했는데 시각
+                # 때문에 막힌 분"* 이 되어 그 자체로 검정 가능한 지표가 된다(관망으로 이미 막힌
+                # 분까지 세면 컷오프의 효과가 팔레트 상태에 따라 요동친다).
+                entry_cutoff_blocked = is_entry and session.is_after_entry_cutoff(poll_time)
+                if entry_cutoff_blocked:
+                    is_entry = False
+
+                if entry_cutoff_blocked:
+                    reject_reason = _REJECT_REASON_ENTRY_CUTOFF
+                elif decision.reject_reasons:
                     reject_reason = decision.reject_reasons[0][:_SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH]
                 elif not is_entry and decision.allowed_strategies:
                     # 팔레트는 셀을 찾았지만 그 내용이 관망뿐이라 진입이 아닌 경우 — 신호 부재
@@ -3162,6 +3212,11 @@ async def poll_signal_fusion_cycle(
                         risk_decision = risk_engine.evaluate_entry(
                             sizing_input, account_state, entry_candidates[0], MarketConditions(),
                             market_halted=market_halted,
+                            # 2026-08-06 Fix#1 — 판단 층이 이미 컷오프를 걸었으므로 여기까지
+                            # 오는 사이클은 컷오프 이전이다. 그래도 넘기는 이유: 이 인자가
+                            # 비어 있으면 Phase 2에서 실행 엔진이 같은 호출을 복사해 갈 때
+                            # 시각 게이트가 조용히 빠진다. **두 층 모두 채워져 있어야 한다.**
+                            now=poll_time,
                         )
                         risk_gate_invocations += 1
                         risk_gate_last_invoked_at = poll_time
@@ -3295,6 +3350,11 @@ def _log_startup_gap_since_last_run() -> None:
     except Exception:
         logger.warning("직전 기동 기록 확인 실패", exc_info=True)
 
+    # 2026-08-06 §3-3 / Fix#4 — 트레이스백 예산이 이 프로세스에서 새로 열렸다는 사실을 남긴다.
+    # 08-06에 프로세스가 세 번 떠서 `오늘 N번째` 카운터가 두 번 되감겼는데, 그 사실이 로그
+    # 어디에도 없어 사후 집계가 205건을 190건으로 봤다.
+    logger.info("%s", _TRACEBACK_BUDGET.describe())
+
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         LAST_START_MARKER_FILE.write_text(db.local_now().isoformat(), encoding="utf-8")
@@ -3399,6 +3459,9 @@ async def main() -> None:
             # 독립한 타이머에서 낸다(CB 감지 / WS 연결).
             poll_market_halt_heartbeat(market_halt_monitor),
             poll_ws_heartbeat(ws_liveness),
+            # 2026-08-06 §2-1 / Fix#2 — 프로세스 자신의 생존 신호. 위 둘과 달리 DB를 거치지
+            # 않는다(DB가 죽는 것과 루프가 죽는 것은 다른 사건이고 조치도 다르다).
+            poll_process_heartbeat(),
             # 2026-08-04 고도화#5 — KIS 응답시간을 서비스 품질 지표로 승격(밀림의 90%가 여기서 온다).
             poll_rest_latency_snapshot(rest_client),
         ]

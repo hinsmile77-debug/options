@@ -57,6 +57,30 @@ ROLE_REFERENCE = "참고"
 
 VERDICT_UNJUDGEABLE = "판정 불가"
 
+# 2026-08-06 §3-1 / Fix#3 — **경로가 애초에 존재하지 않는다.**
+#
+# 08-05에 세운 예측 13건 중 **6건이 주장 지표를 하나도 못 받았다.** `db.decisions.…`,
+# `db.tables.<이름>.rows`, `db.member_availability.<멤버>.…` — 사람이 자연스럽게 적은 경로들이
+# 리포트 구조에 없었고, 전부 조용히 `VERDICT_NO_DATA`("실측 없음")로 표시됐다. 그래서 `p1`의
+# **대가 지표가 12배 초과**(ENTER 예측 ≤5에 실측 62건)한 것을 아무도 자동으로 알아채지 못했다.
+#
+# 같은 날 아침 커밋이 이 위험을 정확히 인지하고 회귀 테스트까지 붙였는데, 그 테스트가
+# `db.` 접두사를 **명시적으로 제외**해서(`tests/test_ops_hypotheses.py`) 나머지 절반이 통과했다.
+#
+# ## 왜 "실측 없음"과 갈라야 하는가
+#
+# 둘은 **조치가 다르다.**
+#   실측 없음  그날 그 값이 안 나왔다 → 내일 다시 본다. 정상일 수 있다.
+#   경로 없음  그 지표는 **영원히** 안 나온다 → yaml을 고쳐야 한다. 절대 정상이 아니다.
+# 한 이름으로 부르면 후자가 전자의 소음에 묻힌다 — 08-06에 28행 표에서 실제로 그랬다.
+#
+# ## 판별 방법
+#
+# **부모 컨테이너가 해석되는가**로 가른다. `db.decisions.reject_reason.strategy_palette:wait_only`
+# 에서 잎(`strategy_palette:wait_only`)은 그날 그 사유가 안 나오면 없는 게 맞다 — 데이터 의존이다.
+# 그러나 부모(`db.decisions.reject_reason`)는 **구조**라 항상 있어야 한다. 부모가 없으면 오타다.
+VERDICT_PATH_DEAD = "경로 없음"
+
 
 def load(path: Path) -> list[dict]:
     """
@@ -83,6 +107,27 @@ def _lookup(metrics: dict | None, db_metrics: dict | None, path: str) -> Any:
     if path.startswith("db."):
         return dig(db_metrics or {}, path[3:])
     return dig(metrics or {}, path)
+
+
+def path_exists(metrics: dict | None, db_metrics: dict | None, path: str) -> bool:
+    """반환: 이 지표 경로가 **구조적으로** 존재하는가 (2026-08-06 Fix#3).
+
+    잎이 아니라 **부모**를 본다 — 잎은 그날 데이터에 따라 없을 수 있고(그건 「실측 없음」),
+    부모가 없으면 오타다(그건 「경로 없음」). 마디가 하나뿐인 경로는 그 자체가 절 이름이므로
+    최상위 dict에서 찾는다.
+
+    부모가 리스트(예: `db.tables`)인 경우도 존재로 본다 — `report.dig()`가 자연 키로 색인하므로
+    그 리스트에 그 이름의 행이 없는 것은 "그날 그 테이블에 행이 없었다"에 해당한다.
+    """
+    from mahdi.ops.report import dig
+
+    is_db = path.startswith("db.")
+    root = (db_metrics or {}) if is_db else (metrics or {})
+    rest = path[3:] if is_db else path
+    parent, _, _ = rest.rpartition(".")
+    if not parent:
+        return rest in root
+    return dig(root, parent) is not None
 
 
 def _verdict(actual: Any, expect: str) -> str:
@@ -140,6 +185,15 @@ def evaluate(
                 path = prediction["metric"]
                 actual = _lookup(metrics, db_metrics, path)
                 expect = str(prediction["expect"])
+                # 2026-08-06 Fix#3 — 경로 자체가 없는 것과 그날 값이 없는 것을 가른다.
+                # 지표를 하나도 못 모은 날(DB 다운 등)에는 전 경로가 "없음"이 되므로,
+                # 집계가 아예 비어 있으면 이 판별을 하지 않는다(전부 경로 없음으로 뜨면
+                # 진짜 오타가 그 소음에 묻힌다 — 이 fix가 고치려던 바로 그 실패다).
+                collected = bool(metrics) or bool(db_metrics)
+                dead_path = (
+                    collected and actual is None
+                    and not path_exists(metrics, db_metrics, path)
+                )
                 out.append(
                     {
                         "id": entry.get("id", "?"),
@@ -150,9 +204,12 @@ def evaluate(
                         "역할": role,
                         "claim_missing": claim_missing,
                         "cost_missing": cost_missing,
+                        "path_dead": dead_path,
                         "대가": entry.get("대가"),
                         "verdict": (
-                            VERDICT_UNJUDGEABLE if claim_missing else _verdict(actual, expect)
+                            VERDICT_UNJUDGEABLE if claim_missing
+                            else VERDICT_PATH_DEAD if dead_path
+                            else _verdict(actual, expect)
                         ),
                         # 2026-08-03 §5-4: 예정일이 **지난** 채로 아직 pending인 항목.
                         # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에
