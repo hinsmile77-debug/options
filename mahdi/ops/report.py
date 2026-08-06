@@ -34,6 +34,9 @@ HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
     ("└ 인프라 결손", "cycles.missing.infra_count", "{:,.0f}분", "down"),
     ("└ 관측 루프 미가동", "cycles.missing.downtime_count", "{:,.0f}분", "down"),
     ("결손 회수", "catchups.count", "{:,.0f}건", None),
+    # 2026-08-06 고도화#1 — 먼슬리 레그 재시도로 살린 레그. **판단 주입력의 두께**다.
+    # 0이면 재시도가 안 돌았거나(예산 없음) 놓친 레그가 없었던 것 — §12의 레그 완전성과 함께 읽는다.
+    ("먼슬리 레그 회복", "priority_retry.recovered", "{:,.0f}레그", "up"),
     ("비200 응답", "rest.non_200.count", "{:,.0f}건", "down"),
     ("백오프 최대 배율", "backoff.max_multiplier", "{:.2f}배", "down"),
     ("느린 REST 호출", "slow_calls.count", "{:,.0f}건", "down"),
@@ -846,7 +849,9 @@ def _render_db_judgement(db: dict) -> list[str]:
         "(1~2종이면 판단이 사실상 고정 출력이다)",
         "",
     ]
+    out += _render_effective_members(db)
     out += _render_entry_cutoff(db)
+    out += _render_decision_outcomes(db)
     out += _table(
         ["레짐", "오늘", "전체 이력", "영업일"],
         [[r["regime"], f"{r['today']:,}", f"{r['total']:,}", str(r["days"])]
@@ -862,6 +867,41 @@ def _render_db_judgement(db: dict) -> list[str]:
         ["피처", "중립값 탈출 비율"],
         [[k, _fmt(v, "{:.1f}%")] for k, v in (fs.get("non_neutral_pct") or {}).items()],
     )
+    return out
+
+
+def _render_effective_members(db: dict) -> list[str]:
+    """2026-08-06 고도화#2 — 「가용 4멤버」가 실제로 몇 개 축을 보고 있었는가.
+
+    §14-3(멤버별 점수)이 *"어느 멤버가 뭐라고 했나"* 라면 이 줄은 그것을 **한 숫자로 접은 것**이다.
+    둘 다 필요하다: 여기서 차이를 보고, §14-3에서 누구인지 본다.
+    """
+    mc = (db.get("decisions") or {}).get("member_count") or {}
+    if not mc.get("available"):
+        return [
+            "> 실질 멤버 수는 2026-08-06 고도화#2 이후 판단부터 나온다"
+            f"({mc.get('reason', '미기록')}).",
+            "",
+        ]
+    dead = mc.get("dead_axis_mean") or 0
+    out = [
+        f"- **실질 멤버 수**: 가용 평균 {mc.get('available_mean')} vs 실질 평균 "
+        f"**{mc.get('effective_mean')}** (죽은 축 평균 **{dead}**, 최소 실질 "
+        f"{mc.get('effective_min')}멤버 · 죽은 축이 있던 분 {mc.get('minutes_with_dead_axis'):,})",
+    ]
+    if dead:
+        out.append(
+            "> **0은 중립이지 의견이 아니다.** 가용 멤버가 넷이어도 그중 하나가 매분 0점을 내면 "
+            "앙상블은 실질 셋이고, 그때 가중치를 바꿔도 답이 안 바뀐다. 08-06에 `regime_hmm`이 "
+            "399분 전량 중립이었다(§14-3) — 레짐이 23영업일 연속 한 상태였기 때문이다. "
+            "**누가 죽었는지는 §14-3에서 본다.**"
+        )
+    else:
+        out.append(
+            "> 죽은 축 0 — 가용 멤버 전부가 매분 의견을 냈다. `available_member_count`를 "
+            "그대로 믿어도 되는 날이다."
+        )
+    out.append("")
     return out
 
 
@@ -885,8 +925,9 @@ def _render_entry_cutoff(db: dict) -> list[str]:
     if violated:
         out.append(
             f"> ⛔ **불변식 위반** — v6 §4.2는 {cutoff.get('cutoff_time')} 이후 신규 진입을 금지한다. "
-            "이 값이 0이 아니면 게이트가 빠진 것이다(2026-08-06 실측 21건 / 평탄화 이후 18건이 "
-            "이 fix를 만든 사건이다)."
+            "이 값이 0이 아니면 게이트가 빠진 것이다(2026-08-06 실측 21건 / 평탄화 시각 이후 "
+            "19건 — 경계는 **이상**이라 15:10 정각을 포함한다. 보고서 §2-2가 적은 18건은 초과로 "
+            "센 값이고, `session.is_after_entry_cutoff`의 경계 규약이 이쪽이다)."
         )
     else:
         out.append(
@@ -894,6 +935,36 @@ def _render_entry_cutoff(db: dict) -> list[str]:
             "앞의 「차단 N분」이 그 구분이다(N이 0이면 그 시간대에 애초에 진입 신호가 없었다)."
         )
     out.append("")
+    return out
+
+
+def _render_decision_outcomes(db: dict) -> list[str]:
+    """2026-08-06 고도화#5 — **진입 판단이 옳았는가.** ADVISORY 기준선이다.
+
+    08-05 `p1`이 팔레트를 연 뒤 ENTER가 0 → 62건이 됐는데, 그 62건을 재는 축이 하나도 없었다.
+    실거래 전환일에 "이전보다 나아졌는가"를 물으려면 그 전의 기준선이 있어야 한다.
+    """
+    outcomes = db.get("decision_outcomes") or {}
+    if not outcomes.get("available"):
+        return [
+            f"> 진입 사후 평가는 ENTER가 있는 날부터 나온다({outcomes.get('reason', '미계산')}).",
+            "",
+        ]
+    rows = [
+        [horizon, f"{s['sample']:,}", f"{s['hits']:,}", _fmt(s["hit_pct"], "{:.1f}%")]
+        for horizon, s in (outcomes.get("horizons") or {}).items()
+    ]
+    out = [f"- 진입 판단 **{outcomes['entries']:,}건**의 방향 적중률", ""]
+    out += _table(["지평", "표본", "적중", "적중률"], rows)
+    out += [
+        "> **표본 수를 반드시 함께 읽는다** — 진입 3건인 날의 100%는 아무 뜻이 없다. 지평이 길수록 "
+        "표본이 주는 것은 정상이다(장 마감을 넘긴 지평은 구조적으로 빈다).",
+        "> **무변동은 적중도 실패도 아니라 분모에서 빠진다.** 0을 실패로 세면 조용한 장에서 "
+        "적중률이 구조적으로 낮아지고, 성공으로 세면 반대가 된다.",
+        "> 이 값으로 **가중치를 바꾸지 않는다** — 평가이지 되먹임이 아니다(v6 §11.3 Thompson "
+        "Sampling은 Phase 3). 며칠 쌓고 사람이 「무엇을 성과로 볼 것인가」부터 정한다.",
+        "",
+    ]
     return out
 
 

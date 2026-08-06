@@ -60,6 +60,10 @@ class FusionDecision:
     allowed_strategies: list[str] = field(default_factory=list)
     signal_agreement_count: int = 0
     available_member_count: int = 0
+    # 2026-08-06 고도화#2 — **비영 점수를 낸 멤버 수.** `available_member_count`와 나란히 둔다.
+    # 08-06 §14-3: `regime_hmm`이 399분 전량 중립이었고, 그래서 가용 4는 실질 3이었다.
+    # **둘의 차이가 곧 죽은 축의 수**다. 상세 근거는 `fusion.ensemble.EnsembleResult`.
+    effective_member_count: int = 0
     reject_reasons: list[str] = field(default_factory=list)
     # 2026-08-05(고도화#4) — **앙상블에 들어간 멤버별 점수 그 자체.**
     #
@@ -114,6 +118,9 @@ class SignalFusionEngine:
         meta_inputs = MetaLabelInputs(
             regime_confidence=regime_confidence,
             signal_agreement_count=conflict.agreement_count,
+            # 2026-08-06 고도화#2 — **여기에는 `effective_member_count`를 넣지 않는다.**
+            # 이 값은 확신도의 분모이고(v6 §11.3), 정의를 바꾸면 그날부터 확신도 시계열이
+            # 과거와 비교 불가능해진다. 이 fix는 **재기만 한다** — 며칠 쌓고 사람이 정한다.
             available_member_count=conflict.available_member_count,
             recent_slippage_elevated=meta_context.recent_slippage_elevated,
             gamma_regime_stable=meta_context.gamma_regime_stable,
@@ -150,6 +157,7 @@ class SignalFusionEngine:
             allowed_strategies=allowed,
             signal_agreement_count=conflict.agreement_count,
             available_member_count=conflict.available_member_count,
+            effective_member_count=conflict.effective_member_count,
             reject_reasons=reject_reasons,
             member_scores=member_scores,
         )

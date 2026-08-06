@@ -28,6 +28,9 @@ class ConflictResolution:
     disagreement_count: int  # 합의 방향과 부호가 반대인 멤버 수
     available_member_count: int
     has_clear_consensus: bool  # 반대가 동조보다 적을 때만 True
+    # 2026-08-06 고도화#2 — 비영 점수를 낸 멤버 수. 상세 근거는 `EnsembleResult`.
+    # 그대로 실어 나르기만 한다(여기서 다시 세면 같은 사실이 두 곳에 적힌다).
+    effective_member_count: int = 0
 
 
 def resolve_conflicts(scores: MemberScores, ensemble_result: EnsembleResult) -> ConflictResolution:
@@ -62,4 +65,5 @@ def resolve_conflicts(scores: MemberScores, ensemble_result: EnsembleResult) -> 
         disagreement_count=disagreement,
         available_member_count=ensemble_result.available_member_count,
         has_clear_consensus=consensus_sign != 0.0 and agreement > disagreement,
+        effective_member_count=ensemble_result.effective_member_count,
     )

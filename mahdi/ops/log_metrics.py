@@ -83,6 +83,12 @@ _ATM_ROLL_DEDUP_SECONDS = 5.0
 _BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 수집 예산\([\d.]+초\) 초과 — 남은 (\d+)레그를 포기하고 (\d+)레그로"
 )
+# 2026-08-06(고도화#1) — 먼슬리 레그 재시도(`mahdi.main.LOG_CHAIN_PRIORITY_RETRY`).
+# **시도와 회복을 둘 다 센다**: 회복 0건은 "KIS가 계속 느렸다"이고, 시도 0건은 "예산이 없었다"라
+# 원인이 다르다. 시도만 세면 그 둘이 같은 0으로 보인다.
+_PRIORITY_RETRY_RE = re.compile(
+    _TS + r" INFO:mahdi\.main:먼슬리 레그 재시도: (\d+)개 중 (\d+)개 회복"
+)
 _LEVEL_RE = re.compile(_TS + r" (INFO|WARNING|ERROR|CRITICAL|DEBUG):(\S+?):")
 
 # 2026-08-05(§2-4) — **로그 레코드 한 줄**을 가리는 기준.
@@ -361,6 +367,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     qualitative_suppressed: collections.Counter = collections.Counter()
     process_starts: list[float] = []
     failures_by_cause: dict[str, collections.Counter] = {}
+    priority_retries: list[dict] = []
     audit_loose: collections.Counter = collections.Counter()
     overrun_seconds: list[float] = []
     total_bytes = 0
@@ -506,6 +513,14 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             )
             continue
 
+        m = _PRIORITY_RETRY_RE.match(line)
+        if m:
+            priority_retries.append(
+                {"at": _hhmm(_seconds_of_day(m)), "attempted": int(m.group(6)),
+                 "recovered": int(m.group(7))}
+            )
+            continue
+
         m = _FAILURE_RE.match(line)
         if m:
             # "옵션 체인 폴링 실패: B01608875 — {...}" → 종목/응답을 떼고 유형만 센다.
@@ -552,6 +567,20 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "samples": budget_events[:10],
         },
         "catchups": {"count": len(catchups), "minutes": [c["minute"] for c in catchups]},
+        # 2026-08-06 고도화#1 — 먼슬리 레그 재시도. 시도/회복을 나눠 두는 이유는
+        # `_PRIORITY_RETRY_RE` 주석 참고(회복 0과 시도 0은 원인이 다르다).
+        "priority_retry": {
+            "cycles": len(priority_retries),
+            "attempted": sum(r["attempted"] for r in priority_retries),
+            "recovered": sum(r["recovered"] for r in priority_retries),
+            "recovery_pct": (
+                round(
+                    sum(r["recovered"] for r in priority_retries)
+                    / sum(r["attempted"] for r in priority_retries) * 100, 1
+                )
+                if sum(r["attempted"] for r in priority_retries) else None
+            ),
+        },
         "poller_phase": _phase_metrics(calls),
         "log_volume": {
             "total_bytes": total_bytes,

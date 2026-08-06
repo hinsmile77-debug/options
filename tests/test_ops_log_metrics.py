@@ -426,3 +426,35 @@ def test_kis_error_bodies_without_quoted_rt_cd_are_still_kis_errors():
         '{rt_cd:"1","msg1":"CME SUB거래소 신청 계좌가 아닙니다.","msg_cd":"EGW00552"}',
     ])
     assert parsed["failures_by_cause"]["ES(E-mini S&P500) 근월물 조회 실패"] == {"kis_error": 1}
+
+
+# ===== 2026-08-06 고도화#1 — 먼슬리 레그 재시도 집계 =====
+
+
+def test_priority_retry_counts_attempts_and_recoveries():
+    """회복 0건("KIS가 계속 느렸다")과 시도 0건("예산이 없었다")은 원인이 다르다."""
+    parsed = _parse([
+        "2026-08-06 10:01:20,000 INFO:mahdi.main:먼슬리 레그 재시도: 3개 중 2개 회복(남은 예산 12.4초) "
+        "— 판단 주입력(GEX/감마플립)의 두께다",
+        "2026-08-06 10:02:20,000 INFO:mahdi.main:먼슬리 레그 재시도: 1개 중 0개 회복(남은 예산 3.1초) "
+        "— 판단 주입력(GEX/감마플립)의 두께다",
+    ])
+    pr = parsed["priority_retry"]
+    assert pr == {"cycles": 2, "attempted": 4, "recovered": 2, "recovery_pct": 50.0}
+
+
+def test_priority_retry_is_zero_when_the_line_never_appears():
+    parsed = _parse([_cycle_line("10:01")])
+    assert parsed["priority_retry"]["cycles"] == 0
+    assert parsed["priority_retry"]["recovery_pct"] is None
+
+
+def test_priority_retry_log_format_matches_the_source_string():
+    """포맷 원본이 바뀌면 이 파서는 조용히 0을 낸다 — 계약을 여기서 못박는다."""
+    from mahdi.main import LOG_CHAIN_PRIORITY_RETRY
+
+    rendered = LOG_CHAIN_PRIORITY_RETRY % (5, 4, 8.25)
+    parsed = _parse([f"2026-08-06 10:01:20,000 INFO:mahdi.main:{rendered}"])
+    assert parsed["priority_retry"] == {
+        "cycles": 1, "attempted": 5, "recovered": 4, "recovery_pct": 80.0
+    }

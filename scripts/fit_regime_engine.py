@@ -6,11 +6,17 @@
 매번 refit하지 않는다.
 
 실행: python scripts/fit_regime_engine.py [--underlying KOSPI200] [--min-samples 5000] [--dry-run]
+      python scripts/fit_regime_engine.py --baseline   # 재학습 **전** 상태를 박제만 하고 끝낸다
 
 `--dry-run`은 **모델을 저장하지 않고** 데이터 적재 → 행렬 구성 → fit()까지만 돌려본다
 (2026-08-03 §4 우선순위 6, NEXT_TODO 이월 항목). 임계 도달일(08-10경)에 처음 실행해서
 스키마 불일치·피처 순서·NaN 처리 같은 기계적 오류를 만나면 하루를 잃으므로, 그 전에 미리
 같은 경로를 밟아 본다. 샘플 부족 경고는 드라이런에서 정상이며 실패로 치지 않는다.
+
+`--baseline`은 **아무것도 학습하지 않는다** — 재학습 전 상태(피처 누적 / 레짐 상태 분포 /
+`regime_hmm` 멤버 점수)를 `docs/동작점검/regime_baseline_YYYY-MM-DD.{json,md}`로 박제한다
+(2026-08-06 고도화#3). 이것을 안 찍고 재학습하면 뒤에 "좋아졌다"를 말할 비교 대상이 없다.
+상세 근거는 `mahdi/ops/regime_baseline.py`.
 """
 
 from __future__ import annotations
@@ -100,6 +106,24 @@ def describe_feature_matrix(history: list[tuple[datetime, dict]], features: np.n
     return lines
 
 
+def _capture_baseline(args) -> None:
+    """재학습 **전** 상태를 박제한다 — 이 스크립트는 얇게, 로직은 `mahdi/ops/regime_baseline.py`."""
+    from mahdi.config.settings import PROJECT_ROOT
+    from mahdi.ops import regime_baseline
+
+    today = db.local_now().date()
+    path = Path(args.baseline_path) if args.baseline_path else (
+        PROJECT_ROOT / "docs" / "동작점검" / f"regime_baseline_{today.isoformat()}"
+    )
+    with db.get_connection() as conn:
+        try:
+            written = regime_baseline.capture_to_file(conn, today, path, args.underlying)
+        except FileExistsError as exc:
+            logger.error("%s", exc)
+            return
+    logger.info("HMM 재학습 기준선 박제 완료: %s (그리고 같은 이름의 .json)", written)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -108,10 +132,22 @@ def main() -> None:
     parser.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES)
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL_PATH))
     parser.add_argument(
+        "--baseline", action="store_true",
+        help="재학습 전 상태만 박제하고 끝낸다(2026-08-06 고도화#3, 학습은 하지 않는다)",
+    )
+    parser.add_argument(
+        "--baseline-path", default=None,
+        help="박제 경로(확장자 없이). 기본값은 docs/동작점검/regime_baseline_<오늘>",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="모델을 저장하지 않고 적재→행렬→fit()까지만 돌려본다(2026-08-03 §4 우선순위 6)",
     )
     args = parser.parse_args()
+
+    if args.baseline:
+        _capture_baseline(args)
+        return
 
     with db.get_connection() as conn:
         history = db.get_feature_history(conn, args.underlying, args.feature_version)

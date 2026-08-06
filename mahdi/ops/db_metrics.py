@@ -64,6 +64,9 @@ _DAILY_TABLES: list[tuple[str, str, str]] = [
     ("feature_store", "timestamp", "레짐 피처"),
     ("rate_limiter_status_history", "recorded_at", "레이트리밋 이력"),
     ("market_halt_event_history", "recorded_at", "CB 전이 이력"),
+    # 2026-08-06 고도화#5 — 진입 판단의 사후 평가. §12에 함께 세워 **테이블이 자란다는 사실**이
+    # 다른 적재량과 같은 자리에서 보이게 한다(그것이 이 고도화가 선언한 대가다).
+    ("decision_outcomes", "timestamp", "판단 사후 평가"),
 ]
 
 # 매크로 컬럼별 non-null/고유값 — 항목별 갱신 주기 분리(2026-07-31)가 의도대로 도는지 본다.
@@ -108,6 +111,9 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
         # `crosscheck`가 잡는다.
         ("decisions", decisions),
         ("signal_reach", signal_reach),
+        # 2026-08-06 고도화#5 — 진입 판단의 사후 평가(ADVISORY 기준선). 계산은 장마감 배치가
+        # 먼저 하고(`scripts/daily_ops_report.py`), 여기서는 읽기만 한다.
+        ("decision_outcomes", _decision_outcomes),
         ("risk_gate_distinct", _risk_gate_distinct),
         ("regime", _regime),
         ("feature_store", _feature_store),
@@ -1030,8 +1036,40 @@ def decisions(conn: ConnectionLike, target: date) -> dict:
         (int(cutoff_row[0]), int(cutoff_row[1]), int(cutoff_row[2])) if cutoff_row else (0, 0, 0)
     )
 
+    # 2026-08-06 고도화#2 — 가용 멤버 수와 **실질(비영 점수) 멤버 수**의 차이.
+    #
+    # 08-06 §14-3이 `regime_hmm` 399분 전량 중립을 드러냈다. 그런데 판단 층은 여전히 4를 세고
+    # 있었고, `available_member_count = 4`는 "판단이 네 개 축을 본다"는 뜻으로 읽혔다.
+    # **차이 자체가 죽은 축의 수**이므로 그것을 직접 낸다.
+    member_row = _fetchone(
+        conn,
+        "SELECT avg((risk_gate_state->>'available_member_count')::numeric),"
+        "       avg((risk_gate_state->>'effective_member_count')::numeric),"
+        "       min((risk_gate_state->>'effective_member_count')::int),"
+        "       count(*) FILTER ("
+        "           WHERE (risk_gate_state->>'effective_member_count')::int"
+        "               < (risk_gate_state->>'available_member_count')::int)"
+        " FROM signal_decisions"
+        " WHERE timestamp::date=%s AND risk_gate_state ? 'effective_member_count'",
+        (target,),
+    )
+    if member_row and member_row[0] is not None:
+        available_mean, effective_mean = float(member_row[0]), float(member_row[1])
+        member_count = {
+            "available": True,
+            "available_mean": round(available_mean, 2),
+            "effective_mean": round(effective_mean, 2),
+            "dead_axis_mean": round(available_mean - effective_mean, 2),
+            "effective_min": int(member_row[2]) if member_row[2] is not None else None,
+            "minutes_with_dead_axis": int(member_row[3]),
+        }
+    else:
+        # 2026-08-06 이전 판단에는 이 키가 없다 — 0으로 채우면 "전 축이 죽었다"는 거짓 신호가 된다.
+        member_count = {"available": False, "reason": "effective_member_count 미기록(2026-08-06 고도화#2 이전)"}
+
     return {
         "total": total,
+        "member_count": member_count,
         "decision": _counts("decision"),
         "conviction": _counts("conviction"),
         "reject_reason": _counts("reject_reason"),
@@ -1317,6 +1355,13 @@ def _market_halt(conn: ConnectionLike, _target: date) -> dict:
         "updated_at": row[0].strftime("%H:%M:%S") if row[0] else None,
         "last_message_at": row[1].strftime("%H:%M:%S") if row[1] else None,
     }
+
+
+def _decision_outcomes(conn: ConnectionLike, target: date) -> dict:
+    """진입 판단의 방향 적중률 — 상세 근거는 `mahdi/ops/decision_outcomes.py`."""
+    from mahdi.ops import decision_outcomes
+
+    return decision_outcomes.summarize(conn, target)
 
 
 def _ws_status(conn: ConnectionLike, _target: date) -> dict:

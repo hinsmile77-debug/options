@@ -208,6 +208,8 @@ _METRIC_ROOTS = {
     "qualitative", "parser_audit", "failures", "overrun",
     # 2026-08-06 Fix#4/#5/#6 — 억제된 예외, 프로세스 기동 시각, 실패의 원인 축.
     "qualitative_suppressed", "process_starts", "failures_by_cause",
+    # 2026-08-06 고도화#1 — 먼슬리 레그 재시도.
+    "priority_retry",
 }
 
 
@@ -220,7 +222,7 @@ _DB_METRIC_ROOTS = {
     "monthly_coverage", "tables", "chain_minute_coverage", "monthly_leg_completeness",
     "spot_source_divergence", "book_coverage", "book_gamma_map", "wide_oi_landscape",
     "member_availability", "member_score_quality", "strike_window_quality",
-    "signal_decisions", "decisions", "signal_reach", "risk_gate_distinct", "regime",
+    "signal_decisions", "decisions", "decision_outcomes", "signal_reach", "risk_gate_distinct", "regime",
     "feature_store", "macro", "market_halt", "ws_status", "remaining_processes", "rate_limiter",
 }
 

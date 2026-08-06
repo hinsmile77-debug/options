@@ -55,6 +55,14 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
             # 경과 분 = 사이클이 돈 분 + 결손 분 — 먼슬리 절대 커버리지의 분모다.
             elapsed = (metrics["cycles"]["count"] or 0) + (metrics["cycles"]["missing"]["count"] or 0)
             with db.get_connection() as conn:
+                # 2026-08-06 고도화#5 — **집계보다 먼저 계산한다.** 사후 평가는 그날의 판단에
+                # 스팟 궤적을 붙이는 일이라 장이 끝난 지금이 유일하게 온전한 시점이고,
+                # 아래 `collect()`가 그 결과를 읽어 리포트에 싣는다.
+                from mahdi.ops import decision_outcomes
+
+                written = decision_outcomes.compute(conn, target)
+                if written:
+                    logger.info("판단 사후 평가 %d건 계산", written)
                 db_metrics_result = db_metrics_module.collect(conn, target, elapsed_minutes=elapsed)
         except Exception:
             logger.warning("DB 집계 실패 — 로그 지표만으로 리포트를 낸다", exc_info=True)

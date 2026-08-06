@@ -869,12 +869,13 @@ def test_poll_option_chain_sends_gap_alert_after_5min_then_recovery_notice(monke
         base + timedelta(minutes=7),   # iter3: 여전히 실패 — 중복 경고 없어야 함
         base + timedelta(minutes=8),   # iter4: 복구 → 복구 알림
     ]
+    # 2026-08-06 고도화#1 — 4번째 반환값은 "놓친 먼슬리 레그"다(이 테스트는 그 경로를 안 탄다).
     outcomes = [
-        (["row0"], 350.0, True),
-        ([], None, True),
-        ([], None, True),
-        ([], None, True),
-        (["row4"], 350.0, True),
+        (["row0"], 350.0, True, []),
+        ([], None, True, []),
+        ([], None, True, []),
+        ([], None, True, []),
+        (["row4"], 350.0, True, []),
     ]
     idx = {"i": -1}
 
@@ -3037,7 +3038,7 @@ def _collect_with_budget(monkeypatch, seconds_per_call: float, budget: float):
     monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
     rest_client = _FakeRestClientCountingQuotes(clock, seconds_per_call, _OPTION_QUOTE_FIXTURE)
     books = [(_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular")]
-    rows, _spot, any_strikes = _run(
+    rows, _spot, any_strikes, _missing = _run(
         _collect_option_chain_cycle(
             rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 10, 0),
             WarningThrottle(60.0), deadline=clock[0] + budget,
@@ -3079,7 +3080,7 @@ def test_collect_option_chain_cycle_without_deadline_is_unbounded(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
     rest_client = _FakeRestClientCountingQuotes(clock, 999.0, _OPTION_QUOTE_FIXTURE)
-    rows, _spot, _any = _run(
+    rows, _spot, _any, _missing = _run(
         _collect_option_chain_cycle(
             rest_client, [(_FakeManagerManyStrikes(frozenset({1000.0, 1002.5})), "regular")],
             _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 10, 0), WarningThrottle(60.0),
@@ -5501,7 +5502,7 @@ def test_option_chain_cycle_that_collects_nothing_is_louder_than_a_truncation(mo
 
     books = [(_FakeManagerManyStrikes(frozenset({1000.0, 1002.5, 1005.0})), "regular")]
     with caplog.at_level(logging.WARNING, logger="mahdi.main"):
-        rows, _spot, any_strikes = _run(
+        rows, _spot, any_strikes, _missing = _run(
             _collect_option_chain_cycle(
                 _AlwaysFailing(), books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 5, 14, 31),
                 # 이 테스트는 실패 경로를 실제로 태우므로 진짜 로거를 준다
@@ -5672,3 +5673,195 @@ def test_main_registers_the_process_heartbeat_task():
 
     source = inspect.getsource(main_module.main)
     assert "poll_process_heartbeat()" in source
+
+
+# ===== 2026-08-06 고도화#1 — 먼슬리 레그 재시도 =====
+#
+# 08-06 실측으로 원래 계획을 정정했다: 먼슬리를 얇게 만든 것은 예산 컷이 아니라 **레그 단위
+# 타임아웃**이다(먼슬리 10레그 미만 128분 vs 예산 컷이 먼슬리에 닿은 분 3분, 체인 레그 실패
+# 119건 중 111건이 ReadTimeout). 순서는 이미 먼슬리 우선이었다.
+
+
+class _FailFirstThenSucceed:
+    """첫 호출만 실패하고 두 번째부터 성공하는 클라이언트 — 재시도의 효과를 격리해서 본다."""
+
+    rate_limit_total_calls = 0
+
+    def __init__(self, resp: dict, fail_symbols: set[str]) -> None:
+        self._resp = resp
+        self._fail_once = set(fail_symbols)
+        self.calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        self.rate_limit_total_calls += 1
+        if symbol in self._fail_once:
+            self._fail_once.discard(symbol)
+            raise RuntimeError("read timeout")
+        return self._resp
+
+
+def test_collect_reports_which_monthly_legs_were_missed():
+    """실패한 레그를 **돌려줘야** 호출측이 그것만 다시 부를 수 있다."""
+    from mahdi.main import _collect_option_chain_cycle
+
+    client = _FailFirstThenSucceed(_OPTION_QUOTE_FIXTURE, {"SYM1000C"})
+    books = [(_FakeManagerManyStrikes(frozenset({1000.0, 1002.5})), "regular")]
+    rows, _spot, _any, missing = _run(
+        _collect_option_chain_cycle(
+            client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 6, 10, 0),
+            WarningThrottle(logging.getLogger("mahdi.main"), 60.0),
+        )
+    )
+    assert len(rows) == 3
+    assert missing == [(1000.0, "C")]
+
+
+def test_weekly_leg_failures_are_not_queued_for_retry():
+    """위클리는 핀 리스크 전용이다 — 전 북을 재시도하면 총 호출이 배가 되어
+    방금 고친 EGW00201/백오프를 되살린다."""
+    from mahdi.main import _collect_option_chain_cycle
+
+    client = _FailFirstThenSucceed(_OPTION_QUOTE_FIXTURE, {"SYM1000C"})
+    books = [(_FakeManagerManyStrikes(frozenset({1000.0})), "weekly_mon")]
+    _rows, _spot, _any, missing = _run(
+        _collect_option_chain_cycle(
+            client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 6, 10, 0),
+            WarningThrottle(logging.getLogger("mahdi.main"), 60.0),
+        )
+    )
+    assert missing == []
+
+
+def test_retry_recovers_the_missed_monthly_legs():
+    from mahdi.main import _retry_priority_legs
+
+    client = _FailFirstThenSucceed(_OPTION_QUOTE_FIXTURE, set())
+    recovered, spot, attempted = _run(
+        _retry_priority_legs(
+            client, [(1000.0, "C"), (1002.5, "P")], _FakeMaster(), "KOSPI200",
+            datetime(2026, 8, 6, 10, 0), WarningThrottle(logging.getLogger("mahdi.main"), 60.0),
+            deadline=None,
+        )
+    )
+    assert attempted == 2
+    assert len(recovered) == 2
+    assert spot is not None
+
+
+def test_retry_stops_at_the_cycle_deadline(monkeypatch):
+    """재시도가 예산을 넘기면 다음 분이 밀린다 — 08-04 Fix#8이 막으려던 바로 그 일이다."""
+    from mahdi.main import _retry_priority_legs
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+
+    class _Slow(_FailFirstThenSucceed):
+        def get_quote(self, symbol, market_div_code=None):
+            clock[0] += 4.0
+            return super().get_quote(symbol, market_div_code)
+
+    client = _Slow(_OPTION_QUOTE_FIXTURE, set())
+    recovered, _spot, attempted = _run(
+        _retry_priority_legs(
+            client, [(1000.0, "C"), (1002.5, "C"), (1005.0, "C")], _FakeMaster(), "KOSPI200",
+            datetime(2026, 8, 6, 10, 0), WarningThrottle(logging.getLogger("mahdi.main"), 60.0),
+            deadline=clock[0] + 5.0,
+        )
+    )
+    assert attempted == 2  # 1000.0(4초) → 1002.5(4초, 아직 예산 안) → 세 번째는 예산 초과
+    assert len(recovered) == 2
+
+
+def test_retry_is_capped_so_a_wider_window_cannot_grow_it_silently():
+    from mahdi.main import _retry_priority_legs, OPTION_CHAIN_PRIORITY_RETRY_MAX_LEGS
+
+    client = _FailFirstThenSucceed(_OPTION_QUOTE_FIXTURE, set())
+    missing = [(1000.0 + i, "C") for i in range(OPTION_CHAIN_PRIORITY_RETRY_MAX_LEGS + 5)]
+    _recovered, _spot, attempted = _run(
+        _retry_priority_legs(
+            client, missing, _FakeMaster(), "KOSPI200", datetime(2026, 8, 6, 10, 0),
+            WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=None,
+        )
+    )
+    assert attempted == OPTION_CHAIN_PRIORITY_RETRY_MAX_LEGS
+
+
+def test_retry_failures_do_not_log_a_second_time():
+    """같은 레그로 두 줄을 남기면 08-04 §2-2의 로그 폭증을 우리 손으로 되살린다."""
+    from mahdi.main import _retry_priority_legs
+
+    class _AlwaysFails:
+        rate_limit_total_calls = 0
+
+        def get_quote(self, symbol, market_div_code=None):
+            raise RuntimeError("read timeout")
+
+    import logging as _logging
+    caplog_logger = _logging.getLogger("mahdi.main")
+    records: list = []
+    handler = _logging.Handler()
+    handler.emit = records.append
+    caplog_logger.addHandler(handler)
+    try:
+        _recovered, _spot, attempted = _run(
+            _retry_priority_legs(
+                _AlwaysFails(), [(1000.0, "C")], _FakeMaster(), "KOSPI200",
+                datetime(2026, 8, 6, 10, 0), WarningThrottle(caplog_logger, 60.0), deadline=None,
+            )
+        )
+    finally:
+        caplog_logger.removeHandler(handler)
+    assert attempted == 1
+    assert records == []
+
+
+def test_priority_retry_calls_are_counted_as_our_own_not_another_pollers():
+    """07-28에 밀림 원인을 특정한 계측이다 — 재시도 콜을 남의 몫으로 세면 그 계측이 오염된다."""
+    import inspect
+
+    import mahdi.main as main_module
+
+    source = inspect.getsource(main_module.poll_option_chain)
+    assert "+ priority_retry_calls" in source
+
+
+# ===== 2026-08-06 고도화#4 — 혼잡 시간대 위클리 감축 레버(기본 OFF) =====
+
+
+def _due_series(poll_time: datetime) -> list[str]:
+    from mahdi.main import _books_due_this_cycle
+
+    books = [
+        (_FakeManagerManyStrikes(frozenset({1000.0})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({1000.0})), "weekly_mon"),
+        (_FakeManagerManyStrikes(frozenset({1000.0})), "weekly_thu"),
+    ]
+    return [series for _m, series in _books_due_this_cycle(books, poll_time)]
+
+
+def test_the_congestion_lever_is_down_by_default():
+    """**레버는 있고, 내려져 있다.** 기본 동작이 08-06 이전과 1비트도 달라지면 안 된다."""
+    from mahdi.main import OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS
+
+    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {}
+    assert _due_series(datetime(2026, 8, 7, 10, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 8, 7, 10, 1)) == ["regular", "weekly_thu"]
+
+
+def test_pulling_the_lever_halves_weekly_polling_in_that_hour_only(monkeypatch):
+    monkeypatch.setattr("mahdi.main.OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS", {10: 4})
+    # 10시: 4분 주기 — mod4가 위상과 같은 분에만 위클리가 붙는다.
+    assert _due_series(datetime(2026, 8, 7, 10, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 8, 7, 10, 1)) == ["regular", "weekly_thu"]
+    assert _due_series(datetime(2026, 8, 7, 10, 2)) == ["regular"]
+    assert _due_series(datetime(2026, 8, 7, 10, 3)) == ["regular"]
+    # 11시는 규칙 밖 — 종전 2분 주기 그대로다.
+    assert _due_series(datetime(2026, 8, 7, 11, 2)) == ["regular", "weekly_mon"]
+
+
+def test_the_lever_never_touches_the_monthly_book(monkeypatch):
+    """먼슬리는 GEX/감마플립의 유일한 입력이다 — 어느 시간대에도 매 분 돈다."""
+    monkeypatch.setattr("mahdi.main.OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS", {h: 10 for h in range(24)})
+    for minute in range(10):
+        assert "regular" in _due_series(datetime(2026, 8, 7, 13, minute))

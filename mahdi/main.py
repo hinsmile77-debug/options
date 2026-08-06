@@ -172,6 +172,41 @@ OPTION_CHAIN_PHASE_OFFSET_SECONDS = 0.0
 OPTION_CHAIN_SLOW_SERIES_PHASE = {"weekly_mon": 0, "weekly_thu": 1}
 OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
 
+# ===== 2026-08-06 고도화#4 — KIS 혼잡 시간대의 위클리 폴링 감축 (레버는 있고, 내려져 있다) =====
+#
+# ## 미리 정해둔 규칙
+#
+# `hypotheses.yaml`의 `2026-08-04-p5`가 **숫자를 보기 전에** 적어둔 사전 대응 규칙이다:
+#
+#   > `inquire-price`의 p95가 2.5초를 넘는 시간대가 **이틀 연속 같은 시간대에** 나타나면,
+#   > 그 시간대에 한해 위클리 폴링을 2분 → 4분 격분으로 늘린다.
+#   > **먼슬리는 건드리지 않는다** — 판단 입력이다.
+#
+# 08-06에 그 조건이 **성립했다**: 10·11·12·13·14시 다섯 구간이 08-05와 이틀 연속 초과.
+#
+# ## 그런데 왜 켜지 않는가
+#
+# 08-06 보고서 §5-4의 권고 그대로다. 같은 날 고도화#1(먼슬리 레그 재시도)이 들어갔고,
+# **그것만으로 먼슬리 두께가 회복되면 폴링 감축은 불필요하다.** 위클리 커버리지를 50% → 25%로
+# 반토막 내는 것은 되돌리기 쉬운 결정이 아니고, 08-06이 위클리 만기일이었으며 핀 집중도 59.6%가
+# 실제로 관측됐다 — 만기일에는 위클리가 판단에 유의미할 수 있다.
+#
+# ## 그러면 왜 구현은 하는가
+#
+# **"발동은 사람이 한다"가 코드로 표현돼야 하기 때문이다.** 규칙만 문서에 있으면 발동하려는
+# 날에 그 자리에서 코드를 짜게 되고, 그때 처음 짜는 코드는 그날 처음 깨진다(워치독을 장전
+# 기동 스크립트로 재사용한 것과 같은 이유). 레버를 미리 만들어 두고 **내려둔다**.
+#
+# ## 켜는 법
+#
+# 아래 dict에 `{시(int): 4}`를 넣는다. 예: 08-06 실측대로라면
+#   OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS = {10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
+# 그리고 **그 자리에서 `hypotheses.yaml`에 예측치를 적는다**(주장: 그 시간대 p95 하락,
+# 대가: 위클리 커버리지 하락). 자동 적응은 의도적으로 구현하지 않는다 — 지연을 보고 폴링을
+# 줄이면 폴링이 줄어 지연이 낮아지고 다시 폴링이 느는 되먹임이 생긴다(2026-07-08에 페이서를
+# 나눴다가 500 폭주로 203분을 잃은 전례).
+OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS: dict[int, int] = {}
+
 # 2026-07-31(운영점검보고서 2026-07-31 §4 우선순위 2) — 밀림으로 건너뛴 분을 먼슬리 10레그로
 # 회수할지 결정하는 임계. 다음 격자 틱까지 남은 대기 시간이 이보다 짧으면 회수를 시도하지 않는다
 # (회수 사이클까지 밀려 연쇄되는 것을 막는다). 먼슬리 10콜 × 기준 1.0초에 백오프 여유를 더해
@@ -260,6 +295,42 @@ LOG_CHAIN_BUDGET_EXCEEDED = (
 LOG_CHAIN_CYCLE_EMPTY = (
     "옵션체인 이번 분 전멸 — 수집 %d레그 중 적재 0행(예산 %.1f초 소진, 재시도 %s). "
     "이 분은 GEX/감마플립 입력이 없다"
+)
+
+# ===== 2026-08-06 고도화#1 — 먼슬리 레그만 한 번 더 부른다 =====
+#
+# ## 원래 계획이 틀렸던 지점
+#
+# 08-06 보고서 §5-1은 *"버려야 한다면 위클리부터 — 레그 큐를 먼슬리 우선으로 정렬한다"* 고 적었다.
+# **그 순서는 이미 그렇게 돼 있었다**(`_books_due_this_cycle`이 입력 순서를 유지하고 `books[0]`이
+# 먼슬리다. `test_collect_option_chain_cycle_visits_the_monthly_book_first`가 08-05부터 지킨다).
+#
+# 구현 직전 실측으로 원인을 다시 확인했다:
+#   - 먼슬리 10레그 미만  **128분**(9레그 82 / 8레그 33 / 7레그 8 / 6레그 5)
+#   - 예산 컷이 먼슬리에 닿은 분  **3분**(rows<10인 사이클 수 — 9행 1 + 10행 2)
+#   - 옵션체인 레그 실패 119건 중 **111건이 ReadTimeout**
+#
+# 즉 먼슬리를 얇게 만든 것은 예산 컷이 아니라 **레그 단위 타임아웃**이다. 순서를 다시 고치는
+# 것은 아무것도 바꾸지 않는다 — 실패한 레그를 **다시 부르는 것**이 그 128분을 줄이는 유일한 길이다.
+#
+# ## 왜 먼슬리만인가
+#
+# 먼슬리는 GEX/감마플립의 **유일한** 입력이고(v6 §11.4), 위클리는 핀 리스크 전용이다.
+# 전 북을 재시도하면 총 호출이 배로 늘어 우리가 방금 고친 EGW00201/백오프를 되살린다.
+#
+# ## 왜 사이클 예산 안에서만인가
+#
+# 재시도가 예산을 넘기면 다음 분 사이클이 밀린다 — 08-04 Fix#8이 막으려던 바로 그 일이다.
+# 같은 `collect_deadline`을 공유하므로 **예산이 남았을 때만** 돈다. 남은 예산이 없으면
+# 이번 분은 얇은 채로 마감하는 것이 옳다(밀림은 다음 분까지 망친다).
+OPTION_CHAIN_PRIORITY_SERIES = "regular"
+
+# 한 사이클에 재시도할 최대 레그 수. 설계상 먼슬리는 10레그이므로 그 전부를 허용한다 —
+# 상한을 두는 이유는 행사가 창이 넓어지는 미래 변경에서 이 경로가 조용히 커지는 것을 막기 위함이다.
+OPTION_CHAIN_PRIORITY_RETRY_MAX_LEGS = 10
+
+LOG_CHAIN_PRIORITY_RETRY = (
+    "먼슬리 레그 재시도: %d개 중 %d개 회복(남은 예산 %.1f초) — 판단 주입력(GEX/감마플립)의 두께다"
 )
 # 2026-08-05(§2-4) — 트레이스백 표본을 다 쓴 뒤의 요약 줄.
 #
@@ -1441,11 +1512,15 @@ async def _collect_option_chain_cycle(
     rows: list[dict] = []
     any_strikes = False
     skipped = 0
+    # 2026-08-06 고도화#1 — **놓친 먼슬리 레그**(실패/파싱불가/예산절단 전부). 호출측이 예산이
+    # 남았을 때 이것만 다시 부른다. 우선 북 외의 실패는 담지 않는다 — 재시도 대상이 아니다.
+    missing_priority: list[tuple[float, str]] = []
     for subscription_manager, series in books:
         strikes = subscription_manager.desired_strikes
         if not strikes:
             continue
         any_strikes = True
+        is_priority = series == OPTION_CHAIN_PRIORITY_SERIES
         for strike in sorted(strikes):
             for option_type in ("C", "P"):
                 symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
@@ -1453,6 +1528,8 @@ async def _collect_option_chain_cycle(
                     continue
                 if deadline is not None and time.monotonic() >= deadline:
                     skipped += 1
+                    if is_priority:
+                        missing_priority.append((strike, option_type))
                     continue
                 try:
                     resp = await asyncio.to_thread(rest_client.get_quote, symbol)
@@ -1461,9 +1538,13 @@ async def _collect_option_chain_cycle(
                         f"옵션 체인 폴링 실패: {symbol}", exc,
                         throttle=warning_throttle, category="option_chain_leg_fetch_failure",
                     )
+                    if is_priority:
+                        missing_priority.append((strike, option_type))
                     continue
                 parsed = _parse_option_quote(resp, strike, option_type, poll_time)
                 if parsed is None:
+                    if is_priority:
+                        missing_priority.append((strike, option_type))
                     continue
                 row, spot = parsed
                 rows.append(row)
@@ -1474,7 +1555,51 @@ async def _collect_option_chain_cycle(
             LOG_CHAIN_BUDGET_EXCEEDED,
             OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows),
         )
-    return rows, latest_spot, any_strikes
+    return rows, latest_spot, any_strikes, missing_priority
+
+
+async def _retry_priority_legs(
+    rest_client: KISRestClient,
+    missing: list[tuple[float, str]],
+    master: IndexDerivativesMaster,
+    underlying: str,
+    poll_time: datetime,
+    warning_throttle: WarningThrottle,
+    deadline: float | None,
+) -> tuple[list[dict], float | None, int]:
+    """
+    입력: 놓친 먼슬리 레그 목록(`_collect_option_chain_cycle`의 4번째 반환값), 사이클 데드라인.
+    반환: (회복된 행, 마지막 스팟, 시도한 레그 수).
+    계산: 예산이 남아 있는 동안 먼슬리 레그만 한 번 더 조회한다. 상세 근거는
+         `OPTION_CHAIN_PRIORITY_SERIES` 위 주석.
+    해석: **회복이 0건인 것과 시도가 0건인 것은 다르다** — 전자는 KIS가 계속 느린 것이고,
+         후자는 예산이 없었던 것이다. 그래서 시도 수를 함께 돌려주고 로그도 둘을 나란히 찍는다.
+    실패 조건: 재시도의 실패는 조용히 넘어간다(원래 실패에서 이미 한 번 로그가 남았다) —
+              같은 레그로 두 줄을 남기면 08-04 §2-2의 로그 폭증을 우리 손으로 되살린다.
+    """
+    recovered: list[dict] = []
+    latest_spot: float | None = None
+    attempted = 0
+    for strike, option_type in missing[:OPTION_CHAIN_PRIORITY_RETRY_MAX_LEGS]:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        symbol = master.option_symbol(
+            option_type, strike, underlying=underlying, series=OPTION_CHAIN_PRIORITY_SERIES
+        )
+        if symbol is None:
+            continue
+        attempted += 1
+        try:
+            resp = await asyncio.to_thread(rest_client.get_quote, symbol)
+        except Exception:
+            continue
+        parsed = _parse_option_quote(resp, strike, option_type, poll_time)
+        if parsed is None:
+            continue
+        row, spot = parsed
+        recovered.append(row)
+        latest_spot = spot
+    return recovered, latest_spot, attempted
 
 
 def _macro_items_due(
@@ -1515,13 +1640,19 @@ def _books_due_this_cycle(
          잡히도록 — 호출측 `_update_atm_iv`가 rows 기준으로 ATM을 고르기 때문).
     실패 조건: 없음 — 알 수 없는 series는 "느린 북이 아니다"로 보아 매 사이클 포함한다(새 북을
               추가했을 때 조용히 폴링에서 빠지는 쪽보다 안전하다).
+
+    2026-08-06 고도화#4: `OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`에 등록된 시간대에서는 위클리
+              주기를 그 값으로 늘린다(기본은 빈 dict = 종전과 완전히 동일). **먼슬리는 어느
+              시간대에도 안 건드린다** — 판단 입력이다. 상세 근거는 그 상수 위 주석.
     """
+    every_n = OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS.get(
+        poll_time.hour, OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES
+    )
     return [
         (manager, series)
         for manager, series in books
         if series not in OPTION_CHAIN_SLOW_SERIES_PHASE
-        or poll_time.minute % OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES
-        == OPTION_CHAIN_SLOW_SERIES_PHASE[series]
+        or poll_time.minute % every_n == OPTION_CHAIN_SLOW_SERIES_PHASE[series]
     ]
 
 
@@ -1701,7 +1832,7 @@ async def _catch_up_missed_option_chain_minute(
     if not fast_books:
         return False
 
-    rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
+    rows, latest_spot, any_strikes, _missing = await _collect_option_chain_cycle(
         rest_client, fast_books, master, underlying, catchup_time, warning_throttle
     )
     if not any_strikes or not rows:
@@ -1810,10 +1941,28 @@ async def poll_option_chain(
         # 2026-08-04 Fix#8: 예산은 **사이클 시작 기준**으로 한 번만 잡는다. 재시도 경로도 같은
         # 데드라인을 쓰므로 "재시도 때문에 2배로 밀리는" 일이 생기지 않는다.
         collect_deadline = collect_started + OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS
-        rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
+        rows, latest_spot, any_strikes, missing_priority = await _collect_option_chain_cycle(
             rest_client, due_books, master, underlying, poll_time, warning_throttle,
             deadline=collect_deadline,
         )
+        # 2026-08-06 고도화#1 — 놓친 먼슬리 레그를 예산 안에서 한 번 더 부른다.
+        # `rows`가 비어 있으면 아래 전체 재시도 경로가 어차피 전 레그를 다시 도므로 여기서는
+        # 건너뛴다(같은 레그를 두 번 부르는 낭비를 막는다).
+        priority_retry_calls = 0
+        if rows and missing_priority:
+            recovered, retry_spot, priority_retry_calls = await _retry_priority_legs(
+                rest_client, missing_priority, master, underlying, poll_time,
+                warning_throttle, collect_deadline,
+            )
+            rows.extend(recovered)
+            if retry_spot is not None:
+                latest_spot = retry_spot
+            if priority_retry_calls:
+                logger.info(
+                    LOG_CHAIN_PRIORITY_RETRY,
+                    priority_retry_calls, len(recovered),
+                    max(collect_deadline - time.monotonic(), 0.0),
+                )
         collect_seconds = time.monotonic() - collect_started
 
         if not any_strikes:
@@ -1834,7 +1983,7 @@ async def poll_option_chain(
             await asyncio.sleep(retry_backoff_seconds)
             retried = True
             retry_started = time.monotonic()
-            rows, latest_spot, any_strikes = await _collect_option_chain_cycle(
+            rows, latest_spot, any_strikes, _missing = await _collect_option_chain_cycle(
                 rest_client, due_books, master, underlying, poll_time, warning_throttle,
                 deadline=collect_deadline,
             )
@@ -1853,7 +2002,10 @@ async def poll_option_chain(
         if calls_before is None or calls_after is None:
             other_poller_calls: int | None = None
         else:
-            own_calls_actual = own_calls_expected * (2 if retried else 1)
+            # 2026-08-06 고도화#1 — 먼슬리 재시도 콜도 **우리 몫**이다. 안 더하면 그 콜이
+            # 「타폴러동시호출추정」으로 잘못 귀속돼, 08-07부터 남의 폴러가 갑자기 붐비는 것처럼
+            # 보인다(07-28에 이 추정값 하나로 밀림 원인을 특정했던 계측이다 — 오염시키면 안 된다).
+            own_calls_actual = own_calls_expected * (2 if retried else 1) + priority_retry_calls
             other_poller_calls = max((calls_after - calls_before) - own_calls_actual, 0)
 
         if rows:
@@ -3165,6 +3317,10 @@ async def poll_signal_fusion_cycle(
                     "conviction_score": decision.conviction_score,
                     "signal_agreement_count": decision.signal_agreement_count,
                     "available_member_count": decision.available_member_count,
+                    # 2026-08-06 고도화#2 — 가용 멤버 중 **실제로 의견을 낸** 수.
+                    # 08-06 §14-3: `regime_hmm`이 399분 전량 0점이라 가용 4는 실질 3이었다.
+                    # 둘의 차이가 곧 죽은 축의 수이고, 그 차이 자체를 매일 리포트에 낸다.
+                    "effective_member_count": decision.effective_member_count,
                     "allowed_strategies": decision.allowed_strategies,
                     # 팔레트 원문(allowed_strategies)과 진입 대상(entry_strategies)을 둘 다 남긴다 —
                     # COCKPIT은 "관망 중"을 표시할 수 있어야 하고, 사후 분석은 실제 진입 후보만
