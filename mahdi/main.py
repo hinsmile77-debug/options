@@ -39,7 +39,7 @@ from mahdi.config.settings import (
 from mahdi import notify
 from mahdi.data import db
 from mahdi.data.collector import MinuteBarAggregator, Tick, VolumeBucketAggregator
-from mahdi.data.subscription_manager import RollingSubscriptionManager
+from mahdi.data.subscription_manager import RollingSubscriptionManager, SubscriptionRetentionPool
 from mahdi.data.overseas_future_master import OverseasFutureMaster, load_overseas_future_master
 from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivatives_master
 from mahdi.data import yfinance_fallback
@@ -430,6 +430,14 @@ class WsLiveness:
     # 프로세스가 매일 아침 새로 뜨므로 "오늘" 카운트는 자연히 초기화된다.
     atm_roll_count: int = 0
 
+    # 2026-08-07(운영점검 §B-1 / 고도화#2) — 롤의 **대가**. 마이그레이션 028 참고.
+    #
+    # 위 `atm_roll_count`는 배지 임계 20회를 이틀 연속 4배 가까이 넘겼는데(08-05 77 / 08-07 76),
+    # 08-07에 롤 76회를 전수 검산하니 **전부 히스테리시스 임계를 정당하게 넘은 것**이었다.
+    # 롤 횟수는 시장 변동성의 함수라 통제 대상이 아니다 — 우리가 통제하는 것은 그 롤이 구독을
+    # 실제로 끊었는가이고(고도화#1의 유지 풀), 그것이 이 값이다. 0이 목표 상태다.
+    atm_roll_dropped_subs: int = 0
+
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
 # 아니라 오프셋은 순전히 기동 로그 가독성을 위한 것.
@@ -784,6 +792,43 @@ async def _sleep_until_first_wall_tick(interval_seconds: float, phase_offset_sec
         await asyncio.sleep(wait)
 
 
+# 2026-08-07(운영점검 §A-1 / Fix#3) — 사이클 시작 시각을 분으로 자를 때 **분 경계 직전을 올린다.**
+#
+# 08-07 실측: `option_analysis_1m`의 07:30이 20행, **07:31이 0행**, 07:32가 20행이었다. 로그
+# 축으로는 결손 0분(사이클은 07:31:19에 rows=20으로 완주했다) — 두 축이 어긋난 원인이 이것이다.
+#
+# `_sleep_until_first_wall_tick`/`_advance_fixed_tick`이 깨우는 시각은 격자점(:00)이지만,
+# `asyncio.sleep`은 **일찍 깨는 것을 금지하지 않는다**(이벤트 루프 타이머 해상도·부동소수점
+# 누적). 07:30:59.9x에 깨면 `replace(second=0)`가 07:30으로 내려깎아, 스케줄러가 의도한 07:31이
+# 아니라 **직전 분**에 적재된다. 그 분은 다음 사이클이 07:32를 쓰므로 영영 빈다.
+#
+# 스케줄러의 목표 틱을 그대로 쓰는 것이 원리상 정확하지만, `next_tick`은 `time.monotonic()`
+# 기준이라 벽시계 datetime으로 되돌리려면 두 시계의 오프셋을 들고 다녀야 한다(그 오프셋 자체가
+# 드리프트한다). 대신 **"경계 직전이면 그 경계로 올린다"**는 국소 규칙으로 같은 결과를 얻는다 —
+# 고정 틱 폴러는 설계상 격자점에서만 깨므로, 경계 2초 전에 깬 사이클의 의도된 분은 다음 분이다.
+#
+# 2초 근거: 이벤트 루프 지연은 통상 밀리초 단위이고(08-07 실측 사이클 완료 시각의 초 성분은
+# 전부 :09/:19대), 정상 사이클이 분 경계 2초 전에 **시작**하는 일은 고정 틱 설계상 없다
+# (`_advance_fixed_tick`이 밀린 사이클도 격자 위 미래 지점으로 스냅한다). 반대로 이 값을 크게
+# 잡으면 실제로 늦게 시작한 사이클의 분을 다음 분으로 밀어 **없는 미래에 적재**하게 된다.
+POLL_TIME_BOUNDARY_SNAP_SECONDS = 2.0
+
+
+def _grid_poll_minute(wall_now: datetime, snap_seconds: float = POLL_TIME_BOUNDARY_SNAP_SECONDS) -> datetime:
+    """
+    입력: 사이클 시작 벽시계 시각, (선택) 경계 스냅 폭.
+    계산: 분으로 내려깎되, 다음 분 경계까지 `snap_seconds` 이내면 **그 경계로 올린다.**
+    해석: 근거는 `POLL_TIME_BOUNDARY_SNAP_SECONDS` 주석. 이 함수는 적재 행의 분 라벨을 정하므로
+         고정 틱 폴러의 **사이클 시작 지점에서만** 쓴다 — 사이클 도중/종료 후의 시각에 쓰면
+         한 사이클의 행이 두 분으로 갈린다.
+    실패 조건: 없다.
+    """
+    remainder = 60.0 - (wall_now.second + wall_now.microsecond / 1_000_000)
+    if remainder <= snap_seconds:
+        wall_now = wall_now + timedelta(seconds=remainder)
+    return wall_now.replace(second=0, microsecond=0)
+
+
 def _advance_fixed_tick(
     next_tick: float | None,
     interval_seconds: float,
@@ -903,6 +948,16 @@ async def _reroll_books_to_spot(
             )
     if rolled and ws_liveness is not None:
         ws_liveness.atm_roll_count += 1
+        # 2026-08-07 고도화#2 — 대가는 매니저가 아니라 **공용 유지 풀**이 안다(세 북이 슬롯을
+        # 공유하므로 축출도 공유 자원에서 일어난다). 매니저에서 꺼내 읽는 이유는 풀을
+        # `run_observation_loop_forever` → `run_observation_loop`까지 두 겹 더 내려보내지 않기
+        # 위해서다 — 매니저가 이미 그 참조를 소유하고 있고, 세 북이 같은 풀을 공유하므로
+        # 아무 매니저에서 읽어도 같은 값이다. 풀이 없으면(테스트/구 경로) 0으로 남는다.
+        pool = next(
+            (m.retention_pool for m in subscription_managers if m.retention_pool is not None), None
+        )
+        if pool is not None:
+            ws_liveness.atm_roll_dropped_subs = pool.dropped_subscriptions
 
 
 async def run_observation_loop(
@@ -1738,6 +1793,9 @@ async def poll_ws_heartbeat(
                     # 2026-08-05(P2-12) — 관측 연속성의 선행지표. `reconnect_count`와 같은 방식으로
                     # 관측 루프가 메모리에서 세고 이 하트비트가 DB에 남긴다.
                     ws_liveness.atm_roll_count,
+                    # 2026-08-07(고도화#2) — 그 롤이 실제로 끊은 구독 수. 롤 횟수와 나란히 읽어야
+                    # "창은 따라갔는데 대가는 없었다"를 말할 수 있다.
+                    ws_liveness.atm_roll_dropped_subs,
                 )
         except Exception:
             logger.warning("WS 하트비트 기록 실패 — 관측 자체에는 영향 없음", exc_info=True)
@@ -1924,7 +1982,7 @@ async def poll_option_chain(
         # 가설이 반증돼도 다음 후보를 못 좁힌다 — 사이클 전체를 REST수집/DB적재/상태기록/기타
         # 네 구간으로 나눠 어디가 실제로 늘어나는지 매 사이클 비교할 수 있게 한다.
         cycle_started = time.monotonic()
-        poll_time = db.local_now().replace(second=0, microsecond=0)
+        poll_time = _grid_poll_minute(db.local_now())
         # 2026-07-28: 공유 _RateLimiter는 이 폴러 혼자 쓰는 게 아니라 poll_investor_flow/
         # poll_expiry_liquidity/poll_macro_snapshot과 asyncio.gather로 동시에 나눠 쓴다
         # (main.py의 run_observation_loop가 KISRestClient 인스턴스 하나를 전부에 넘김) — REST수집
@@ -2265,7 +2323,7 @@ async def poll_expiry_liquidity(
     next_tick: float | None = None
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
     while True:
-        poll_time = db.local_now().replace(second=0, microsecond=0)
+        poll_time = _grid_poll_minute(db.local_now())
         due_books = _expiry_liquidity_books_due(books, poll_time)
         any_strikes = False
         rows: list[dict] = []
@@ -2645,7 +2703,7 @@ async def poll_macro_snapshot(
     # 2026-07-31: 항목별 마지막 조회 시각(monotonic). 첫 사이클에는 비어 있어 전부 due가 된다.
     macro_last_fetched_at: dict[str, float] = {}
     while True:
-        poll_time = db.local_now().replace(second=0, microsecond=0)
+        poll_time = _grid_poll_minute(db.local_now())
         fetch_started = time.monotonic()
         due_items = _macro_items_due(macro_last_fetched_at, fetch_started, item_refresh_seconds)
         row = await _collect_macro_snapshot_cycle(rest_client, overseas_master, poll_time, due_items)
@@ -3229,7 +3287,7 @@ async def poll_signal_fusion_cycle(
     calendar_throttle = WarningThrottle(logger, EVENT_CALENDAR_WARNING_WINDOW_SECONDS)
     next_tick: float | None = None
     while True:
-        poll_time = db.local_now().replace(second=0, microsecond=0)
+        poll_time = _grid_poll_minute(db.local_now())
         try:
             with db.get_connection() as conn:
                 signal_inputs, chain_inputs = _build_signal_inputs(
@@ -3437,7 +3495,7 @@ async def poll_account_balance_cycle(
 
     next_tick: float | None = None
     while True:
-        poll_time = db.local_now().replace(second=0, microsecond=0)
+        poll_time = _grid_poll_minute(db.local_now())
         try:
             response = await asyncio.to_thread(rest_client.get_balance)
             snapshot = parse_balance_response(response, poll_time)
@@ -3556,12 +3614,16 @@ async def main() -> None:
         # + 1(선물) = 31 / MAX_SUBSCRIPTIONS(41). ATM±3(14슬롯)을 유지하면 3북 합계가 43으로
         # 한도를 넘겨(RESEARCH_EXPIRY_SELECTION_v1.md §3.1이 미리 지적한 트레이드오프) 세 북
         # 모두 ATM±2로 축소하기로 결정(사용자 확인, [[DECISION_LOG]] 참고).
+        # 2026-08-07(고도화#1) — 세 북이 **한 풀을 공유한다.** 슬롯은 WS 세션당 자원이라
+        # 북마다 나눠 주면 3북 날(31/41 사용)에는 북당 3슬롯이라 아무것도 유지하지 못한다.
+        retention_pool = SubscriptionRetentionPool(ws_client)
         monthly_manager = RollingSubscriptionManager(
             ws_client,
             tr_id=tr_codes.WS_TR_OPTION_CONTRACT,
             strike_interval=KOSPI200_OPTION_STRIKE_INTERVAL,
             strikes_each_side=STRIKES_EACH_SIDE,
             symbol_formatter=lambda strike, opt: master.option_symbol(opt, strike, underlying="KOSPI200"),
+            retention_pool=retention_pool,
         )
         weekly_mon_manager = RollingSubscriptionManager(
             ws_client,
@@ -3571,6 +3633,7 @@ async def main() -> None:
             symbol_formatter=lambda strike, opt: master.option_symbol(
                 opt, strike, underlying="KOSPI200", series="weekly_mon"
             ),
+            retention_pool=retention_pool,
         )
         weekly_thu_manager = RollingSubscriptionManager(
             ws_client,
@@ -3580,6 +3643,7 @@ async def main() -> None:
             symbol_formatter=lambda strike, opt: master.option_symbol(
                 opt, strike, underlying="KOSPI200", series="weekly_thu"
             ),
+            retention_pool=retention_pool,
         )
         books = [
             (monthly_manager, "regular"),

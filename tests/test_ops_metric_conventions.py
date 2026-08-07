@@ -135,12 +135,20 @@ def test_chain_age_warning_threshold_stays_below_the_snapshot_window():
     창을 바꾸든 임계를 바꾸든, 임계가 창 위로 올라가면 이 테스트가 깨진다 — 그것이 요점이다
     (2026-08-05 §2-4가 느린 호출 임계에서 겪은 것과 같은 계열의 불변식).
     """
+    from mahdi import main
     from mahdi.data import db
     from mahdi.ops import db_metrics
 
     window_seconds = db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60
-    assert db_metrics.SIGNAL_REACH_WARNINGS["chain_age_seconds_max"] < window_seconds, (
+    threshold = db_metrics.SIGNAL_REACH_WARNINGS["chain_age_seconds_max"]
+    assert threshold < window_seconds, (
         "체인 나이 경고 임계가 스냅샷 창 위에 있으면 그 경고는 구조적으로 울리지 않는다"
+    )
+    # 2026-08-07 Fix#2 — 아래쪽 경계도 건다. 임계가 먼슬리 폴링 주기의 2배 아래로 내려가면
+    # **정상 사이클 한 번만 밀려도** 울려서, 08-06까지 겪은 것과 반대 방향의 침묵(경고 피로로
+    # 아무도 안 읽는 상태)이 된다. 180초 = 60초 주기 x 3 = "2사이클 이상 밀렸다"의 경계다.
+    assert threshold >= 2 * main.OPTION_CHAIN_POLL_INTERVAL_SECONDS, (
+        "임계가 먼슬리 폴링 주기의 2배 아래면 정상 밀림에도 매분 울린다"
     )
 
 

@@ -814,6 +814,9 @@ _WS_STATUS_COLUMNS = (
     "market_op_subscribed_at",
     # 2026-08-05(P2-12, 마이그레이션 026) — 관측 연속성의 선행지표. 상세 근거는 그 파일 주석.
     "atm_roll_count_today",
+    # 2026-08-07(고도화#2, 마이그레이션 028) — 그 롤이 **실제로 끊은** 구독 수. 롤 횟수는
+    # 시장 변동성의 함수라 통제 불가지만 이 값은 통제 대상이다(0이 목표).
+    "atm_roll_dropped_subs_today",
 )
 
 
@@ -825,6 +828,7 @@ def upsert_ws_status(
     reconnect_count_today: int,
     market_op_subscribed_at: datetime | None = None,
     atm_roll_count_today: int = 0,
+    atm_roll_dropped_subs_today: int = 0,
 ) -> None:
     """
     입력: 하트비트 시각과 `mahdi.main.WsLiveness`의 현재 값.
@@ -838,6 +842,7 @@ def upsert_ws_status(
         "last_message_at": last_message_at, "reconnect_count_today": reconnect_count_today,
         "market_op_subscribed_at": market_op_subscribed_at,
         "atm_roll_count_today": atm_roll_count_today,
+        "atm_roll_dropped_subs_today": atm_roll_dropped_subs_today,
     }
     _upsert(conn, "ws_status", _WS_STATUS_COLUMNS, ("id",), row)
 
@@ -852,7 +857,7 @@ def latest_ws_status(conn: ConnectionLike) -> dict | None:
         conn,
         base="SELECT updated_at, connected_since, last_message_at, reconnect_count_today, "
              "market_op_subscribed_at",
-        optional=("atm_roll_count_today",),
+        optional=("atm_roll_count_today", "atm_roll_dropped_subs_today"),
         tail=" FROM ws_status LIMIT 1",
     )
     if row is None:
@@ -864,7 +869,30 @@ def latest_ws_status(conn: ConnectionLike) -> dict | None:
         # 마이그레이션 026(2026-08-05 P2-12) 미적용이면 None — 그때는 이 배지 하나만 "미기록"이
         # 되고 나머지 WS 판정은 그대로 산다(`_select_with_optional_columns` 참고).
         "atm_roll_count_today": row[5],
+        # 마이그레이션 028(2026-08-07 고도화#2). 같은 이유로 None을 0으로 채우지 않는다 —
+        # "아직 안 셌다"와 "대가가 0이었다"는 정반대의 뜻이다.
+        "atm_roll_dropped_subs_today": row[6],
     }
+
+
+def market_halt_message_ever_received(conn: ConnectionLike) -> bool:
+    """
+    계산: `market_halt_event_history`에 **한 건이라도** 있는가 — H0UNMKO0 수신 경로가 살아
+         있다는 유일한 누적 증거다.
+    해석: 2026-08-07(운영점검 §A-3 / Fix#6). `ws_status.last_message_at`은 관측 루프가 매일
+         아침 새로 뜨면서 초기화되므로 **"오늘 안 왔다"만 말할 수 있고 "한 번도 안 왔다"는 못
+         말한다.** 그런데 정상일에도 하루 0~2건이라(07-31 1건 / 08-03 0건 / 08-07 0건) 하루치로는
+         아무 판정도 못 한다 — 임계를 걸면 상시 오경보가 된다.
+
+         **넉 달째 이 경로가 살아 있다는 증거가 한 번도 없었는데 배지는 초록이었다.** 구독
+         성립(`market_op_subscribed_at`)은 확인되지만 그건 "보낸 요청이 받아들여졌다"이지
+         "데이터가 온다"가 아니다. 이 함수는 그 둘 사이의 빈 칸을 메운다.
+    실패 조건: 조회 실패는 그대로 전파한다 — 호출측(COCKPIT 배지)이 잡아 "조회 실패"로 표시한다.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM market_halt_event_history)")
+        row = cur.fetchone()
+    return bool(row[0]) if row else False
 
 
 def append_market_halt_event_history(
@@ -952,6 +980,43 @@ def get_active_futures_symbol(conn: ConnectionLike, underlying: str) -> str | No
 # 2분은 중앙 10레그로 설계값과 정확히 같지만 결손 분(08-04 48분) 2회 연속에 빈 체인이 된다.
 CHAIN_SNAPSHOT_MAX_AGE_MINUTES = 5
 
+# 2026-08-07(운영점검 §B-2 / Fix#1) — **창 길이는 그대로 두고 행사가 집합만 자른다.**
+#
+# 위 08-04 주석이 "창 길이가 곧 오염 길이"라고 진단하고 10 → 5분으로 줄였는데, 그건 오염을
+# **절반으로 줄인 것이지 없앤 것이 아니다.** 08-07 실측(장중 202분):
+#
+#   스냅샷 레그   분    최고령 평균   의미
+#      10(설계)   45      62초       롤 없이 한 창으로 계산
+#      12         88     185초       롤 잔상 1세트 혼입
+#      14         45     191초       2세트
+#      16         20     229초       3세트
+#      18          3     250초       4세트
+#
+# **장중 판단의 78%(157/202분)가 서로 다른 두 개 이상의 ATM 창을 섞어 GEX를 냈다.** 초과분은
+# ATM 창 밖으로 빠져 더 이상 폴링되지 않는 행사가이고, `DISTINCT ON`이 그 마지막 값을 창
+# 만료까지 붙들고 있다. GEX는 OI 가중 합이라 행사가가 늘면 |GEX|가 그만큼 부풀고, 그 값이
+# v6 §11.4 프리미엄 매도 게이트(positive GEX 요구)의 입력이다.
+#
+# **왜 창 길이를 더 줄이지 않는가**: 5분 창의 목적은 "결손 분에 빈 체인이 되지 않는 것"이고
+# 그 목적은 여전히 유효하다(08-04 실측 결손 48분). 오염의 원인은 창 **길이**가 아니라 창 안에
+# 여러 행사가 집합이 겹쳐 쌓이는 것이므로, 길이를 건드리지 말고 **집합을 자르는 것**이 맞다.
+#
+# **왜 「최신 사이클의 행사가 범위」인가**(집합이 아니라 범위): 세 후보를 08-07 실데이터
+# 327분으로 리플레이했다 —
+#
+#   후보                     중앙 레그  최대  설계(10) 미만 분  최고령 중앙/최대
+#   현행(5분 창 전체)            12      20        0분          120초 / 300초
+#   최신 사이클의 행사가 집합     10      10       **1분**         0초 /   0초
+#   최신 사이클의 행사가 범위     10      10        0분            0초 /  60초   ← 채택
+#
+# 집합안은 그 사이클에서 **실패한 레그를 이월로 살리지 못한다**(레그 단위 ReadTimeout은
+# 08-06에 119건 중 111건이었다 — 가정이 아니라 상시 현상이다). 범위안은 [min, max] 안쪽의
+# 구멍을 직전 값으로 메우므로 내부 실패에 강하고, 창 밖으로 빠진 행사가만 정확히 떨어뜨린다.
+# 가장자리 레그가 실패하면 범위가 한 칸 좁아지지만 다음 사이클에 자동 복구된다.
+#
+# **만기별로 따로 자른다** — 북마다 폴링 주기(먼슬리 매분 / 위클리 격분)와 창이 다르다.
+# 구현은 `_restrict_to_latest_cycle_window()`.
+
 _CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", "expiry", "timestamp")
 
 # `DISTINCT ON`에 **expiry를 포함한다**(2026-08-03 §2-2). 종전에는 (strike, option_type)으로만 묶어
@@ -967,6 +1032,40 @@ _CHAIN_SNAPSHOT_SQL = """
       AND expiry >= %s
     ORDER BY expiry, strike, option_type, timestamp DESC
 """
+
+
+def _restrict_to_latest_cycle_window(rows: list[tuple]) -> list[tuple]:
+    """
+    입력: `_CHAIN_SNAPSHOT_SQL`이 돌려준 행 목록 — (strike, option_type, oi, iv, gamma, gex,
+         expiry, timestamp, rv_5d) 순서에 의존한다.
+    계산: **만기별로** 그 북의 가장 최근 사이클(= 그 만기의 최대 timestamp)이 수집한 행사가의
+         [최소, 최대] 범위를 구하고, 그 범위 **밖** 행사가를 떨어뜨린다. 범위 안쪽 행사가는
+         이번 사이클에 실패해 직전 값이 이월된 것이라도 그대로 남긴다.
+    해석: 근거와 후보 비교는 `CHAIN_SNAPSHOT_MAX_AGE_MINUTES` 위 2026-08-07 주석. 요약하면
+         5분 창은 *결손 이월*을 위해 필요하지만, 그 창 안에 ATM 롤로 생긴 **다른 행사가 창**이
+         겹쳐 쌓이는 것은 이월이 아니라 유령이다. 창 길이(시간축)는 그대로 두고 행사가축만 자른다.
+         **범위(min~max)이지 집합이 아니다** — 집합으로 자르면 그 사이클에서 ReadTimeout으로
+         빠진 레그가 이월로도 못 살아난다(08-07 실측 327분 중 1분이 설계 미만으로 떨어졌다).
+    실패 조건: 없다 — 빈 입력은 빈 출력. 어떤 만기든 최신 사이클이 1행뿐이면 그 행사가 하나만
+              남는데, 그건 실제로 그 분에 한 레그밖에 못 받았다는 뜻이므로 숨기지 않는다
+              (호출측이 `GAMMA_FLIP_MIN_LEGS` 미달로 산출을 건너뛴다).
+    """
+    if not rows:
+        return rows
+    _STRIKE, _EXPIRY, _TIMESTAMP = 0, 6, 7
+    latest_ts: dict[object, datetime] = {}
+    for row in rows:
+        expiry, ts = row[_EXPIRY], row[_TIMESTAMP]
+        if expiry not in latest_ts or ts > latest_ts[expiry]:
+            latest_ts[expiry] = ts
+    window: dict[object, tuple[float, float]] = {}
+    for row in rows:
+        expiry, ts, strike = row[_EXPIRY], row[_TIMESTAMP], float(row[_STRIKE])
+        if ts != latest_ts[expiry]:
+            continue
+        low, high = window.get(expiry, (strike, strike))
+        window[expiry] = (min(low, strike), max(high, strike))
+    return [row for row in rows if window[row[_EXPIRY]][0] <= float(row[_STRIKE]) <= window[row[_EXPIRY]][1]]
 
 
 def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> list[dict]:
@@ -991,6 +1090,7 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
     with conn.cursor() as cur:
         cur.execute(_CHAIN_SNAPSHOT_SQL, (underlying, as_of, oldest, as_of.date()))
         rows = cur.fetchall()
+    rows = _restrict_to_latest_cycle_window(rows)
     return [
         {
             "strike": float(strike),

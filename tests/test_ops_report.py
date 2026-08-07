@@ -492,3 +492,70 @@ def test_dig_list_indexing_does_not_swallow_scalars():
 
     assert dig({"a": 1}, "a.b") is None
     assert dig({"a": [1, 2, 3]}, "a.b") is None
+
+
+# ==========================================================================================
+# 2026-08-07 고도화#5 — 멤버 부호 일치율의 3영업일 추이
+# ==========================================================================================
+
+
+def _scores_db(pairs):
+    return {"member_score_quality": {"available": True, "members": [], "pairs": pairs}}
+
+
+def test_member_score_pairs_show_the_previous_business_days():
+    """하루치 변화로는 「갈렸다」와 「부호가 뒤집혀 있다」를 구분할 수 없다.
+
+    08-07 실측 `flow_position ↔ options_flow` 22.3%(197분 중 44분만 부호 일치)가 이 열을
+    만든 이유다 — 무작위라면 50% 근처여야 한다.
+    """
+    today = _scores_db([
+        {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 197,
+         "same_sign_minutes": 44, "same_sign_pct": 22.3},
+    ])
+    history = [
+        {"date": "2026-08-06", "db": _scores_db([
+            {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 380,
+             "same_sign_minutes": 95, "same_sign_pct": 25.0},
+        ])},
+        {"date": "2026-08-05", "db": _scores_db([
+            {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 300,
+             "same_sign_minutes": 72, "same_sign_pct": 24.0},
+        ])},
+    ]
+
+    text = "\n".join(report._render_member_scores(today, history))
+
+    assert "2026-08-06" in text and "2026-08-05" in text
+    assert "22.3%" in text and "25.0%" in text and "24.0%" in text
+    # 임계를 걸지 않는다는 것 자체가 이 절의 결정이다 — 문구가 사라지면 다음 사람이 임계를 만든다.
+    assert "지금 임계를 걸지 않는다" in text
+
+
+def test_member_score_pairs_leave_a_gap_instead_of_dropping_the_column():
+    """그날 그 쌍이 없었으면 자리를 비운다 — 열이 사라지면 「안 쟀다」와 「0%였다」가 같아진다."""
+    today = _scores_db([
+        {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 10,
+         "same_sign_minutes": 5, "same_sign_pct": 50.0},
+    ])
+    history = [{"date": "2026-08-06", "db": _scores_db([])}]
+
+    rows = [
+        line for line in report._render_member_scores(today, history)
+        if line.startswith("| flow_position ↔")
+    ]
+
+    assert len(rows) == 1
+    assert rows[0].rstrip().endswith("| — |")
+
+
+def test_member_scores_without_history_render_the_same_columns_as_before():
+    """이력이 없으면(첫날) 열이 안 늘어난다 — 기존 리포트 형태가 그대로여야 한다."""
+    today = _scores_db([
+        {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 10,
+         "same_sign_minutes": 5, "same_sign_pct": 50.0},
+    ])
+
+    header = [line for line in report._render_member_scores(today, None) if "멤버 쌍" in line][0]
+
+    assert header.count("|") == 5   # 앞뒤 파이프 + 4열

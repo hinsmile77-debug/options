@@ -140,6 +140,13 @@ def main() -> None:
         help="박제 경로(확장자 없이). 기본값은 docs/동작점검/regime_baseline_<오늘>",
     )
     parser.add_argument(
+        "--allow-nonconverged", action="store_true",
+        help=(
+            "EM이 수렴하지 않아도 저장한다(2026-08-07 고도화#4). 기본값은 저장 거부 — "
+            "수렴 안 한 모델을 저장하면 그날부터 모든 레짐 판단이 그것을 믿는다"
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="모델을 저장하지 않고 적재→행렬→fit()까지만 돌려본다(2026-08-03 §4 우선순위 6)",
     )
@@ -183,12 +190,37 @@ def main() -> None:
             len(visited),
         )
 
+    # 2026-08-07 고도화#4 — **드라이런이 찾아낸 것.** 08-07 실측(7,680샘플)에서 hmmlearn이
+    # `Model is not converging` 4건을 냈다(로그우도 델타가 음수). `fit()`은 예외를 안 던지므로
+    # 이대로 08-10에 저장했으면 **수렴하지 않은 모델이 조용히 라이브에 올라갔을 것**이다 —
+    # 그리고 그 뒤의 모든 레짐 판단이 그 모델에서 나온다.
+    #
+    # 저장을 막는 쪽을 기본값으로 둔다: 안 저장하면 오늘 하루 WARMUP 폴백이 이어질 뿐이지만
+    # (08-06까지 24영업일 그랬다), 나쁜 모델을 저장하면 그날부터 판단이 그것을 믿는다.
+    # 억지로 저장해야 할 근거가 생기면 `--allow-nonconverged`로 **명시적으로** 넘긴다.
+    converged = getattr(getattr(engine.model, "monitor_", None), "converged", None)
+    if converged is False:
+        logger.warning(
+            "EM이 수렴하지 않았다(hmmlearn monitor_.converged=False) — n_iter(%d)를 늘리거나 "
+            "피처 분산을 재점검할 것. 08-07 드라이런에서도 같은 경고가 났다.",
+            engine.model.n_iter,
+        )
+    elif converged is None:
+        logger.warning("수렴 여부를 읽지 못했다(hmmlearn 버전 차이?) — 저장 전 사람이 확인할 것")
+
     if args.dry_run:
         # 저장하지 않는다 — 드라이런의 목적은 "기계적 오류가 없는지"이지 모델을 만드는 게 아니다.
         # 지금 저장하면 RegimeStateMachine이 그 파일을 보고 곧바로 predict()로 전환해버린다.
         logger.info(
             "드라이런 성공(%d개 샘플) — fit()이 예외 없이 끝났다. 모델은 저장하지 않았다(%s).",
             len(features), args.model_path,
+        )
+        return
+    if converged is not True and not args.allow_nonconverged:
+        logger.error(
+            "수렴하지 않은 모델은 저장하지 않는다 — 저장하면 그날부터 모든 레짐 판단이 이 모델에서 "
+            "나온다. 안 저장하면 WARMUP 폴백이 하루 더 이어질 뿐이다(v6 §16.1). "
+            "그래도 저장하려면 --allow-nonconverged."
         )
         return
     engine.save(args.model_path)

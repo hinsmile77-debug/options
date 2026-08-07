@@ -929,12 +929,14 @@ def test_macro_freshness_check_handles_query_error():
 _NOW = datetime(2026, 8, 5, 12, 12)
 
 
-def _ws_status(atm_roll_count: int) -> dict:
+def _ws_status(atm_roll_count: int, dropped: int | None = 0) -> dict:
     return {
         "updated_at": _NOW, "connected_since": datetime(2026, 8, 5, 7, 30),
         "last_message_at": _NOW, "reconnect_count_today": 0,
         "market_op_subscribed_at": datetime(2026, 8, 5, 7, 30),
         "atm_roll_count_today": atm_roll_count,
+        # 2026-08-07 고도화#2 — 판정 축이 여기로 옮겨왔다(마이그레이션 028).
+        "atm_roll_dropped_subs_today": dropped,
     }
 
 
@@ -948,15 +950,47 @@ def test_atm_roll_churn_check_ok_below_threshold(monkeypatch):
     assert "6회" in check.detail
 
 
-def test_atm_roll_churn_check_warns_at_the_observed_08_05_level(monkeypatch):
-    # 08-05 실측 77회 — 임계(20)의 약 4배. 방향성 이동이 아니라 격자 중간점 근처에서 오간 결과다.
-    monkeypatch.setattr("mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(77))
+def test_atm_roll_churn_check_no_longer_warns_on_roll_count_alone(monkeypatch):
+    """2026-08-07 고도화#2 — 롤 횟수는 시장 변동성의 함수라 통제 대상이 아니다.
+
+    08-05는 77회를 "중간점 근처에서 오간 결과"로 읽고 임계 20을 걸었다. 08-07에 롤 76회를
+    **전수 검산**하니 전부 히스테리시스 임계(2.5 x 0.75 = 1.875p)를 정당하게 넘은 것이었다 —
+    그날 지수가 40p를 움직였다. 통제 못 하는 값에 임계를 걸면 상시 경고가 되고, 상시 경고는
+    곧 안 읽는 경고다.
+    """
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(77, dropped=0)
+    )
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "ok"
+    assert "77회" in check.detail
+    assert "0건" in check.detail
+
+
+def test_atm_roll_churn_check_warns_when_rolls_actually_dropped_subscriptions(monkeypatch):
+    """판정 축은 **끊긴 구독 수**다 — 그것이 Flow Radar 공백의 직접 원인이고 우리가 통제한다."""
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(30, dropped=12)
+    )
 
     check = _atm_roll_churn_check(object(), _NOW)
 
     assert check.status == "warning"
-    assert "77회" in check.detail
-    assert "히스테리시스" in check.detail
+    assert "12건" in check.detail
+
+
+def test_atm_roll_churn_check_falls_back_to_roll_count_before_migration_028(monkeypatch):
+    """대가를 못 재는 구간에서는 대리 지표(롤 횟수)로라도 판정한다 — 침묵하지 않는다."""
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(77, dropped=None)
+    )
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "warning"
+    assert "집계 전" in check.detail
 
 
 def test_atm_roll_churn_check_says_not_counted_yet_instead_of_zero(monkeypatch):
@@ -1234,11 +1268,67 @@ def test_market_halt_check_ok_with_heartbeat_when_no_transition_yet(monkeypatch)
             "last_message_at": datetime(2026, 7, 31, 9, 0, 5),
         },
     )
+    # 2026-08-07 Fix#6 — 누적 수신 이력이 **있는** 경우가 이 시나리오다(없으면 아래 "미검증").
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.market_halt_message_ever_received", lambda conn: True
+    )
     check = _market_halt_check(object())
     assert check.status == "ok"
     assert "발동 이력 없음" in check.detail
     assert "09:05:00" in check.detail  # 관측 루프 하트비트
     assert "09:00:05" in check.detail  # 최근 장운영정보 수신
+
+
+def test_market_halt_check_says_unverified_when_no_message_was_ever_received(monkeypatch):
+    """2026-08-07 §A-3 / Fix#6 — 넉 달째 수신 누적 0건인데 배지는 초록이었다.
+
+    구독 성립(`market_op_subscribed_at`)은 "보낸 요청이 받아들여졌다"이지 "데이터가 온다"가
+    아니다. 하루치 0건에는 임계를 걸 수 없지만(정상일에도 0~2건) **누적 0건**은 "이 경로가
+    살아 있는 것을 한 번도 본 적이 없다"는 다른 사실이다.
+
+    경고가 아니라 정보인 이유: 이상이 있다는 증거도 없다 — 진짜로 CB가 없었을 수 있다.
+    """
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 8, 7, 12, 15))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 8, 7, 12, 14), "is_halted": False,
+            "mkop_cls_code": None, "label": "정상", "halted_since": None,
+            "last_message_at": None,
+        },
+    )
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.market_halt_message_ever_received", lambda conn: False
+    )
+
+    check = _market_halt_check(object())
+
+    assert check.status == "info"
+    assert "미검증" in check.detail
+    assert "누적 0건" in check.detail
+    # "정상"이라고 쓰지 않는 것이 이 fix의 전부다.
+    assert "정상(발동 이력 없음)" not in check.detail
+
+
+def test_market_halt_check_still_flags_an_active_halt_regardless_of_history(monkeypatch):
+    """미검증 판정이 **실제 발동 중**을 덮으면 안 된다 — 그건 최우선 경고다."""
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: datetime(2026, 8, 7, 12, 15))
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_market_halt_state",
+        lambda conn: {
+            "updated_at": datetime(2026, 8, 7, 12, 14), "is_halted": True,
+            "mkop_cls_code": "20", "label": "CB 1단계", "halted_since": datetime(2026, 8, 7, 12, 10),
+            "last_message_at": datetime(2026, 8, 7, 12, 10),
+        },
+    )
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.market_halt_message_ever_received", lambda conn: False
+    )
+
+    check = _market_halt_check(object())
+
+    assert check.status == "warning"
+    assert "신규진입 차단" in check.detail
 
 
 def test_market_halt_check_handles_tz_aware_timestamps_from_postgres(monkeypatch):

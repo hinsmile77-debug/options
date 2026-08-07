@@ -138,10 +138,14 @@ def _section(title: str, builder: Callable[[], list[str]]) -> list[str]:
 
 
 def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None = None,
-           hypotheses: list[dict] | None = None) -> str:
+           hypotheses: list[dict] | None = None, history: list[dict] | None = None) -> str:
     """
-    입력: 오늘 로그 지표, (선택) 전일 지표, (선택) DB 지표, (선택) 가설 검정 결과.
+    입력: 오늘 로그 지표, (선택) 전일 지표, (선택) DB 지표, (선택) 가설 검정 결과,
+         (선택) **직전 영업일들의 지표**(최신순, 2026-08-07 고도화#5).
     계산: 운영점검 보고서가 인용할 수 있는 표 묶음을 마크다운으로 낸다.
+    해석: `previous`는 하루 전 하나이고 `history`는 그 이상이다 — 둘을 합치지 않은 이유는
+         전일 대비 델타(§1·§9-1·§15)와 **추세 판정**(§14-3 부호 일치율)이 서로 다른 질문이기
+         때문이다. 하루치 변화로는 "갈렸다"와 "부호가 뒤집혀 있다"를 구분할 수 없다.
     실패 조건: 절 단위로 예외를 격리한다 — 한 절이 죽어도 나머지는 나온다.
     """
     date_label = metrics.get("date", "?")
@@ -178,7 +182,7 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
         lines += _section("14-2. 행사가 창 품질 — 수집한 행사가가 스팟을 감쌌는가",
                           lambda: _render_strike_window(db_metrics, metrics))
         lines += _section("14-3. 판단 품질 — 멤버가 무엇을 말했는가",
-                          lambda: _render_member_scores(db_metrics))
+                          lambda: _render_member_scores(db_metrics, history))
         lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
                           lambda: _render_book_gamma_map(db_metrics, previous))
         lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
@@ -648,7 +652,28 @@ def _render_member_availability(db: dict) -> list[str]:
     return out
 
 
-def _render_member_scores(db: dict) -> list[str]:
+def _member_pair_history(history: list[dict] | None) -> tuple[list[str], dict[tuple[str, str], list]]:
+    """
+    입력: 직전 영업일들의 지표 사이드카(최신순).
+    계산: (날짜 라벨 목록, 멤버 쌍 -> 그 날짜들의 일치율 목록)을 만든다. 값이 없는 날은 None.
+    해석: 2026-08-07 고도화#5. 쌍이 그날 없었으면 자리를 비우되 열은 유지한다 — 열이 사라지면
+         "그날은 안 쟀다"와 "그날은 0%였다"가 화면에서 같아진다.
+    실패 조건: 없다 — 이력이 없으면 빈 결과.
+    """
+    labels: list[str] = []
+    series: dict[tuple[str, str], list] = {}
+    for day in history or []:
+        labels.append(str(day.get("date", "?")))
+        by_pair = {
+            (p["a"], p["b"]): p.get("same_sign_pct")
+            for p in ((day.get("db") or {}).get("member_score_quality") or {}).get("pairs") or []
+        }
+        for key in set(series) | set(by_pair):
+            series.setdefault(key, [None] * (len(labels) - 1)).append(by_pair.get(key))
+    return labels, series
+
+
+def _render_member_scores(db: dict, history: list[dict] | None = None) -> list[str]:
     """2026-08-05 고도화#4 — 가용성(§14-1)이 "누가 살아 있었나"라면 여기는 "뭐라고 했나"다."""
     mq = db.get("member_score_quality") or {}
     if not mq.get("available"):
@@ -666,16 +691,32 @@ def _render_member_scores(db: dict) -> list[str]:
     )
     pairs = mq.get("pairs") or []
     if pairs:
+        # 2026-08-07 고도화#5 — 일치율에 **직전 영업일들의 값을 나란히** 붙인다.
+        past_labels, past_series = _member_pair_history(history)
         out += _table(
-            ["멤버 쌍", "둘 다 비영인 분", "부호 일치", "일치율"],
+            ["멤버 쌍", "둘 다 비영인 분", "부호 일치", "일치율"] + past_labels,
             [
                 [
                     f"{p['a']} ↔ {p['b']}", f"{p['both_nonzero_minutes']:,}",
                     f"{p['same_sign_minutes']:,}", _fmt(p.get("same_sign_pct"), "{:.1f}%"),
                 ]
+                + [
+                    _fmt(v, "{:.1f}%")
+                    for v in past_series.get((p["a"], p["b"]), [None] * len(past_labels))
+                ]
                 for p in pairs
             ],
         )
+        out += [
+            "> **일치율이 50%에서 크게 벗어나 며칠 고착되면 그건 '갈렸다'가 아니라 '한쪽 부호가 "
+            "뒤집혀 있다'일 수 있다.** 무작위라면 50% 근처여야 하고, 두 축이 정말 독립적으로 "
+            "시장을 보는 것이라면 날마다 흔들려야 한다. 08-07 실측 `flow_position ↔ options_flow` "
+            "**22.3%** 가 이 열을 만든 이유다 — 197분 중 44분만 부호가 같았다.",
+            "> **지금 임계를 걸지 않는다.** 정상 범위를 모르는 상태에서 임계를 먼저 정하면 그 임계가 "
+            "곧 결론이 된다(08-05 스팟 소스 괴리율에서 같은 실수를 했다). 위 3영업일 열이 "
+            "채워지면 사람이 읽고 그때 정한다 — 고착이면 `signal_layer`의 부호 규약을 의심하고, "
+            "흔들리면 그것이 앙상블이 살아 있다는 증거다.",
+        ]
     out += [
         "> **일치율이 이 표의 핵심이다.** 멤버가 항상 같은 부호면 앙상블은 **실질 1멤버**이고, "
         "그때 `available_member_count` 4는 판단이 4개 축을 본다는 뜻이 아니다(가중치를 바꿔도 "
@@ -1008,7 +1049,15 @@ def _render_signal_reach(db: dict) -> list[str]:
                 "체인 스냅샷 레그 수",
                 f"중앙 {_fmt(reach.get('chain_leg_median'), '{:.0f}')} / "
                 f"최대 {_fmt(reach.get('chain_leg_max'), '{:,.0f}')}",
-                "북수 x (ATM±N)x2 에서 크게 벗어나면",
+                f"설계 {db_metrics_module.MONTHLY_LEGS_PER_CYCLE_DESIGN}레그(먼슬리 ATM±N x C/P)",
+            ],
+            # 2026-08-07 고도화#2 — 위 줄의 "좀 두껍다"를 **분 단위로 세어** 불변식으로 만든다.
+            # 08-07 이전에는 이 값이 매일 100분대였는데 레그 수 중앙/최대만 봐서는 안 보였다.
+            [
+                "└ 그중 설계 초과 분(ATM 롤 잔상)",
+                f"{_fmt(reach.get('chain_leg_over_design_minutes'), '{:,.0f}분')} "
+                f"(최대 +{_fmt(reach.get('chain_leg_excess_max'), '{:,.0f}')}레그)",
+                "> 0 (불변식 — 08-07 Fix#1 이후 0이어야 한다)",
             ],
             [
                 "체인 스냅샷 최고령 레그",

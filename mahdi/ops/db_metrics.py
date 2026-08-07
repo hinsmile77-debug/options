@@ -1130,6 +1130,29 @@ SIGNAL_REACH_WARNINGS = {
     # 내렸는데 느린 호출 임계가 5초에 남아 자기를 정당화한 계측을 침묵시켰다). 여기서 물리적
     # 상한은 스냅샷 창 `db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES * 60` = 300초이고 180 < 300이다.
     # 이 부등식은 `tests/test_ops_db_metrics.py`의 불변식 테스트가 기계적으로 지킨다.
+    #
+    # 2026-08-07(§B-3 / Fix#2) — **값은 그대로 두되, 이 지표가 재던 것이 오늘부터 바뀐다.**
+    #
+    # 08-06의 위 문단은 임계 180초를 "먼슬리가 2사이클 이상 밀렸다"로 정의했다. 그런데 08-07
+    # 실측에서 이 값은 **폴링 지연이 아니라 ATM 롤 잔상**을 재고 있었다:
+    #
+    #   스냅샷 레그   분(장중)   최고령 평균
+    #      10(설계)      45        62초      ← 롤 없이 한 창. 임계 아래
+    #      12            88       185초
+    #      14            45       191초
+    #      16            20       229초
+    #      18             3       250초      ← 250초는 12레그 이상 분에서만 난다
+    #
+    # 즉 250초는 "먼슬리가 밀렸다"가 아니라 "창 밖으로 빠진 행사가가 5분 창에 남아 있다"였고,
+    # 그래서 08-06(250.086초)과 08-07(250.139초)이 **창 길이에 붙어 고정**됐다. 임계가 재려던
+    # 것과 지표가 재던 것이 달랐다 — 08-06 §2-4가 고친 것과 **같은 계열의 오류가 한 겹 더** 있었다.
+    #
+    # `db._restrict_to_latest_cycle_window()`(08-07 Fix#1)가 그 잔상을 걷어냈으므로, 이제 이
+    # 값은 주석이 처음부터 주장하던 것 — 먼슬리 폴링이 얼마나 늙었는가 — 을 실제로 잰다.
+    # 08-07 리플레이 기준 중앙 0초 / 최대 60초이고, 임계 180초는 그 위에 2사이클의 여유를 둔다.
+    #
+    # **08-06 이전 값과 비교하지 말 것**: 모집단이 바뀌었다(전 북 → 먼슬리는 08-06, 전 행사가
+    # → 현재 창은 08-07). 시계열의 단절 지점이 두 곳이다.
     "chain_age_seconds_max": 180.0,
 }
 
@@ -1205,9 +1228,13 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
             "       percentile_cont(0.5) WITHIN GROUP (ORDER BY chain_leg_count), "
             "       max(chain_leg_count), "
             "       percentile_cont(0.5) WITHIN GROUP (ORDER BY chain_oldest_leg_age_seconds), "
-            "       max(chain_oldest_leg_age_seconds) "
+            "       max(chain_oldest_leg_age_seconds), "
+            # 2026-08-07 고도화#2 — Fix#1(창 자르기)의 회귀 감시. 설계보다 두꺼운 분은
+            # 서로 다른 ATM 창을 섞어 GEX를 낸 분이다(08-07 장중 157/202분).
+            "       count(*) FILTER (WHERE chain_leg_count > %s), "
+            "       max(chain_leg_count - %s) "
             "FROM signal_decisions WHERE timestamp::date=%s",
-            (target,),
+            (MONTHLY_LEGS_PER_CYCLE_DESIGN, MONTHLY_LEGS_PER_CYCLE_DESIGN, target),
         )
     except Exception:
         conn.rollback()
@@ -1231,6 +1258,11 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
         "chain_leg_max": int(row[4]) if row[4] is not None else None,
         "chain_age_seconds_median": float(row[5]) if row[5] is not None else None,
         "chain_age_seconds_max": float(row[6]) if row[6] is not None else None,
+        # 2026-08-07 고도화#2 — **ATM 롤의 잔상**. 08-07 이전에는 이 값이 매일 100분 단위였고
+        # 아무도 그걸 못 봤다(레그 수 중앙/최대만 보면 "좀 두껍다"로 읽힌다). Fix#1 이후
+        # 0이 정상이며, 0이 아니면 창 자르기가 깨졌거나 한 사이클이 두 분에 걸쳐 적재된 것이다.
+        "chain_leg_over_design_minutes": int(row[7]) if row[7] is not None else None,
+        "chain_leg_excess_max": max(int(row[8]), 0) if row[8] is not None else None,
     }
     out["gamma_flip_out_of_range_count"] = _gamma_flip_out_of_range_count(conn, target)
 
@@ -1277,6 +1309,14 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
     if age_max is not None and age_max > SIGNAL_REACH_WARNINGS["chain_age_seconds_max"]:
         warnings.append(
             f"체인 스냅샷 최고령 레그 {age_max / 60:.0f}분 — 신선도 경계가 깨졌다"
+        )
+    # 2026-08-07 고도화#2 — Fix#1(창 자르기)의 회귀 감시. **0이 불변식이다.**
+    over_design = out["chain_leg_over_design_minutes"]
+    if over_design:
+        warnings.append(
+            f"설계({MONTHLY_LEGS_PER_CYCLE_DESIGN}레그)보다 두꺼운 체인 {over_design}분 "
+            f"(최대 +{out['chain_leg_excess_max']}레그) — 서로 다른 ATM 창을 섞어 GEX를 냈다. "
+            "08-07 Fix#1(창 자르기)이 뚫렸거나 한 사이클이 두 분에 걸쳐 적재된 것이다"
         )
     out["warnings"] = warnings
     out["notes"] = notes
@@ -1374,13 +1414,16 @@ def _ws_status(conn: ConnectionLike, _target: date) -> dict:
     row = _fetchone(
         conn,
         "SELECT updated_at, connected_since, last_message_at, reconnect_count_today,"
-        " market_op_subscribed_at, atm_roll_count_today FROM ws_status LIMIT 1",
+        " market_op_subscribed_at, atm_roll_count_today, atm_roll_dropped_subs_today"
+        " FROM ws_status LIMIT 1",
     )
     if not row:
         return {
             "updated_at": None, "connected_since": None, "last_message_at": None,
             "reconnect_count_today": None, "market_op_subscribed_at": None,
             "atm_roll_count_today": None,
+            # 2026-08-07 고도화#2 — 롤의 대가(마이그레이션 028).
+            "atm_roll_dropped_subs_today": None,
         }
 
     def _hms(value):
@@ -1393,6 +1436,8 @@ def _ws_status(conn: ConnectionLike, _target: date) -> dict:
         "reconnect_count_today": int(row[3]) if row[3] is not None else None,
         "market_op_subscribed_at": _hms(row[4]),
         "atm_roll_count_today": int(row[5]) if row[5] is not None else None,
+        # 2026-08-07 고도화#2 — 판정 축은 횟수가 아니라 이쪽이다(마이그레이션 028).
+        "atm_roll_dropped_subs_today": int(row[6]) if row[6] is not None else None,
     }
 
 

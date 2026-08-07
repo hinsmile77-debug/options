@@ -7,7 +7,12 @@ KIS WS는 세션당 구독 슬롯이 제한적(약 41건)이라 전체 옵션 �
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
+
 from mahdi.broker.ws_client import KISWebSocketClient, Subscription
+
+logger = logging.getLogger("mahdi.data.subscription_manager")
 
 
 # 2026-08-04(운영점검보고서 §2-2 / Fix#6) — ATM 재롤링 히스테리시스.
@@ -78,6 +83,120 @@ def should_roll_atm(
     return atm_for_spot(spot, strike_interval) != current_atm
 
 
+# 2026-08-07(운영점검 §B-1 / 고도화#1) — 유지 큐가 항상 비워 두는 슬롯 수.
+#
+# **작아야 한다.** 롤 경로의 슬롯 부족은 이 예약이 아니라 `ensure_free()`가 그때그때 축출해
+# 해결한다 — 예약은 **풀을 거치지 않는 구독**(기동 시 선물 A01609 / KOSPI 005930, 재연결 직후
+# 재등록)만을 위한 여유다. 그 경로들은 유지 큐가 비어 있을 때만 도는데(기동 시점, `clear()`
+# 직후), 그래도 0으로 두지 않는 것은 순서를 코드 밖 사실에 의존하고 싶지 않아서다.
+#
+# 크게 잡으면 **3북 날에 이 고도화가 통째로 무력화된다**: 설계 구독은 (2*2+1)x2x3북 + 선물 +
+# KOSPI = 32/41이라 여유가 9뿐이고, 예약을 8로 두면 유지 가능 슬롯이 1이 된다. 2로 두면 3북
+# 날에도 7슬롯(행사가 3.5칸분)을 유지할 수 있고, 2북 날(08-07 실측 활성 21~22)에는 17슬롯이다.
+SUBSCRIPTION_RESERVED_SLOTS = 2
+
+
+class SubscriptionRetentionPool:
+    """
+    ATM 창을 벗어난 구독을 **슬롯이 남는 동안 유지**하고, 슬롯이 필요하면 오래된 것부터 버린다.
+
+    2026-08-07(운영점검 §B-1 / 고도화#1). 종전에는 창이 움직이는 즉시 해제했다. 08-07 실측:
+
+        ATM 롤 76회 / 287분 = 3.8분마다 1회, 그중 즉시 왕복 24회(31.6%)
+        WS 구독 요청 410건 / 해제 388건 — 반나절에 798회 갈아엎었다
+        BAFBRW980: 11:35:00 해제 → 11:36:59 재구독 → 11:42:59 또 해제
+
+    피해는 슬롯이 아니라 **1분봉의 연속성**이다. 해제된 종목은 그 구간 `market_raw_1m`에
+    행이 안 생기고, COCKPIT Flow Radar의 「봉 없음 N분」이 그것이다(08-07 8분). 유동성 공백이
+    아니라 **우리가 끊은 것**이다.
+
+    **히스테리시스를 넓히는 것으로는 못 고친다** — 08-07 롤 76회를 전수 검산하면 전부 임계
+    (2.5 x 0.75 = 1.875p)를 정당하게 넘었다. 오늘 지수가 1004~964~982(40p)를 오갔고 격자가
+    2.5p라 어떤 임계값을 써도 이 왕복은 남는다. 08-04 리플레이도 같은 결론이었다
+    (`db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES` 위 주석). 그래서 **롤을 줄이는 대신 롤의 대가를 없앤다.**
+
+    **왜 공짜에 가까운가**: WS 구독은 REST 페이서 예산을 1건도 안 쓴다. REST 폴링 대상은
+    `desired_strikes`(창)에서 나오므로(main.py `_reroll_books_to_spot` 주석) 유지된 구독은
+    체인 수집을 1콜도 늘리지 않는다. 비용은 슬롯뿐이고, 08-07 실측 활성은 21~22/41이었다.
+
+    **왜 매니저마다가 아니라 공용인가**: 세 북이 `KISWebSocketClient` 하나를 공유하므로 슬롯도
+    공유 자원이다. 북마다 예산을 나눠 주면 3북 날(31/41 사용)에는 북당 3슬롯이라 아무것도
+    유지하지 못하고, 2북 날(22/41)에는 놀리는 슬롯이 생긴다.
+    """
+
+    def __init__(self, ws_client: KISWebSocketClient, reserved_slots: int = SUBSCRIPTION_RESERVED_SLOTS) -> None:
+        self._ws = ws_client
+        self._reserved = reserved_slots
+        # 축출 순서 = 유지 큐에 들어온 순서(창을 벗어난 순서). OrderedDict가 곧 LRU다.
+        self._retained: OrderedDict[tuple[str, str], Subscription] = OrderedDict()
+        # 2026-08-07 고도화#2 — 롤의 **대가**. 마이그레이션 028 참고.
+        self._dropped = 0
+
+    @property
+    def retained(self) -> tuple[Subscription, ...]:
+        """유지 중(창 밖이지만 아직 구독 살아 있음)인 구독 — 오래된 것부터."""
+        return tuple(self._retained.values())
+
+    @property
+    def dropped_subscriptions(self) -> int:
+        """
+        슬롯이 모자라 **실제로 해제한** 구독 수(누적) — 2026-08-07 고도화#2의 대가 지표.
+
+        롤 횟수와 달리 이 값은 우리가 통제한다: 0이면 창은 따라갔는데 1분봉은 하나도 안 끊겼다는
+        뜻이다. `clear()`(재연결)는 이 값을 **리셋하지 않는다** — 하루치 누적이라야 대가를 잰다.
+        """
+        return self._dropped
+
+    def hold(self, sub: Subscription) -> bool:
+        """
+        입력: 창을 벗어난 구독.
+        계산: 해제하지 않고 유지 큐 **맨 뒤**에 넣는다. 실제 구독은 그대로 살아 있다.
+        해석: 반환값은 "유지했는가" — 활성 구독이 아니었으면(이미 해제됐거나 심볼 생성 실패)
+             유지할 것도 없으므로 False.
+        실패 조건: 없다.
+        """
+        key = (sub.tr_id, sub.tr_key)
+        if key not in self._ws.active_subscriptions:
+            return False
+        self._retained.pop(key, None)
+        self._retained[key] = sub
+        return True
+
+    def reclaim(self, sub: Subscription) -> bool:
+        """
+        입력: 창 안으로 다시 들어온 구독.
+        계산: 유지 큐에서 빼기만 한다 — **구독은 끊긴 적이 없으므로 재구독 메시지가 없다.**
+             즉시 왕복(08-07 31.6%)이 WS 트래픽도 1분봉 공백도 만들지 않게 되는 지점이다.
+        실패 조건: 없다. 유지 큐에 없으면 False(호출측이 새로 구독해야 한다).
+        """
+        return self._retained.pop((sub.tr_id, sub.tr_key), None) is not None
+
+    async def ensure_free(self, needed: int) -> None:
+        """
+        입력: 지금 새로 구독해야 하는 슬롯 수.
+        계산: `needed + reserved`만큼 빌 때까지 유지 큐의 **오래된 것부터** 실제로 해제한다.
+        해석: 유지 큐가 비면 더 버릴 게 없으므로 조용히 끝낸다 — 그때 슬롯이 모자라면
+             `subscribe()`가 ValueError를 던지고, 그건 창 설계가 슬롯 한도를 넘었다는 뜻이라
+             조용히 삼키면 안 되는 사고다(종전과 같은 동작).
+        실패 조건: 없다.
+        """
+        while self._retained:
+            free = self._ws.MAX_SUBSCRIPTIONS - len(self._ws.active_subscriptions)
+            if free >= needed + self._reserved:
+                return
+            _key, sub = self._retained.popitem(last=False)
+            await self._ws.unsubscribe(sub)
+            self._dropped += 1
+
+    def clear(self) -> None:
+        """
+        WS 재연결 시 호출 — 서버 쪽 구독 상태가 전부 초기화되므로 유지 큐도 의미를 잃는다.
+        `RollingSubscriptionManager.rebind()`가 `_desired_strikes`를 비우는 것과 같은 이유다:
+        살아 있다고 믿는 구독이 실제로는 없는 상태를 만들면 안 된다.
+        """
+        self._retained.clear()
+
+
 class RollingSubscriptionManager:
     """ATM 이동에 따라 WS 구독을 자동으로 롤링한다."""
 
@@ -90,8 +209,11 @@ class RollingSubscriptionManager:
         option_types: tuple[str, ...] = ("C", "P"),
         symbol_formatter=None,
         hysteresis_ratio: float = ATM_ROLL_HYSTERESIS_RATIO,
+        retention_pool: SubscriptionRetentionPool | None = None,
     ) -> None:
         self._ws = ws_client
+        # None이면 종전 동작(창을 벗어나는 즉시 해제) — 기존 테스트와 백테스트 경로가 그대로 돈다.
+        self._retention = retention_pool
         self._tr_id = tr_id
         self._strike_interval = strike_interval
         self._strikes_each_side = strikes_each_side
@@ -106,6 +228,11 @@ class RollingSubscriptionManager:
     @property
     def current_atm(self) -> float | None:
         return self._current_atm
+
+    @property
+    def retention_pool(self) -> SubscriptionRetentionPool | None:
+        """공용 구독 유지 풀(2026-08-07 고도화#1). 없으면 종전대로 즉시 해제하는 매니저다."""
+        return self._retention
 
     async def roll_to_spot(self, spot: float) -> None:
         """
@@ -129,17 +256,32 @@ class RollingSubscriptionManager:
         to_remove = self._desired_strikes - new_strikes
         to_add = new_strikes - self._desired_strikes
 
-        for strike in to_remove:
+        # 창을 벗어난 것: 유지 풀이 있으면 **해제하지 않고** 넘긴다(2026-08-07 고도화#1).
+        for strike in sorted(to_remove):
             for opt in self._option_types:
                 symbol = self._symbol_formatter(strike, opt)
-                if symbol is not None:
-                    await self._ws.unsubscribe(Subscription(self._tr_id, symbol))
+                if symbol is None:
+                    continue
+                sub = Subscription(self._tr_id, symbol)
+                if self._retention is None or not self._retention.hold(sub):
+                    await self._ws.unsubscribe(sub)
 
-        for strike in to_add:
+        # 창에 들어온 것: 유지 풀에 살아 있으면 회수만 하고(재구독 없음), 없는 것만 새로 구독한다.
+        fresh: list[Subscription] = []
+        for strike in sorted(to_add):
             for opt in self._option_types:
                 symbol = self._symbol_formatter(strike, opt)
-                if symbol is not None:
-                    await self._ws.subscribe(Subscription(self._tr_id, symbol))
+                if symbol is None:
+                    continue
+                sub = Subscription(self._tr_id, symbol)
+                if self._retention is not None and self._retention.reclaim(sub):
+                    continue
+                fresh.append(sub)
+
+        if fresh and self._retention is not None:
+            await self._retention.ensure_free(len(fresh))
+        for sub in fresh:
+            await self._ws.subscribe(sub)
 
         self._desired_strikes = new_strikes
         self._current_atm = atm_for_spot(spot, self._strike_interval)
@@ -160,6 +302,12 @@ class RollingSubscriptionManager:
         """
         self._ws = ws_client
         self._desired_strikes = set()
+        # 2026-08-07(고도화#1): 유지 큐도 비운다. 재연결은 서버 쪽 구독을 전부 날리므로
+        # "창 밖이지만 살아 있다"고 믿던 구독이 실제로는 없다 — 그대로 두면 `reclaim()`이
+        # 없는 구독을 회수했다고 판정해 **그 행사가가 새 연결에 영영 등록되지 않는다**
+        # (바로 아래 `_current_atm = None`이 막으려는 것과 같은 계열의 상태 불일치).
+        if self._retention is not None:
+            self._retention.clear()
         # 2026-08-04(Fix#6): 히스테리시스도 함께 초기화한다 — 안 그러면 재연결 직후
         # `should_roll_atm()`이 "이미 그 ATM이다"로 판정해 **새 연결에 구독을 하나도 안 보낸다**
         # (위 `_desired_strikes = set()`이 막으려던 바로 그 상태를 다른 경로로 다시 만든다).

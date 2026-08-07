@@ -3783,6 +3783,37 @@ def test_poll_account_balance_cycle_continues_after_failure(monkeypatch):
 # ===== 2026-07-30 운영점검 Fix#3: 스케줄 밀림 시 위상 격자 스냅 =====
 
 
+def test_grid_poll_minute_lifts_a_cycle_that_woke_just_before_the_boundary():
+    """2026-08-07 §A-1 / Fix#3 — 격자점 직전에 깬 사이클이 직전 분에 적재되던 것.
+
+    08-07 실측: option_analysis_1m의 07:30이 20행, **07:31이 0행**, 07:32가 20행이었다.
+    로그 축은 결손 0분(07:31:19에 rows=20으로 완주)이라 두 축이 어긋났다.
+    """
+    from mahdi.main import _grid_poll_minute
+
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 30, 59, 900_000)) == datetime(2026, 8, 7, 7, 31)
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 30, 58, 100_000)) == datetime(2026, 8, 7, 7, 31)
+
+
+def test_grid_poll_minute_floors_everything_outside_the_snap_window():
+    """스냅 폭 밖은 그대로 내려깎는다 — 늦게 시작한 사이클을 **없는 미래**로 밀면 안 된다."""
+    from mahdi.main import _grid_poll_minute
+
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 31, 0)) == datetime(2026, 8, 7, 7, 31)
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 31, 0, 500)) == datetime(2026, 8, 7, 7, 31)
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 31, 30)) == datetime(2026, 8, 7, 7, 31)
+    # 경계 정확히 2.0초 전은 스냅 대상(<=), 2.1초 전은 아니다.
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 31, 58)) == datetime(2026, 8, 7, 7, 32)
+    assert _grid_poll_minute(datetime(2026, 8, 7, 7, 31, 57, 900_000)) == datetime(2026, 8, 7, 7, 31)
+
+
+def test_grid_poll_minute_snap_window_is_far_below_the_poll_interval():
+    """스냅 폭이 폴링 주기에 가까워지면 사이클의 분 라벨이 통째로 한 칸 밀린다."""
+    from mahdi.main import OPTION_CHAIN_POLL_INTERVAL_SECONDS, POLL_TIME_BOUNDARY_SNAP_SECONDS
+
+    assert 0 < POLL_TIME_BOUNDARY_SNAP_SECONDS <= OPTION_CHAIN_POLL_INTERVAL_SECONDS / 10
+
+
 def test_advance_fixed_tick_first_cycle_schedules_one_full_interval():
     # 2026-07-31 §4 우선순위 5: 첫 틱은 "지금 + 주기"가 아니라 **벽시계 격자의 다음 지점**이다.
     # 정확히 격자 위(09:00:00, 위상 0초·주기 60초)면 이중 실행을 피해 한 주기 뒤를 잡는다.

@@ -623,6 +623,80 @@ def test_chain_snapshot_bounds_freshness_and_expiry():
     )
 
 
+def _chain_row(strike, option_type, expiry, ts):
+    """`_CHAIN_SNAPSHOT_SQL` 컬럼 순서 그대로의 한 행 — 창 자르기 테스트에서 값은 무관하다."""
+    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15)
+
+
+def test_chain_snapshot_drops_strikes_outside_the_latest_cycle_window():
+    """2026-08-07 §B-2 / Fix#1 — ATM 롤로 창을 벗어난 행사가는 이월이 아니라 유령이다.
+
+    08-07 실측: 장중 202분 중 157분(78%)이 서로 다른 두 개 이상의 ATM 창을 섞어 GEX를 냈다.
+    GEX는 OI 가중 합이라 행사가가 늘면 |GEX|가 부풀고, 그 값이 v6 §11.4 프리미엄 매도 게이트의
+    입력이다.
+    """
+    expiry, old, new = date(2026, 8, 13), datetime(2026, 8, 7, 9, 58), datetime(2026, 8, 7, 10, 0)
+    rows = [
+        _chain_row(970.0, "C", expiry, old),   # 롤 전 창의 아래끝 — 떨어져야 한다
+        _chain_row(975.0, "C", expiry, new),
+        _chain_row(977.5, "C", expiry, new),
+        _chain_row(980.0, "C", expiry, new),
+        _chain_row(985.0, "C", expiry, old),   # 롤 전 창의 위끝 — 떨어져야 한다
+    ]
+
+    chain = db.latest_option_chain(FakeReadConnection(rows), "KOSPI200")
+
+    assert [leg["strike"] for leg in chain] == [975.0, 977.5, 980.0]
+
+
+def test_chain_snapshot_keeps_carried_over_legs_inside_the_window():
+    """범위(min~max)로 자르지 집합으로 자르지 않는다 — 안쪽 구멍은 이월로 메워야 한다.
+
+    레그 단위 ReadTimeout은 08-06에 옵션체인 실패 119건 중 111건이었다. 집합으로 자르면 그
+    분의 먼슬리가 설계(10레그) 미만으로 떨어진다(08-07 리플레이 327분 중 1분).
+    """
+    expiry, old, new = date(2026, 8, 13), datetime(2026, 8, 7, 9, 59), datetime(2026, 8, 7, 10, 0)
+    rows = [
+        _chain_row(975.0, "C", expiry, new),
+        _chain_row(977.5, "C", expiry, old),   # 이번 사이클에 실패 → 직전 값 이월. 범위 안이므로 살린다
+        _chain_row(980.0, "C", expiry, new),
+    ]
+
+    chain = db.latest_option_chain(FakeReadConnection(rows), "KOSPI200")
+
+    assert [leg["strike"] for leg in chain] == [975.0, 977.5, 980.0]
+    assert chain[1]["timestamp"] == old
+
+
+def test_chain_snapshot_cuts_each_expiry_by_its_own_window():
+    """북마다 폴링 주기(먼슬리 매분 / 위클리 격분)와 창이 다르므로 만기별로 따로 자른다."""
+    monthly, weekly = date(2026, 8, 13), date(2026, 8, 10)
+    t0, t1 = datetime(2026, 8, 7, 9, 58), datetime(2026, 8, 7, 10, 0)
+    rows = [
+        _chain_row(970.0, "C", monthly, t0),   # 먼슬리 최신은 t1 → 범위 밖, 탈락
+        _chain_row(977.5, "C", monthly, t1),
+        _chain_row(980.0, "C", monthly, t1),
+        _chain_row(970.0, "C", weekly, t0),    # 위클리 최신은 t0 → 이 행이 창을 정의한다, 생존
+        _chain_row(972.5, "C", weekly, t0),
+    ]
+
+    chain = db.latest_option_chain(FakeReadConnection(rows), "KOSPI200")
+
+    assert {(leg["expiry"], leg["strike"]) for leg in chain} == {
+        (monthly, 977.5), (monthly, 980.0), (weekly, 970.0), (weekly, 972.5),
+    }
+
+
+def test_chain_snapshot_window_cut_does_not_change_the_sql_bounds():
+    """창 자르기는 **행사가축**에만 건다 — 5분 신선도 창(시간축)은 결손 이월을 위해 그대로다."""
+    conn = FakeReadConnection([])
+    as_of = datetime(2026, 8, 7, 13, 0)
+
+    db.option_chain_as_of(conn, "KOSPI200", as_of)
+
+    assert conn.store["params"][2] == as_of - timedelta(minutes=db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES)
+
+
 def test_latest_option_chain_uses_same_bounds_as_backtest_path(monkeypatch):
     # 라이브와 백테스트가 다른 체인을 보면 백테스트 결과를 라이브에 적용할 수 없다.
     now = datetime(2026, 8, 3, 13, 0)
@@ -908,11 +982,11 @@ def test_upsert_ws_status_writes_the_singleton_row():
     assert conn.store["params"][0] is True  # id
 
 
-def test_latest_ws_status_returns_all_six_signals():
+def test_latest_ws_status_returns_all_seven_signals():
     conn = FakeReadConnection(
         [(
             datetime(2026, 8, 3, 15, 43), datetime(2026, 8, 3, 7, 31), datetime(2026, 8, 3, 15, 33), 0,
-            datetime(2026, 8, 3, 7, 31, 4), 77,
+            datetime(2026, 8, 3, 7, 31, 4), 77, 4,
         )]
     )
     state = db.latest_ws_status(conn)
@@ -925,6 +999,8 @@ def test_latest_ws_status_returns_all_six_signals():
     assert state["market_op_subscribed_at"] == datetime(2026, 8, 3, 7, 31, 4)
     # 2026-08-05 P2-12(마이그레이션 026) — 관측 연속성의 선행지표. 08-05 실측 77회.
     assert state["atm_roll_count_today"] == 77
+    # 2026-08-07 고도화#2(마이그레이션 028) — 그 롤이 실제로 끊은 구독 수. 판정은 이쪽으로 옮겼다.
+    assert state["atm_roll_dropped_subs_today"] == 4
 
 
 def test_latest_ws_status_keeps_unknown_atm_roll_count_as_none():
@@ -934,9 +1010,12 @@ def test_latest_ws_status_keeps_unknown_atm_roll_count_as_none():
     스키마 정합성 배지가 따로 경고한다.
     """
     conn = FakeReadConnection(
-        [(datetime(2026, 8, 3, 15, 43), None, None, 0, None, None)]
+        [(datetime(2026, 8, 3, 15, 43), None, None, 0, None, None, None)]
     )
-    assert db.latest_ws_status(conn)["atm_roll_count_today"] is None
+    state = db.latest_ws_status(conn)
+    assert state["atm_roll_count_today"] is None
+    # 2026-08-07 고도화#2 — 028 미적용 구간도 같다. "안 셌다"와 "대가가 0이었다"는 정반대다.
+    assert state["atm_roll_dropped_subs_today"] is None
 
 
 def test_latest_ws_status_returns_none_when_observation_loop_never_ran():

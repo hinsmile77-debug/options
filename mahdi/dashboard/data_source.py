@@ -579,7 +579,26 @@ _OVERRUN_COUNT_WARNING = 30  # 07-31 실측 46건. 페이서 분리 재개 조�
 # 중간점 근처에서 오간 결과다(11:55 1035~1045 → 11:57 되돌림 → 12:01 재이동이 로그에 그대로 있다).
 # 롤 로직에 히스테리시스가 없어서 생기는 현상인데, 그 수정은 구독 정책 변경이라 별건이다
 # ([[NEXT_TODO]]) — 먼저 **보이게** 만든다. 며칠 실측이 쌓이면 이 값을 조정할 것.
+# 2026-08-07(운영점검 §B-1 / 고도화#2) — **이 임계는 이제 판정에 안 쓴다.**
+#
+# 08-05의 위 주석은 "20을 넘는 것은 방향성 이동이 아니라 중간점 근처에서 오간 결과"라고 적었다.
+# 08-07에 롤 76회를 **전수 검산**했더니 그 추정이 틀렸다 — 전부 히스테리시스 임계(2.5 x 0.75 =
+# 1.875p)를 정당하게 넘었고, 그날 지수는 1004~964~982(40p)를 움직였다. 격자가 2.5p인 이상
+# 어떤 임계값을 써도 이 왕복은 남는다(08-04 리플레이도 같은 결론이었다).
+#
+# 즉 **롤 횟수는 시장 변동성의 함수라 우리가 통제할 수 없고, 통제 못 하는 값에 임계를 걸면
+# 변동성 있는 날마다 울리는 상시 경고가 된다.** 우리가 통제하는 것은 그 롤이 구독을 실제로
+# 끊었는가이고(고도화#1의 유지 풀), 판정은 아래 `_ATM_ROLL_DROPPED_WARNING`으로 옮겼다.
+# 이 값은 마이그레이션 028 미적용 구간의 **대리 지표**로만 남는다.
 _ATM_ROLL_WARNING = 20
+# 롤 때문에 실제로 해제된 WS 구독 수의 경고 임계. **0이 목표 상태다.**
+#
+# 0이 아니라 4인 이유: 스팟이 창 폭(±2칸 = 5p)만큼 한 번에 뛰면 유지 풀이 어차피 전량 축출되고,
+# 그건 결함이 아니라 시장이다. 4 = 행사가 2칸분(칸당 콜/풋 2건) — 그 정도의 급변은 하루에 몇 번
+# 있을 수 있다. 이 값을 넘으면 슬롯이 구조적으로 모자란 것이므로 `STRIKES_EACH_SIDE`나
+# 예약 슬롯을 다시 봐야 한다. **잠정치다** — 며칠 실측이 쌓이면 조정한다(08-05에 20을 잠정치로
+# 두고 이틀 만에 근거가 틀린 것으로 드러난 전례가 바로 위에 있다).
+_ATM_ROLL_DROPPED_WARNING = 4
 # WS 하트비트(mahdi.main.WS_HEARTBEAT_SECONDS=300초)의 2배. CB 하트비트와 같은 기준이다.
 _WS_HEARTBEAT_STALE_SECONDS = 600.0
 
@@ -665,6 +684,33 @@ def _market_halt_check(conn) -> HealthCheck:
             label, "warning",
             f"H0UNMKO0 구독 미성립 — 하트비트는 정상({status['updated_at']:%H:%M:%S})이지만 감지기가 "
             f"장운영정보에 붙어 있지 않다{seen_text}",
+        )
+    # 2026-08-07(운영점검 §A-3 / Fix#6) — **"구독은 됐다"를 "정상"이라고 쓰지 않는다.**
+    #
+    # 08-03에 (C)의 빈 칸을 메우려고 구독 성립 판정을 넣었는데, 그것으로도 안 채워지는 칸이
+    # 하나 남았다: 구독이 성립해도 **데이터가 실제로 오는지는 여전히 모른다.** 07-05 이후 넉 달
+    # 동안 `market_halt_event_history`는 0행이고 그동안 이 배지는 계속 초록이었다.
+    #
+    # 하루치 수신 0건에는 임계를 걸 수 없다(정상일에도 0~2건 — 07-31 1건 / 08-03 0건 / 08-07 0건).
+    # 하지만 **누적 0건**은 다른 사실이다: 그건 "오늘 조용했다"가 아니라 "이 경로가 살아 있는 것을
+    # 한 번도 본 적이 없다"이고, 그 상태를 초록으로 칠하면 **검증 안 된 것을 검증됐다고 말하는 것**
+    # 이다(07-30에 CB 배지에서 이미 한 번 겪은 실수의 다른 얼굴이다).
+    #
+    # 경고(warning)가 아니라 정보(info)인 이유: 이상이 있다는 증거도 없다. 진짜로 CB가 넉 달간
+    # 없었을 수 있다(그게 가장 그럴듯하다). **모르는 것을 모른다고 쓴다.**
+    try:
+        ever_seen = db.market_halt_message_ever_received(conn)
+    except Exception:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        logger.warning("장운영정보 누적 수신 이력 조회 실패 — 나머지 판정은 계속한다", exc_info=True)
+        ever_seen = True  # 못 읽었으면 판정을 덧붙이지 않는다(없는 경고를 만들지 않는다).
+    if not ever_seen and status["mkop_cls_code"] is None:
+        return HealthCheck(
+            label, "info",
+            f"미검증 — 구독은 성립했지만 장운영정보 수신 이력이 **누적 0건**이라 이 경로가 살아 "
+            f"있다는 증거가 아직 없다(CB가 실제로 없었을 수도 있다). 관측루프 "
+            f"{status['updated_at']:%H:%M:%S}{subscribed_text}",
         )
     if status["mkop_cls_code"] is None:
         return HealthCheck(
@@ -956,14 +1002,34 @@ def _atm_roll_churn_check(conn, now: datetime) -> HealthCheck:
             "집계 전 — 이 값을 세는 관측 루프가 아직 안 떴습니다(마이그레이션 026 미적용이거나 구 코드 실행 중)",
             group="관측 품질",
         )
-    detail = f"{count}회 — 롤마다 창을 벗어난 종목의 1분봉이 끊긴다(Flow Radar 공백의 원인)"
-    if count >= _ATM_ROLL_WARNING:
+    # 2026-08-07(고도화#2) — **판정은 롤 횟수가 아니라 그 롤이 실제로 끊은 구독 수로 한다.**
+    # 근거는 `_ATM_ROLL_WARNING` 위 주석과 마이그레이션 028. 요약: 08-07에 롤 76회를 전수
+    # 검산했더니 전부 히스테리시스 임계를 정당하게 넘은 것이었고(그날 지수 40p 이동), 롤 횟수는
+    # 시장 변동성의 함수라 우리가 통제할 수 없다. 통제 대상은 대가다.
+    # `.get()`인 이유: 마이그레이션 028 이전에 만들어진 `latest_ws_status()` 반환 dict에는 이 키
+    # 자체가 없을 수 있다(구 코드가 만든 dict를 넘겨받는 테스트 더블·호출 경로). 키 없음도
+    # 값 None과 같은 뜻 — "아직 안 셌다"이고, 0("대가가 없었다")과 구분해야 한다.
+    dropped = status.get("atm_roll_dropped_subs_today")
+    detail = f"{count}회"
+    if dropped is None:
+        # 마이그레이션 028 미적용이거나 구 코드 실행 중 — 026 때와 같은 이유로 0으로 지어내지
+        # 않는다. 이 경우에만 종전 임계(횟수)로 판정한다: 대가를 못 재면 대리 지표라도 봐야 한다.
+        detail += " · 끊긴 구독 수 집계 전(마이그레이션 028 미적용이거나 구 코드 실행 중)"
+        level = "warning" if count >= _ATM_ROLL_WARNING else "ok"
+        return HealthCheck(label, level, detail, group="관측 품질")
+    detail += f" · 그 때문에 실제로 끊긴 WS 구독 {dropped}건"
+    if dropped > _ATM_ROLL_DROPPED_WARNING:
         return HealthCheck(
             label, "warning",
-            f"{detail} · 임계 {_ATM_ROLL_WARNING}회 초과 — 히스테리시스 없이 격자 중간점을 오가는지 확인",
+            f"{detail} — 슬롯이 모자라 유지 풀이 축출했다(끊긴 구간은 그 종목 1분봉이 빈다). "
+            f"임계 {_ATM_ROLL_DROPPED_WARNING}건",
             group="관측 품질",
         )
-    return HealthCheck(label, "ok", detail, group="관측 품질")
+    return HealthCheck(
+        label, "ok",
+        f"{detail} — 창은 따라갔지만 1분봉은 안 끊겼다(구독 유지 풀, 2026-08-07 고도화#1)",
+        group="관측 품질",
+    )
 
 
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:

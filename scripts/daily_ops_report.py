@@ -37,6 +37,11 @@ logger = logging.getLogger("mahdi.daily_ops_report")
 LOG_DIR = PROJECT_ROOT / "logs"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "docs" / "동작점검" / "auto"
 
+# 2026-08-07 고도화#5 — §14-3 멤버 부호 일치율을 나란히 볼 직전 영업일 수.
+# 3인 이유: 하루치로는 "갈렸다"와 "부호가 뒤집혀 있다"를 구분할 수 없고, 그 이상 늘리면
+# 표가 옆으로 넘쳐 사람이 안 읽는다. 판정 자체는 사람이 하므로 **보이기만 하면 된다.**
+MEMBER_SIGN_HISTORY_DAYS = 3
+
 
 def build(target: date, out_dir: Path, use_db: bool) -> Path:
     """
@@ -67,13 +72,23 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
         except Exception:
             logger.warning("DB 집계 실패 — 로그 지표만으로 리포트를 낸다", exc_info=True)
 
-    previous = None
-    prev_path = out_dir / f"{log_metrics.previous_business_day(target).isoformat()}_지표.json"
-    if prev_path.exists():
+    # 2026-08-07 고도화#5 — 전일 하나가 아니라 **직전 영업일들**을 읽는다.
+    # `previous`(전일 대비 델타)와 `history`(추세 판정)는 다른 질문이다: 하루치 변화로는
+    # 멤버 부호 일치율이 "갈렸다"인지 "뒤집혀 있다"인지 구분할 수 없다(§14-3).
+    history: list[dict] = []
+    day = target
+    for _ in range(MEMBER_SIGN_HISTORY_DAYS):
+        day = log_metrics.previous_business_day(day)
+        path = out_dir / f"{day.isoformat()}_지표.json"
+        if not path.exists():
+            continue  # 공휴일/미가동일 — 건너뛰되 더 거슬러 올라가지는 않는다(창은 영업일 고정).
         try:
-            previous = json.loads(prev_path.read_text(encoding="utf-8"))
+            history.append(json.loads(path.read_text(encoding="utf-8")))
         except Exception:
-            logger.warning("전일 지표 사이드카 읽기 실패 — 델타를 생략한다", exc_info=True)
+            logger.warning("%s 지표 사이드카 읽기 실패 — 그날은 비운다", day, exc_info=True)
+    previous = history[0] if history and str(history[0].get("date")) == str(
+        log_metrics.previous_business_day(target)
+    ) else None
 
     hypothesis_results = None
     try:
@@ -97,7 +112,10 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
 
     md_path = out_dir / f"{target.isoformat()}_지표.md"
     md_path.write_text(
-        report.render(metrics, previous=previous, db_metrics=db_metrics_result, hypotheses=hypothesis_results),
+        report.render(
+            metrics, previous=previous, db_metrics=db_metrics_result,
+            hypotheses=hypothesis_results, history=history,
+        ),
         encoding="utf-8",
     )
     return md_path

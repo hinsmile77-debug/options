@@ -121,7 +121,25 @@ class SignalFusionEngine:
             # 2026-08-06 고도화#2 — **여기에는 `effective_member_count`를 넣지 않는다.**
             # 이 값은 확신도의 분모이고(v6 §11.3), 정의를 바꾸면 그날부터 확신도 시계열이
             # 과거와 비교 불가능해진다. 이 fix는 **재기만 한다** — 며칠 쌓고 사람이 정한다.
-            available_member_count=conflict.available_member_count,
+            #
+            # 2026-08-07 고도화#3 — **레버를 만들되 내려 둔다**(08-06 고도화#4와 같은 방식).
+            # 08-07 실측: 가용 평균 3.16 vs 실질 2.15(죽은 축 1.02) — 확신도의 분모가 매일
+            # 47% 과대평가돼 있다. `regime_hmm`이 212분 전량 중립이었기 때문이고, 그 원인은
+            # 레짐이 24영업일 연속 한 상태라는 것이다(학습 미완).
+            #
+            # **지금 켜지 않는 이유**: (a) 정의를 바꾸면 그날부터 확신도 시계열이 과거와 비교
+            # 불가가 된다 (b) 08-10 HMM 재학습으로 `regime_hmm`이 살아나면 격차가 저절로 줄어,
+            # 그때 켜는 것이 전환 비용이 가장 작다 (c) 재학습과 분모 변경을 같은 날 하면
+            # 확신도 변화를 둘 중 무엇이 만들었는지 영영 못 가른다.
+            #
+            # **켜는 방법**: `strategy_params`의 `use_effective_member_count: true`.
+            # **켜는 시점**: 08-10 재학습 후 `regime_hmm`이 비영 점수를 내는 것을 확인한 **다음
+            # 영업일**(재학습 효과와 분리하기 위해). 그때 `hypotheses.yaml`에 예측을 먼저 적는다.
+            available_member_count=(
+                conflict.effective_member_count
+                if self._params.get("use_effective_member_count", False)
+                else conflict.available_member_count
+            ),
             recent_slippage_elevated=meta_context.recent_slippage_elevated,
             gamma_regime_stable=meta_context.gamma_regime_stable,
             foreign_flow_aligned=foreign_flow_aligned,

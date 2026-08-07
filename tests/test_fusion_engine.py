@@ -124,3 +124,58 @@ def test_engine_logs_again_when_member_availability_changes(caplog):
     records = [r for r in caplog.records if "판단 형태 전이" in r.getMessage()]
     assert len(records) == 2
     assert "직전 가용멤버" in records[1].getMessage()
+
+
+# ==========================================================================================
+# 2026-08-07 고도화#3 — 확신도 분모를 「실질 멤버 수」로 바꾸는 레버 (지금은 내려져 있다)
+# ==========================================================================================
+
+
+def _dead_axis_inputs():
+    """`regime_hmm`이 중립(0점)인 상태 — 08-07 실측 212분 전량이 이랬다.
+
+    레짐이 24영업일 연속 한 상태(학습 미완)라 방향 점수가 안 나온다. 그래도 `available`은
+    그 멤버를 세므로 확신도의 분모가 부풀려진다.
+    """
+    return SignalInputs(
+        regime_state=_regime_state(RegimeLabel.RANGE_BALANCED, prob=1.0),
+        gex=-1000.0, gamma_flip=100.0, spot=105.0,
+        ofi=5.0, queue_imbalance=0.3, foreign_net_flow=500.0,
+    )
+
+
+def test_effective_member_count_lever_is_down_by_default():
+    """켜지 않은 상태에서는 08-06까지와 **1비트도 다르지 않아야** 한다.
+
+    이 값은 확신도의 분모라(v6 §11.3) 정의를 바꾸면 그날부터 시계열이 과거와 비교 불가가 된다.
+    """
+    inputs = _dead_axis_inputs()
+    base = SignalFusionEngine(strategy_params=_STRATEGY_PARAMS).evaluate(inputs, MetaLabelContext())
+    explicit_off = SignalFusionEngine(
+        strategy_params={**_STRATEGY_PARAMS, "use_effective_member_count": False}
+    ).evaluate(inputs, MetaLabelContext())
+
+    assert base.conviction_score == explicit_off.conviction_score
+    assert base.available_member_count == explicit_off.available_member_count
+    assert base.available_member_count >= base.effective_member_count
+
+
+def test_effective_member_count_lever_changes_the_confidence_denominator_when_raised():
+    """올리면 죽은 축이 분모에서 빠진다 — 08-10 재학습 **다음** 영업일에 켠다.
+
+    재학습과 같은 날 켜면 확신도 변화를 둘 중 무엇이 만들었는지 영영 못 가른다.
+    """
+    inputs = _dead_axis_inputs()
+    off = SignalFusionEngine(strategy_params=_STRATEGY_PARAMS).evaluate(inputs, MetaLabelContext())
+    on = SignalFusionEngine(
+        strategy_params={**_STRATEGY_PARAMS, "use_effective_member_count": True}
+    ).evaluate(inputs, MetaLabelContext())
+
+    # 기록되는 두 계측값 자체는 레버와 무관하게 그대로다(둘의 차이가 곧 죽은 축의 수다).
+    assert on.available_member_count == off.available_member_count
+    assert on.effective_member_count == off.effective_member_count
+    # 전제를 조건문이 아니라 단언으로 둔다 — 죽은 축이 사라지면 이 테스트는 **깨져야** 한다
+    # (조건문으로 두면 레버가 아무것도 안 하게 돼도 조용히 통과한다).
+    assert off.available_member_count > off.effective_member_count, "죽은 축이 없으면 이 시나리오가 아니다"
+    # 죽은 축이 분모에서 빠지므로 확신도가 올라간다(4개 중 3개 동조 → 3개 중 3개 동조).
+    assert on.conviction_score > off.conviction_score
