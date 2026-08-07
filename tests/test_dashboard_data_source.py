@@ -958,6 +958,7 @@ def test_atm_roll_churn_check_no_longer_warns_on_roll_count_alone(monkeypatch):
     그날 지수가 40p를 움직였다. 통제 못 하는 값에 임계를 걸면 상시 경고가 되고, 상시 경고는
     곧 안 읽는 경고다.
     """
+    monkeypatch.setattr("mahdi.dashboard.data_source._live_book_count", lambda conn: 2)
     monkeypatch.setattr(
         "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(77, dropped=0)
     )
@@ -969,16 +970,51 @@ def test_atm_roll_churn_check_no_longer_warns_on_roll_count_alone(monkeypatch):
     assert "0건" in check.detail
 
 
-def test_atm_roll_churn_check_warns_when_rolls_actually_dropped_subscriptions(monkeypatch):
-    """판정 축은 **끊긴 구독 수**다 — 그것이 Flow Radar 공백의 직접 원인이고 우리가 통제한다."""
+def test_atm_roll_churn_check_warns_when_the_pool_is_not_doing_its_job(monkeypatch):
+    """판정 축은 끊긴 구독의 **절대 건수가 아니라 롤·북당 비율**이다.
+
+    08-07 커밋 직후 선물 1분봉 300개(스팟 41.75p = 행사가 17칸 이동)를 실제 풀에 흘려보내
+    절대 건수 임계 4가 25~100배 틀렸다는 것을 확인했다 — 끊긴 구독은 스팟 이동거리의 함수다.
+    풀 없이 돌 때의 값은 북 수와 무관하게 롤·북당 **2.42**로 고정된다.
+    """
+    monkeypatch.setattr("mahdi.dashboard.data_source._live_book_count", lambda conn: 2)
     monkeypatch.setattr(
-        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(30, dropped=12)
+        # 롤 96회 x 2북 x 2.42 ≈ 464 — 유지 풀이 없을 때의 값이다.
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(96, dropped=464)
     )
 
     check = _atm_roll_churn_check(object(), _NOW)
 
     assert check.status == "warning"
-    assert "12건" in check.detail
+    assert "2.42" in check.detail
+
+
+def test_atm_roll_churn_check_is_ok_when_the_pool_absorbs_the_round_trips(monkeypatch):
+    """08-07 리플레이 실측: 2북 유지 풀 ON(예약 2)은 롤 96회에 끊긴 구독 97건 = 롤·북당 0.51."""
+    monkeypatch.setattr("mahdi.dashboard.data_source._live_book_count", lambda conn: 2)
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(96, dropped=97)
+    )
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "ok"
+    assert "0.51" in check.detail
+    # 롤 횟수가 임계(20)를 크게 넘어도 초록인 것이 이 고도화의 목표 상태다.
+    assert "96회" in check.detail
+
+
+def test_atm_roll_churn_check_holds_the_ratio_verdict_without_a_book_count(monkeypatch):
+    """북 수를 못 읽으면 비율을 지어내지 않는다 — 판정을 보류한다."""
+    monkeypatch.setattr("mahdi.dashboard.data_source._live_book_count", lambda conn: 0)
+    monkeypatch.setattr(
+        "mahdi.dashboard.data_source.db.latest_ws_status", lambda conn: _ws_status(96, dropped=97)
+    )
+
+    check = _atm_roll_churn_check(object(), _NOW)
+
+    assert check.status == "ok"
+    assert "보류" in check.detail
 
 
 def test_atm_roll_churn_check_falls_back_to_roll_count_before_migration_028(monkeypatch):

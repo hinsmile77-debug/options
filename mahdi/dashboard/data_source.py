@@ -591,14 +591,28 @@ _OVERRUN_COUNT_WARNING = 30  # 07-31 실측 46건. 페이서 분리 재개 조�
 # 끊었는가이고(고도화#1의 유지 풀), 판정은 아래 `_ATM_ROLL_DROPPED_WARNING`으로 옮겼다.
 # 이 값은 마이그레이션 028 미적용 구간의 **대리 지표**로만 남는다.
 _ATM_ROLL_WARNING = 20
-# 롤 때문에 실제로 해제된 WS 구독 수의 경고 임계. **0이 목표 상태다.**
+# 롤이 실제로 끊은 구독의 경고 임계 — **롤 1회·북 1개당** 몇 건인가.
 #
-# 0이 아니라 4인 이유: 스팟이 창 폭(±2칸 = 5p)만큼 한 번에 뛰면 유지 풀이 어차피 전량 축출되고,
-# 그건 결함이 아니라 시장이다. 4 = 행사가 2칸분(칸당 콜/풋 2건) — 그 정도의 급변은 하루에 몇 번
-# 있을 수 있다. 이 값을 넘으면 슬롯이 구조적으로 모자란 것이므로 `STRIKES_EACH_SIDE`나
-# 예약 슬롯을 다시 봐야 한다. **잠정치다** — 며칠 실측이 쌓이면 조정한다(08-05에 20을 잠정치로
-# 두고 이틀 만에 근거가 틀린 것으로 드러난 전례가 바로 위에 있다).
-_ATM_ROLL_DROPPED_WARNING = 4
+# 처음엔 절대 건수 4로 잡았다("0이 목표"). 커밋 직후 08-07 선물 1분봉 300개(스팟 964.70~1006.45,
+# 41.75p = 행사가 17칸)를 실제 유지 풀에 흘려보내 그 값이 **25~100배 틀렸다**는 것을 확인했다:
+#
+#   구성                      WS 메시지(구독+해제)   구독분    끊긴 구독   롤·북당
+#   2북 유지 풀 OFF                  948            6,000       464       2.42
+#   2북 유지 풀 ON(예약 2)           231 (-76%)    10,878 (+81%)  97       0.51
+#   3북 유지 풀 OFF                1,422            9,000       696       2.42
+#   3북 유지 풀 ON(예약 2)           975 (-31%)    11,052 (+23%) 469       1.63
+#   3북 유지 풀 ON(예약 8)         1,421 ( -0%)     9,294 ( +3%) 695       2.41  ← 예약이 크면 무효
+#
+# **절대 건수는 스팟 이동거리의 함수라 통제 대상이 아니다** — 롤 횟수에 임계를 걸었다가 틀린
+# 것과 정확히 같은 실수를, 같은 배지에서 두 번 할 뻔했다. 유지 풀이 없을 때의 값은 북 수와
+# 무관하게 **롤·북당 2.42**로 고정되며(롤 1회 = 행사가 1칸 = 콜/풋 2건이 창을 벗어남), 풀이
+# 일하면 그 아래로 내려간다. 그래서 **정규화한 비율**에 임계를 건다.
+#
+# 2.0의 근거: 위 실측에서 풀이 일한 두 구성(0.51 / 1.63)은 전부 그 아래이고, 풀이 무력화된 세
+# 구성(2.42 / 2.42 / 2.41)은 전부 그 위다. 즉 이 임계는 "얼마나 잘하나"가 아니라
+# **"풀이 아예 일을 안 하고 있나"** 를 판정한다 — 그것이 지금 확실히 아는 유일한 경계다.
+# 여전히 잠정치이며, 며칠 쌓이면 그때 다시 본다.
+_ATM_ROLL_DROPPED_PER_ROLL_PER_BOOK_WARNING = 2.0
 # WS 하트비트(mahdi.main.WS_HEARTBEAT_SECONDS=300초)의 2배. CB 하트비트와 같은 기준이다.
 _WS_HEARTBEAT_STALE_SECONDS = 600.0
 
@@ -1018,18 +1032,49 @@ def _atm_roll_churn_check(conn, now: datetime) -> HealthCheck:
         level = "warning" if count >= _ATM_ROLL_WARNING else "ok"
         return HealthCheck(label, level, detail, group="관측 품질")
     detail += f" · 그 때문에 실제로 끊긴 WS 구독 {dropped}건"
-    if dropped > _ATM_ROLL_DROPPED_WARNING:
+    # 절대 건수는 스팟 이동거리의 함수다 — **롤 1회·북 1개당**으로 정규화해야 판정이 성립한다.
+    # 근거는 `_ATM_ROLL_DROPPED_PER_ROLL_PER_BOOK_WARNING` 위 실측표.
+    books = _live_book_count(conn)
+    if not count or not books:
+        return HealthCheck(label, "ok", f"{detail} (아직 롤이 없어 비율 판정 보류)", group="관측 품질")
+    per_roll_per_book = dropped / (count * books)
+    detail += f" = 롤·북당 {per_roll_per_book:.2f}건 (북 {books}개)"
+    if per_roll_per_book >= _ATM_ROLL_DROPPED_PER_ROLL_PER_BOOK_WARNING:
         return HealthCheck(
             label, "warning",
-            f"{detail} — 슬롯이 모자라 유지 풀이 축출했다(끊긴 구간은 그 종목 1분봉이 빈다). "
-            f"임계 {_ATM_ROLL_DROPPED_WARNING}건",
+            f"{detail} — **유지 풀이 일을 못 하고 있다.** 풀 없이 돌 때의 값이 2.42이고 지금이 "
+            f"그 근처다(임계 {_ATM_ROLL_DROPPED_PER_ROLL_PER_BOOK_WARNING}). 예약 슬롯이 너무 크거나 "
+            f"북 수 대비 `MAX_SUBSCRIPTIONS` 여유가 없는 것이다",
             group="관측 품질",
         )
     return HealthCheck(
         label, "ok",
-        f"{detail} — 창은 따라갔지만 1분봉은 안 끊겼다(구독 유지 풀, 2026-08-07 고도화#1)",
+        f"{detail} — 유지 풀이 왕복분을 흡수하고 있다(풀 없이는 2.42, 2026-08-07 고도화#1)",
         group="관측 품질",
     )
+
+
+def _live_book_count(conn) -> int:
+    """
+    계산: 오늘 옵션체인이 실제로 수집한 **만기 북 수**(1~3).
+    해석: 2026-08-07 고도화#2 후속. 끊긴 구독 수를 정규화하려면 북 수가 필요한데, 그 값은
+         날마다 다르다 — 위클리(목) 만기가 먼슬리와 같은 날이면 2북, 아니면 3북이다.
+         상수로 박으면 그 날에 판정이 조용히 틀린다.
+    실패 조건: 조회 실패/행 없음은 0 — 호출측이 비율 판정을 보류한다(지어내지 않는다).
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(DISTINCT expiry) FROM option_analysis_1m WHERE timestamp::date=%s",
+                (db.local_now().date(),),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] else 0
+    except Exception:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        logger.warning("북 수 조회 실패 — 롤 대가 비율 판정을 보류한다", exc_info=True)
+        return 0
 
 
 def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
