@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from mahdi.ops import report
 
 _TODAY = {
@@ -529,7 +531,7 @@ def test_member_score_pairs_show_the_previous_business_days():
     assert "2026-08-06" in text and "2026-08-05" in text
     assert "22.3%" in text and "25.0%" in text and "24.0%" in text
     # 임계를 걸지 않는다는 것 자체가 이 절의 결정이다 — 문구가 사라지면 다음 사람이 임계를 만든다.
-    assert "지금 임계를 걸지 않는다" in text
+    assert "여전히 임계를 걸지 않는다" in text
 
 
 def test_member_score_pairs_leave_a_gap_instead_of_dropping_the_column():
@@ -546,7 +548,8 @@ def test_member_score_pairs_leave_a_gap_instead_of_dropping_the_column():
     ]
 
     assert len(rows) == 1
-    assert rows[0].rstrip().endswith("| — |")
+    # 마지막 두 칸이 「전일 대비」와 그날의 일치율 — 둘 다 비어야 한다(지어내지 않는다).
+    assert rows[0].rstrip().endswith("| — | — |")
 
 
 def test_member_scores_without_history_render_the_same_columns_as_before():
@@ -558,4 +561,94 @@ def test_member_scores_without_history_render_the_same_columns_as_before():
 
     header = [line for line in report._render_member_scores(today, None) if "멤버 쌍" in line][0]
 
-    assert header.count("|") == 5   # 앞뒤 파이프 + 4열
+    # 앞뒤 파이프 + 5열(멤버 쌍 / 분 / 일치 / 일치율 / 전일 대비) — 이력 열은 안 늘어난다.
+    assert header.count("|") == 6
+
+
+# ==========================================================================================
+# 2026-08-07 고도화#C — REJECT 대조군(시간대 매칭)
+# ==========================================================================================
+
+
+def _control_rows():
+    """(decision, hour, total, n_5, h_5, n_15, h_15, n_30, h_30)."""
+    from datetime import datetime as _dt
+
+    h9, h10, h15 = _dt(2026, 8, 7, 9), _dt(2026, 8, 7, 10), _dt(2026, 8, 7, 15)
+    return [
+        ("ENTER", h9, 40, 40, 20, 40, 24, 40, 18),
+        ("ENTER", h10, 30, 30, 15, 30, 15, 30, 15),
+        ("REJECT", h9, 20, 20, 12, 20, 14, 20, 14),
+        # 15시는 ENTER가 없다 — 시간대 매칭에서 빠져야 한다(진입 컷오프 이후라 구조적이다).
+        ("REJECT", h15, 45, 45, 45, 45, 45, 45, 45),
+    ]
+
+
+def test_control_group_matches_hours_before_comparing():
+    """08-07 실측에서 두 그룹의 시간대 분포가 심하게 달랐다 — 그대로 비교하면 시간대를 잰다."""
+    from mahdi.ops import decision_outcomes
+
+    folded = decision_outcomes._fold_control_group(_control_rows())
+
+    assert folded["shared_hours"] == ["09"]
+    # 15시 REJECT 45건(전부 적중)이 매칭에서 빠져야 한다 — 안 빼면 REJECT가 100%에 가까워진다.
+    assert folded["horizons"]["5m"]["hit_pct"] == pytest.approx(87.7, abs=0.1)   # 원시(교란됨)
+    assert folded["time_matched"]["reject"]["5m"]["hit_pct"] == 60.0             # 12/20
+    assert folded["time_matched"]["enter"]["5m"]["hit_pct"] == 50.0              # 20/40
+
+
+def test_control_group_delta_is_none_when_a_side_has_no_sample():
+    """한쪽 표본이 없으면 차이를 0으로 만들지 않는다 — 없는 것과 같은 것은 다르다."""
+    assert report._pt_delta({"hit_pct": 50.0}, {"hit_pct": None}) is None
+    assert report._pt_delta(None, {"hit_pct": 50.0}) is None
+    assert report._pt_delta({"hit_pct": 49.5}, {"hit_pct": 60.8}) == -11.3
+
+
+def test_control_group_renders_the_direction_of_the_gap():
+    """차이가 음수면 「우리가 거른 판단이 더 잘 맞혔다」 — 그 독법이 표에 붙어 있어야 한다."""
+    from mahdi.ops import decision_outcomes
+
+    control = decision_outcomes._fold_control_group(_control_rows())
+    text = "\n".join(report._render_outcome_control(control))
+
+    assert "시간대를 맞춘 비교다" in text
+    assert "거른 판단이 더 잘 맞혔다" in text
+    assert "하루치로 결론 내지 않는다" in text
+
+
+def test_member_sign_agreement_shows_the_day_over_day_swing():
+    """2026-08-07 고도화#B — 판정 축은 고정 임계가 아니라 **전일 대비 변화폭**이다.
+
+    `flow_position ↔ options_flow`가 08-06의 74.6% → 08-07의 13.1%로 하루 만에 뒤집혔다.
+    그 전날 낮에 제기한 「부호 규약이 뒤집혀 있을 가능성」은 이 값으로 기각된다 —
+    규약 버그라면 매일 낮아야 한다.
+    """
+    today = _scores_db([
+        {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 404,
+         "same_sign_minutes": 53, "same_sign_pct": 13.1},
+    ])
+    history = [
+        {"date": "2026-08-06", "db": _scores_db([
+            {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 380,
+             "same_sign_minutes": 283, "same_sign_pct": 74.6},
+        ])},
+    ]
+
+    text = "\n".join(report._render_member_scores(today, history))
+
+    assert "-61.5pt" in text
+    assert "흔들린다는 것이 앙상블이 살아 있다는 증거다" in text
+    assert "여전히 임계를 걸지 않는다" in text
+
+
+def test_member_sign_agreement_delta_is_blank_without_yesterday():
+    """전일 값이 없으면 변화폭을 0(변화 없음)으로 지어내지 않는다."""
+    today = _scores_db([
+        {"a": "flow_position", "b": "options_flow", "both_nonzero_minutes": 10,
+         "same_sign_minutes": 5, "same_sign_pct": 50.0},
+    ])
+    row = next(
+        line for line in report._render_member_scores(today, None)
+        if line.startswith("| flow_position ↔")
+    )
+    assert row.split("|")[5].strip() == "—"

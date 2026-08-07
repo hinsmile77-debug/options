@@ -187,7 +187,7 @@ def test_parser_audit_does_not_fire_on_a_genuinely_quiet_day():
 def test_chain_cycle_breakdown_line_is_parsed():
     line = _emit(
         "mahdi.main", "INFO", main.LOG_CHAIN_CYCLE_BREAKDOWN,
-        33.90, 0.12, 0.05, 0.31, 20, 0.0, "", "3건",
+        33.90, 0.12, 0.05, 0.31, 20, 0.0, "", "3건", "10:11",
     )
     cycles = _parse(line)["cycles"]
     assert cycles["count"] == 1
@@ -195,6 +195,43 @@ def test_chain_cycle_breakdown_line_is_parsed():
     # `rows_distribution`은 2026-08-04 Fix#8의 검증 지표다 — 수집 예산이 걸리면 20 미만
     # 사이클이 나타나야 하고, 하나도 없으면 예산이 안 걸린 것이다.
     assert cycles["rows_distribution"] == {20: 1}
+    assert cycles["duplicate_poll_minutes"] == {"count": 0, "list": [], "labelled": 1}
+
+
+def test_two_cycles_writing_the_same_minute_are_counted(monkeypatch):
+    """2026-08-07 §2-1 / Fix#3 — 덮어쓴 분은 결손보다 나쁘다(행 수가 정상이라 안 보인다).
+
+    08-07 15:18에 DB가 0행인데 로그에는 사이클이 완주해 있었다. 그 사이클이 15:17:59.99x에
+    깨어 `poll_time`이 15:17로 내려깎였고 직전 분의 행을 UPSERT로 덮어썼다.
+    """
+    lines = [
+        _emit("mahdi.main", "INFO", main.LOG_CHAIN_CYCLE_BREAKDOWN,
+              17.1, 0.08, 0.01, 0.0, 10, 0.0, "", "0건", "15:17"),
+        _emit("mahdi.main", "INFO", main.LOG_CHAIN_CYCLE_BREAKDOWN,
+              25.7, 0.06, 0.03, 0.0, 10, 0.0, "", "0건", "15:17"),
+    ]
+    dup = _parse(*lines)["cycles"]["duplicate_poll_minutes"]
+
+    assert dup["count"] == 1
+    assert dup["list"] == ["15:17"]
+    assert dup["labelled"] == 2
+
+
+def test_cycle_lines_without_a_minute_label_still_parse():
+    """08-07 이전 로그에는 `분=` 라벨이 없다 — 그 날들을 재집계할 때 파서가 눈이 멀면 안 된다.
+
+    08-04 §2-1에서 정확히 그 사고를 겪었다(문구가 바뀌자 계측이 통째로 죽고, 그 0건이
+    리포트에 「개선」으로 표시됐다). `labelled=0`이 "라벨이 없었다"를 드러낸다.
+    """
+    legacy = (
+        f"{_TS} INFO:mahdi.main:옵션체인 사이클 소요 분해: "
+        "REST수집 19.30초 + DB적재 0.09초 + 상태기록 0.03초 + 기타 0.00초 "
+        "(rows=20, 밀림=0.0초, 타폴러동시호출추정=0건)"
+    )
+    cycles = _parse(legacy)["cycles"]
+
+    assert cycles["count"] == 1
+    assert cycles["duplicate_poll_minutes"] == {"count": 0, "list": [], "labelled": 0}
 
 
 def test_chain_overrun_line_is_parsed():

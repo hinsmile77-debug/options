@@ -307,6 +307,22 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
             "로그 축은 *사이클이 돌았는가*, DB 축은 *행이 남았는가*를 잰다. "
             "`rows=0`으로 끝난 사이클(전 레그 실패/예산 소진)은 로그 축에 안 잡힌다(§2-6).",
         ]
+    # 2026-08-07(§2-1 / Fix#3) — **덮어쓴 분.** 빈 분보다 나쁘다: 행 수가 정상이라 위 두 축
+    # 어디에도 안 잡히고, 그 분의 데이터는 실제로 **다음 분에 수집된 값**이다.
+    dup = (metrics.get("cycles") or {}).get("duplicate_poll_minutes") or {}
+    if dup.get("labelled"):
+        if dup.get("count"):
+            out += [
+                "",
+                f"- ⚠ **같은 분 라벨로 두 번 적재된 분 {dup['count']}개** — {', '.join(dup['list'])}. "
+                "그 분의 데이터는 **다음 분에 수집된 값으로 덮여 있다**(UPSERT라 행 수는 정상이다). "
+                "사이클이 분 경계 직전에 깨어 `poll_time`이 내려깎인 것이다 — 08-07 Fix#3의 대상.",
+            ]
+        else:
+            out += ["", f"- 같은 분 라벨 중복 **0건** (라벨이 실린 사이클 {dup['labelled']:,}개)"]
+    else:
+        # 규약 C — 0을 "없었다"로 읽지 않는다. 08-07 이전 로그에는 라벨 자체가 없다.
+        out += ["", "- 같은 분 라벨 중복: **측정 불가** — 이 로그에는 `분=` 라벨이 없다(08-07 Fix#3 이전)"]
     out.append("")
     return out
 
@@ -694,11 +710,19 @@ def _render_member_scores(db: dict, history: list[dict] | None = None) -> list[s
         # 2026-08-07 고도화#5 — 일치율에 **직전 영업일들의 값을 나란히** 붙인다.
         past_labels, past_series = _member_pair_history(history)
         out += _table(
-            ["멤버 쌍", "둘 다 비영인 분", "부호 일치", "일치율"] + past_labels,
+            ["멤버 쌍", "둘 다 비영인 분", "부호 일치", "일치율", "전일 대비"] + past_labels,
             [
                 [
                     f"{p['a']} ↔ {p['b']}", f"{p['both_nonzero_minutes']:,}",
                     f"{p['same_sign_minutes']:,}", _fmt(p.get("same_sign_pct"), "{:.1f}%"),
+                    # 2026-08-07 고도화#B — **변화폭이 판정 축이다.** 아래 주석 참고.
+                    _fmt(
+                        _pct_points(
+                            p.get("same_sign_pct"),
+                            (past_series.get((p["a"], p["b"])) or [None])[0],
+                        ),
+                        "{:+.1f}pt",
+                    ),
                 ]
                 + [
                     _fmt(v, "{:.1f}%")
@@ -708,14 +732,16 @@ def _render_member_scores(db: dict, history: list[dict] | None = None) -> list[s
             ],
         )
         out += [
-            "> **일치율이 50%에서 크게 벗어나 며칠 고착되면 그건 '갈렸다'가 아니라 '한쪽 부호가 "
-            "뒤집혀 있다'일 수 있다.** 무작위라면 50% 근처여야 하고, 두 축이 정말 독립적으로 "
-            "시장을 보는 것이라면 날마다 흔들려야 한다. 08-07 실측 `flow_position ↔ options_flow` "
-            "**22.3%** 가 이 열을 만든 이유다 — 197분 중 44분만 부호가 같았다.",
-            "> **지금 임계를 걸지 않는다.** 정상 범위를 모르는 상태에서 임계를 먼저 정하면 그 임계가 "
-            "곧 결론이 된다(08-05 스팟 소스 괴리율에서 같은 실수를 했다). 위 3영업일 열이 "
-            "채워지면 사람이 읽고 그때 정한다 — 고착이면 `signal_layer`의 부호 규약을 의심하고, "
-            "흔들리면 그것이 앙상블이 살아 있다는 증거다.",
+            "> **판정 축은 고정 임계가 아니라 「전일 대비 변화폭」이다**(2026-08-07 고도화#B). "
+            "08-07에 `flow_position ↔ options_flow`가 08-06의 **74.6% → 13.1%** 로 하루 만에 "
+            "뒤집혔다(−61.5pt). 그 전날 낮에는 22.3%를 보고 *「부호 규약이 뒤집혀 있을 가능성」* 을 "
+            "의심했는데, **그 가설은 기각된다** — 규약 버그라면 매일 낮아야 한다. "
+            "**흔들린다는 것이 앙상블이 살아 있다는 증거다.**",
+            "> **여전히 임계를 걸지 않는다.** 정상 변동폭을 모르는 상태에서 임계를 먼저 정하면 그 "
+            "임계가 곧 결론이 된다(08-05 스팟 소스 괴리율에서 같은 실수를 했다). 며칠 쌓아 "
+            "「하루에 60pt 흔들리는 것이 정상인가」부터 안 뒤에 정한다. "
+            "**고착**(며칠 연속 같은 방향으로 50%에서 멀리)이면 그때 `signal_layer`의 부호 규약을 본다.",
+            "> 0은 중립이지 동의가 아니므로 **둘 다 비영인 분만** 분모로 센다.",
         ]
     out += [
         "> **일치율이 이 표의 핵심이다.** 멤버가 항상 같은 부호면 앙상블은 **실질 1멤버**이고, "
@@ -1006,7 +1032,62 @@ def _render_decision_outcomes(db: dict) -> list[str]:
         "Sampling은 Phase 3). 며칠 쌓고 사람이 「무엇을 성과로 볼 것인가」부터 정한다.",
         "",
     ]
+    out += _render_outcome_control(outcomes.get("control") or {})
     return out
+
+
+def _render_outcome_control(control: dict) -> list[str]:
+    """2026-08-07 고도화#C — **거른 판단은 어땠는가.** 대조군 없이는 위 적중률을 못 읽는다.
+
+    그날 시장이 한 방향으로 흘렀으면 아무 방향이나 찍어도 50%대가 나온다. "진입 신호가
+    무작위보다 나은가"의 답은 **같은 시각에 우리가 거른 판단**과 비교해야 나온다.
+    """
+    if not control.get("available"):
+        return [f"> REJECT 대조군 없음({control.get('reason', '사유 미상')}).", ""]
+    matched = control.get("time_matched") or {}
+    enter, reject = matched.get("enter") or {}, matched.get("reject") or {}
+    shared = control.get("shared_hours") or []
+    out = [
+        f"- **REJECT 대조군** {control.get('rejects', 0):,}건 — 같은 규칙·같은 지평으로 매긴 값 "
+        "(적재하지 않는다. 읽을 때 만든다)",
+        "",
+    ]
+    out += _table(
+        ["지평", "ENTER 적중률", "표본", "REJECT 적중률", "표본", "차이(ENTER−REJECT)"],
+        [
+            [
+                horizon,
+                _fmt((enter.get(horizon) or {}).get("hit_pct"), "{:.1f}%"),
+                f"{(enter.get(horizon) or {}).get('sample', 0):,}",
+                _fmt((reject.get(horizon) or {}).get("hit_pct"), "{:.1f}%"),
+                f"{(reject.get(horizon) or {}).get('sample', 0):,}",
+                _fmt(_pt_delta(enter.get(horizon), reject.get(horizon)), "{:+.1f}pt"),
+            ]
+            for horizon in (enter or reject)
+        ],
+    )
+    out += [
+        f"> **시간대를 맞춘 비교다** — 두 그룹이 모두 표본을 가진 시(hour)로만 제한했다"
+        f"({', '.join(shared) or '없음'}시). 08-07 실측에서 두 그룹의 분포가 심하게 달랐다"
+        "(ENTER는 12~13시 집중, REJECT는 08시·15시 집중) — 그대로 비교하면 **신호 품질이 아니라 "
+        "시간대를 재게 된다.**",
+        "> **차이가 음수면 우리가 거른 판단이 더 잘 맞혔다는 뜻이다.** 하루치로 결론 내지 않는다 — "
+        "표본이 100건 안팎이고, 방향이 0인 판단은 양쪽 모두 분모에서 빠진다. 며칠 쌓아 부호가 "
+        "고착되는지부터 본다.",
+        "> 이 값도 **되먹임이 아니다**(위 주석과 같다).",
+        "",
+    ]
+    return out
+
+
+def _pt_delta(a: dict | None, b: dict | None) -> float | None:
+    """두 적중률의 퍼센트포인트 차. 한쪽이라도 표본이 없으면 None(0으로 만들지 않는다)."""
+    return _pct_points((a or {}).get("hit_pct"), (b or {}).get("hit_pct"))
+
+
+def _pct_points(today: float | None, previous: float | None) -> float | None:
+    """퍼센트포인트 차. **한쪽이 없으면 None** — 없는 것을 0(변화 없음)으로 만들지 않는다."""
+    return None if today is None or previous is None else round(today - previous, 1)
 
 
 def _render_signal_reach(db: dict) -> list[str]:

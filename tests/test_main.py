@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -1226,6 +1227,8 @@ def test_poll_option_chain_logs_cycle_breakdown_each_cycle(monkeypatch, caplog):
     (
         collect_seconds, insert_seconds, db_write_seconds, other_seconds,
         rows_count, overrun, suffix, other_poller_calls_text,
+        # 2026-08-07 Fix#3 — 이 사이클이 적재한 분 라벨. 파서가 「덮어쓴 분」을 세는 근거다.
+        poll_minute,
     ) = breakdown_records[0].args
     assert rows_count == 2  # 1개 행사가 x (C, P)
     assert insert_seconds >= 0.09  # 레그 2건 x 0.05초 슬립 누적(오버헤드 감안 여유)
@@ -1234,6 +1237,8 @@ def test_poll_option_chain_logs_cycle_breakdown_each_cycle(monkeypatch, caplog):
     # rate_limit_total_calls(=len(calls))가 own_calls_expected(2)와 정확히 일치 — 다른 폴러의
     # 동시 호출이 끼어들지 않은 정상 사이클이라는 뜻(2026-07-28 신규 계측).
     assert other_poller_calls_text == "0건"
+    # 라벨은 HH:MM 형태여야 한다 — `log_metrics._CYCLE_RE`가 그 형태로만 잡는다.
+    assert re.fullmatch(r"\d\d:\d\d", poll_minute)
 
 
 class _FakeRestClientChainWithForeignCalls:
@@ -1296,7 +1301,7 @@ def test_poll_option_chain_breakdown_detects_other_poller_contention(monkeypatch
     assert len(breakdown_records) == 1
     # 1개 행사가 x (C, P) = own_calls_expected 2건, 콜당 foreign 3건 -> 총 증가분 2*(1+3)=8,
     # 자기 몫 2를 뺀 6건이 다른 폴러가 끼어든 것으로 추정돼야 한다.
-    assert breakdown_records[0].args[-1] == "6건"
+    assert breakdown_records[0].args[-2] == "6건"   # 마지막은 2026-08-07 Fix#3의 분 라벨
 
 
 def test_poll_option_chain_overrun_warning_includes_rest_db_breakdown(monkeypatch, caplog):

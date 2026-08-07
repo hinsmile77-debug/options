@@ -449,3 +449,62 @@ def test_every_pending_hypothesis_in_the_repo_has_a_claim_metric():
         assert hypotheses.ROLE_CLAIM in roles, f"{entry['id']}: 주장 지표가 없다"
         if entry.get("대가"):
             assert hypotheses.ROLE_COST in roles, f"{entry['id']}: 대가를 선언하고 안 쟀다"
+
+
+# ==========================================================================================
+# 2026-08-07(§4 / Fix#5) — 규약 F: 주장 지표는 절대 건수로 세우지 않는다
+# ==========================================================================================
+
+
+def test_count_shaped_metrics_are_recognised():
+    """08-07에 세 번 틀린 그 형태들이 전부 잡혀야 한다."""
+    assert hypotheses.is_count_shaped("db.tables.expiry_liquidity_1m.rows")
+    assert hypotheses.is_count_shaped("db.signal_reach.chain_leg_over_design_minutes")
+    assert hypotheses.is_count_shaped("rest.by_group.옵션체인_calls")
+    # 정규화된 것은 아니다 — 구조 변수가 분모에서 약분된다.
+    assert not hypotheses.is_count_shaped("db.monthly_coverage.coverage_pct")
+    assert not hypotheses.is_count_shaped("db.signal_reach.chain_age_seconds_median")
+    assert not hypotheses.is_count_shaped("rest.calls_per_second")
+    assert not hypotheses.is_count_shaped("db.decisions.member_count.dead_axis_mean")
+
+
+def test_normalized_claim_rule_flags_the_three_08_07_mistakes():
+    """08-07 하루에 같은 형태로 세 번 틀렸다 — fix는 맞았는데 예측이 반증으로 찍혔다."""
+    assert hypotheses.violates_normalized_claim_rule("주장", "db.tables.expiry_liquidity_1m.rows", ">= 100")
+    assert hypotheses.violates_normalized_claim_rule("주장", "db.ws_status.atm_roll_dropped_subs_today", "<= 4")
+    assert hypotheses.violates_normalized_claim_rule("주장", "db.signal_reach.chain_leg_count", "0 ~ 10")
+
+
+def test_normalized_claim_rule_allows_invariants_and_non_claim_roles():
+    """`== 0`(불변식)과 대가·참고는 막지 않는다.
+
+    0은 구조 변수에 비례하지 않는 유일한 건수다 — 08-07 Fix#1의
+    `chain_leg_over_design_minutes == 0`이 정확히 그 형태이고, 그건 옳은 예측이다.
+    대가는 "얼마나 늘었나"가 본질이라 건수가 맞는 경우가 많다.
+    """
+    assert not hypotheses.violates_normalized_claim_rule(
+        "주장", "db.signal_reach.chain_leg_over_design_minutes", "== 0"
+    )
+    assert not hypotheses.violates_normalized_claim_rule("대가", "rest.by_group.옵션체인", "<= 9500")
+    assert not hypotheses.violates_normalized_claim_rule("참고", "db.tables.feature_store.rows", ">= 8000")
+    # 수기 판정으로 내리면 통과한다 — 사람이 그날의 구조 변수를 보고 읽겠다는 선언이다.
+    assert not hypotheses.violates_normalized_claim_rule(
+        "주장", "db.tables.expiry_liquidity_1m.rows", "수기 판정 — 북 수로 나눠 읽을 것"
+    )
+
+
+def test_repo_pending_hypotheses_obey_the_normalized_claim_rule():
+    """규약 F를 **실제 파일에** 강제한다 — 08-07에 세 번 겪은 실수를 파일이 막는다."""
+    entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
+    offenders = [
+        f"{e['id']}: {p['metric']} ({p.get('expect')})"
+        for e in entries if str(e.get("상태", "")).lower() == "pending"
+        for p in e.get("예측") or []
+        if hypotheses.violates_normalized_claim_rule(
+            p.get("역할", hypotheses.ROLE_REFERENCE), p["metric"], p.get("expect", "")
+        )
+    ]
+    assert not offenders, (
+        "주장 지표를 절대 건수 부등식으로 걸었다 — 그 건수를 만드는 구조 변수(관측 길이·북 수·"
+        f"스팟 이동거리)가 바뀌면 멀쩡한 fix가 반증으로 찍힌다: {offenders}"
+    )

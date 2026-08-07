@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from datetime import time as dtime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -210,6 +211,51 @@ def test_closing_auction_boundary_has_a_single_source():
     # §14-1이 그 분들을 가용률에서 분리해 낸다.
     assert main.MEMBER_UNAVAILABLE_CLOSING_AUCTION in db_metrics.STRUCTURAL_UNAVAILABLE_REASONS
     assert main.MEMBER_UNAVAILABLE_PREOPEN in db_metrics.STRUCTURAL_UNAVAILABLE_REASONS
+    # 2026-08-07 Fix#2 — 현물 장 마감(15:20~) 스팟 부재. 세 번째 구조적 사유다.
+    assert main.MEMBER_UNAVAILABLE_EQUITY_CLOSED in db_metrics.STRUCTURAL_UNAVAILABLE_REASONS
+    # 세 사유가 서로 달라야 §14-1이 어느 구조인지 구분해 낼 수 있다.
+    assert len({
+        main.MEMBER_UNAVAILABLE_CLOSING_AUCTION,
+        main.MEMBER_UNAVAILABLE_PREOPEN,
+        main.MEMBER_UNAVAILABLE_EQUITY_CLOSED,
+    }) == 3
+
+
+def test_spot_source_ownership_by_time_of_day():
+    """고도화 A — **어느 시간대에 어느 스팟 소스가 유효한가**를 코드가 알고 있어야 한다.
+
+    08-07까지 이 지식은 사람 머릿속에만 있었고, 그래서 나흘 연속 같은 9분을 장애로 신고했다.
+    하루는 세 구간으로 나뉜다:
+
+        07:30~09:00   지수 없음(장전, 2026-08-05 `9ffcb9c`)      · 선물 WS 있음
+        09:00~15:20   지수 실시간                                · 선물 WS 있음
+        15:20~15:45   지수 없음(현물 마감, 2026-08-07 Fix#1)     · 선물 WS 15:35까지
+
+    `underlying_spot_1m`이 적재되는 구간과 `is_equity_spot_live()`가 True인 구간은 **같아야
+    한다** — 갈라지면 그 차이만큼 판단이 죽은 스팟을 본다(08-07까지 25분이 그랬다).
+    """
+    from mahdi import main, session
+
+    live = [t for t in _every_minute() if session.is_equity_spot_live(t)]
+    assert live[0] == session.TRADING_DAY_START
+    assert live[-1] == dtime(15, 19)
+    # 장전은 「지수 없음」의 **부분집합**이다 — 장전이면 반드시 스팟이 없어야 하고,
+    # 그 역은 성립하지 않는다(현물 마감 25분이 장전이 아닌 「지수 없음」이다).
+    assert all(not session.is_equity_spot_live(t) for t in _every_minute() if session.is_preopen(t))
+    assert any(
+        not session.is_equity_spot_live(t) and not session.is_preopen(t) for t in _every_minute()
+    )
+    # 선물 WS는 파생 단일가 시작(15:35)까지 살아 있다 — 지수보다 15분 더 간다.
+    assert session.is_continuous_trading(dtime(15, 30)) is True
+    assert session.is_equity_spot_live(dtime(15, 30)) is False
+    assert main.MEMBER_UNAVAILABLE_EQUITY_CLOSED  # 그 구간의 사유가 존재한다
+
+
+def _every_minute():
+    from datetime import datetime as _dt, timedelta as _td
+
+    start = _dt(2026, 8, 7, 7, 30)
+    return [(start + _td(minutes=i)).time() for i in range((15 - 7) * 60 + 15)]
 
 
 def test_entry_cutoff_is_known_in_exactly_one_place(monkeypatch):

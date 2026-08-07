@@ -269,9 +269,17 @@ MARKET_OPEN_TIME = dtime(9, 0)
 # 규약: 이 상수들을 바꾸면 `tests/test_ops_log_metrics_contract.py`가 깨진다. 파서를 함께 고쳐야
 # 테스트가 다시 통과한다 — 로그만 바꾸고 넘어가는 일이 조용히 지나갈 수 없게 하는 것이 전부다.
 # (`log_metrics`는 여전히 이 모듈을 import하지 않는다 — 순수 파서로 남긴다. 계약은 테스트가 진다.)
+# 2026-08-07(§2-1 / Fix#3) — 끝에 `분=HH:MM`(이 사이클이 **적재한 분 라벨**)을 붙인다.
+#
+# 08-07 15:18에 DB가 0행인데 로그에는 사이클이 완주해 있었다. 원인은 그 사이클이 15:17:59.99x에
+# 깨어 `poll_time`이 15:17로 내려깎였고, **직전 분의 행을 UPSERT로 덮어썼다**는 것이다 —
+# 행 수가 정상이라 어떤 지표도 못 잡았다(빈 분은 `zero_row_count`가 잡지만, 덮어쓴 분은 안 잡힌다).
+#
+# 라벨을 로그에 실으면 파서가 **같은 분이 두 번 나오는지**를 직접 셀 수 있다. 괄호 **밖**에
+# 붙이는 이유는 규약 A다 — `_CYCLE_RE`가 `\)`로 끝나므로 기존 파서를 깨지 않는다.
 LOG_CHAIN_CYCLE_BREAKDOWN = (
     "옵션체인 사이클 소요 분해: REST수집 %.2f초 + DB적재 %.2f초 + 상태기록 %.2f초 + 기타 %.2f초 "
-    "(rows=%d, 밀림=%.1f초%s, 타폴러동시호출추정=%s)"
+    "(rows=%d, 밀림=%.1f초%s, 타폴러동시호출추정=%s) 분=%s"
 )
 LOG_CHAIN_OVERRUN = (
     "옵션 체인 폴링 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 위상 격자의 다음 틱까지 %.1f초 대기 "
@@ -1910,8 +1918,10 @@ async def _catch_up_missed_option_chain_minute(
                     )
                     conn.rollback()
                     continue
-            # 장전이면 이 값은 전일 종가다 — 근거는 `MARKET_OPEN_TIME` 주석.
-            if latest_spot is not None and catchup_time.time() >= MARKET_OPEN_TIME:
+            # 장전이면 전일 종가, **15:20 이후면 현물 단일가/종가의 잔상**이다 —
+            # 어느 쪽도 실시간 스팟이 아니므로 적재하지 않는다(`session.is_equity_spot_live`
+            # 주석, 2026-08-07 Fix#1·#2). 장전 차단은 2026-08-05 `9ffcb9c`가 먼저 했다.
+            if latest_spot is not None and session.is_equity_spot_live(catchup_time):
                 try:
                     db.insert_underlying_spot(conn, catchup_time, underlying, latest_spot)
                 except Exception:
@@ -2107,8 +2117,9 @@ async def poll_option_chain(
                         )
                         conn.rollback()
                         continue
-                # 장전이면 이 값은 전일 종가다 — 근거는 `MARKET_OPEN_TIME` 주석.
-                if latest_spot is not None and poll_time.time() >= MARKET_OPEN_TIME:
+                # 장전이면 전일 종가, **15:20 이후면 현물 단일가/종가의 잔상**이다 —
+                # 근거는 `session.is_equity_spot_live` 주석(2026-08-07 Fix#1·#2).
+                if latest_spot is not None and session.is_equity_spot_live(poll_time):
                     try:
                         db.insert_underlying_spot(conn, poll_time, underlying, latest_spot)
                     except Exception:
@@ -2185,6 +2196,7 @@ async def poll_option_chain(
             LOG_CHAIN_CYCLE_BREAKDOWN,
             collect_seconds, insert_seconds, db_write_seconds, other_seconds,
             len(rows), overrun_seconds, ", 재시도함" if retried else "", other_poller_calls_text,
+            poll_time.strftime("%H:%M"),
         )
         if overrun_seconds > 0 and delay >= OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS:
             # 회수에 쓴 시간만큼 남은 대기를 줄인다. 이벤트 루프 시계가 아니라 time.monotonic()을
@@ -2891,6 +2903,20 @@ MEMBER_UNAVAILABLE_CLOSING_AUCTION = "종가 단일가(연속체결 없음)"
 # 여기서도 멤버를 살리지 않는다. 사유만 가른다.
 MEMBER_UNAVAILABLE_PREOPEN = "장전(스팟 미적재)"
 
+# 2026-08-07(§3-1 / Fix#2) — **현물 장 마감 이후 스팟 부재.** 위 둘과 같은 계열의 세 번째다.
+#
+# 유가증권시장은 15:20~15:30이 장 마감 동시호가이고 그 뒤로는 종가에 고정된다. 반면 옵션은
+# 15:45까지 계속 거래되므로, 15:20~15:45의 25분 동안 **체인은 살아 있는데 스팟만 죽어 있다.**
+# 08-07까지는 그 죽은 스팟(08-07 실측 975.03 고정, 같은 시각 선물 978.40~980.25)으로 GEX를
+# 계산했다 — 두 입력이 서로 다른 시각을 보고 있었다.
+#
+# **왜 선물 스팟으로 대체하지 않는가**(사용자 결정, 2026-08-07): 그러면 하루 중 시간대에 따라
+# 스팟 소스가 달라지고, 그 순간 GEX 시계열이 두 개의 다른 것을 이어 붙인 값이 된다.
+# 08-05 §2-3이 지적한 "감시자와 감시 대상이 입력을 공유한다" 문제와 같은 계열의 오염이다.
+# **없는 값을 지어내지 않는다** — 스팟이 없는 구간은 없다고 쓰고, 그 25분은 진입 컷오프
+# (14:50) 이후라 신규 진입에 영향이 없다.
+MEMBER_UNAVAILABLE_EQUITY_CLOSED = "현물 장마감(스팟 미적재)"
+
 
 def _member_scores_for_record(scores) -> dict[str, float]:
     """
@@ -2951,6 +2977,12 @@ def _member_unavailable_reasons(inputs: SignalInputs, now: datetime, scores=None
                 # 2026-08-06 Fix#5 — 스팟이 없어서 죽은 것이고, 장전에 스팟이 없는 것은 설계다.
                 # `spot`이 있는데도 죽었다면 그건 장전이라도 진짜 결함이므로 아래로 떨어뜨린다.
                 reasons[name] = MEMBER_UNAVAILABLE_PREOPEN
+            elif inputs.spot is None and not session.is_equity_spot_live(now):
+                # 2026-08-07 Fix#2 — 같은 논리의 장 마감 쪽. 현물은 15:20에 연속거래가 끝나는데
+                # 옵션은 15:45까지 거래되므로 **체인은 살아 있고 스팟만 없는** 25분이 생긴다.
+                # `is_preopen`을 먼저 보는 이유는 두 조건이 겹치지 않게 하려는 것이 아니라
+                # (겹치지 않는다) 읽는 순서를 하루의 시간 순서와 맞추기 위해서다.
+                reasons[name] = MEMBER_UNAVAILABLE_EQUITY_CLOSED
             else:
                 reasons[name] = f"입력 없음: {', '.join(missing)}" if missing else "성분 전부 부호 0"
         elif name == "orderflow_ofi_vpin":

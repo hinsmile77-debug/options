@@ -55,6 +55,68 @@ ROLE_CLAIM = "주장"
 ROLE_COST = "대가"
 ROLE_REFERENCE = "참고"
 
+# 2026-08-07(§4 / Fix#5) — **규약 F: 주장 지표는 절대 건수로 세우지 않는다.**
+#
+# 08-07 하루에 같은 형태의 예측 오류가 **세 번** 났다:
+#
+#   p4  `chain_leg_median == 10`            5분 스냅샷 창을 계산에 안 넣음   → 실측 12
+#   e1  `atm_roll_dropped_subs <= 4`        스팟 이동거리를 안 넣음          → 실측 97~469
+#   p2  `expiry_liquidity_1m.rows >= 100`   북 수(3→2)를 안 넣음             → 실측 85
+#
+# 셋 다 **fix는 맞았는데 예측이 틀렸다**. 그리고 셋 다 자동 판정에서 「반증」으로 찍혔다 —
+# 그대로 두면 멀쩡한 fix를 되돌리게 된다(08-04 p4의 `untested` 구분과 같은 위험이다).
+#
+# 공통 원인은 부주의가 아니라 **형태**다: 건수는 관측 길이·북 수·시장 이동거리 같은 구조
+# 변수에 비례하는데, 예측을 쓰는 순간에는 그 변수들이 상수처럼 느껴진다. 비율·중앙값·
+# 정규화 지표는 그 변수들이 분모에서 약분되므로 같은 실수를 할 수 없다.
+#
+# 그래서 **주장 역할에 한해** 건수 계열 지표에 부등식을 걸면 경고한다. 대가·참고는 막지 않는다
+# (대가는 "얼마나 늘었나"가 본질이라 건수가 맞는 경우가 많다). 정말 건수로 재야 하면
+# `수기 판정`으로 내리면 된다 — 그건 사람이 그날의 구조 변수를 보고 읽겠다는 선언이다.
+_COUNT_METRIC_SUFFIXES = ("_minutes", "_count", "_calls", ".rows", "_rows", "_legs", "_today")
+# **접미사로만** 판정한다 — 부분 문자열로 보면 `_minutes`가 `_min`에 걸려 정규화로 오분류된다.
+_NORMALIZED_SUFFIXES = ("_pct", "_ratio", "_median", "_mean", "_avg", "_max", "_min")
+_NORMALIZED_SUBSTRINGS = ("per_", "_per_")
+
+
+def is_count_shaped(metric: str) -> bool:
+    """
+    입력: 지표 경로.
+    계산: **절대 건수 계열**인가 — 정규화 힌트가 하나라도 있으면 아니다.
+    해석: 근거는 위 규약 F 주석. 완벽한 분류가 목적이 아니라, 예측을 쓰는 사람이 "이 값이
+         무엇에 비례하는가"를 한 번 더 생각하게 만드는 것이 목적이다.
+    실패 조건: 없다.
+    """
+    lowered = metric.lower()
+    if lowered.endswith(_NORMALIZED_SUFFIXES) or any(x in lowered for x in _NORMALIZED_SUBSTRINGS):
+        return False
+    return lowered.endswith(_COUNT_METRIC_SUFFIXES)
+
+
+def violates_normalized_claim_rule(role: str, metric: str, expect: str) -> bool:
+    """
+    입력: 예측의 역할·지표 경로·기대식.
+    계산: 규약 F 위반인가 — **주장** 역할 + 건수 계열 지표 + 자동 판정 부등식(`<=`/`>=`/범위).
+    해석: **구조 변수에 비례하지 않는 경계는 통과시킨다.**
+         - `== 0` / `>= 0`: 관측 길이·북 수·이동거리가 무엇이든 판정이 안 바뀐다.
+           08-07 Fix#1의 `chain_leg_over_design_minutes == 0`(불변식)과
+           08-06 Fix#3의 `underlying_spot_1m.rows >= 0`(경로 생존 확인)이 그 형태다.
+         - `수기 판정`: 사람이 그날의 구조 변수를 보고 읽겠다는 선언이다.
+    실패 조건: 없다.
+    """
+    if str(role) != ROLE_CLAIM or not is_count_shaped(metric):
+        return False
+    text = str(expect).strip()
+    # **평가기가 자동 판정하는 형태만** 본다. `수기 판정`은 애초에 「반증」을 못 만들므로
+    # 이 규약의 대상이 아니다 — 그리고 그 문구 안의 `~`(예: "07:31~09:00")를 범위로 오인하면
+    # 규칙이 자기 목적을 넘어 문서를 검열하게 된다(도입 당일 실제로 그랬다).
+    comparison = _COMPARISON_RE.match(text)
+    if comparison:
+        op, raw = comparison.group(1), float(comparison.group(2))
+        # `== 0` / `>= 0`은 구조 변수가 무엇이든 판정이 안 바뀐다 — 불변식·경로 생존 확인이다.
+        return not (op == "==" or (op in (">=", ">") and raw == 0))
+    return bool(_RANGE_RE.match(text))
+
 VERDICT_UNJUDGEABLE = "판정 불가"
 
 # 2026-08-06 §3-1 / Fix#3 — **경로가 애초에 존재하지 않는다.**

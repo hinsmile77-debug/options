@@ -42,7 +42,11 @@ STRUCTURAL_UNAVAILABLE_REASON = "종가 단일가(연속체결 없음)"
 # 2026-08-06(§2-5 / Fix#5) — 장전 스팟 부재(`main.MEMBER_UNAVAILABLE_PREOPEN`)도 같은 계열이다.
 # 두 사유 모두 결함이 아니라 시장 구조/설계이므로 §14-1의 「그중 구조적」 열이 함께 세야 한다.
 # 문자열 일치는 `tests/test_ops_metric_conventions.py`가 기계적으로 지킨다.
-STRUCTURAL_UNAVAILABLE_REASONS = frozenset({STRUCTURAL_UNAVAILABLE_REASON, "장전(스팟 미적재)"})
+# 2026-08-07(§3-1 / Fix#2) — 현물 장 마감(15:20~) 스팟 부재도 같은 계열이다.
+# 문자열 일치는 `tests/test_ops_metric_conventions.py`가 세 상수 모두에 대해 기계적으로 지킨다.
+STRUCTURAL_UNAVAILABLE_REASONS = frozenset(
+    {STRUCTURAL_UNAVAILABLE_REASON, "장전(스팟 미적재)", "현물 장마감(스팟 미적재)"}
+)
 
 # 2026-08-06(§2-2 / Fix#1) — v6 §4.2 신규 진입 컷오프로 막힌 판단의 사유.
 # `main._REJECT_REASON_ENTRY_CUTOFF`·`RiskEngine`이 내는 문자열과 **같아야** 이 지표가 그 분들을
@@ -331,6 +335,14 @@ def spot_source_divergence(conn: ConnectionLike, target: date, underlying: str =
         "  FROM underlying_spot_1m s JOIN market_raw_1m m "
         "    ON m.timestamp = s.timestamp AND m.symbol = %s "
         "  WHERE s.timestamp::date = %s AND s.underlying = %s AND s.spot > 0"
+        # 2026-08-07(§3-1 / Fix#1) — **지수가 살아 있는 구간만** 본다. 유가증권시장은
+        # 15:20~15:30이 장 마감 동시호가이고 그 뒤로는 종가에 고정이라, 그 25분의 "정지"는
+        # 사고가 아니라 시장 구조다. 08-04~08-07 나흘 내내 매일 정확히 9분이 이 지표에
+        # 잡혀 원인 규명 대기 목록에 올라 있었다 — 규칙성 자체가 답이었다.
+        # **2026-08-07 이후 데이터에는 그 구간 행이 아예 없지만**(main.py가 적재를 끊는다)
+        # 과거 날짜를 재집계할 때를 위해 쿼리에도 경계를 건다. 두 곳이 갈리면 그날부터
+        # 이 지표의 시계열이 조용히 두 가지가 된다.
+        "    AND s.timestamp::time < %s"
         "), f AS ("
         "  SELECT t, (prev_idx = idx AND prev_fut IS DISTINCT FROM fut) AS frozen FROM j"
         "), g AS ("
@@ -344,7 +356,7 @@ def spot_source_divergence(conn: ConnectionLike, target: date, underlying: str =
         "       (SELECT count(*) FROM f WHERE frozen), "
         "       COALESCE((SELECT max(n) FROM ("
         "           SELECT count(*) AS n FROM g WHERE frozen GROUP BY grp) q), 0)",
-        (symbol_row[0], target, underlying),
+        (symbol_row[0], target, underlying, session.EQUITY_CONTINUOUS_TRADING_END),
     )
     minutes = int(row[0]) if row and row[0] is not None else 0
     if not minutes:
@@ -353,6 +365,9 @@ def spot_source_divergence(conn: ConnectionLike, target: date, underlying: str =
     return {
         "available": True,
         "futures_symbol": symbol_row[0],
+        # 2026-08-07 Fix#1 — 아래 값들이 재는 구간의 끝. 08-06 이전 리포트와 비교할 때
+        # 이 경계가 없었다는 것을 알아야 한다(그때는 15:45까지 셌다).
+        "live_window_end": session.EQUITY_CONTINUOUS_TRADING_END.strftime("%H:%M"),
         "minutes": minutes,
         "max_pct": round(float(row[1]), 3) if row[1] is not None else None,
         "median_pct": round(float(row[2]), 3) if row[2] is not None else None,

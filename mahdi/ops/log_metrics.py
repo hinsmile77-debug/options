@@ -44,6 +44,9 @@ _CYCLE_RE = re.compile(
     _TS + r" INFO:mahdi\.main:옵션체인 사이클 소요 분해: "
     r"REST수집 ([\d.]+)초 \+ DB적재 ([\d.]+)초 \+ 상태기록 ([\d.]+)초 \+ 기타 ([\d.]+)초 "
     r"\(rows=(\d+)(?:, 재시도함)?, 밀림=([\d.-]+)초, 타폴러동시호출추정=(\S+?)\)"
+    # 2026-08-07 Fix#3 — `분=HH:MM`은 **선택**이다. 08-07까지의 로그에는 없고, 그 날들을
+    # 재집계할 때 이 정규식이 통째로 눈이 머는 것이 08-04 §2-1에서 겪은 사고다.
+    r"(?: 분=(\d\d:\d\d))?"
 )
 _OVERRUN_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션 체인 폴링 사이클이 주기\([\d.]+초\)를 초과해 "
@@ -329,6 +332,19 @@ def _seconds_of_day(m: re.Match, group_offset: int = 0) -> float:
     return h * 3600 + mi * 60 + s + ms / 1000
 
 
+def _duplicate_poll_minutes(cycles: list[dict]) -> dict:
+    """
+    입력: 파싱된 사이클 목록.
+    계산: `분=HH:MM` 라벨이 **두 번 이상** 나온 분과 그 건수. 라벨이 실린 사이클 수도 함께 낸다.
+    해석: 근거는 호출측 주석(2026-08-07 Fix#3). 이 값이 0이 아니면 그 분의 데이터는
+         **다음 분에 수집된 값으로 덮여 있다** — 결손보다 나쁘다(행이 정상이라 안 보인다).
+    실패 조건: 없다 — 라벨이 없는 로그는 `labelled=0`으로 그 사실을 드러낸다.
+    """
+    labels = [c.get("poll_minute") for c in cycles if c.get("poll_minute")]
+    duplicated = sorted(m for m, n in collections.Counter(labels).items() if n > 1)
+    return {"count": len(duplicated), "list": duplicated, "labelled": len(labels)}
+
+
 def _hhmm(seconds_of_day: float) -> str:
     total = int(seconds_of_day)
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}"
@@ -445,6 +461,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
                     "rows": int(m.group(10)),
                     "slip": float(m.group(11)),
                     "concurrent_reported": None if not concurrent.isdigit() else int(concurrent),
+                    # 2026-08-07 Fix#3 — 이 사이클이 적재한 분 라벨(구 로그에는 없어 None).
+                    "poll_minute": m.group(13),
                 }
             )
             continue
@@ -737,6 +755,7 @@ def _cycle_metrics(
         return {
             "count": 0, "by_hour": [], "by_mod10": [],
             "missing": {"count": 0, "list": [], "downtime_count": 0, "infra_count": 0},
+            "duplicate_poll_minutes": {"count": 0, "list": [], "labelled": 0},
         }
     process_starts = process_starts or []
 
@@ -803,6 +822,17 @@ def _cycle_metrics(
         "rest_seconds": _stats(rests),
         "over_60s": sum(1 for x in rests if x > 60),
         "rows_distribution": dict(sorted(collections.Counter(c["rows"] for c in cycles).items())),
+        # 2026-08-07(§2-1 / Fix#3) — **두 사이클이 같은 분 라벨로 적재한 경우.**
+        #
+        # 08-07 15:18에 DB가 0행인데 로그에는 사이클이 완주해 있었다. 그 사이클이 15:17:59.99x에
+        # 깨어 `poll_time`이 15:17로 내려깎였고, 직전 분의 행을 UPSERT로 **덮어썼다**.
+        # 행 수가 정상이라 `zero_row_count`(빈 분)로도, 결손 지표로도 안 잡혔다 —
+        # 유일한 흔적은 "다음 분이 비어 있다"였고 그건 기동 아티팩트와 구분되지 않았다.
+        #
+        # `labelled`를 함께 내는 이유: 08-07 이전 로그에는 `분=` 라벨이 없어 `count`가
+        # 구조적으로 0이다. **0을 "중복이 없었다"로 읽으면 안 된다** — 규약 C(0건 보고는
+        # 증명을 동반한다)와 같은 이유다.
+        "duplicate_poll_minutes": _duplicate_poll_minutes(cycles),
         "by_hour": by_hour,
         "by_mod10": by_mod10,
         "missing": {
