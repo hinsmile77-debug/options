@@ -178,6 +178,103 @@ def test_parser_audit_does_not_fire_on_a_genuinely_quiet_day():
     assert _parse(quiet)["parser_audit"]["blind"] == {}
 
 
+# ===== 포맷의 **변형**도 계약이다 (2026-08-10 / 규약 A 확장) =====
+#
+# 08-10에 이 파일이 있는데도 사고가 났다. `LOG_CHAIN_CYCLE_BREAKDOWN`의 정규식이 `, 재시도함`을
+# **`rows` 뒤**로 기대했는데 포맷은 **`밀림` 뒤**에 찍고 있었다(포맷 07-28 → 정규식 08-01,
+# 옮겨 적을 때부터 틀렸다). 아래 기존 테스트들이 **전부 그 자리에 `""`만 넣었기 때문에**
+# 10일간 안 걸렸다 — 포맷은 검사했지만 **포맷의 변형**은 안 했다.
+#
+# 발현: 08-10 15:15, 그날 유일한 재시도 사이클이 통째로 사라져 사이클 494→493이 되고
+# 그 분이 「결손」으로 오분류됐다. **하필 그 분이 옵션체인 전멸(rows=0)이라 그날 가장 중요한
+# 사이클이었다.**
+#
+# 구조적 교훈: **조건부 조각은 상황이 나쁠 때만 채워진다.** 그 자리를 안 재면 파서는
+# 정확히 가장 나쁜 순간에만 눈이 먼다. 그래서 조합을 여기에 **명시적으로 선언**한다 —
+# 포맷에 새 조건부 조각이 생기면 이 목록에 안 넣는 한 커버되지 않는다는 사실이 눈에 보이도록.
+
+# (retried 조각, 분= 라벨) 조합 — `LOG_CHAIN_CYCLE_BREAKDOWN`이 실제로 낼 수 있는 모든 모양.
+_CYCLE_BREAKDOWN_VARIANTS = [
+    ("", "10:11"),            # 평상시
+    (", 재시도함", "10:11"),   # 전체 재시도가 일어난 사이클 — 08-10에 여기서 실명했다
+    ("", None),               # 08-07 이전 로그(라벨 없음)
+    (", 재시도함", None),      # 08-07 이전 + 재시도
+]
+
+
+@pytest.mark.parametrize("retried,minute", _CYCLE_BREAKDOWN_VARIANTS)
+def test_chain_cycle_breakdown_parses_in_every_variant(retried, minute):
+    """포맷이 낼 수 있는 **모든 모양**이 파서를 통과해야 한다."""
+    body = main.LOG_CHAIN_CYCLE_BREAKDOWN % (
+        33.90, 0.12, 0.05, 0.31, 20, 0.0, retried, "3건", minute or "",
+    )
+    if minute is None:  # 구 로그에는 ` 분=` 꼬리 자체가 없다
+        body = body[: body.rindex(" 분=")]
+    cycles = _parse(f"{_TS} INFO:mahdi.main:{body}")["cycles"]
+
+    assert cycles["count"] == 1, f"retried={retried!r} minute={minute!r}에서 파서가 눈이 멀었다"
+    assert cycles["rows_distribution"] == {20: 1}
+    assert cycles["duplicate_poll_minutes"]["labelled"] == (0 if minute is None else 1)
+
+
+def test_retried_cycle_is_not_reported_as_a_missing_minute():
+    """08-10 15:15 재현 — 재시도 사이클이 안 읽히면 그 분이 「결손」으로 둔갑한다.
+
+    그날 리포트는 이 분을 **인프라 결손**으로 올렸다. 실제로는 사이클이 완주했고(전멸이지만),
+    결손 축이 재야 하는 것은 *사이클이 돌았는가*이지 *행이 남았는가*가 아니다
+    (후자는 DB 축 `chain_minute_coverage`의 몫이다).
+    """
+    def cycle(rest, rows, retried, minute):
+        return _emit("mahdi.main", "INFO", main.LOG_CHAIN_CYCLE_BREAKDOWN,
+                     rest, 0.1, 0.0, 0.0, rows, 0.0, retried, "0건", minute)
+
+    cycles = _parse(
+        cycle(20.0, 20, "", "15:14"),
+        cycle(49.56, 0, ", 재시도함", "15:15"),   # 그날 실제로 전멸한 사이클
+        cycle(20.0, 20, "", "15:16"),
+    )["cycles"]
+
+    assert cycles["count"] == 3
+    assert cycles["missing"]["count"] == 0, "재시도 사이클이 결손으로 둔갑했다"
+    assert cycles["missing"]["infra_count"] == 0
+
+
+def test_missing_minutes_use_the_label_axis_not_the_derived_start():
+    """2026-08-10 — 파생 start(종료 − 소요 합)는 반올림으로 분 경계를 몇 ms 넘어간다.
+
+    실측: 11:09 사이클의 파생 시작이 11:08:59.996(4ms 이르다)이라 11:08에 귀속됐고,
+    11:09가 허위 결손으로 잡혔다. 아래는 그 산술을 그대로 재현한다 —
+    소요 합 33.45초, 종료 11:09:33.446 → 파생 11:08:59.996.
+    """
+    lines = [
+        "2026-08-05 11:08:19,474 INFO:mahdi.main:" + main.LOG_CHAIN_CYCLE_BREAKDOWN % (
+            19.33, 0.09, 0.01, 0.0, 20, 0.0, "", "0건", "11:08"),
+        "2026-08-05 11:09:33,446 INFO:mahdi.main:" + main.LOG_CHAIN_CYCLE_BREAKDOWN % (
+            33.36, 0.06, 0.03, 0.0, 10, 0.0, "", "0건", "11:09"),
+    ]
+    cycles = _parse(*lines)["cycles"]
+
+    assert cycles["count"] == 2
+    assert cycles["missing"]["list"] == [], "파생 start 반올림이 허위 결손을 만들었다"
+
+
+def test_legacy_logs_without_labels_still_fall_back_to_derived_start():
+    """08-07 이전 로그에는 `분=`이 없다 — 그 날들을 재집계할 때 결손 축이 죽으면 안 된다."""
+    legacy = [
+        "2026-08-05 10:10:19,000 INFO:mahdi.main:옵션체인 사이클 소요 분해: "
+        "REST수집 19.00초 + DB적재 0.00초 + 상태기록 0.00초 + 기타 0.00초 "
+        "(rows=20, 밀림=0.0초, 타폴러동시호출추정=0건)",
+        # 10:11이 통째로 없다 → 진짜 결손 1분
+        "2026-08-05 10:12:19,000 INFO:mahdi.main:옵션체인 사이클 소요 분해: "
+        "REST수집 19.00초 + DB적재 0.00초 + 상태기록 0.00초 + 기타 0.00초 "
+        "(rows=20, 밀림=0.0초, 타폴러동시호출추정=0건)",
+    ]
+    cycles = _parse(*legacy)["cycles"]
+
+    assert cycles["duplicate_poll_minutes"]["labelled"] == 0
+    assert cycles["missing"]["list"] == ["10:11"], "라벨 없는 로그에서 폴백이 안 돈다"
+
+
 # ===== mahdi.main 쪽 지표성 로그 (2026-08-04 고도화#1 규약 A 확장) =====
 #
 # 08-04에는 `rest_client`만 상수화했는데, 아래 여섯 줄은 **리포트 §1~§4·§8·§9-1·§14-2의 거의
