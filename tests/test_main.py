@@ -5901,3 +5901,61 @@ def test_the_lever_never_touches_the_monthly_book(monkeypatch):
     monkeypatch.setattr("mahdi.main.OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS", {h: 10 for h in range(24)})
     for minute in range(10):
         assert "regular" in _due_series(datetime(2026, 8, 7, 13, minute))
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-10 — ATM IV 구형파. `_update_atm_iv`가 북을 섞어 평균 내는 바람에 위클리 격분 폴링이
+# `iv_chg`를 분 단위 진동으로 만들었고, 그것을 학습한 HMM이 "짝수분/홀수분"을 레짐으로 재현했다.
+# ---------------------------------------------------------------------------
+
+
+class _IvRecorder:
+    def __init__(self):
+        self.ivs = []
+
+    def update_iv(self, atm_iv):
+        self.ivs.append(atm_iv)
+
+
+def _iv_chain_row(expiry, strike, option_type, iv):
+    return {"expiry": expiry, "strike": strike, "option_type": option_type, "iv": iv}
+
+
+def test_update_atm_iv_uses_only_the_monthly_book():
+    from mahdi.main import _update_atm_iv
+
+    monthly, weekly = date(2026, 8, 13), date(2026, 8, 10)
+    rows = [
+        _iv_chain_row(monthly, 980.0, "C", 0.74), _iv_chain_row(monthly, 980.0, "P", 0.74),
+        _iv_chain_row(weekly, 980.0, "C", 0.32), _iv_chain_row(weekly, 980.0, "P", 0.32),
+    ]
+    recorder = _IvRecorder()
+    _update_atm_iv(recorder, rows, latest_spot=980.0)
+
+    assert recorder.ivs == [0.74], "위클리 IV가 섞이면 격분마다 값이 달라진다"
+
+
+def test_update_atm_iv_is_stable_across_the_weekly_polling_cadence():
+    """격분 폴링을 그대로 재현 — 짝수분엔 위클리가 있고 홀수분엔 없다.
+
+    08-10 실측: 짝수분 평균 IV 0.5285 / 홀수분 0.7387. 그 격차가 iv_chg 구형파의 원인이었다.
+    """
+    from mahdi.main import _update_atm_iv
+
+    monthly, weekly = date(2026, 8, 13), date(2026, 8, 10)
+    recorder = _IvRecorder()
+    for minute in range(8):
+        rows = [_iv_chain_row(monthly, 980.0, "C", 0.74), _iv_chain_row(monthly, 980.0, "P", 0.74)]
+        if minute % 2 == 0:  # 위클리는 격분에만 조회된다(_books_due_this_cycle)
+            rows += [_iv_chain_row(weekly, 980.0, "C", 0.32), _iv_chain_row(weekly, 980.0, "P", 0.32)]
+        _update_atm_iv(recorder, rows, latest_spot=980.0)
+
+    assert len(set(recorder.ivs)) == 1, f"ATM IV가 폴링 격자를 따라 진동한다: {recorder.ivs}"
+
+
+def test_update_atm_iv_skips_rows_without_expiry():
+    from mahdi.main import _update_atm_iv
+
+    recorder = _IvRecorder()
+    _update_atm_iv(recorder, [{"strike": 980.0, "iv": 0.5}], latest_spot=980.0)
+    assert recorder.ivs == []

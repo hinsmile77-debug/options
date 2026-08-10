@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pytest
 
@@ -241,3 +243,167 @@ def test_warmup_fallback_large_gap_risk_off_is_vol_expansion():
 def test_warmup_fallback_extreme_gap_risk_off_is_crisis():
     state = warmup_fallback(RegimeLabel.RANGE_BALANCED, macro_score=-1.0, gap_zscore=3.5)
     assert state.regime == RegimeLabel.CRISIS_DEFENSE
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-10 — startprob one-hot 붕괴 회귀 방지.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_sessions(n_sessions=6, bars=60, seed=0):
+    """레짐이 서로 다른 세션들 — 세션 경계가 살아 있으면 startprob이 여러 상태에 퍼진다."""
+    rng = np.random.default_rng(seed)
+    sessions = []
+    for s in range(n_sessions):
+        centre = np.array([0.3 + 0.1 * (s % 3), 20.0 + 15 * (s % 3), 0.8 + 0.2 * (s % 3),
+                           0.0, 1.0 * (s % 3), 1.0 * (s % 2)])
+        sessions.append(centre + rng.normal(0, 0.05, size=(bars, len(FEATURE_NAMES))))
+    return sessions
+
+
+def test_fit_with_lengths_keeps_startprob_from_collapsing_to_one_hot():
+    """`lengths`가 startprob 추정의 표본 수다 — 없으면 시작점이 1개라 one-hot으로 붕괴한다."""
+    sessions = _synthetic_sessions()
+    features = np.vstack(sessions)
+    lengths = [len(s) for s in sessions]
+
+    engine = RegimeEngine(n_restarts=2, n_iter=50)
+    engine.fit(features, lengths)
+
+    nonzero = int((engine.model.startprob_ > 1e-12).sum())
+    assert nonzero >= 2, f"startprob_ 비영이 {nonzero}개 — 08-10 사고와 같은 붕괴다"
+
+
+def test_fit_rejects_lengths_that_do_not_sum_to_the_matrix():
+    # 필터로 빠진 행을 안 다시 센 경우 — 조용히 틀리는 대신 즉시 죽어야 한다.
+    features = np.zeros((10, len(FEATURE_NAMES)))
+    with pytest.raises(ValueError, match="lengths 합"):
+        RegimeEngine(n_restarts=1, n_iter=5).fit(features, [4, 4])
+
+
+def test_fit_without_lengths_warns_that_startprob_may_collapse(caplog):
+    # `lengths=None`은 테스트·단발 실험용 하위호환으로만 남긴다 — 운영 경로가 실수로 이리 오면
+    # 로그에 흔적이 남아야 한다(08-10 사고는 이 경로로 학습된 모델이 만들었다).
+    features = np.vstack(_synthetic_sessions())
+    with caplog.at_level(logging.WARNING, logger="mahdi.engines.regime"):
+        RegimeEngine(n_restarts=1, n_iter=20).fit(features)
+    assert any("one-hot" in r.getMessage() for r in caplog.records)
+
+
+def _single_row_warnings(caplog):
+    return [r for r in caplog.records if "길이 1" in r.getMessage()]
+
+
+def test_predict_warns_once_when_given_a_single_row(caplog):
+    """길이 1 시퀀스는 전이행렬을 안 쓴다 — 라이브에서 이 경고가 뜨면 그 자체가 회귀 신호다."""
+    rows = np.array([_feature_row(rv_ratio=1.0 + i) for i in range(len(RegimeLabel))])
+    engine = _engine_with_stub(np.arange(len(RegimeLabel)), rows)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.engines.regime"):
+        engine.predict(rows[:1])
+        engine.predict(rows[:1])
+
+    assert len(_single_row_warnings(caplog)) == 1, "인스턴스당 1회만 — 매분 호출되는 경로다"
+
+
+def test_predict_does_not_warn_for_a_window(caplog):
+    rows = np.array([_feature_row(rv_ratio=1.0 + i) for i in range(len(RegimeLabel))])
+    engine = _engine_with_stub(np.arange(len(RegimeLabel)), rows)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.engines.regime"):
+        engine.predict(rows)
+
+    assert not _single_row_warnings(caplog)
+
+
+def test_save_and_load_round_trip_training_metadata(tmp_path):
+    """학습 출처는 모델 **안에** 남아야 한다 — 로그는 지워지고 사람의 기억은 흐려진다."""
+    rows = np.array([_feature_row(rv_ratio=1.0 + i) for i in range(len(RegimeLabel))])
+    engine = _engine_with_stub(np.arange(len(RegimeLabel)), rows)
+    path = tmp_path / "m.pkl"
+
+    engine.save(path, metadata={"iv_chg_source": "먼슬리 단독 재계산", "db_rows_modified": False})
+    restored = RegimeEngine.load(path)
+
+    assert restored.metadata["iv_chg_source"] == "먼슬리 단독 재계산"
+    assert restored.metadata["db_rows_modified"] is False
+
+
+def test_load_tolerates_models_saved_before_metadata_existed(tmp_path):
+    # 2026-08-10 이전 pickle에는 "metadata" 키가 없다 — 없다고 죽으면 안 되고,
+    # 지어내서도 안 된다(빈 dict = "모른다").
+    import pickle
+
+    rows = np.array([_feature_row(rv_ratio=1.0 + i) for i in range(len(RegimeLabel))])
+    engine = _engine_with_stub(np.arange(len(RegimeLabel)), rows)
+    path = tmp_path / "old.pkl"
+    with open(path, "wb") as f:
+        pickle.dump({"model": engine.model, "state_to_label": engine._state_to_label}, f)
+
+    assert RegimeEngine.load(path).metadata == {}
+
+
+class _FitProbeHMM:
+    """`fit()`의 후보 선택만 검증하기 위한 가짜 GaussianHMM.
+
+    seed에 따라 (점수, 수렴 여부)를 정해 두고, `fit()`이 **점수 최고**가 아니라
+    **수렴한 것 중 점수 최고**를 고르는지 본다.
+    """
+
+    plan: dict = {}
+
+    def __init__(self, n_components, covariance_type, random_state, n_iter):
+        self.n_components = n_components
+        self.random_state = random_state
+        self.n_iter = n_iter
+        score, converged = self.plan[random_state]
+        self._score = score
+        history = [10.0, 10.0 + (0.001 if converged else -0.5)]
+        self.monitor_ = type("M", (), {
+            "history": history, "iter": 5, "n_iter": n_iter, "tol": 0.01,
+        })()
+        self.startprob_ = np.full(n_components, 1 / n_components)
+        self.means_ = np.zeros((n_components, len(FEATURE_NAMES)))
+
+    def fit(self, features, lengths=None):
+        return self
+
+    def score(self, features, lengths=None):
+        return self._score
+
+    def predict(self, features, lengths=None):
+        return np.arange(len(features)) % self.n_components
+
+
+def _fit_with_plan(monkeypatch, plan, n_restarts):
+    from mahdi.engines import regime as regime_module
+
+    _FitProbeHMM.plan = plan
+    monkeypatch.setattr(regime_module, "GaussianHMM", _FitProbeHMM)
+    engine = RegimeEngine(random_state=0, n_restarts=n_restarts, n_iter=50)
+    engine.fit(np.zeros((len(RegimeLabel), len(FEATURE_NAMES))), [len(RegimeLabel)])
+    return engine
+
+
+def test_fit_prefers_a_converged_candidate_over_a_higher_scoring_diverged_one(monkeypatch):
+    """2026-08-10 — 재계산 피처로 학습했을 때 **승자가 delta=−0.32로 발산한 후보**였다.
+
+    점수만 보면 발산 중인 후보가 이길 수 있다(로그우도가 줄어드는 중이라 마지막 값이 우연히
+    높을 수 있다). 그러면 저장 게이트가 런 전체를 거부한다 — 멀쩡한 후보가 있었는데도.
+    """
+    engine = _fit_with_plan(monkeypatch, {0: (100.0, False), 1: (50.0, True)}, n_restarts=2)
+    assert engine.model.random_state == 1, "수렴한 후보를 골라야 한다"
+
+
+def test_fit_falls_back_to_the_best_diverged_candidate_when_none_converged(monkeypatch, caplog):
+    # 물러설 때는 조용히 하지 않는다 — 저장 게이트가 거부할 것이라고 미리 말한다.
+    with caplog.at_level(logging.WARNING, logger="mahdi.engines.regime"):
+        engine = _fit_with_plan(monkeypatch, {0: (10.0, False), 1: (99.0, False)}, n_restarts=2)
+
+    assert engine.model.random_state == 1, "비수렴끼리는 점수 최고"
+    assert any("수렴한 후보가 없다" in r.getMessage() for r in caplog.records)
+
+
+def test_fit_still_picks_the_best_score_among_converged_candidates(monkeypatch):
+    engine = _fit_with_plan(monkeypatch, {0: (10.0, True), 1: (99.0, True), 2: (50.0, True)}, n_restarts=3)
+    assert engine.model.random_state == 1

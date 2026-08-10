@@ -46,6 +46,27 @@ _ROLLING_WINDOW_MINUTES = 120  # Hurst/ADX 입력 — 약 2시간, R/S 방법이
 _IV_WINDOW_MINUTES = 30
 _SPREAD_WINDOW_MINUTES = 30
 _MIN_WARMUP_BARS = 30  # 이 정도 봉이 쌓이기 전에는 모델이 있어도 predict() 대신 warmup_fallback 유지(burn-in)
+
+# 2026-08-10 — `RegimeEngine.predict()`에 넘기는 **세션 누적 창**의 길이.
+#
+# `_ROLLING_WINDOW_MINUTES`와 값이 같지만 **독립 상수로 선언한다**: 저쪽은 Hurst/ADX가 수렴하는
+# 데 필요한 관측 창이고 이쪽은 HMM 전방 필터링의 문맥 길이다 — 서로 다른 결정이며, 한쪽을 바꿀
+# 때 다른 쪽이 조용히 따라가면 안 된다.
+#
+# **왜 창이어야 하는가**: 종전 구현은 `predict(np.array([features]))`로 **길이 1**을 넘겼다.
+# 길이 1의 사후확률은 `normalize(startprob ⊙ emission(x))`라 전이행렬이 통째로 안 쓰이고,
+# `startprob_`가 뾰족하면 출력이 입력과 무관한 상수가 된다. 08-10 재학습 모델이 정확히 그랬고
+# (`startprob_` 비영 1개), 전 이력 8,241분이 전부 TREND_UP_STRONG으로 나왔다.
+# 같은 모델에 창을 넘기면 8종이 나온다 — **모델에는 정보가 있었고 호출 방식이 그것을 버렸다.**
+#
+# 대가: 상태 전환이 는다(전 이력 리플레이 실측 길이1 5.1%/분 → 창 12.9%/분). 그 민감도는
+# `RegimeState.stability_flag`(최고확률 < 0.40 → REGIME_UNSTABLE)가 흡수하도록 설계돼 있다.
+_PREDICT_WINDOW_MINUTES = 120
+
+# 예측 창에 넣기 전에 거르는 피처 절대값 상한 — `scripts/fit_regime_engine.py`의
+# `_MAX_ABS_FEATURE_VALUE`와 **같은 값이어야 한다**. 학습이 걸러낸 종류의 값을 예측이 먹으면
+# 라이브가 학습 분포 밖에서 돈다(08-03에 cross_asset_stress 1e11이 EM을 발산시킨 그 값들이다).
+_MAX_ABS_PREDICT_FEATURE = 100.0
 _DAILY_CLOSES_LOOKBACK_DAYS = 30  # rv_ratio가 21개를 요구 — 롤오버 등을 감안해 여유 있게 조회
 _MACRO_STRESS_DAILY_LOOKBACK_DAYS = 10  # USDKRW/US10Y(일봉 전용) z-score 베이스라인 — 9거래일치 baseline
 _MACRO_STRESS_USDCNH_RECENT_BUCKETS = 24  # USDCNH(5분 주기) z-score 베이스라인 — 약 2시간
@@ -245,6 +266,37 @@ def latest_prior_close_regime(conn) -> RegimeLabel:
     return RegimeLabel(regime_int)
 
 
+def replay_live_predictions(
+    engine: RegimeEngine,
+    sessions: list[np.ndarray],
+    *,
+    warmup: int = _MIN_WARMUP_BARS,
+    window: int = _PREDICT_WINDOW_MINUTES,
+) -> list[RegimeLabel]:
+    """
+    입력: 캘리브레이션된 엔진, **세션별로 나눈** 피처 배열 목록((n_i, 6) 각각).
+    계산: `RegimeStateMachine.step()`과 **똑같은 방식**으로 — 세션 안에서 워밍업 `warmup`봉을
+         건너뛰고 최대 `window`분 누적 창을 만들어 — 매분 예측하고 레짐 라벨을 모아 돌려준다.
+    해석: 2026-08-10. 저장 게이트가 "이 모델이 라이브에서 상태를 바꾸는가"를 검사하려면 **라이브와
+         같은 축으로** 재야 한다. 종전 게이트(`scripts/fit_regime_engine.py`)는 전 이력을 한
+         시퀀스로 배치 Viterbi해서 "잠재상태 8/8 방문"을 확인했는데, 같은 모델을 라이브 축으로
+         재면 **1/8**이었다 — 재는 축이 주장하는 축과 달라 통과시킨 것이다(운영점검 규약 F의
+         코드판). 그래서 이 함수는 스크립트가 아니라 **라이브 호출부와 같은 모듈**에 산다:
+         `step()`의 창 구성이 바뀌면 게이트도 같이 바뀌어야 하고, 파일이 다르면 그 동기화가
+         사람의 기억에 의존하게 된다.
+    실패 조건: 없음 — 예측할 분이 하나도 없으면(전 세션이 warmup 이하) 빈 목록.
+    """
+    labels: list[RegimeLabel] = []
+    for session in sessions:
+        # 라이브 경계와 정확히 맞춘다: `step()`은 봉 인덱스 i에서 `_bar_count == i+1`이고
+        # `_bar_count >= warmup`일 때 예측하며, 창에는 0..i행(최대 `window`개)이 들어 있다.
+        # 여기서 한 칸이라도 어긋나면 게이트가 라이브와 다른 것을 재게 된다.
+        for i in range(warmup - 1, len(session)):
+            start = max(0, i - window + 1)
+            labels.append(engine.predict(session[start : i + 1]).regime)
+    return labels
+
+
 class RegimeStateMachine:
     """세션 하나(프로세스 하나)당 1개 — main.py가 선물봉마다 step()을 호출한다."""
 
@@ -258,6 +310,10 @@ class RegimeStateMachine:
         # 이번 프로세스에서 이미 "중립값 탈출"을 알린 피처 — 피처당 한 번만 남긴다(§5-2).
         self._escaped_neutral: set[str] = set()
         self._last_regime: RegimeLabel | None = None
+        # 2026-08-10 — `RegimeEngine.predict()`에 넘길 세션 누적 피처 창(위 `_PREDICT_WINDOW_MINUTES`
+        # 주석 참고). 이 클래스는 **세션당 1개**(클래스 docstring 계약)라 세션 경계 초기화는
+        # 프로세스 재기동이 담당한다 — 여기에 별도 리셋 훅을 두지 않는다.
+        self._predict_window: deque[list[float]] = deque(maxlen=_PREDICT_WINDOW_MINUTES)
         try:
             self.engine: RegimeEngine | None = RegimeEngine.load(model_path)
         except FileNotFoundError:
@@ -292,8 +348,17 @@ class RegimeStateMachine:
         self._log_neutral_escapes(named_features)
         db.insert_feature_store(conn, timestamp, self.underlying, named_features, FEATURE_VERSION)
 
-        if self.engine is not None and self._bar_count >= _MIN_WARMUP_BARS:
-            state = self.engine.predict(np.array([features]))
+        # 2026-08-10 — 예측 창 적재. **적재는 feature_store 저장 뒤에 한다**: DB에는 그날 실제로
+        # 계산된 값이 무엇이었든 남아야 하고(기록), 예측 창에는 학습이 받아들이는 범위의 값만
+        # 들어가야 한다(판단). 두 목적이 달라 필터가 여기에만 걸린다.
+        if all(math.isfinite(v) and abs(v) <= _MAX_ABS_PREDICT_FEATURE for v in features):
+            self._predict_window.append(features)
+
+        # `_predict_window`가 비어 있으면(이번 세션 전 행이 필터에 걸림) 모델이 있어도 못 부른다 —
+        # 빈 배열을 넘기면 predict_proba가 IndexError를 낸다. 그때는 폴백이 정답이다.
+        use_model = self.engine is not None and self._bar_count >= _MIN_WARMUP_BARS and bool(self._predict_window)
+        if use_model:
+            state = self.engine.predict(np.array(self._predict_window))
         else:
             if self._gap_zscore is None:
                 self._gap_zscore = compute_gap_zscore(conn, self.underlying)
@@ -302,11 +367,15 @@ class RegimeStateMachine:
             state = warmup_fallback(prior_regime, macro_score=macro_score, gap_zscore=self._gap_zscore)
 
         if self._last_regime != state.regime:
+            # 2026-08-10 — 모델/폴백 표기는 **실제로 탄 분기**(`use_model`)에서 가져온다. 종전에는
+            # 조건식을 여기서 한 번 더 적었는데, 분기 조건이 늘면(예측 창 비어 있음) 그 복제가
+            # 조용히 틀려 로그가 "predict"라고 쓰면서 폴백 값을 싣게 된다.
             logger.info(
-                "레짐 전이: %s → %s (안정=%s, 모델=%s)",
+                "레짐 전이: %s → %s (안정=%s, 모델=%s, 창=%d분)",
                 self._last_regime.name if self._last_regime is not None else "(최초)",
                 state.regime.name, state.stability_flag,
-                "predict" if self.engine is not None and self._bar_count >= _MIN_WARMUP_BARS else "warmup_fallback",
+                "predict" if use_model else "warmup_fallback",
+                len(self._predict_window),
             )
             self._last_regime = state.regime
 

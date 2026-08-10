@@ -1220,6 +1220,46 @@ def get_feature_history(conn: ConnectionLike, symbol: str, feature_version: str)
     return [(ts, features if isinstance(features, dict) else json.loads(features)) for ts, features in rows]
 
 
+def get_chain_minutes_for_regime_fit(
+    conn: ConnectionLike, underlying: str
+) -> list[tuple[datetime, list[dict], float]]:
+    """
+    입력: DB 커넥션, underlying 라벨.
+    계산: `option_analysis_1m`을 **분 단위로 묶어** (시각, 그 분의 체인 행들, 그 분의 스팟)를
+         시간순으로 돌려준다. 행 dict는 `options_intel.monthly_atm_iv()`가 요구하는 키
+         (`expiry`/`strike`/`iv`)만 담는다.
+    해석: 2026-08-10 — `scripts/fit_regime_engine.py`가 `iv_chg`를 **먼슬리 단독**으로 재계산하기
+         위한 원본이다. `feature_store`에 이미 쌓인 `iv_chg`는 북을 섞어 계산돼 분 단위 구형파로
+         오염돼 있는데(그 경위는 `options_intel.monthly_atm_iv()` docstring), **DB의 과거 행은
+         고쳐 쓰지 않는다** — 그날 실제로 계산된 값이 무엇이었는지는 기록으로 남아야 한다
+         (`fit_regime_engine._MAX_ABS_FEATURE_VALUE` 주석과 같은 원칙). 그래서 원본 체인에서
+         학습 시점에 다시 만든다.
+
+         한 분씩 `option_chain_as_of()`를 부르지 않는 이유: 25영업일이면 1만 회가 넘는 쿼리가
+         된다. 신선도 창도 여기서는 불필요하다 — 그 분에 실제로 적재된 행만 쓰기 때문이다
+         (창은 "지금 판단에 쓸 만큼 신선한가"를 재는 장치이고, 여기서는 과거의 그 분을 그대로
+         복원한다).
+    실패 조건: 없음 — 스팟이 없는 분은 ATM을 정할 수 없으므로 아예 빠진다(JOIN).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT o.timestamp, o.expiry, o.strike, o.iv, s.spot "
+            "FROM option_analysis_1m o "
+            "JOIN underlying_spot_1m s ON s.timestamp=o.timestamp AND s.underlying=%s "
+            "WHERE o.iv IS NOT NULL AND s.spot IS NOT NULL "
+            "ORDER BY o.timestamp ASC",
+            (underlying,),
+        )
+        rows = cur.fetchall()
+
+    minutes: list[tuple[datetime, list[dict], float]] = []
+    for timestamp, expiry, strike, iv, spot in rows:
+        if not minutes or minutes[-1][0] != timestamp:
+            minutes.append((timestamp, [], float(spot)))
+        minutes[-1][1].append({"expiry": expiry, "strike": float(strike), "iv": float(iv)})
+    return minutes
+
+
 def latest_regime_before(conn: ConnectionLike, before: datetime) -> int | None:
     """
     입력: 기준 시각(보통 오늘 자정) — 이 시각 이전(전일까지)의 마지막 레짐을 찾는다.

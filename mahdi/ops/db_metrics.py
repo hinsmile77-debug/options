@@ -1388,7 +1388,32 @@ def _feature_store(conn: ConnectionLike, target: date) -> dict:
         "hmm_threshold": HMM_MIN_SAMPLES,
         "hmm_progress_pct": round(total / HMM_MIN_SAMPLES * 100, 1),
         "non_neutral_pct": non_neutral,
+        "model": _regime_model_provenance(),
     }
+
+
+def _regime_model_provenance() -> dict | None:
+    """
+    계산: 배포된 레짐 모델(`regime_pipeline.DEFAULT_MODEL_PATH`)의 학습 출처 메타데이터를 읽는다.
+    해석: 2026-08-10 — 이날부터 학습은 `iv_chg`를 **DB가 기록한 값이 아니라 재계산한 값**으로
+         쓴다(`feature_store`는 그대로 두고 학습 시점에만 대체). 리포트 §13이 `feature_store`
+         누적 행수를 내면서 그 사실을 안 적으면, **읽는 사람은 학습 입력이 그 표와 같다고
+         가정한다.** 학습이 쓴 값과 DB가 기록한 값이 다르다는 것은 조용히 넘어가면 안 된다.
+         메타데이터가 없으면(08-10 이전 모델) `{}`가 아니라 그 사실을 그대로 낸다 —
+         「메타데이터 없음」과 「대체 없었음」은 다른 사실이다.
+    실패 조건: 파일이 없거나 못 읽으면 None(모델 미배포 — 리포트가 줄을 생략한다).
+    """
+    try:
+        from mahdi.engines.regime import RegimeEngine
+        from mahdi.engines.regime_pipeline import DEFAULT_MODEL_PATH
+
+        engine = RegimeEngine.load(DEFAULT_MODEL_PATH)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("레짐 모델 학습 출처 조회 실패", exc_info=True)
+        return None
+    return dict(engine.metadata) or {"note": "메타데이터 없음(2026-08-10 이전 모델)"}
 
 
 def _macro(conn: ConnectionLike, target: date) -> dict:

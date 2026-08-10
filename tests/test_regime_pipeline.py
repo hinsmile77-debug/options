@@ -307,3 +307,131 @@ def test_feature_activation_uses_the_same_neutral_values_as_the_ops_report():
 
     for name, neutral in _FEATURE_NEUTRAL.items():
         assert _FEATURE_NEUTRAL_VALUES[name] == neutral
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-10 — HMM 상수 출력 사고 회귀 방지.
+#
+# `step()`이 `predict(np.array([features]))`로 **길이 1**을 넘기고 있었다. 길이 1의 사후확률은
+# `normalize(startprob ⊙ emission)`이라 전이행렬이 통째로 안 쓰이고, 그날 학습된 모델의
+# `startprob_`가 one-hot이라 전 이력 8,241분이 단일 레짐으로 나왔다. 아래 테스트들은 그 호출이
+# 다시 길이 1로 돌아가면 즉시 죽는다.
+# ---------------------------------------------------------------------------
+
+
+def _mute_db(monkeypatch):
+    monkeypatch.setattr(db, "underlying_daily_closes", lambda conn, underlying, days: [])
+    monkeypatch.setattr(db, "recent_usdkrw_daily_series", lambda conn, days: [])
+    monkeypatch.setattr(db, "recent_usdcnh_series", lambda conn, limit: [])
+    monkeypatch.setattr(db, "recent_us10y_daily_series", lambda conn, days: [])
+    monkeypatch.setattr(db, "insert_feature_store", lambda conn, ts, symbol, features, version: None)
+    # 워밍업 구간(_MIN_WARMUP_BARS 이전)은 폴백 경로를 타므로 그쪽 DB 호출도 막아야 한다.
+    monkeypatch.setattr(regime_pipeline, "compute_gap_zscore", lambda conn, underlying: 0.0)
+    monkeypatch.setattr(regime_pipeline, "compute_macro_score_proxy", lambda conn, underlying: 0.0)
+    monkeypatch.setattr(regime_pipeline, "latest_prior_close_regime", lambda conn: RegimeLabel.RANGE_BALANCED)
+
+
+class _RecordingEngine:
+    """predict()가 받은 배열의 shape을 전부 기록한다."""
+
+    def __init__(self):
+        self.shapes = []
+
+    def predict(self, features_1m):
+        self.shapes.append(np.asarray(features_1m).shape)
+        return RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple([1.0] + [0.0] * 7))
+
+
+def test_step_feeds_a_growing_window_not_a_single_row(monkeypatch, tmp_path):
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    engine = _RecordingEngine()
+    machine.engine = engine
+    _mute_db(monkeypatch)
+
+    for i in range(_MIN_WARMUP_BARS + 5):
+        machine.update_bar(_bar(close=100.0 + i * 0.1, high=100.5 + i * 0.1, low=99.5 + i * 0.1))
+        machine.step(conn=None, timestamp=datetime(2026, 7, 10, 9, 30))
+
+    assert engine.shapes, "워밍업 이후에는 predict()가 불려야 한다"
+    # 핵심 단언: 길이 1이 단 한 번도 없어야 한다.
+    assert all(shape[0] > 1 for shape in engine.shapes), f"길이 1 호출이 있다: {engine.shapes}"
+    # 창은 봉마다 자란다.
+    assert [s[0] for s in engine.shapes] == sorted(s[0] for s in engine.shapes)
+    assert engine.shapes[0][0] == _MIN_WARMUP_BARS, "첫 예측은 워밍업 봉 수만큼의 창을 받는다"
+    assert engine.shapes[-1][1] == len(FEATURE_NAMES)
+
+
+def test_predict_window_is_capped_at_the_declared_length(monkeypatch, tmp_path):
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    engine = _RecordingEngine()
+    machine.engine = engine
+    _mute_db(monkeypatch)
+
+    over = regime_pipeline._PREDICT_WINDOW_MINUTES + 20
+    for i in range(over):
+        machine.update_bar(_bar(close=100.0 + i * 0.1, high=100.5 + i * 0.1, low=99.5 + i * 0.1))
+        machine.step(conn=None, timestamp=datetime(2026, 7, 10, 9, 30))
+
+    assert max(s[0] for s in engine.shapes) == regime_pipeline._PREDICT_WINDOW_MINUTES
+
+
+def test_non_finite_features_are_kept_out_of_the_predict_window(monkeypatch, tmp_path):
+    # 학습(`build_feature_matrix`)이 거르는 종류의 값을 예측이 먹으면 라이브가 학습 분포 밖에서
+    # 돈다. 08-03에 cross_asset_stress 1e11이 EM을 발산시킨 그 값들이다.
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    engine = _RecordingEngine()
+    machine.engine = engine
+    _mute_db(monkeypatch)
+
+    poisoned = [float("inf")] * len(FEATURE_NAMES)
+    monkeypatch.setattr(RegimeFeatureBuilder, "build", lambda self, *a, **kw: list(poisoned))
+    for _ in range(_MIN_WARMUP_BARS + 3):
+        machine.update_bar(_bar(close=100.0, high=100.5, low=99.5))
+        machine.step(conn=None, timestamp=datetime(2026, 7, 10, 9, 30))
+
+    assert not engine.shapes, "비유한 피처만 들어온 세션에서는 모델을 부르지 않고 폴백해야 한다"
+    assert len(machine._predict_window) == 0
+
+
+def test_replay_live_predictions_matches_the_live_window_boundary():
+    # 게이트가 라이브와 **같은 축**으로 재는지 — 리플레이가 만드는 창 길이가 step()과 같아야 한다.
+    class _ShapeEngine:
+        def __init__(self):
+            self.lengths = []
+
+        def predict(self, window):
+            self.lengths.append(len(window))
+            return RegimeState(regime=RegimeLabel.RANGE_BALANCED, prob_vector=tuple([1.0] + [0.0] * 7))
+
+    engine = _ShapeEngine()
+    session = np.zeros((_MIN_WARMUP_BARS + 5, len(FEATURE_NAMES)))
+    labels = regime_pipeline.replay_live_predictions(engine, [session])
+
+    assert len(labels) == 5 + 1  # 워밍업 봉에서 한 번, 이후 5봉
+    assert engine.lengths[0] == _MIN_WARMUP_BARS
+    assert engine.lengths == list(range(_MIN_WARMUP_BARS, _MIN_WARMUP_BARS + 6))
+
+
+def test_replay_live_predictions_does_not_bleed_across_sessions():
+    # 프로세스가 매일 재기동하므로 창은 세션에서 끊긴다 — 전날 마지막 봉이 오늘 첫 봉의 문맥이
+    # 되면 게이트가 라이브에 없는 정보로 판정하게 된다.
+    class _ShapeEngine:
+        def __init__(self):
+            self.lengths = []
+
+        def predict(self, window):
+            self.lengths.append(len(window))
+            return RegimeState(regime=RegimeLabel.RANGE_BALANCED, prob_vector=tuple([1.0] + [0.0] * 7))
+
+    engine = _ShapeEngine()
+    sessions = [np.zeros((_MIN_WARMUP_BARS + 2, len(FEATURE_NAMES))) for _ in range(3)]
+    regime_pipeline.replay_live_predictions(engine, sessions)
+
+    # 세션마다 창이 워밍업 길이에서 다시 시작한다.
+    assert engine.lengths.count(_MIN_WARMUP_BARS) == 3

@@ -170,6 +170,44 @@ def signal_book_legs(chain_rows: Sequence[dict], today: date) -> tuple[list[Opti
     return by_expiry[expiry], expiry
 
 
+def monthly_atm_iv(chain_rows: Sequence[dict], spot: float | None) -> float | None:
+    """
+    입력: 체인 스냅샷 행(여러 북이 섞여 있어도 된다), 기준 스팟.
+    계산: **먼슬리(최대 만기) 북 한 개**로 좁힌 뒤 스팟에 가장 가까운 행사가를 ATM으로 보고,
+         그 행사가의 콜/풋 IV 평균을 돌려준다.
+    해석: 2026-08-10 — §7.3 `iv_chg`(ATM IV 변화율)의 유일한 입력이다. **북을 좁히는 것이 이
+         함수의 존재 이유다.** 종전에는 `main._update_atm_iv()`가 전 북에서 ATM 행사가를 고르고
+         그 행사가를 가진 **모든 북의 IV를 평균**했는데, 위클리는 `main._books_due_this_cycle()`로
+         격분에만 조회되므로 ATM IV가 **분 단위 구형파**가 됐다(08-10 실측: 짝수분 0.5285 /
+         홀수분 0.7387, 차분 자기상관 −0.900). 그 진동을 학습한 HMM이 "짝수분/홀수분"을 레짐으로
+         94% 재현했고, 재생에서 분당 99.2%가 레짐 전이였다.
+
+         **여기에 있는 이유**: 라이브(`main._update_atm_iv`)와 오프라인 재계산
+         (`scripts/fit_regime_engine.reconstruct_iv_chg`)이 **반드시 같은 규칙**을 써야 한다.
+         두 곳에 같은 로직을 적으면 한쪽만 바뀌어도 학습과 라이브가 다른 피처를 보게 되고,
+         그것이 곧 08-10 사고의 구조다(`replay_live_predictions`를 `regime_pipeline`에 둔 것과
+         같은 원칙).
+
+         "먼슬리 = 최대 만기" 규칙은 `signal_book_legs()`와 같다 — 판단(GEX/감마플립)이 보는 북과
+         레짐 피처가 보는 북이 갈리면 안 된다. 그쪽 docstring의 단서(월물 만기 주간에 관계가
+         뒤집힐 수 있음)도 그대로 적용된다. 다만 **Black-Scholes 사용 가능 여부로 거르지 않는다** —
+         만기 당일이라 GEX가 0이 되는 북이라도 IV 자체는 관측값이라 레짐 피처로는 유효하다.
+    실패 조건: rows/spot이 없거나, 만기가 있는 행이 없거나, ATM 행사가에 IV가 하나도 없으면 None.
+    """
+    if not chain_rows or spot is None:
+        return None
+    expiries = [row["expiry"] for row in chain_rows if row.get("expiry") is not None]
+    if not expiries:
+        return None
+    monthly = max(expiries)
+    monthly_rows = [row for row in chain_rows if row.get("expiry") == monthly]
+    if not monthly_rows:
+        return None
+    atm_strike = min(monthly_rows, key=lambda row: abs(row["strike"] - spot))["strike"]
+    ivs = [row["iv"] for row in monthly_rows if row["strike"] == atm_strike and row.get("iv") is not None]
+    return sum(ivs) / len(ivs) if ivs else None
+
+
 def calculate_gex(legs: Sequence[OptionLeg], spot: float, multiplier: float = 250_000) -> float:
     """
     GEX = Sigma(Gamma x OI x multiplier x S^2/100), call(+) put(-) 관례.

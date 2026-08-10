@@ -53,6 +53,7 @@ from mahdi.features.options_intel import (
     calculate_vrp,
     find_gamma_flip,
     gamma_walls,
+    monthly_atm_iv,
     signal_book_legs,
     vanna_charm_drift,
     with_computed_charm,
@@ -1722,16 +1723,37 @@ def _books_due_this_cycle(
 def _update_atm_iv(regime_state_machine: RegimeStateMachine | None, rows: list[dict], latest_spot: float | None) -> None:
     """
     입력: 레짐 상태머신(없으면 아무 것도 안 함), 이번 사이클에서 파싱된 옵션체인 행들, 최신 스팟.
-    계산: 스팟에 가장 가까운 행사가를 ATM으로 보고 그 행사가의 콜/풋 IV 평균을 구해
-         RegimeFeatureBuilder의 iv_chg 롤링 윈도에 흘려넣는다(§7.3 ATM IV 변화율 근사 입력).
-    실패 조건: rows나 latest_spot이 없으면 건너뛴다.
+    계산: **먼슬리(최근월) 북 한 개**로 좁힌 뒤, 스팟에 가장 가까운 행사가를 ATM으로 보고 그
+         행사가의 콜/풋 IV 평균을 구해 RegimeFeatureBuilder의 iv_chg 롤링 윈도에 흘려넣는다
+         (§7.3 ATM IV 변화율 근사 입력).
+
+    **왜 북을 좁히는가(2026-08-10)**: 종전 구현은 `rows` 전체에서 ATM 행사가를 고르고 **그
+    행사가를 가진 모든 북의 IV를 평균**했다. 그런데 위클리는 `_books_due_this_cycle()`로 격분에만
+    조회되므로, 같은 행사가라도 **짝수분에는 위클리+먼슬리 평균 / 홀수분에는 먼슬리 단독**이
+    된다. 08-10 실측: 짝수분 평균 IV 0.5285 vs 홀수분 0.7387 — ATM IV가 **분 단위 구형파**가 되고
+    `iv_change_rate`가 매분 +0.34 / −0.29로 진동했다(전 이력 차분 자기상관 −0.900).
+
+    피해는 레짐 엔진을 켜는 순간 드러났다. 그 진동을 학습한 HMM이 **"짝수분=TREND_UP_STRONG /
+    홀수분=VOL_COMPRESSION"을 94% 일치로 재현**했고, 08-10 재생에서 분당 99.2%가 레짐 전이였다.
+    `stability_flag`도 못 잡는다 — 모델은 매분 **확률 1.000으로 확신하며** 뒤집혔다.
+    24영업일간 WARMUP 폴백이었기에 아무도 몰랐을 뿐, `feature_store.iv_chg`는 처음부터 오염돼 있었다.
+
+    이 위 `_books_due_this_cycle()` docstring은 이미 *"먼슬리를 먼저 조회해 스팟/ATM IV가 항상
+    주력 북 기준으로 잡히도록"* 이라고 적고 있었다 — **의도는 맞았고 구현이 그것을 안 지켰다.**
+    조회 순서로는 못 지킨다. 필터가 `strike` 기준이라 뒤에 온 위클리 행이 같은 행사가면 그대로
+    평균에 섞이기 때문이다. 2026-08-06 Fix#4가 체인 나이 지표에서 고친 것과 같은 계열이다
+    (*"`chain_rows`가 아니라 `monthly_rows`에서 잰다"*).
+
+    규칙 자체는 `options_intel.monthly_atm_iv()`에 있다 — **오프라인 재계산
+    (`scripts/fit_regime_engine.reconstruct_iv_chg`)이 같은 함수를 쓰기 때문이다.** 학습이 쓰는
+    피처와 라이브가 쓰는 피처가 다른 코드에서 나오면 그 둘이 갈라지는 것을 아무도 못 본다.
+    실패 조건: 상태머신이 없거나 ATM IV를 못 구하면 건너뛴다.
     """
-    if regime_state_machine is None or not rows or latest_spot is None:
+    if regime_state_machine is None:
         return
-    atm_strike = min(rows, key=lambda r: abs(r["strike"] - latest_spot))["strike"]
-    ivs = [r["iv"] for r in rows if r["strike"] == atm_strike and r.get("iv") is not None]
-    if ivs:
-        regime_state_machine.update_iv(sum(ivs) / len(ivs))
+    atm_iv = monthly_atm_iv(rows, latest_spot)
+    if atm_iv is not None:
+        regime_state_machine.update_iv(atm_iv)
 
 
 # 2026-08-04(고도화#5) — REST 응답시간 요약 주기. 5분이면 하루 99줄로 로그 부담이 없고

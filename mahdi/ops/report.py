@@ -934,7 +934,32 @@ def _render_db_judgement(db: dict) -> list[str]:
         ["피처", "중립값 탈출 비율"],
         [[k, _fmt(v, "{:.1f}%")] for k, v in (fs.get("non_neutral_pct") or {}).items()],
     )
+    out += _render_regime_model_provenance(fs.get("model"))
     return out
+
+
+def _render_regime_model_provenance(model: dict | None) -> list[str]:
+    """2026-08-10 — 배포된 레짐 모델이 **무엇으로** 학습됐는지.
+
+    위 `feature_store` 줄은 **DB가 기록한 값**을 센다. 그런데 08-10부터 학습은 `iv_chg`를
+    먼슬리 단독으로 **재계산해서** 쓴다(DB는 안 고친다). 그 사실을 여기 안 적으면 읽는 사람은
+    학습 입력이 위 표와 같다고 가정한다 — 그 가정이 틀린 날이 오늘부터다.
+    """
+    if not model:
+        return [
+            "- 레짐 모델: **미배포** — WARMUP 폴백 동작 중(v6 §16.1)",
+            "",
+        ]
+    if model.get("note"):
+        return [f"- 레짐 모델: {model['note']}", ""]
+    return [
+        f"- 레짐 모델: {model.get('trained_at', '?')} 학습 · 샘플 {model.get('samples', 0):,}개 "
+        f"/ 세션 {model.get('sessions', 0)}개 · **iv_chg = {model.get('iv_chg_source', '?')}**",
+        "> **학습 입력이 위 `feature_store` 표와 다르다**(2026-08-10). `iv_chg`는 북 혼합으로 "
+        "분 단위 구형파라(짝수분 0.5285 / 홀수분 0.7387) 학습 시점에 먼슬리 단독으로 재계산한다. "
+        "**DB의 과거 행은 고치지 않는다** — 그날 실제로 계산된 값이 무엇이었는지는 기록으로 남는다.",
+        "",
+    ]
 
 
 def _render_effective_members(db: dict) -> list[str]:

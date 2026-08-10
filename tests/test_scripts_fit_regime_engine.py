@@ -27,43 +27,44 @@ def _history(*feature_dicts) -> list[tuple[datetime, dict]]:
 
 
 def test_build_feature_matrix_keeps_ordinary_rows():
-    matrix = build_feature_matrix(_history(_features(), _features(adx=30.0)))
+    matrix, lengths = build_feature_matrix(_history(_features(), _features(adx=30.0)))
     assert matrix.shape == (2, 6)
+    assert lengths == [2]  # 같은 날 두 행 = 세션 1개
 
 
 def test_build_feature_matrix_drops_pre_clamp_zscore_outliers():
     # 08-03 실측 값 — cross_asset_stress 1.05e12 (클램프 도입 이전에 계산된 행).
-    matrix = build_feature_matrix(_history(_features(), _features(cross_asset_stress=1.05e12)))
+    matrix, _ = build_feature_matrix(_history(_features(), _features(cross_asset_stress=1.05e12)))
     assert matrix.shape == (1, 6)
 
 
 def test_build_feature_matrix_drops_non_finite_rows():
-    matrix = build_feature_matrix(_history(_features(), _features(book_thinning=float("nan"))))
+    matrix, _ = build_feature_matrix(_history(_features(), _features(book_thinning=float("nan"))))
     assert matrix.shape == (1, 6)
 
 
 def test_build_feature_matrix_drops_rows_missing_a_feature():
     incomplete = _features()
     del incomplete["hurst"]
-    assert build_feature_matrix(_history(_features(), incomplete)).shape == (1, 6)
+    assert build_feature_matrix(_history(_features(), incomplete))[0].shape == (1, 6)
 
 
 def test_build_feature_matrix_admits_the_widest_legitimate_feature_value():
     # 임계(100)의 근거는 "현행 정의가 만들 수 있는 가장 넓은 범위 = adx(0~100)" 이다 —
     # 정상적으로 계산된 값은 하나도 거르지 않아야 한다.
-    assert build_feature_matrix(_history(_features(adx=100.0))).shape == (1, 6)
+    assert build_feature_matrix(_history(_features(adx=100.0)))[0].shape == (1, 6)
 
 
 def test_describe_reports_dropped_rows_so_they_do_not_vanish_silently():
     history = _history(_features(), _features(cross_asset_stress=1.05e12))
-    lines = describe_feature_matrix(history, build_feature_matrix(history))
+    lines = describe_feature_matrix(history, *build_feature_matrix(history))
     assert "제외 1행" in lines[0]
 
 
 def test_describe_flags_zero_variance_features():
     # rv_ratio가 정확히 이 상태였다(410건 전부 1.0) — 분산 0이면 HMM 공분산 추정이 무너진다.
     history = _history(_features(adx=10.0), _features(adx=20.0), _features(adx=30.0))
-    lines = describe_feature_matrix(history, build_feature_matrix(history))
+    lines = describe_feature_matrix(history, *build_feature_matrix(history))
     rv_line = next(line for line in lines if "rv_ratio" in line)
     assert "고유값 1개" in rv_line
     adx_line = next(line for line in lines if "adx" in line)
@@ -71,6 +72,20 @@ def test_describe_flags_zero_variance_features():
 
 
 def test_describe_handles_empty_matrix():
-    assert describe_feature_matrix([], np.array([])) == [
+    assert describe_feature_matrix([], np.array([]), []) == [
         "이력 0행 → 행렬 0행 (누락·비유한값·범위초과로 제외 0행)"
     ]
+
+
+def test_describe_reports_session_count():
+    # 2026-08-10 — 세션 수는 `startprob_` 추정의 표본 수다. 1이면 그 자리에서 one-hot 붕괴가
+    # 예정돼 있으므로 사람이 fit 전에 봐야 한다.
+    history = [
+        (datetime(2026, 8, 3, 9, 0), _features()),
+        (datetime(2026, 8, 3, 9, 1), _features(adx=30.0)),
+        (datetime(2026, 8, 4, 9, 0), _features(adx=40.0)),
+    ]
+    lines = describe_feature_matrix(history, *build_feature_matrix(history))
+    session_line = next(line for line in lines if "세션(거래일)" in line)
+    assert "2개" in session_line
+    assert "min=1" in session_line and "max=2" in session_line
