@@ -587,3 +587,140 @@ def test_traceback_omitted_marker_is_derived_from_the_emit_format():
     """규약 A — 파서의 마커가 emit 측 포맷에서 실제로 나오는 문자열이어야 한다."""
     rendered = main.LOG_KIS_FAILURE_TRACEBACK_OMITTED % ("msg", "exc", "httpx.ReadTimeout", 1)
     assert log_metrics._TRACEBACK_OMITTED_MARKER + "httpx.ReadTimeout" in rendered
+
+
+# ===== 0행 분의 원인 분해 (2026-08-10) =====
+#
+# DB 축의 `zero_row_count` 하나에 세 원인이 만난다. 08-10에 그 값이 1이 되어 08-07 Fix#3의
+# 불변식이 반증으로 찍혔는데, 그 1건은 그 fix와 무관한 「수집 전멸」이었다.
+
+
+def _cycle_line(minute: str, rows: int, retried: str = "") -> str:
+    return _emit("mahdi.main", "INFO", main.LOG_CHAIN_CYCLE_BREAKDOWN,
+                 20.0, 0.1, 0.0, 0.0, rows, 0.0, retried, "0건", minute)
+
+
+def test_log_axis_exposes_cycles_that_ran_with_zero_rows():
+    """DB 축과 대조하려면 로그 축이 「돌았는데 0행」을 따로 내놓아야 한다."""
+    cycles = _parse(
+        _cycle_line("15:14", 20),
+        _cycle_line("15:15", 0, ", 재시도함"),
+        _cycle_line("15:16", 20),
+    )["cycles"]
+
+    assert cycles["zero_row_minutes"] == ["15:15"]
+    assert cycles["minutes_with_cycle"] == ["15:14", "15:15", "15:16"]
+
+
+def test_zero_row_cause_split_separates_a_wiped_collection_from_a_missing_cycle():
+    """08-10 15:15 재현 — 「수집 전멸」과 「사이클 없음」은 다른 사건이다."""
+    cycles = _parse(
+        _cycle_line("15:14", 20),
+        _cycle_line("15:15", 0, ", 재시도함"),   # 돌았는데 0행
+        # 15:16은 사이클 자체가 없다
+        _cycle_line("15:17", 20),
+    )["cycles"]
+    coverage = {"available": True, "zero_row_minutes": ["15:15", "15:16"]}
+
+    causes = db_metrics.attribute_zero_row_causes(coverage, cycles)
+
+    assert causes["collection_wiped"] == ["15:15"]
+    assert causes["no_cycle"] == ["15:16"]
+    assert causes["written_elsewhere"] == []
+    assert causes["labelled"] is True
+
+
+def test_zero_row_cause_split_flags_rows_written_to_a_neighbour_minute():
+    """사이클도 돌고 행도 있었는데 라벨이 옆 분으로 간 경우 — 08-07 Fix#3이 겨냥한 원인이다."""
+    cycles = _parse(_cycle_line("15:14", 20), _cycle_line("15:15", 20))["cycles"]
+    coverage = {"available": True, "zero_row_minutes": ["15:15"]}
+
+    causes = db_metrics.attribute_zero_row_causes(coverage, cycles)
+
+    assert causes["written_elsewhere"] == ["15:15"]
+    assert causes["collection_wiped"] == []
+
+
+def test_zero_row_cause_split_returns_none_without_both_axes():
+    """지어내지 않는다 — 한쪽이라도 없으면 분해를 내지 않는다."""
+    cycles = _parse(_cycle_line("15:14", 20))["cycles"]
+    assert db_metrics.attribute_zero_row_causes(None, cycles) is None
+    assert db_metrics.attribute_zero_row_causes({"available": False}, cycles) is None
+    assert db_metrics.attribute_zero_row_causes({"available": True, "zero_row_minutes": []}, None) is None
+
+
+def test_zero_row_cause_split_marks_unlabelled_legacy_days():
+    """08-07 이전 로그는 파생 start 기반이라 정확도가 낮다 — 그 사실이 값에 남아야 한다."""
+    legacy = (
+        f"{_TS} INFO:mahdi.main:옵션체인 사이클 소요 분해: "
+        "REST수집 19.00초 + DB적재 0.00초 + 상태기록 0.00초 + 기타 0.00초 "
+        "(rows=0, 밀림=0.0초, 타폴러동시호출추정=0건)"
+    )
+    cycles = _parse(legacy)["cycles"]
+    # 파생 start = 10:11:12.345 − 19.0초 = 10:10:53 → "10:10". 라벨이 없으면 이렇게 **한 분
+    # 앞으로 밀릴 수 있다** — 그것이 `labelled=False`가 경고하는 부정확성이다.
+    assert cycles["zero_row_minutes"] == ["10:10"]
+    causes = db_metrics.attribute_zero_row_causes(
+        {"available": True, "zero_row_minutes": ["10:10"]}, cycles
+    )
+
+    assert causes["collection_wiped"] == ["10:10"], "라벨이 없어도 파생 start로 분해는 된다"
+    assert causes["labelled"] is False, "정확도가 낮다는 사실이 값에 남아야 한다"
+
+
+# ===== §14 「GEX 입력이 없던 분」 · §5 북 수 정규화 (2026-08-10) =====
+
+
+def test_signal_reach_renders_the_gex_input_missing_row():
+    """08-10 15:15의 전멸은 §14 어디에도 안 보였다 — 이제 불변식 줄로 보인다."""
+    from mahdi.ops import report
+
+    rendered = "\n".join(report._render_signal_reach({
+        "signal_reach": {
+            "available": True, "decisions": 494, "member_count_max": 4,
+            "gamma_flip_count": 0, "gamma_flip_pct": 0.0,
+            "chain_leg_median": 10.0, "chain_leg_max": 10,
+            "chain_age_seconds_median": 72.0, "chain_age_seconds_max": 190.0,
+            "chain_leg_over_design_minutes": 0, "chain_leg_excess_max": 0,
+            "gex_input_missing_minutes": 1,
+            "warnings": [], "notes": [],
+        }
+    }))
+    assert "GEX 입력이 없던 분" in rendered
+    assert "1분" in rendered
+
+
+def test_rest_table_shows_per_book_calls_and_warns_when_the_book_count_moved():
+    """08-10 재현 — 북 3→2로 옵션체인 호출이 준 것을 fix 효과로 읽을 뻔했다."""
+    from mahdi.ops import report
+
+    metrics = {"rest": {"total_calls": 7488, "span_seconds": 29640, "by_group": {"옵션체인": 7488}}}
+    today = {"book_coverage": [{"series": "regular"}, {"series": "weekly_mon"}]}
+    yesterday = {"db": {"book_coverage": [{"series": "regular"}, {"series": "w1"}, {"series": "w2"}]}}
+
+    rendered = "\n".join(report._render_rest(metrics, today, yesterday))
+
+    assert "북당(옵션체인만)" in rendered
+    assert "3,744" in rendered, "7,488 / 북 2개"
+    assert "바뀌었다" in rendered
+
+
+def test_rest_table_says_totals_are_comparable_when_the_book_count_held():
+    from mahdi.ops import report
+
+    metrics = {"rest": {"total_calls": 100, "span_seconds": 600, "by_group": {"옵션체인": 100}}}
+    books = {"book_coverage": [{"series": "regular"}, {"series": "weekly_mon"}]}
+
+    rendered = "\n".join(report._render_rest(metrics, books, {"db": books}))
+
+    assert "전일과 같다" in rendered
+
+
+def test_rest_table_omits_the_per_book_column_without_db_metrics():
+    """DB 집계가 없는 날(`--no-db`)에는 북 수를 모른다 — 지어내지 않는다."""
+    from mahdi.ops import report
+
+    metrics = {"rest": {"total_calls": 100, "span_seconds": 600, "by_group": {"옵션체인": 100}}}
+    rendered = "\n".join(report._render_rest(metrics))
+
+    assert "북당" not in rendered

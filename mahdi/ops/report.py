@@ -163,7 +163,7 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     lines += _section("2. 시간대별 사이클/밀림", lambda: _render_by_hour(metrics))
     lines += _section("3. 시작분 mod10 — 폴러 충돌", lambda: _render_by_mod10(metrics))
     lines += _section("4. 결손 분 — 로그 기준과 DB 기준", lambda: _render_missing(metrics, db_metrics))
-    lines += _section("5. REST 수요/응답", lambda: _render_rest(metrics))
+    lines += _section("5. REST 수요/응답", lambda: _render_rest(metrics, db_metrics, previous))
     lines += _section("6. 백오프", lambda: _render_backoff(metrics))
     lines += _section("7. 버스트 점유 시간", lambda: _render_bursts(metrics))
     lines += _section("8. 연속 지연 에피소드", lambda: _render_stalls(metrics))
@@ -292,6 +292,7 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
     ]
     if coverage["zero_row_minutes"]:
         out += ["", "```", " ".join(coverage["zero_row_minutes"]), "```"]
+    out += _render_zero_row_causes(coverage.get("zero_row_by_cause"))
     if coverage["over_design_count"]:
         over = ", ".join(f"{t}({n}행)" for t, n in coverage["over_design_minutes"])
         out += [
@@ -333,7 +334,52 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
     return out
 
 
-def _render_rest(metrics: dict) -> list[str]:
+_ZERO_ROW_CAUSE_LABELS = (
+    ("collection_wiped", "수집 전멸", "사이클은 돌았는데 적재 0행 — 전 레그 실패/예산 소진"),
+    ("no_cycle", "사이클 없음", "그 분에 옵션체인 사이클 자체가 없었다"),
+    ("written_elsewhere", "이웃 분 적재", "사이클도 행도 있었는데 라벨이 옆 분으로 갔다"),
+)
+
+
+def _render_zero_row_causes(causes: dict | None) -> list[str]:
+    """2026-08-10 — 0행 분을 **원인별로** 낸다.
+
+    이 분해가 없으면 세 원인이 한 칸에서 만나고, **원인을 주장하는 fix를 검정할 수 없다.**
+    08-10에 `zero_row_count`가 1이 되어 08-07 Fix#3(분 경계 스냅)의 불변식이 반증으로 찍혔는데,
+    그 1건은 `collection_wiped`(KIS 지연으로 예산 소진)였다 — **그 fix와는 무관한 사건**이다.
+    """
+    if not causes:
+        return []
+    rows = [
+        [label, str(len(causes.get(key) or [])), " ".join(causes.get(key) or []) or "—", why]
+        for key, label, why in _ZERO_ROW_CAUSE_LABELS
+    ]
+    out = ["", "0행 분 원인:", ""]
+    out += _table(["원인", "분", "해당 분", "무엇인가"], rows)
+    if not causes.get("labelled"):
+        out += [
+            "> ⚠ **이 분해는 파생 start 기반이다** — 그날 로그에 `분=` 라벨이 없다(08-07 이전). "
+            "라벨 축보다 정확도가 낮으니 경계 근처 1분은 의심할 것.",
+        ]
+    return out
+
+
+def _book_count(db: dict | None) -> int | None:
+    """그날 옵션체인이 실제로 수집한 **만기 북 수**(1~3).
+
+    2026-08-10 — 옵션체인 REST 호출 수의 가장 큰 구조 변수다. 08-10에 이 값이 3→2로 줄어
+    `rest.by_group.옵션체인`이 9,241 → 7,489로 떨어졌는데, 그것을 08-07 유지 풀 fix의 공로로
+    읽을 뻔했다(`2026-08-07-e1`의 대가 지표 `<= 9,500`이 "확인"으로 찍혔다).
+
+    규약 F는 **주장 역할**의 건수 지표만 막고 대가는 의도적으로 면제한다("대가는 얼마나
+    늘었나가 본질이라 건수가 맞는 경우가 많다"). 그 판단은 그대로 두고, 대신 **구조 변수를
+    값 옆에 인쇄**한다 — 읽는 사람이 나눗셈을 할 수 있으면 규약을 조일 필요가 없다.
+    """
+    books = (db or {}).get("book_coverage") or []
+    return len(books) or None
+
+
+def _render_rest(metrics: dict, db: dict | None = None, previous: dict | None = None) -> list[str]:
     rest = metrics.get("rest") or {}
     out = [
         f"- 총 **{rest.get('total_calls', 0):,}건** / {rest.get('span_seconds', 0) / 60:.0f}분 "
@@ -342,9 +388,27 @@ def _render_rest(metrics: dict) -> list[str]:
         f"적자 시작 배율 **{_fmt(rest.get('deficit_threshold_multiplier'), '{:.2f}')}배**)",
         "",
     ]
-    out += _table(
-        ["폴러 그룹", "호출 수"], [[k, f"{v:,}"] for k, v in (rest.get("by_group") or {}).items()]
-    )
+    books = _book_count(db)
+    prev_books = _book_count((previous or {}).get("db"))
+    group_headers = ["폴러 그룹", "호출 수"] + (["북당(옵션체인만)"] if books else [])
+    group_rows = []
+    for name, calls in (rest.get("by_group") or {}).items():
+        row = [name, f"{calls:,}"]
+        if books:
+            row.append(f"{calls / books:,.0f}" if name == "옵션체인" else "—")
+        group_rows.append(row)
+    out += _table(group_headers, group_rows)
+    if books:
+        note = f"> **오늘 북 {books}개**"
+        if prev_books and prev_books != books:
+            note += (
+                f" — 전일 {prev_books}개에서 **바뀌었다.** 옵션체인 호출 수는 북 수에 거의 비례하므로 "
+                "이 표의 전일 비교는 **북당 열로만** 읽을 것(2026-08-10에 3→2 변화를 fix 효과로 "
+                "읽을 뻔했다)"
+            )
+        elif prev_books:
+            note += " (전일과 같다 — 총계를 그대로 비교해도 된다)"
+        out += [note, ""]
     out += _table(
         ["상태코드", "건수"], [[k, f"{v:,}"] for k, v in (rest.get("by_status") or {}).items()]
     )
@@ -1176,6 +1240,14 @@ def _render_signal_reach(db: dict) -> list[str]:
                 f"중앙 {_fmt(_minutes(reach.get('chain_age_seconds_median')), '{:.1f}분')} / "
                 f"최대 {_fmt(_minutes(reach.get('chain_age_seconds_max')), '{:.1f}분')}",
                 f"> {db_metrics_module.SIGNAL_REACH_WARNINGS['chain_age_seconds_max'] / 60:.0f}분",
+            ],
+            # 2026-08-10 — 위 줄들은 전부 "얼마나 두껍고 신선한가"를 잰다. **아무것도 없었던
+            # 분**은 그 축 어디에도 안 나타난다(레그 0은 중앙값에 묻히고 최고령은 NULL이다).
+            # 08-10 15:15의 옵션체인 전멸이 정확히 그랬다 — §14는 그날 아무 경고도 안 냈다.
+            [
+                "GEX 입력이 없던 분",
+                _fmt(reach.get("gex_input_missing_minutes"), "{:,.0f}분"),
+                "> 0 (불변식 — 그 분의 판단은 감마 지형을 못 봤다)",
             ],
         ],
     )

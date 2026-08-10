@@ -83,11 +83,18 @@ _MACRO_COLUMNS = [
 _FEATURE_NEUTRAL = {"rv_ratio": 1.0, "book_thinning": 0.0}
 
 
-def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = None) -> dict:
+def collect(
+    conn: ConnectionLike,
+    target: date,
+    elapsed_minutes: int | None = None,
+    log_cycles: dict | None = None,
+) -> dict:
     """
-    입력: DB 커넥션, 대상 날짜, (선택) 그날 관측이 돌아간 총 분 수 — 로그 지표에서 온다.
+    입력: DB 커넥션, 대상 날짜, (선택) 그날 관측이 돌아간 총 분 수와 로그 축의 `cycles` dict —
+         둘 다 로그 지표에서 온다.
     계산: D1~D9을 한 번에 모은다. `elapsed_minutes`가 있으면 **먼슬리 절대 커버리지**도 함께
-         낸다(§5-5 배지와 같은 함수를 쓴다).
+         낸다(§5-5 배지와 같은 함수를 쓴다). `log_cycles`가 있으면 「0행 분」을 **원인별로**
+         가른다(`attribute_zero_row_causes()` — 근거는 그쪽 docstring).
     실패 조건: 지표 그룹마다 독립적으로 try/except 한다 — 하나가 죽어도 나머지는 낸다
               (`get_health_summary()`와 같은 원칙). 실패한 그룹은 키 자체가 빠진다.
     """
@@ -133,6 +140,15 @@ def collect(conn: ConnectionLike, target: date, elapsed_minutes: int | None = No
         except Exception:
             conn.rollback()
             logger.warning("DB 지표 집계 실패: %s", key, exc_info=True)
+
+    # 2026-08-10 — 로그 축이 있어야만 계산되는 분해라 루프 밖에서 붙인다(루프는 `fn(conn, target)`
+    # 시그니처로 고정돼 있다). 실패해도 나머지 지표를 죽이지 않는다.
+    try:
+        causes = attribute_zero_row_causes(out.get("chain_minute_coverage"), log_cycles)
+        if causes is not None:
+            out["chain_minute_coverage"]["zero_row_by_cause"] = causes
+    except Exception:
+        logger.warning("DB 지표 집계 실패: zero_row_by_cause", exc_info=True)
     return out
 
 
@@ -297,6 +313,48 @@ def chain_minute_coverage(conn: ConnectionLike, target: date, underlying: str = 
         "over_design_minutes": [[r[0], int(r[1])] for r in over],
         "over_design_count": len(over),
     }
+
+
+def attribute_zero_row_causes(coverage: dict | None, log_cycles: dict | None) -> dict | None:
+    """
+    입력: `chain_minute_coverage()` 결과, 로그 축의 `cycles` 하위 dict.
+    계산: DB 축의 「0행 분」을 **로그 축과 대조해 원인별로** 가른다.
+           collection_wiped  사이클이 돌았는데 적재 0행 — 전 레그 실패/예산 소진
+           no_cycle          그 분에 사이클 자체가 없었다
+           written_elsewhere 사이클은 돌고 행도 있었는데 이웃 분 라벨로 갔다
+    해석: 2026-08-10 — 세 원인이 한 칸에서 만나면 **원인을 주장하는 fix를 검정할 수 없다.**
+         08-07 Fix#3(분 경계 스냅)은 `written_elsewhere`/기동 첫 분을 겨냥했고 불변식으로
+         `zero_row_count == 0`을 예측했는데, 08-10에 그 값이 1이 됐다. 그런데 그 1건(15:15)은
+         **`collection_wiped`** 였다 — KIS 지연으로 50초 예산이 소진돼 20레그 중 0행이 적재됐다.
+         **그 fix는 잘못이 없는데 자동 판정은 반증을 냈다.** 규약 F("원인을 주장하는 fix는
+         원인별 지표로 검정한다")가 지표 쪽에서 재현된 것이다.
+
+         **여기(db_metrics)에 두는 이유**: 두 축을 합쳐야만 계산되는데, 결과는 DB 축 절(§4)에
+         붙어야 읽힌다. `crosscheck`는 **서로 다른 절의 모순을 지적**하는 자리이고 이것은
+         한 절 안에서 끝나는 분해라 그쪽이 아니다(그 모듈 docstring의 구분 그대로).
+    실패 조건: 어느 한쪽이 없거나 `available=False`면 None — 지어내지 않는다. 로그 축에 라벨이
+              없는 구 로그(08-07 이전)에서도 `minutes_with_cycle`은 파생 start로 채워지므로
+              분해는 성립하지만, 그때는 정확도가 라벨 축보다 낮다는 것을 사람이 알아야 한다.
+    """
+    if not coverage or not coverage.get("available") or not log_cycles:
+        return None
+    zero_minutes = coverage.get("zero_row_minutes") or []
+    if not zero_minutes:
+        return {"collection_wiped": [], "no_cycle": [], "written_elsewhere": [], "labelled": True}
+
+    with_cycle = set(log_cycles.get("minutes_with_cycle") or [])
+    wiped = set(log_cycles.get("zero_row_minutes") or [])
+    out: dict[str, list[str]] = {"collection_wiped": [], "no_cycle": [], "written_elsewhere": []}
+    for minute in zero_minutes:
+        if minute in wiped:
+            out["collection_wiped"].append(minute)
+        elif minute not in with_cycle:
+            out["no_cycle"].append(minute)
+        else:
+            out["written_elsewhere"].append(minute)
+    # 라벨이 실린 사이클이 하나도 없으면 위 분해는 파생 start 기반이라 신뢰도가 낮다.
+    out["labelled"] = bool((log_cycles.get("duplicate_poll_minutes") or {}).get("labelled"))
+    return out
 
 
 def spot_source_divergence(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> dict:
@@ -1247,7 +1305,13 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
             # 2026-08-07 고도화#2 — Fix#1(창 자르기)의 회귀 감시. 설계보다 두꺼운 분은
             # 서로 다른 ATM 창을 섞어 GEX를 낸 분이다(08-07 장중 157/202분).
             "       count(*) FILTER (WHERE chain_leg_count > %s), "
-            "       max(chain_leg_count - %s) "
+            "       max(chain_leg_count - %s), "
+            # 2026-08-10 — **GEX 입력이 아예 없던 분.** 08-10 15:15에 옵션체인이 전멸해
+            # (20레그 시도 / 0행 적재) 그 분의 판단은 감마 지형을 못 보고 내려졌다. 그때 남은
+            # 흔적은 `main.LOG_CHAIN_CYCLE_EMPTY` ERROR 한 줄뿐이었고 **§14 어디에도 안 보였다** —
+            # 「데이터가 판단까지 갔는가」를 재는 절이 정작 "아무것도 못 갔다"를 안 셌다.
+            # `chain_leg_count`가 0이거나 NULL인 분이 그것이다(전자는 전멸, 후자는 체인 미조회).
+            "       count(*) FILTER (WHERE coalesce(chain_leg_count, 0) = 0) "
             "FROM signal_decisions WHERE timestamp::date=%s",
             (MONTHLY_LEGS_PER_CYCLE_DESIGN, MONTHLY_LEGS_PER_CYCLE_DESIGN, target),
         )
@@ -1278,6 +1342,11 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
         # 0이 정상이며, 0이 아니면 창 자르기가 깨졌거나 한 사이클이 두 분에 걸쳐 적재된 것이다.
         "chain_leg_over_design_minutes": int(row[7]) if row[7] is not None else None,
         "chain_leg_excess_max": max(int(row[8]), 0) if row[8] is not None else None,
+        # 2026-08-10 — 위 SQL 주석 참고. **비율이 아니라 건수로 낸다**: 이 값은 0이 정상이고
+        # 1건이라도 그 분의 판단 근거가 통째로 비었다는 뜻이라, 494분으로 나누면 0.2%가 되어
+        # 눈에 안 띈다. 규약 F의 "건수로 주장하지 마라"는 **비례하는 값**에 대한 규칙이고
+        # 이것은 불변식(0이어야 한다)이라 해당하지 않는다.
+        "gex_input_missing_minutes": int(row[9]) if row[9] is not None else None,
     }
     out["gamma_flip_out_of_range_count"] = _gamma_flip_out_of_range_count(conn, target)
 
@@ -1332,6 +1401,14 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
             f"설계({MONTHLY_LEGS_PER_CYCLE_DESIGN}레그)보다 두꺼운 체인 {over_design}분 "
             f"(최대 +{out['chain_leg_excess_max']}레그) — 서로 다른 ATM 창을 섞어 GEX를 냈다. "
             "08-07 Fix#1(창 자르기)이 뚫렸거나 한 사이클이 두 분에 걸쳐 적재된 것이다"
+        )
+    # 2026-08-10 — **0이 불변식이다.** 이 분의 판단은 GEX/감마플립 없이 내려졌다.
+    # 위 지표들은 전부 "얼마나 두껍고 신선한가"라 **아무것도 없던 분**을 구조적으로 못 본다.
+    gex_missing = out.get("gex_input_missing_minutes")
+    if gex_missing:
+        warnings.append(
+            f"GEX 입력이 없던 분 {gex_missing}분 — 그 분의 판단은 감마 지형을 못 봤다. "
+            "§4의 「0행 분 원인」에서 `수집 전멸`인지 확인할 것"
         )
     out["warnings"] = warnings
     out["notes"] = notes

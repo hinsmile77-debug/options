@@ -869,6 +869,17 @@ def _cycle_metrics(
         # 구조적으로 0이다. **0을 "중복이 없었다"로 읽으면 안 된다** — 규약 C(0건 보고는
         # 증명을 동반한다)와 같은 이유다.
         "duplicate_poll_minutes": _duplicate_poll_minutes(cycles),
+        # 2026-08-10 — DB 축(`db.chain_minute_coverage`)의 「0행 분」을 **원인별로 가르기 위한
+        # 로그 쪽 절반**이다. 그 지표만으로는 세 원인이 한 칸에서 만난다:
+        #   (a) 사이클이 돌았는데 적재가 0행     ← 여기(`zero_row_minutes`)로 식별
+        #   (b) 사이클 자체가 없었다             ← `missing`으로 식별
+        #   (c) 사이클의 행이 이웃 분으로 갔다   ← 위 둘 다 아닌 나머지
+        # 08-10 15:15이 (a)였는데 08-07 Fix#3의 예측(불변식 `zero_row_count == 0`)은 (c)를
+        # 겨냥한 것이었다 — **원인이 다른데 지표가 하나라 멀쩡한 fix가 반증으로 찍혔다.**
+        "minutes_with_cycle": sorted(seen),
+        "zero_row_minutes": sorted(
+            c["poll_minute"] or _hhmm(c["start"]) for c in cycles if c["rows"] == 0
+        ),
         "by_hour": by_hour,
         "by_mod10": by_mod10,
         "missing": {

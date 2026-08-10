@@ -68,7 +68,11 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
                 written = decision_outcomes.compute(conn, target)
                 if written:
                     logger.info("판단 사후 평가 %d건 계산", written)
-                db_metrics_result = db_metrics_module.collect(conn, target, elapsed_minutes=elapsed)
+                # 2026-08-10 — `log_cycles`를 넘기면 DB 축의 「0행 분」이 원인별로 갈린다
+                # (`db_metrics.attribute_zero_row_causes()`). 두 축을 다 가진 곳이 여기뿐이다.
+                db_metrics_result = db_metrics_module.collect(
+                    conn, target, elapsed_minutes=elapsed, log_cycles=metrics["cycles"],
+                )
         except Exception:
             logger.warning("DB 집계 실패 — 로그 지표만으로 리포트를 낸다", exc_info=True)
 
