@@ -165,13 +165,38 @@ Fix#1(`db._restrict_to_latest_cycle_window`)이 08-10부터 그것을 걷어낸�
 **등록(PC별 1회, 관리자 PowerShell)** — 배치 주석에 두지 않는다(위 규약 ②):
 
 ```powershell
-schtasks /Create /TN "Mahdi-Watchdog" /SC MINUTE /MO 1 `
-  /TR "wscript.exe \"<프로젝트경로>\scripts\watchdog_mahdi_hidden.vbs\"" `
-  /RL HIGHEST /F
+schtasks /Create /TN "Mahdi-Watchdog" /SC MINUTE /MO 1 /TR "wscript.exe //B //Nologo <프로젝트경로>\scripts\watchdog_mahdi_hidden.vbs" /RL HIGHEST /F
 ```
 
-확인: 등록 후 매 `:x0`분에 `logs/watchdog.log`에 `OK` 줄이 붙는다(정상은 10분에 한 번만 기록).
-**2026-08-11 현재 이 PC(MW0601)에도 아직 미등록이다 — 사용자 실행 대기.**
+- **`/TR` 안에 따옴표를 넣지 말 것.** 첫 시도(08-11 08:39)가 `\"경로\"`로 감쌌다가 등록은
+  "SUCCESS"인데 **동작은 깨졌다**: PowerShell 5.1은 `\"`를 자기 이스케이프로 안 보고 그대로
+  네이티브 인자로 넘기는데, 경로 끝 `.vbs\"`에서 백슬래시가 따옴표를 이스케이프해 문자열이
+  거기서 안 끝났다. 결과로 **`/RL HIGHEST /F`가 `/TR` 값 안으로 빨려 들어갔고**, 스위치로
+  도달하지 못해 RunLevel이 `Limited`로 남았다. 저장된 값이 그대로 증거다:
+
+      Argument: [" C:\...\watchdog_mahdi_hidden.vbs\ /RL HIGHEST /F]
+
+  wscript는 그 뭉친 문자열을 상대경로로 받아 `C:\WINDOWS\system32\` 기준으로 찾다 실패하고
+  **모달 오류 대화상자**를 띄웠다 — 작업이 `Running`에 멈춰 후속 실행이 전부 무시됐다.
+  **"SUCCESS"는 등록이 됐다는 뜻이지 인자가 옳다는 뜻이 아니다.**
+- 경로에 공백이 없으면 따옴표가 필요 없다. 공백이 있는 PC라면 `schtasks --%` 로
+  **정지 파싱 토큰**을 쓰거나 `Register-ScheduledTask -Execute/-Argument`(인자를 따로 받아
+  인용이 아예 없다)를 쓸 것.
+- `//B //Nologo`는 wscript가 실패해도 **대화상자를 안 띄우게** 한다. 1분 주기 작업이 모달
+  창을 띄우면 그 순간부터 워치독이 멈춘다(위가 정확히 그 사고다).
+
+**등록 직후 반드시 저장된 값을 되읽어 확인할 것** — 등록 성공 메시지로는 판정하지 않는다:
+
+```powershell
+$t = Get-ScheduledTask -TaskName 'Mahdi-Watchdog'
+$t.Actions[0].Execute; $t.Actions[0].Arguments; $t.Principal.RunLevel   # Highest 여야 한다
+schtasks /Run /TN "Mahdi-Watchdog"                                       # 즉시 1회 실행
+(Get-ScheduledTaskInfo -TaskName 'Mahdi-Watchdog').LastTaskResult        # 0 이어야 한다
+```
+
+최종 확인은 `logs/watchdog.log`다 — 매 `:x0`분에 `OK` 줄이 붙는다(정상은 10분에 한 번만 기록).
+
+**2026-08-11 08:40 이 PC(MW0601) 등록·검증 완료** — `[2026-08-11 08:40:48] OK — 정상`.
 
 ---
 
