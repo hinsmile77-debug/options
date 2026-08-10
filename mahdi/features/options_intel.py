@@ -12,7 +12,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import date, time
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from vollib.black_scholes.greeks.analytical import delta as _bs_delta
 from vollib.black_scholes.greeks.analytical import gamma as _bs_gamma
@@ -136,6 +136,47 @@ def legs_by_expiry(chain_rows: Sequence[dict], today: date) -> dict[date, list[O
     }
 
 
+def monthly_expiry(expiries: Iterable[date]) -> date | None:
+    """
+    입력: 후보 만기일들(중복·순서 무관).
+    계산: 그중 **먼슬리(월물)** 만기를 고른다. KRX 코스피200 옵션의 월물 만기는 **그 달 두 번째
+         목요일**이므로, 그 형태인 후보가 정확히 하나면 그것이 답이다. 아니면 최대 만기로 떨어진다.
+    해석: 2026-08-11 — 종전 규칙은 `max(expiries)` 하나였다. 근거는 *"위클리는 늘 먼슬리보다
+         가깝다"* 였는데 **이번 주에 그것이 깨졌다.** 08-13(목)이 8월물 만기이고, 08-15 광복절이
+         토요일이라 08-17(월)이 대체공휴일이 되면서 위클리(월) 만기가 **08-18로 먼슬리 뒤로
+         밀렸다.** 그래서 `max()`가 위클리를 먼슬리로 지목했다.
+
+         이 함수 이전의 두 호출부는 그 위험을 알고 있었고, 완화 논리까지 적어 뒀다 —
+         *"월물 만기 주간에 뒤집힐 수 있는데, 그때는 먼슬리가 이미 만기 당일이라
+         `usable_for_black_scholes()`가 걸러 GEX가 0이 된다."* **그 완화는 만기 당일에만
+         성립한다.** 오늘은 만기 **이틀 전**에 뒤집혔다(위클리가 먼슬리를 건너뛰었기 때문이지
+         먼슬리가 가까워졌기 때문이 아니다). 공휴일이 만드는 이 형태는 매달 재현될 수 있다.
+
+         실측 피해(2026-08-11 07:31~08:05, 개장 전에 발견): `max()`가 분 단위로 교대했다 —
+         위클리는 격분에만 조회되므로 홀수분엔 먼슬리(08-13)만, 짝수분엔 위클리(08-18)가
+         섞여 최대가 된다. 두 북의 ATM IV는 0.7910 vs 0.6229로 **격차 0.168**이고, 이는
+         2026-08-10에 R6이 없앤 구형파(0.210)의 80% 크기다. **R6이 지운 진동이 다른 원인으로
+         같은 자리에 돌아와 있었고**, 하필 HMM이 처음 라이브로 도는 날이었다.
+
+         **왜 series 컬럼이 아니라 날짜 규칙인가**: `option_analysis_1m`에는 series가 없다
+         (`signal_book_legs()` 주석). 컬럼을 추가하면 과거 행이 전부 NULL이라 오프라인 재계산
+         (`fit_regime_engine.reconstruct_iv_chg`)이 라이브와 갈라진다 — 그 분기가 곧 08-10
+         사고의 구조다. 날짜 규칙은 **과거 행에도 똑같이 적용된다.**
+    실패 조건: 후보가 없으면 None. 두 번째 목요일이 0개거나 2개 이상이면 `max()`로 떨어진다 —
+              월물 만기가 공휴일로 앞당겨지는 경우를 **지어내서 맞추려 하지 않는다**(종전 동작
+              유지). 그 상황은 `db_metrics.monthly_book_expiry_with_source()`의 1순위
+              (`expiry_liquidity_1m.series='regular'`)가 08:30 이후에 정정해 준다.
+    """
+    candidates = sorted(set(expiries))
+    if not candidates:
+        return None
+    # 두 번째 목요일 = 목요일(weekday 3)이면서 8~14일. 달마다 정확히 하루뿐이다.
+    second_thursdays = [d for d in candidates if d.weekday() == 3 and 8 <= d.day <= 14]
+    if len(second_thursdays) == 1:
+        return second_thursdays[0]
+    return candidates[-1]
+
+
 def signal_book_legs(chain_rows: Sequence[dict], today: date) -> tuple[list[OptionLeg], date | None]:
     """
     입력: 체인 스냅샷 행, 잔존만기 계산 기준일.
@@ -148,12 +189,18 @@ def signal_book_legs(chain_rows: Sequence[dict], today: date) -> tuple[list[Opti
          −33.5B ~ +99.1B를 오갔고(양수 233분 / 음수 259분), `_options_flow_score()`가 GEX
          부호로 회귀/증폭을 가르므로 **신호 부호가 그 상쇄에 좌우됐다.**
 
-         "먼슬리"를 **만기가 가장 먼 북**으로 고르는 이유: `option_analysis_1m`에는 series
-         컬럼이 없다. 폴링 중인 북은 먼슬리 1 + 위클리 2뿐이고 위클리는 늘 먼슬리보다 가까우므로
-         (위클리는 매주 만기, 먼슬리는 월 1회) 최대 만기가 곧 먼슬리다. 월물 만기 주간에
-         이 관계가 뒤집힐 수 있는데(`db_metrics.monthly_book_expiry()` 주석 참고), 그때는
-         먼슬리가 이미 만기 당일이라 `usable_for_black_scholes()`가 걸러 GEX가 0이 된다 —
-         `signal_decisions.gex_expiry`(마이그레이션 023)에 실제 사용 만기를 남기는 이유다.
+         **어느 북이 먼슬리인가는 `monthly_expiry()`가 정한다** — 규칙과 그 근거는 그 함수
+         docstring에 있다. `option_analysis_1m`에 series 컬럼이 없어 날짜로 판별한다.
+
+         2026-08-11 이전에는 여기가 `max(by_expiry)`였고, 근거는 *"위클리는 늘 먼슬리보다
+         가깝다"* 였다. **그 전제가 2026-08-11에 깨졌다**(공휴일로 위클리(월)가 먼슬리 뒤로
+         밀렸다). 당시 이 자리에 적혀 있던 완화 논리 — *"뒤집혀도 그때는 먼슬리가 만기
+         당일이라 `usable_for_black_scholes()`가 걸러 GEX가 0이 된다"* — 는 **만기 당일에만
+         성립**하고, 실제 사고는 만기 이틀 전에 났다. 위험을 알면서 적어 둔 완화가 실제 발생
+         형태를 못 덮은 사례라 지우지 않고 남긴다.
+
+         `signal_decisions.gex_expiry`(마이그레이션 023)에 실제 사용 만기를 남기는 이유가
+         여기 있다 — 08-11의 오선택도 그 컬럼으로 사후 확인된다.
 
          2026-08-05(COCKPIT 육안 점검 P0-2): `mahdi/main.py`의 private 헬퍼였던 것을 여기로
          옮긴다. **COCKPIT(`dashboard/data_source.py`)이 같은 규칙을 쓰지 않아 화면의 Gamma
@@ -166,15 +213,18 @@ def signal_book_legs(chain_rows: Sequence[dict], today: date) -> tuple[list[Opti
     by_expiry = legs_by_expiry(chain_rows, today)
     if not by_expiry:
         return [], None
-    expiry = max(by_expiry)
+    # 2026-08-11 — `max()`에서 `monthly_expiry()`로. 근거는 그 함수 docstring.
+    # 후보는 **usable 레그가 남은 만기**뿐이다(`legs_by_expiry`가 이미 걸렀다) — 먼슬리가
+    # 만기 당일이라 통째로 걸러졌으면 여기 없고, 그때는 종전대로 남은 것 중 최대로 떨어진다.
+    expiry = monthly_expiry(by_expiry)
     return by_expiry[expiry], expiry
 
 
 def monthly_atm_iv(chain_rows: Sequence[dict], spot: float | None) -> float | None:
     """
     입력: 체인 스냅샷 행(여러 북이 섞여 있어도 된다), 기준 스팟.
-    계산: **먼슬리(최대 만기) 북 한 개**로 좁힌 뒤 스팟에 가장 가까운 행사가를 ATM으로 보고,
-         그 행사가의 콜/풋 IV 평균을 돌려준다.
+    계산: **먼슬리 북 한 개**(`monthly_expiry()`)로 좁힌 뒤 스팟에 가장 가까운 행사가를 ATM으로
+         보고, 그 행사가의 콜/풋 IV 평균을 돌려준다.
     해석: 2026-08-10 — §7.3 `iv_chg`(ATM IV 변화율)의 유일한 입력이다. **북을 좁히는 것이 이
          함수의 존재 이유다.** 종전에는 `main._update_atm_iv()`가 전 북에서 ATM 행사가를 고르고
          그 행사가를 가진 **모든 북의 IV를 평균**했는데, 위클리는 `main._books_due_this_cycle()`로
@@ -188,9 +238,10 @@ def monthly_atm_iv(chain_rows: Sequence[dict], spot: float | None) -> float | No
          그것이 곧 08-10 사고의 구조다(`replay_live_predictions`를 `regime_pipeline`에 둔 것과
          같은 원칙).
 
-         "먼슬리 = 최대 만기" 규칙은 `signal_book_legs()`와 같다 — 판단(GEX/감마플립)이 보는 북과
-         레짐 피처가 보는 북이 갈리면 안 된다. 그쪽 docstring의 단서(월물 만기 주간에 관계가
-         뒤집힐 수 있음)도 그대로 적용된다. 다만 **Black-Scholes 사용 가능 여부로 거르지 않는다** —
+         북 선택은 `signal_book_legs()`와 **같은 함수**(`monthly_expiry()`)를 쓴다 —
+         판단(GEX/감마플립)이 보는 북과 레짐 피처가 보는 북이 갈리면 안 된다.
+         2026-08-11에 그 공유가 값을 했다: 규칙을 한 곳에서 고치니 두 경로가 함께 나았다.
+         다만 **Black-Scholes 사용 가능 여부로 거르지 않는다** —
          만기 당일이라 GEX가 0이 되는 북이라도 IV 자체는 관측값이라 레짐 피처로는 유효하다.
     실패 조건: rows/spot이 없거나, 만기가 있는 행이 없거나, ATM 행사가에 IV가 하나도 없으면 None.
     """
@@ -199,7 +250,10 @@ def monthly_atm_iv(chain_rows: Sequence[dict], spot: float | None) -> float | No
     expiries = [row["expiry"] for row in chain_rows if row.get("expiry") is not None]
     if not expiries:
         return None
-    monthly = max(expiries)
+    # 2026-08-11 — `max()`에서 `monthly_expiry()`로. 아래 "먼슬리 = 최대 만기" 서술은 그 함수가
+    # 대체했다. `signal_book_legs()`와 **같은 함수**를 부르는 것이 요점이다 — 판단이 보는 북과
+    # 레짐 피처가 보는 북은 갈리면 안 되고, 규칙이 두 벌이면 한쪽만 고쳐진다.
+    monthly = monthly_expiry(expiries)
     monthly_rows = [row for row in chain_rows if row.get("expiry") == monthly]
     if not monthly_rows:
         return None

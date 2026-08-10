@@ -15,6 +15,8 @@ from mahdi.features.options_intel import (
     legs_by_expiry,
     legs_from_chain_rows,
     pin_risk,
+    monthly_atm_iv,
+    monthly_expiry,
     signal_book_legs,
     usable_for_black_scholes,
     vanna_charm_drift,
@@ -350,7 +352,11 @@ def test_legs_by_expiry_keeps_the_same_exclusion_rules_as_the_flat_conversion():
 
 
 def test_signal_book_legs_picks_only_the_monthly_book():
-    """만기가 가장 먼 북(= 먼슬리) 하나만 — 위클리와 합산하면 GEX 부호가 상쇄로 좌우된다(08-04 §2-8)."""
+    """먼슬리 북 하나만 — 위클리와 합산하면 GEX 부호가 상쇄로 좌우된다(08-04 §2-8).
+
+    2026-08-11: 여기서 08-13이 뽑히는 이유가 "가장 먼 만기"에서 "그 달 두 번째 목요일"로
+    바뀌었다. 이 케이스는 둘 다 같은 답을 내므로 그대로 통과한다 — 갈리는 케이스는 아래.
+    """
     rows = [
         {"strike": 1045.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
          "expiry": date(2026, 8, 13)},  # 먼슬리
@@ -373,6 +379,65 @@ def test_signal_book_legs_returns_empty_without_usable_rows():
     expired = [{"strike": 1045.0, "option_type": "C", "oi": 1.0, "iv": 0.1, "gamma": 0.01,
                 "expiry": date(2026, 7, 1)}]
     assert signal_book_legs(expired, today=date(2026, 8, 5)) == ([], None)
+
+
+# ===== 2026-08-11: 공휴일이 위클리를 먼슬리 뒤로 밀면 `max(expiry)`가 뒤집힌다 =====
+#
+# 실사고: 2026-08-13(목)이 8월물 만기인데 08-15 광복절이 토요일이라 08-17(월)이 대체공휴일이
+# 됐고, 위클리(월) 만기가 08-18로 **먼슬리 뒤로** 밀렸다. `max()`가 위클리를 먼슬리로 지목했다.
+# 아래 넷은 전부 `monthly_expiry()`를 `max()`로 되돌리면 깨진다 — 그것이 이 테스트들의 목적이다.
+
+
+def test_monthly_expiry_prefers_the_second_thursday_over_the_farthest():
+    # 08-13 = 2026년 8월의 두 번째 목요일(8월 1일이 토요일 → 목요일은 6일, 13일).
+    assert monthly_expiry([date(2026, 8, 13), date(2026, 8, 18)]) == date(2026, 8, 13)
+    # 순서와 중복에 흔들리지 않는다.
+    assert monthly_expiry([date(2026, 8, 18), date(2026, 8, 13), date(2026, 8, 18)]) == date(2026, 8, 13)
+
+
+def test_monthly_expiry_falls_back_to_the_farthest_when_no_second_thursday_is_present():
+    """먼슬리가 이미 만기로 빠진 뒤(위클리만 남음)에는 종전 동작을 유지한다 — 지어내지 않는다."""
+    assert monthly_expiry([date(2026, 8, 17), date(2026, 8, 24)]) == date(2026, 8, 24)
+    assert monthly_expiry([]) is None
+
+
+def test_signal_book_legs_picks_the_monthly_even_when_a_weekly_expires_later():
+    """2026-08-11 실사고 형태. `max()`로 되돌리면 08-18(위클리)이 뽑혀 이 테스트가 깨진다."""
+    rows = [
+        {"strike": 979.0, "option_type": "C", "oi": 100.0, "iv": 0.79, "gamma": 0.02,
+         "expiry": date(2026, 8, 13)},  # 먼슬리(8월물) — 두 번째 목요일
+        {"strike": 979.0, "option_type": "C", "oi": 800.0, "iv": 0.62, "gamma": 0.08,
+         "expiry": date(2026, 8, 18)},  # 위클리(월) — 대체공휴일로 먼슬리보다 뒤
+    ]
+
+    legs, expiry = signal_book_legs(rows, today=date(2026, 8, 11))
+
+    assert expiry == date(2026, 8, 13)
+    assert len(legs) == 1
+    assert legs[0].iv == pytest.approx(0.79)
+
+
+def test_monthly_atm_iv_does_not_alternate_when_the_weekly_book_appears_on_even_minutes():
+    """R6의 본질 — 위클리가 격분에만 조회돼도 ATM IV는 **같은 값**이어야 한다.
+
+    2026-08-11 실측 격차는 0.168이었다(먼슬리 0.7910 / 위클리 0.6229). R6이 2026-08-10에
+    없앤 구형파(0.210)의 80%가 다른 원인으로 같은 자리에 돌아와 있었고, 하필 HMM이 처음
+    라이브로 도는 날이었다. 이 테스트가 그 재발을 막는다.
+    """
+    monthly = [
+        {"strike": 979.0, "option_type": "C", "iv": 0.7910, "expiry": date(2026, 8, 13)},
+        {"strike": 979.0, "option_type": "P", "iv": 0.7910, "expiry": date(2026, 8, 13)},
+    ]
+    weekly = [
+        {"strike": 979.0, "option_type": "C", "iv": 0.6229, "expiry": date(2026, 8, 18)},
+        {"strike": 979.0, "option_type": "P", "iv": 0.6229, "expiry": date(2026, 8, 18)},
+    ]
+
+    odd_minute = monthly_atm_iv(monthly, spot=979.18)             # 홀수분 — 먼슬리 단독
+    even_minute = monthly_atm_iv(monthly + weekly, spot=979.18)   # 짝수분 — 위클리가 섞인다
+
+    assert odd_minute == pytest.approx(0.7910)
+    assert even_minute == pytest.approx(odd_minute)
 
 
 def test_pin_risk_is_computable_on_expiry_day_when_gamma_flip_is_not():

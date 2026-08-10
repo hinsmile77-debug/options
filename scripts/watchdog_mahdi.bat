@@ -1,21 +1,35 @@
 @echo off
 setlocal
-chcp 65001 >nul
-REM 관측 루프 워치독 — Windows 작업 스케줄러가 **1분 주기**로 호출한다 (2026-08-06 §2-1 / Fix#2).
+REM Observation-loop watchdog. Task Scheduler calls this every minute.
+REM Logic lives in scripts/watchdog_observation_loop.py + mahdi/liveness.py;
+REM this file only sets up the environment. Korean rationale is in those
+REM docstrings, which are UTF-8 safe. Keep this file ASCII.
 REM
-REM 등록(관리자 PowerShell에서 한 번만, 경로는 이 파일 위치에 맞춰 바꿀 것):
-REM   schtasks /Create /TN "Mahdi Watchdog" /SC MINUTE /MO 1 ^
-REM     /TR "\"%~f0\"" /RL HIGHEST /F
+REM ============ ASCII ONLY - DO NOT PUT NON-ASCII TEXT IN THIS FILE ============
+REM 2026-08-11: this script had never run. "chcp 65001" plus UTF-8 Korean
+REM comments desynced the cmd.exe batch read offset (cmd tracks a byte offset
+REM into the file and 3-byte characters shift it). cmd resumed parsing in the
+REM middle of a comment line, lost the REM prefix, and executed the fragments.
+REM One of those fragments was a "schtasks /Create" example that was sitting
+REM inside a comment - it actually ran. "cd /d" also failed, so the script only
+REM worked when the caller already happened to be in the project root.
 REM
-REM 창을 띄우지 않는다 — 1분마다 콘솔이 깜빡이면 사람이 곧 스케줄을 꺼버린다.
-REM (작업 스케줄러 등록 시 "사용자가 로그온한 경우에만 실행" + "숨김"을 함께 켠다.)
+REM Two rules follow from that, and both are load-bearing:
+REM   1. No non-ASCII in this file - not even in comments.
+REM   2. No runnable command inside a comment. The registration procedure is in
+REM      docs/dev_memory/CURRENT_STATE.md instead.
+REM =============================================================================
 REM
-REM PYTHONUTF8: 기동 스크립트와 같은 이유 — 파이썬이 파일에 쓰는 인코딩은 콘솔 코드페이지가
-REM 아니라 OS 시스템 로캘을 따르므로 chcp로는 logs/watchdog.log의 한글을 못 고친다.
+REM PYTHONUTF8=1 is what makes logs/watchdog.log come out as UTF-8. chcp cannot
+REM do it: Python picks its file encoding from the OS system locale, not from
+REM the console code page.
 set PYTHONUTF8=1
 
+REM Project root is resolved from this file's own location - no absolute paths,
+REM so the repo stays portable across PCs.
 for %%I in ("%~dp0..") do set "PROJECT_DIR=%%~fI"
-cd /d "%PROJECT_DIR%"
+if not defined PROJECT_DIR exit /b 1
+cd /d "%PROJECT_DIR%" || exit /b 1
 
 uv run python scripts\watchdog_observation_loop.py
 
