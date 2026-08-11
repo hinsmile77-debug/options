@@ -96,23 +96,40 @@ class _FakeConn:
 
 def test_summarize_reports_sample_size_alongside_the_rate():
     """**표본 수를 반드시 함께 낸다** — 진입 3건인 날의 100%는 아무 뜻이 없다."""
-    # (entries, n_5, hit_5, n_15, hit_15, n_30, hit_30) — 08-06 실측값이다.
-    conn = _FakeConn((62, 57, 28, 61, 37, 47, 37))
+    # (entries, n_5, hit_5, n_15, hit_15, n_30, hit_30, mv_5, mv_15, mv_30) — 08-06 실측값
+    # + 2026-08-11 고도화 C의 |이동폭| 세 열(비율이라 0.00123 = 0.123%).
+    conn = _FakeConn((62, 57, 28, 61, 37, 47, 37, 0.00123, 0.00250, 0.00410))
     result = decision_outcomes.summarize(conn, date(2026, 8, 6))
     assert result["entries"] == 62
-    assert result["horizons"]["5m"] == {"sample": 57, "hits": 28, "hit_pct": 49.1}
-    assert result["horizons"]["30m"] == {"sample": 47, "hits": 37, "hit_pct": 78.7}
+    assert result["horizons"]["5m"] == {
+        "sample": 57, "hits": 28, "hit_pct": 49.1, "abs_move_pct": 0.123
+    }
+    assert result["horizons"]["30m"]["abs_move_pct"] == 0.41
+
+
+def test_absolute_move_is_reported_even_when_direction_hits_are_meaningless():
+    """고도화 C — 방향 중립 전략(`straddle_accumulate`)에는 적중률이 틀린 질문이다.
+
+    08-11에 ENTER 281건이 전부 스트래들이었는데 적중률만 있었다. 이동폭은 별개 축이라
+    적중이 0건이어도 값이 나와야 한다.
+    """
+    conn = _FakeConn((10, 10, 0, 10, 0, 10, 0, 0.005, 0.008, 0.011))
+    result = decision_outcomes.summarize(conn, date(2026, 8, 11))
+    assert result["horizons"]["15m"]["hit_pct"] == 0.0
+    assert result["horizons"]["15m"]["abs_move_pct"] == 0.8
 
 
 def test_a_horizon_with_no_sample_reports_none_not_zero():
     """0%와 "잴 게 없었다"는 다르다 — 0으로 내면 마지막 30분 진입이 성과를 끌어내린다."""
-    conn = _FakeConn((5, 0, 0, 0, 0, 0, 0))
+    conn = _FakeConn((5, 0, 0, 0, 0, 0, 0, None, None, None))
     result = decision_outcomes.summarize(conn, date(2026, 8, 6))
     assert result["horizons"]["5m"]["hit_pct"] is None
+    # 이동폭도 같은 규칙 — 표본이 없으면 0이 아니라 None이다.
+    assert result["horizons"]["5m"]["abs_move_pct"] is None
 
 
 def test_a_day_without_entries_is_not_available_rather_than_zero():
-    conn = _FakeConn((0, 0, 0, 0, 0, 0, 0))
+    conn = _FakeConn((0, 0, 0, 0, 0, 0, 0, None, None, None))
     assert decision_outcomes.summarize(conn, date(2026, 8, 6))["available"] is False
 
 

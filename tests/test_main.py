@@ -3078,6 +3078,180 @@ def test_collect_option_chain_cycle_collects_everything_when_it_fits(monkeypatch
     assert [r for r in caplog.records if "수집 예산" in r.getMessage()] == []
 
 
+# ===== 2026-08-11 Fix#1/#2 — 연속 타임아웃 조기 포기 + 컷 귀속 =====
+#
+# 08-11 15:01~15:22에 22분 연속으로 적재가 0행이었다. KIS 지연이 4초를 넘기자 read 타임아웃이
+# 전 호출을 실패로 바꿨고, **실패한 호출도 성공한 호출과 똑같이 예산을 먹으므로** 사이클이
+# 50초를 다 태우고 0행을 남기는 상태에 고정됐다.
+
+
+class _FakeRestClientAlwaysTimingOut:
+    """모든 레그가 `httpx.ReadTimeout`으로 끝나는 KIS — 08-11 15시대의 재현."""
+
+    def __init__(self, clock: list[float], seconds_per_call: float) -> None:
+        self._clock = clock
+        self._seconds_per_call = seconds_per_call
+        self.calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        self._clock[0] += self._seconds_per_call
+        raise httpx.ReadTimeout("The read operation timed out")
+
+
+def _collect_all_timeouts(monkeypatch, books, budget: float = 50.0):
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientAlwaysTimingOut(clock, seconds_per_call=5.0)
+    rows, _spot, _any, missing = _run(
+        _collect_option_chain_cycle(
+            rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 11, 15, 1),
+            # 실패 경로를 타므로 진짜 로거가 필요하다(`WarningThrottle(60.0)`은 성공 경로 전용).
+            WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=clock[0] + budget,
+        )
+    )
+    return rest_client, rows, missing
+
+
+def test_consecutive_read_timeouts_abort_the_cycle_instead_of_burning_the_budget(monkeypatch, caplog):
+    """08-11 15:01 재현 — 10레그를 다 부르지 않고 3회 연속 타임아웃에서 접어야 한다.
+
+    되돌리면(조기 포기 제거) 호출이 10건이 되어 이 테스트가 깨진다. 그것이 이 테스트의 목적이다.
+    """
+    books = [(_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular")]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rest_client, rows, missing = _collect_all_timeouts(monkeypatch, books)
+
+    assert len(rest_client.calls) == mahdi_main.OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT  # 3건에서 접는다
+    assert rows == []
+    # 접었어도 남은 먼슬리 레그는 재시도 대상으로 그대로 넘어간다(고도화#1 경로를 안 깬다).
+    assert len(missing) == 10
+
+    aborts = [r for r in caplog.records if "연속 타임아웃" in r.getMessage()]
+    assert len(aborts) == 1  # 레그마다가 아니라 사이클당 1줄
+    assert "컷당한북=regular" in aborts[0].getMessage()
+    # 예산 초과와 **다른 줄**이어야 한다 — 원인이 다르므로 지표도 갈려야 한다.
+    assert [r for r in caplog.records if "수집 예산" in r.getMessage()] == []
+
+
+def test_a_single_timeout_does_not_abort_the_cycle(monkeypatch, caplog):
+    """단발 지터로 접으면 안 된다 — 카운터는 **연속**이고 성공하면 0으로 돌아간다."""
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+
+    class _FlakyOnce:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+            self.calls.append(symbol)
+            clock[0] += 1.0
+            if len(self.calls) in (1, 3, 5):  # 사이사이 실패 — 연속이 아니다
+                raise httpx.ReadTimeout("The read operation timed out")
+            return _OPTION_QUOTE_FIXTURE
+
+    rest_client = _FlakyOnce()
+    books = [(_FakeManagerManyStrikes(frozenset({1000.0, 1002.5, 1005.0})), "regular")]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rows, _spot, _any, _missing = _run(
+            _collect_option_chain_cycle(
+                rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 11, 10, 0),
+                WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=clock[0] + 50.0,
+            )
+        )
+
+    assert len(rest_client.calls) == 6  # 3행사가 x (C,P) — 하나도 안 건너뛴다
+    assert len(rows) == 3
+    assert [r for r in caplog.records if "연속 타임아웃" in r.getMessage()] == []
+
+
+def test_cumulative_failures_abort_even_when_they_are_not_consecutive(monkeypatch, caplog):
+    """고도화 A — Fix#1의 **연속** 카운터가 못 보는 패턴을 잡는다.
+
+    08-11 14시대가 이 형태였다: 예산 초과 20건인데 전멸은 1건뿐이었고, 나머지는 성공/실패가
+    섞여 얇아진 분이다. 성공 하나에 연속 카운터가 0으로 돌아가므로 Fix#1만으로는 안 접힌다.
+    """
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+
+    class _AlternatingFailure:
+        """실패-성공을 번갈아 낸다 — 연속은 항상 1이지만 누적은 쌓인다."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+            self.calls.append(symbol)
+            clock[0] += 1.0
+            if len(self.calls) % 2 == 1:
+                raise httpx.ReadTimeout("The read operation timed out")
+            return _OPTION_QUOTE_FIXTURE
+
+    rest_client = _AlternatingFailure()
+    # 12레그(6행사가 x C/P) — 홀수 호출이 실패하므로 6번째 실패가 11번째 호출에서 난다.
+    # 10레그로는 실패가 5건이라 예산(6)에 애초에 못 닿는다.
+    books = [
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0, 1007.5})), "regular")
+    ]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rows, _spot, _any, _missing = _run(
+            _collect_option_chain_cycle(
+                rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 11, 14, 30),
+                WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=clock[0] + 50.0,
+            )
+        )
+
+    # 실패 6건째에서 접는다 — 시간 예산(50초)은 아직 한참 남아 있다.
+    assert len(rest_client.calls) == 2 * mahdi_main.OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS - 1
+    assert len(rows) == mahdi_main.OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS - 1
+    aborts = [r for r in caplog.records if "실패 예산" in r.getMessage()]
+    assert len(aborts) == 1
+    # 연속 타임아웃 줄이 아니어야 한다 — 원인이 다르다.
+    assert [r for r in caplog.records if "연속 타임아웃" in r.getMessage()] == []
+
+
+def test_budget_cut_names_the_book_it_reached(monkeypatch, caplog):
+    """Fix#2 — 컷이 **어느 북에 닿았는가**를 로그가 말한다.
+
+    08-06이 "예산 컷이 먼슬리에 닿은 분 3분"을 손으로 세어 고도화#1의 방향을 정했는데,
+    그 실측이 지표로는 없었다. 먼슬리 우선 순서상 컷은 뒤쪽 북부터 닿으므로 **여기 `regular`가
+    들어오면 그 자체가 사건**이다.
+    """
+    books = [
+        (_FakeManagerManyStrikes(frozenset({1000.0, 1002.5})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({1000.0, 1002.5})), "weekly_mon"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rest_client, rows, _ = _collect_with_budget_books(monkeypatch, books, seconds_per_call=10.0, budget=40.0)
+
+    assert len(rows) == 4  # 먼슬리 4레그는 지켜졌다
+    cut = [r for r in caplog.records if "수집 예산" in r.getMessage()]
+    assert len(cut) == 1
+    # 위클리만 잘렸다 — 먼슬리가 이 목록에 들어오면 순서 보장이 깨진 것이다.
+    assert "컷당한북=weekly_mon" in cut[0].getMessage()
+
+
+def _collect_with_budget_books(monkeypatch, books, seconds_per_call: float, budget: float):
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientCountingQuotes(clock, seconds_per_call, _OPTION_QUOTE_FIXTURE)
+    rows, _spot, any_strikes, _missing = _run(
+        _collect_option_chain_cycle(
+            rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 11, 10, 0),
+            WarningThrottle(60.0), deadline=clock[0] + budget,
+        )
+    )
+    return rest_client, rows, any_strikes
+
+
 def test_collect_option_chain_cycle_without_deadline_is_unbounded(monkeypatch):
     """`deadline=None`(기본값)은 종전과 완전히 동일하게 동작해야 한다 — 백테스트/테스트 경로 보호."""
     from mahdi.main import _collect_option_chain_cycle
@@ -3289,6 +3463,9 @@ def _patch_signal_fusion_cycle_db_defaults(monkeypatch):
     monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
     monkeypatch.setattr("mahdi.main.db.insert_risk_snapshot", lambda *a, **k: None)
     monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 0))
+    # 2026-08-11 고도화 D — 쿨다운 입력. 호출측이 try/except로 감싸지만, 스텁을 두는 쪽이
+    # 빠르고 "이 폴러가 무엇을 조회하는가"를 이 헬퍼 한 곳에서 읽을 수 있게 한다.
+    monkeypatch.setattr("mahdi.main.db.minutes_since_last_entry_by_strategy", lambda conn, now: {})
 
 
 def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule(monkeypatch):
@@ -3453,6 +3630,9 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     monkeypatch.setattr("mahdi.main.db.latest_market_halt_state", lambda conn: None)
     # 2026-08-06 Fix#1 — 컷오프 이전 시각 고정(안 그러면 오후에 돌릴 때 REJECT가 된다).
     monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 0))
+    # 2026-08-11 고도화 D — 쿨다운 입력. 호출측이 try/except로 감싸지만, 스텁을 두는 쪽이
+    # 빠르고 "이 폴러가 무엇을 조회하는가"를 이 헬퍼 한 곳에서 읽을 수 있게 한다.
+    monkeypatch.setattr("mahdi.main.db.minutes_since_last_entry_by_strategy", lambda conn, now: {})
 
     @contextmanager
     def fake_get_connection(settings=None):
@@ -3623,6 +3803,9 @@ def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
     # 2026-08-06 Fix#1 — 컷오프 이전 시각으로 고정(위 헬퍼와 같은 이유. 이 테스트는 halt 쪽을
     # 보려고 헬퍼를 안 쓰고 직접 스텁을 깐다).
     monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 6, 10, 0))
+    # 2026-08-11 고도화 D — 쿨다운 입력. 호출측이 try/except로 감싸지만, 스텁을 두는 쪽이
+    # 빠르고 "이 폴러가 무엇을 조회하는가"를 이 헬퍼 한 곳에서 읽을 수 있게 한다.
+    monkeypatch.setattr("mahdi.main.db.minutes_since_last_entry_by_strategy", lambda conn, now: {})
     chain_rows = [
         {"strike": 95.0, "option_type": "C", "oi": 100.0, "iv": 0.18, "gamma": 0.02,
          "gex": 0.0, "expiry": date(2026, 8, 13)},
@@ -5065,9 +5248,12 @@ def test_poll_signal_fusion_cycle_passes_vrp_to_the_strategy_palette(monkeypatch
     captured: list[float] = []
     real_evaluate = SignalFusionEngine.evaluate
 
-    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+    # 2026-08-11: **`**kwargs`로 받는다.** 고정 시그니처 스파이는 `evaluate()`에 인자가
+    # 하나 늘 때 TypeError를 내고, 그 예외를 폴러가 사이클마다 삼켜 **테스트가 실패하는
+    # 대신 무한 루프**가 된다(고도화 D 구현 중 실제로 겪었다).
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset(), **kwargs):
         captured.append(vrp)
-        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today, **kwargs)
 
     monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
 
@@ -5108,9 +5294,12 @@ def test_poll_signal_fusion_cycle_falls_back_to_fair_when_vrp_is_unavailable(mon
     captured: list[float] = []
     real_evaluate = SignalFusionEngine.evaluate
 
-    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+    # 2026-08-11: **`**kwargs`로 받는다.** 고정 시그니처 스파이는 `evaluate()`에 인자가
+    # 하나 늘 때 TypeError를 내고, 그 예외를 폴러가 사이클마다 삼켜 **테스트가 실패하는
+    # 대신 무한 루프**가 된다(고도화 D 구현 중 실제로 겪었다).
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset(), **kwargs):
         captured.append(vrp)
-        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today, **kwargs)
 
     monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
 
@@ -5222,9 +5411,12 @@ def test_poll_signal_fusion_cycle_passes_real_meta_label_context(monkeypatch):
     captured: list = []
     real_evaluate = SignalFusionEngine.evaluate
 
-    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+    # 2026-08-11: **`**kwargs`로 받는다.** 고정 시그니처 스파이는 `evaluate()`에 인자가
+    # 하나 늘 때 TypeError를 내고, 그 예외를 폴러가 사이클마다 삼켜 **테스트가 실패하는
+    # 대신 무한 루프**가 된다(고도화 D 구현 중 실제로 겪었다).
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset(), **kwargs):
         captured.append(meta_context)
-        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today, **kwargs)
 
     monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
 
@@ -5257,9 +5449,12 @@ def _spy_evaluate(monkeypatch, captured: list):
 
     real_evaluate = SignalFusionEngine.evaluate
 
-    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset()):
+    # 2026-08-11: **`**kwargs`로 받는다.** 고정 시그니처 스파이는 `evaluate()`에 인자가
+    # 하나 늘 때 TypeError를 내고, 그 예외를 폴러가 사이클마다 삼켜 **테스트가 실패하는
+    # 대신 무한 루프**가 된다(고도화 D 구현 중 실제로 겪었다).
+    def spy(self, signal_inputs, meta_context, vrp=0.0, already_used_strategies_today=frozenset(), **kwargs):
         captured.append(already_used_strategies_today)
-        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today)
+        return real_evaluate(self, signal_inputs, meta_context, vrp, already_used_strategies_today, **kwargs)
 
     monkeypatch.setattr(SignalFusionEngine, "evaluate", spy)
 

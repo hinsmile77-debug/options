@@ -22,6 +22,16 @@ ensemble:
 
 strategy_gates:
   max_priority_strategies_per_regime_day: 2
+  # 2026-08-11 고도화 D — 동일 전략 재진입 쿨다운(분). **0 = OFF**, 종전과 같은 동작이다.
+  #
+  # 위 상한은 **가짓수**(하루에 몇 개 전략을 벌이는가)를 막고, 이 값은 **빈도**(같은 전략에
+  # 얼마나 자주 들어가는가)를 막는다. 08-11에 ENTER가 281건/494분(56.9%)이었고 09:03~09:19에
+  # 분 단위로 연속했다 — ADVISORY라 무해했지만 실주문이었다면 16분 연속 진입이다.
+  #
+  # 켤 조건과 예측치는 `mahdi/fusion/strategy_palette.enforce_reentry_cooldown` 위 주석에 있다.
+  # 요약: **실주문 배선 전에** 켜고, 그 전에 며칠치 ENTER 빈도 분포를 본다. 권고 시작값 15분
+  # (v6 §13.3 청산 레이어의 최단 시간 스케일 — 그보다 짧으면 직전 진입의 청산 판단이 안 끝난다).
+  reentry_cooldown_minutes: 0
   short_gamma_requires:
     - "highest_confidence_level"
     - "positive_gex"

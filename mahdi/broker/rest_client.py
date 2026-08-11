@@ -148,6 +148,45 @@ _HTTP_TIMEOUT = httpx.Timeout(
 # 아닌지를 알 수 없는 상태**가 되고, 그 모호함은 4초를 아껴서 얻을 이득보다 훨씬 비싸다.
 # 지금은 ExecutionEngine이 배선 전이라 실제 호출이 없지만, 배선되는 날 이 값이 4초면 곤란하다.
 _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS = 10.0
+
+# ===== 2026-08-11 Fix#3 — 옵션체인 read 타임아웃 레버 (오늘은 **안 켠다**) =====
+#
+# ## 왜 레버로 두는가
+#
+# 08-11 15:01~15:22에 22분 연속으로 옵션체인 적재가 0행이었다. 원인은 KIS 지연이 4초를 넘긴
+# 것이고, **우리 타임아웃 4.0초가 그것을 100% 실패로 변환**했다. 느린 호출 줄의 HTTP 성분이
+# 4.03~4.06초에 못 박혀 있는 것이 그 증거다(페이서 배율은 1.00배 — 우리 쪽 압력이 아니다).
+#
+# ## 08-11 실측 (자동 리포트 §9-1, 전수 백분위)
+#
+#     inquire-price   7,165건   p50 0.62초   p95 2.99초   p99 3.29초   최대 7.01초
+#
+# **4.0초는 p99(3.29)와 최대(7.01) 사이에 있다.** 정상 구간에서는 넉넉하고 지연 구간에서는
+# 전부 자른다 — 즉 이 값은 *평시에는 아무 일도 안 하다가 사고 때만 사고를 키우는* 자리에 있다.
+#
+# ## 그런데 왜 오늘 안 올리는가
+#
+# **타임아웃을 늘리면 레그당 비용이 늘어 예산이 더 빨리 마른다.** 지금 레그당 비용은
+# 페이서 1초 + 타임아웃 4초 = 5초이고, 6초로 올리면 7초가 되어 50초 예산에 7레그밖에 안 들어간다
+# (지금 10레그). 즉 **이 레버 단독으로는 상황을 악화시킬 수 있다.**
+#
+# 그래서 순서가 정해져 있다: **오늘 들어간 Fix#1(연속 타임아웃 조기 포기)이 먼저 실측되어야
+# 한다.** 조기 포기가 있으면 "느린 레그를 더 기다린다"의 비용 상한이 3레그로 묶이므로 그때
+# 타임아웃을 올리는 것이 안전해진다. 하루에 변수 하나 — 08-04 p4의 교훈이다.
+#
+# ## 켤 조건과 예측치 (숫자를 보기 전에 적는다)
+#
+#   조건  08-12 이후 `timeout_abort.count > 0`인 날이 있고, 그날 `budget_exceeded.count`가
+#         08-11(87건)보다 줄어 있을 것 — 즉 Fix#1이 실제로 조기에 접었다는 증거가 먼저 있어야 한다.
+#   값    6.0초 (p99 3.29의 약 1.8배 — 최대 7.01보다 아래로 둬 "진짜 죽은 호출"은 계속 자른다)
+#   주장  `db.chain_minute_coverage.zero_row_by_cause.수집전멸` 감소 (08-11 기준선 **27분**)
+#   대가  `qualitative.read_timeout` 감소 · `옵션체인 REST수집 평균` 증가 (08-11 28.6초)
+#   대가  `timeout_abort.count` 증가 — 레그당 비용이 늘어 조기 포기가 더 자주 걸린다(의도된 것)
+#
+# **`rest_latency` p95는 예측하지 않는다** — KIS 귀속이므로 우리가 콜을 줄여도 그들의 p95는
+# 안 바뀐다(08-07 NEXT_TODO의 정정과 같은 이유).
+OPTION_CHAIN_READ_TIMEOUT_SECONDS: float | None = None  # None = 전역값(4.0초) 사용 = 레버 OFF
+
 _ENDPOINT_READ_TIMEOUT_SECONDS: dict[str, float] = {
     # 300초 주기 단발 호출 — 느려도 다음 사이클을 밀지 않는다.
     tr_codes.PATH_FUTUREOPTION_BALANCE: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
@@ -158,6 +197,20 @@ _ENDPOINT_READ_TIMEOUT_SECONDS: dict[str, float] = {
     tr_codes.PATH_FUTUREOPTION_ORDER: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
     tr_codes.PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL: _SLOW_ENDPOINT_READ_TIMEOUT_SECONDS,
 }
+
+# Fix#3 레버가 켜져 있을 때만 옵션체인 경로를 등록한다. `None`이면 항목 자체가 안 생기므로
+# `timeout_for_url()`이 전역값으로 떨어진다 — **레버 OFF가 종전과 바이트 단위로 같은 동작**이다.
+#
+# 경로 충돌 확인(위 `_ENDPOINT_LABEL_OVERRIDES` 주석이 경고한 그것): 국내
+# `/uapi/domestic-futureoption/.../inquire-price`와 해외
+# `/uapi/overseas-futureoption/.../inquire-price`는 **서로의 suffix가 아니다**
+# (`domestic-`/`overseas-`가 앞에서 갈린다). `inquire-asking-price`와도 겹치지 않는다.
+# 그래서 `timeout_for_url()`의 "등록 경로끼리는 서로의 suffix가 아니다" 전제가 유지된다 —
+# 이 전제는 `tests/test_broker_rest_client.py`가 기계적으로 지킨다.
+if OPTION_CHAIN_READ_TIMEOUT_SECONDS is not None:
+    _ENDPOINT_READ_TIMEOUT_SECONDS[tr_codes.PATH_FUTUREOPTION_QUOTE] = (
+        OPTION_CHAIN_READ_TIMEOUT_SECONDS
+    )
 
 
 # 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 4 후속) — 계측용 엔드포인트 라벨.

@@ -989,11 +989,27 @@ def _render_db_judgement(db: dict) -> list[str]:
     out += _render_effective_members(db)
     out += _render_entry_cutoff(db)
     out += _render_decision_outcomes(db)
+    # 2026-08-11 Fix#4 — `db.regime`이 list에서 dict로 바뀌었다(`visits` + `trend_minutes`).
+    # 구 JSON(08-10 이전)을 읽을 때를 위해 list도 그대로 받는다 — 전일 대비 델타가 깨지면
+    # 리포트가 조용히 빈 표를 낸다.
+    regime = db.get("regime") or {}
+    regime_visits = regime.get("visits", []) if isinstance(regime, dict) else regime
     out += _table(
         ["레짐", "오늘", "전체 이력", "영업일"],
-        [[r["regime"], f"{r['today']:,}", f"{r['total']:,}", str(r["days"])]
-         for r in db.get("regime") or []],
+        [[r["regime"], f"{r['today']:,}", f"{r['total']:,}", str(r["days"])] for r in regime_visits],
     )
+    if isinstance(regime, dict) and regime.get("today_total"):
+        trend = regime.get("trend_minutes", 0)
+        out += [
+            f"- **추세 레짐 방문 {trend}분** / 오늘 {regime['today_total']}분"
+            + (
+                " — 추세가 0분이면 `regime_hmm` 멤버가 매분 0점인 것은 **정상이고 반증이 아니다**"
+                "(v6 §7: 방향은 TREND_UP/DOWN_STRONG에만 있다). 그때 §14-3의 그 축은 «판정 불가»다."
+                if trend == 0 else
+                " — 이 분들에서 `regime_hmm`이 비영이어야 한다(0이면 그것이 진짜 결함이다)."
+            ),
+            "",
+        ]
     fs = db.get("feature_store") or {}
     out += [
         f"- `feature_store` 오늘 {fs.get('today', 0):,}건 / 누적 **{fs.get('total', 0):,}건** "
@@ -1113,12 +1129,20 @@ def _render_decision_outcomes(db: dict) -> list[str]:
             "",
         ]
     rows = [
-        [horizon, f"{s['sample']:,}", f"{s['hits']:,}", _fmt(s["hit_pct"], "{:.1f}%")]
+        [horizon, f"{s['sample']:,}", f"{s['hits']:,}", _fmt(s["hit_pct"], "{:.1f}%"),
+         _fmt(s.get("abs_move_pct"), "{:.3f}%")]
         for horizon, s in (outcomes.get("horizons") or {}).items()
     ]
-    out = [f"- 진입 판단 **{outcomes['entries']:,}건**의 방향 적중률", ""]
-    out += _table(["지평", "표본", "적중", "적중률"], rows)
+    out = [f"- 진입 판단 **{outcomes['entries']:,}건**의 사후 평가", ""]
+    out += _table(["지평", "표본", "적중", "적중률(방향성)", "|이동폭|(방향 무관)"], rows)
     out += [
+        "> **전략 종류에 맞는 열을 읽는다**(2026-08-11 고도화 C). `적중률`은 "
+        "`direction x 이동`의 부호라 **방향성 전략을 전제**한다. 08-11에 허용된 전략은 "
+        "`straddle_accumulate`(방향 중립)였고, 스트래들은 어느 쪽으로든 크게 움직이면 이긴다 — "
+        "그날 적중률 열은 **틀린 질문에 답했다.** 변동성 전략은 `|이동폭|`으로 읽는다.",
+        "> `|이동폭|`에 **임계를 걸지 않는다** — 정상 분포를 모르고, 모르는 채 임계를 정하면 "
+        "그 임계가 곧 결론이 된다(08-05 스팟 괴리율에서 한 실수). 진입 스팟 대비 비율이라 "
+        "지수 수준이 달라도 비교할 수 있다.",
         "> **표본 수를 반드시 함께 읽는다** — 진입 3건인 날의 100%는 아무 뜻이 없다. 지평이 길수록 "
         "표본이 주는 것은 정상이다(장 마감을 넘긴 지평은 구조적으로 빈다).",
         "> **무변동은 적중도 실패도 아니라 분모에서 빠진다.** 0을 실패로 세면 조용한 장에서 "
@@ -1251,6 +1275,21 @@ def _render_signal_reach(db: dict) -> list[str]:
             ],
         ],
     )
+    # 2026-08-11 고도화 B — 판단이 **그 분** 체인을 봤는가(마이그레이션 029).
+    source = reach.get("chain_input_source") or {}
+    if source.get("available"):
+        counts = source["counts"]
+        parts = " / ".join(f"{k} {v:,}분" for k, v in sorted(counts.items()))
+        stale_pct = source.get("stale_pct")
+        out += [
+            "",
+            f"- **체인 입력 출처**: {parts} — 그중 직전 분 이상(stale) **{_fmt(stale_pct, '{:.1f}%')}**",
+            "> 08-11에 하루의 절반이 stale이었다(짝수분 20레그 폴링 19.3초 > 판단 위상 :10초). "
+            "`chain_age_seconds_max` 하나로는 «느려졌다»만 알 수 있고 «몇 분이 늙은 값을 봤는가»는 "
+            "못 센다 — 그것이 이 줄이 생긴 이유다. 위상 레버는 `SIGNAL_FUSION_PHASE_OFFSET_SECONDS`.",
+        ]
+    elif source:
+        out += ["", f"- 체인 입력 출처: 집계 전 — {source.get('reason', '')}"]
     for warning in reach.get("warnings") or []:
         out.append(f"- ⚠ {warning}")
     # 2026-08-06 Fix#5 — 장전 표본만 있는 구간의 판정 유예. 경고가 아니지만 **보이기는 한다**.
@@ -1349,14 +1388,33 @@ def _render_hypotheses(results: list[dict]) -> list[str]:
     # 2026-08-03 §5-4 — 예정일이 지났는데 아직 `상태: pending`인 항목을 **표 위로** 띄운다.
     # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에 섞여 들어가면 놓치기
     # 쉽고 그렇게 쌓이면 "예측 → 실측 검정" 규약 자체가 무력해진다.
-    overdue = sorted({(r["id"], r.get("검증예정일")) for r in results if r.get("overdue")})
+    # 2026-08-11 Fix#8 — **경과일 내림차순**으로 낸다. 08-11에 이 목록이 23건이었고 id 알파벳
+    # 순이라 4일 지난 것과 오래 묵은 것이 섞여 보였다. 목록이 길어지면 사람은 통째로 소음
+    # 취급하고, 그러면 규약 F/G가 막으려는 것과 같은 실패("진짜가 소음에 묻힌다")가 난다.
+    overdue = sorted(
+        {(r["id"], r.get("검증예정일"), r.get("overdue_days", 0), bool(r.get("stale")))
+         for r in results if r.get("overdue")},
+        key=lambda t: (-t[2], t[0]),
+    )
     if overdue:
-        out += [
+        stale_count = sum(1 for *_x, is_stale in overdue if is_stale)
+        header = (
             f"> ⚠ **확정 대기 {len(overdue)}건** — 검증예정일이 지났는데 `hypotheses.yaml`의 "
-            "`상태`가 아직 `pending`이다. 오늘 보고서를 쓰면서 손으로 확정할 것:",
-            "",
+            "`상태`가 아직 `pending`이다. 오늘 보고서를 쓰면서 손으로 확정할 것"
+        )
+        if stale_count:
+            header += (
+                f" — 그중 **{stale_count}건은 {hypotheses_module.STALE_PENDING_DAYS}일을 넘겼다**. "
+                "그 나이면 그 사이 코드가 여러 번 바뀌어 귀속이 안 갈리므로 `inconclusive`로 닫는다"
+            )
+        out += [header + ":", ""]
+        out += [
+            f"> - `{hid}` (예정일 {due or '미지정'}"
+            + (f", **{days}일 경과**" if days else "")
+            + (" · ⏳ 강등 대상" if is_stale else "")
+            + ")"
+            for hid, due, days, is_stale in overdue
         ]
-        out += [f"> - `{hid}` (예정일 {due or '미지정'})" for hid, due in overdue]
         out.append("")
 
     # 2026-08-05 고도화#2(규약 E) — **자기 주장을 검정하지 않는 지표로 받은 합격**을 막는다.

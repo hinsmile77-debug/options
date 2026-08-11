@@ -213,6 +213,23 @@ def regime_state_columns() -> tuple[str, ...]:
     return _REGIME_STATE_COLUMNS
 
 
+# 2026-08-11(고도화 B) — `insert_signal_decision()`이 쓰는 컬럼 목록.
+#
+# 위 둘과 **같은 이유**로 노출한다. 이 표는 매분 INSERT되므로 마이그레이션 029가 라이브 DB에
+# 안 붙어 있으면 **판단이 한 줄도 안 남는다** — regime_state보다 파급이 크다.
+# 025를 넣을 때 적은 원칙("컬럼을 늘린 이번에 대상 테이블도 함께 늘린다")을 그대로 적용한다.
+_SIGNAL_DECISION_COLUMNS = (
+    "timestamp", "conviction", "decision", "reject_reason", "risk_gate_state", "exec_mode",
+    "gamma_flip", "gex", "chain_leg_count", "chain_oldest_leg_age_seconds",
+    "gex_expiry", "vrp", "chain_input_source",
+)
+
+
+def signal_decision_columns() -> tuple[str, ...]:
+    """해석: `macro_snapshot_columns()`와 동일 — 코드가 실제로 쓰는 컬럼 목록의 단일 소스."""
+    return _SIGNAL_DECISION_COLUMNS
+
+
 def ws_status_columns() -> tuple[str, ...]:
     """
     해석: `macro_snapshot_columns()`와 동일. 마이그레이션 026(atm_roll_count_today) 미적용이면
@@ -1398,16 +1415,55 @@ def insert_signal_decision(
         cur.execute(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
             "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
-            "chain_oldest_leg_age_seconds, gex_expiry, vrp) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "chain_oldest_leg_age_seconds, gex_expiry, vrp, chain_input_source) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
                 chain.get("gamma_flip"), chain.get("gex"),
                 chain.get("chain_leg_count"), chain.get("chain_oldest_leg_age_seconds"),
                 chain.get("gex_expiry"), chain.get("vrp"),
+                # 2026-08-11 고도화 B — 마이그레이션 029. 상세 근거는 그 파일과
+                # `_SIGNAL_DECISION_COLUMNS` 주석.
+                chain.get("chain_input_source"),
             ),
         )
     conn.commit()
+
+
+def minutes_since_last_entry_by_strategy(
+    conn: ConnectionLike, now: datetime
+) -> dict[str, float]:
+    """
+    입력: DB 커넥션, 기준 시각(보통 이번 사이클의 `poll_time`).
+    계산: 그날 `decision='ENTER'` 행들의 `risk_gate_state.entry_strategies`를 펼쳐, 전략별
+         **가장 최근 진입 이후 경과 분**을 돌려준다.
+    해석: 2026-08-11 고도화 D — `enforce_reentry_cooldown()`의 입력이다. 상세 근거는 그 함수
+         위 주석. `entry_strategies_used_today()`와 **같은 출처를 쓰는 것이 중요하다** —
+         "무엇을 썼는가"(가짓수 상한)와 "언제 썼는가"(빈도 쿨다운)가 다른 표를 보면
+         두 게이트가 서로 다른 사실 위에서 판단하게 된다.
+
+         **알려진 한계**: 출처가 `signal_decisions`, 즉 «권고된 진입»이지 체결이 아니다.
+         `entry_strategies_used_today()`가 적어 둔 것과 같은 한계이고, 실주문 배선 시
+         **두 함수를 함께** `trade_history`로 옮겨야 한다.
+    실패 조건: 그날 ENTER가 없으면 빈 dict. 구버전 기록(키 없음/배열 아님)은 건너뛴다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT s.strategy, max(d.timestamp) FROM signal_decisions d, "
+            "     LATERAL jsonb_array_elements_text(d.risk_gate_state->'entry_strategies') AS s(strategy) "
+            "WHERE d.decision='ENTER' AND d.timestamp::date=%s "
+            "  AND jsonb_typeof(d.risk_gate_state->'entry_strategies')='array' "
+            "GROUP BY s.strategy",
+            (now.date(),),
+        )
+        rows = cur.fetchall()
+    out: dict[str, float] = {}
+    for strategy, last_at in rows:
+        if last_at is None:
+            continue
+        naive = last_at.replace(tzinfo=None) if last_at.tzinfo else last_at
+        out[str(strategy)] = (now - naive).total_seconds() / 60.0
+    return out
 
 
 def entry_strategies_used_today(conn: ConnectionLike, on_date: date) -> frozenset[str]:

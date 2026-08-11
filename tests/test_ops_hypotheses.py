@@ -210,6 +210,12 @@ _METRIC_ROOTS = {
     "qualitative_suppressed", "process_starts", "failures_by_cause",
     # 2026-08-06 고도화#1 — 먼슬리 레그 재시도.
     "priority_retry",
+    # 2026-08-11 Fix#1 / 고도화 A — 사이클 조기 종료의 **두 원인**. 예산 초과(우리가 느렸다)와
+    # 원인이 다르므로 지표도 갈렸다: 연속 타임아웃(KIS가 4초 천장에 닿았다) / 누적 실패
+    # (성공·실패가 섞여 절반이 죽었다). 08-11에는 셋이 한 줄이었다.
+    "timeout_abort", "failure_budget_abort",
+    # 2026-08-11 Fix#7 — 폴러별 밀림. `overrun`은 옵션체인 전용이라 다른 폴러가 안 잡혔다.
+    "overrun_by_poller",
 }
 
 
@@ -491,6 +497,64 @@ def test_normalized_claim_rule_allows_invariants_and_non_claim_roles():
     assert not hypotheses.violates_normalized_claim_rule(
         "주장", "db.tables.expiry_liquidity_1m.rows", "수기 판정 — 북 수로 나눠 읽을 것"
     )
+
+
+# ===== 규약 G (2026-08-11 Fix#6) — 시장 상태 의존 지표에 무조건부 하한 금지 =====
+
+
+def test_market_state_rule_flags_the_08_11_regime_mistake():
+    """08-11 실사고 — 레짐 엔진이 완벽히 돌았는데 검증 기준 둘이 반증을 찍었다.
+
+    원인은 엔진이 아니라 그날 시장이 추세가 아니었던 것이다(방문 셋 전부 방향 없는 레짐).
+    """
+    assert hypotheses.violates_market_state_rule("주장", "db.decisions.member_count.dead_axis_mean", "< 1.02") is False
+    # 하한이 문제다 — "죽은 축이 이만큼은 있어야 한다"는 조용한 날에 성립하지 않는다.
+    assert hypotheses.violates_market_state_rule("주장", "db.decisions.member_count.effective_mean", ">= 3.0")
+    assert hypotheses.violates_market_state_rule("주장", "db.regime.trend_minutes", "> 0")
+    assert hypotheses.violates_market_state_rule("주장", "db.signal_reach.gamma_flip_pct", ">= 80")
+
+
+def test_market_state_rule_allows_upper_bounds_and_invariants():
+    """상한은 막지 않는다 — "이보다 많으면 이상"은 시장이 조용해도 성립한다."""
+    # 채터링 감시가 그 형태다.
+    assert not hypotheses.violates_market_state_rule("주장", "db.regime.trend_minutes", "<= 20")
+    # `>= 0`은 경로 생존 확인이라 시장과 무관하다.
+    assert not hypotheses.violates_market_state_rule("주장", "db.tables.market_raw_1m.rows", ">= 0")
+    # 대가·참고는 대상이 아니다.
+    assert not hypotheses.violates_market_state_rule("대가", "db.tables.market_raw_1m.rows", ">= 900")
+    # 수기 판정은 사람이 그날 시장을 보고 읽겠다는 선언이다.
+    assert not hypotheses.violates_market_state_rule(
+        "주장", "db.regime.trend_minutes", "수기 판정 — 추세 방문이 0분이면 판정 불가"
+    )
+
+
+def test_repo_pending_hypotheses_obey_the_market_state_rule():
+    """규약 G를 **실제 파일에** 강제한다 — 규약 F와 같은 방식이다."""
+    entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
+    offenders = [
+        f"{e['id']}: {p['metric']} ({p.get('expect')})"
+        for e in entries if str(e.get("상태", "")).lower() == "pending"
+        for p in e.get("예측") or []
+        if hypotheses.violates_market_state_rule(
+            p.get("역할", hypotheses.ROLE_REFERENCE), p["metric"], p.get("expect", "")
+        )
+    ]
+    assert not offenders, (
+        "시장 상태에 의존하는 지표에 무조건부 하한을 걸었다 — 시장이 조용한 날마다 멀쩡한 "
+        f"구현이 반증으로 찍힌다. 조건을 지표로 만들어 함께 걸 것: {offenders}"
+    )
+
+
+def test_directional_regimes_match_the_signal_layer():
+    """`db_metrics.DIRECTIONAL_REGIMES`는 `signal_layer._TREND_DIRECTION`의 복제다.
+
+    갈라지면 `trend_minutes`가 조용히 틀린 전제를 세우고, 그 위에서 `regime_hmm` 판정이
+    다시 08-11과 같은 오독을 한다. `log_metrics.PRIORITY_SERIES_LABEL`과 같은 계약이다.
+    """
+    from mahdi.fusion import signal_layer
+    from mahdi.ops import db_metrics
+
+    assert set(db_metrics.DIRECTIONAL_REGIMES) == {int(r) for r in signal_layer._TREND_DIRECTION}
 
 
 def test_repo_pending_hypotheses_obey_the_normalized_claim_rule():

@@ -4,6 +4,55 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ---
 
+## [MW0601] 2026-08-12(수) 검증 — 08-11 Fix 10종 + 고도화 6종
+
+> 예측치는 `hypotheses.yaml`의 `2026-08-11-*` 8건에 **전부 등재돼 있다**(숫자를 보기 전에 적었다).
+> 상세는 `docs/동작점검/2026-08-11_마흐디_운영점검보고서.md`.
+> **08-12 07:30 기동이 이것들을 함께 집어든다.**
+
+### 켤 것 — 오늘 단 하나만
+
+- [ ] **확신도 분모 레버(고도화 F)** — `strategy_params.yaml`의 `use_effective_member_count: true`.
+      원계획 기준일("재학습 성공 확인 다음 영업일")이 08-12다. 예측은 `2026-08-11-eF`에 등재.
+      08-11 기준선: 가용 3.41 / 실질 2.36 / 죽은 축 1.06 / HIGH_CONVICTION 34건 / ENTER 281건.
+- [ ] ⚠ **KIS 지연 레버(E)는 08-13이다.** 둘 다 판단 출력을 움직이므로 같은 날 켜면 귀속이
+      안 갈린다. **E를 미룬 이유의 절반이 F를 오늘 단독으로 켜기 위해서다.**
+
+### 내려 둔 레버 셋 — 조건이 성립해도 오늘은 안 켠다
+
+| 레버 | 상수 | 켤 조건 |
+|---|---|---|
+| 옵션체인 read 타임아웃(Fix#3) | `rest_client.OPTION_CHAIN_READ_TIMEOUT_SECONDS` | **Fix#1 효과가 먼저 실측돼야** 한다(`timeout_abort.count > 0`인 날) |
+| fusion 위상(Fix#10) | `main.SIGNAL_FUSION_PHASE_OFFSET_SECONDS` | Fix#1·고도화A와 같은 날 금지(둘 다 체인 나이를 움직인다) |
+| 재진입 쿨다운(고도화 D) | `strategy_params.strategy_gates.reentry_cooldown_minutes` | **실주문 배선 전**. 그 전에 며칠치 ENTER 빈도 분포를 본다 |
+
+### 판정 — 존재부터 본다
+
+- [ ] `budget_exceeded.labelled == budget_exceeded.count` — **규약 C.** 08-11 로그에는 라벨이
+      없어 `priority_cut_minutes`가 `None`이었다(«못 쟀다»). 08-12부터 숫자가 나와야 한다.
+- [ ] `budget_exceeded.priority_cut_minutes == 0` — **불변식.** 0이 아니면 먼슬리 우선 순서가 깨졌다.
+- [ ] `db.signal_reach.chain_input_source.available == True` — 마이그레이션 029가 실렸는가.
+      `stale_pct`는 **임계 없이 인쇄만** 한다(Fix#10을 켜기 전에는 높은 것이 정상이다).
+- [ ] `db.decision_outcomes.horizons.*.abs_move_pct` 키 존재 — 고도화 C.
+- [ ] `timeout_abort` / `failure_budget_abort` — **0건이 반증이 아니다.** 그날 KIS가 안 느렸다는 뜻이다.
+      판정은 «발생한 분에서 `budget_exceeded`와 갈렸는가»이지 «몇 건인가»가 아니다.
+
+### 대가 감시
+
+- [ ] `db.monthly_leg_completeness.below_design_pct` — 08-11 기준선 **12.4%**.
+      **나빠지면 실패 예산(6건)이 너무 빡빡한 것**이다.
+- [ ] `db.decisions.decision.ENTER` — 08-11 기준선 **281건**. 쿨다운은 OFF이므로 이 fix 때문에
+      바뀌면 안 된다(바뀌면 OFF가 OFF가 아니다).
+
+### ⚠ 규약 G가 새로 생겼다 — 예측을 쓸 때 걸린다
+
+**시장 상태에 의존하는 지표에 무조건부 하한을 걸지 않는다.** 08-11에 `regime_hmm 비영 분 > 0`과
+`dead_axis_mean < 1.02`가 멀쩡한 엔진을 반증으로 찍었다 — 그날 시장이 추세가 아니었을 뿐이다.
+`hypotheses.violates_market_state_rule()`이 기계적으로 막고, **도입 당일 `2026-08-06-e2`의 살아
+있는 예측을 잡았다**(규약 F가 도입 당일 셋을 잡은 것과 같다).
+
+---
+
 ## [MW0601] 날짜가 걸린 두 건 — **결정 절차를 08-10에 미리 확정한다**
 
 > 이 저장소의 규약은 *"숫자를 보기 전에 규칙을 확정한다"* 다(`2026-08-04-p5`가 그렇게 쓰였다).

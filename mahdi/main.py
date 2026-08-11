@@ -244,6 +244,54 @@ OPTION_CHAIN_CATCHUP_MIN_DELAY_SECONDS = 25.0
 # rows 20 미만이 하나도 안 생겼다면 예산이 안 걸린 것이고, 절반이 얇아졌다면 임계가 너무 낮다.
 OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS = 50.0
 
+# ===== 2026-08-11 고도화 A — **실패를 시간 예산에서 분리한다** =====
+#
+# ## 위 예산이 08-11에 드러낸 구조적 결함
+#
+# 위 50초는 "이 사이클이 REST에 쓸 수 있는 시간"이고, **성공한 호출과 실패한 호출을 구분하지
+# 않는다.** 08-11 15:01~15:22에 KIS 응답이 read 타임아웃(4초)을 넘기자 이렇게 됐다:
+#
+#     레그당 = 페이서 1초 + 타임아웃 4초 = 5초  →  50초에 10레그  →  전부 실패  →  적재 0행
+#
+# **실패가 성공과 같은 값을 치르므로 사이클이 스스로 못 빠져나온다.** 같은 일이 22분 반복됐다.
+#
+# Fix#1(`OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT`)이 이 상태를 **감지해서 접는다**. 그것은
+# 증상 처리로 옳지만 근본은 예산의 단위다 — 시간이 아니라 **성과**로 재야 한다.
+#
+# ## 무엇을 바꾸는가
+#
+# 두 예산을 나란히 둔다. 둘 중 **먼저 소진되는 쪽**이 사이클을 끝낸다.
+#
+#     시간 예산   50초        위 상수. 다음 분을 정시에 시작하기 위한 상한 — 그대로 둔다.
+#     실패 예산   6건         이번 사이클에서 허용하는 **누적 실패 레그 수**.
+#
+# 실패 예산 6의 근거: 설계 20레그(먼슬리 10 + 위클리 10) 중 **30%**다. 08-11 실측에서 정상
+# 사이클의 레그 실패는 분당 0~2건이었고(옵션체인 레그 실패 180건 / 494분), 6건은 그 3배다.
+# 그보다 많이 실패하는 분은 "조금 나쁜 날"이 아니라 **그 분의 KIS가 우리에게 응답하지 않는 날**이다.
+#
+# ## Fix#1과 무엇이 다른가 — 둘 다 필요하다
+#
+#   Fix#1(연속 3회)   **빠른 감지**. 전멸 패턴을 15초 만에 알아챈다. 단 연속이어야 한다.
+#   고도화 A(누적 6건) **누적 감지**. 성공/실패가 섞여 절반이 죽는 분을 잡는다 —
+#                      Fix#1의 연속 카운터는 성공 하나에 0으로 돌아가므로 이 패턴을 못 본다.
+#
+# 08-11 14시대가 정확히 후자였다: 예산 초과 20건인데 전멸은 1건뿐이었다(14:31).
+# 나머지 19분은 **섞여서 얇아진** 분이고, 그 분들이 먼슬리 레그 완전성 12.4% 미달의 본체다.
+#
+# ## 대가 — 이것은 교환이다
+#
+# 실패 예산에 걸려 접는 분은 **시간 예산이 남아 있어도 끝난다.** 즉 "조금 더 기다렸으면
+# 성공했을 레그"를 포기할 수 있다. 그 대가를 받아들이는 이유는 위와 같다 — 실패가 6건 쌓인
+# 분에서 남은 레그가 성공할 확률은 낮고, 그 시도는 다음 분의 정시 시작을 갉아먹는다.
+# **검증은 `db.monthly_leg_completeness.below_design_pct`로 한다**(08-11 기준선 12.4%):
+# 이 값이 나빠지면 예산이 너무 빡빡한 것이다.
+OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS = 6
+
+LOG_CHAIN_FAILURE_BUDGET = (
+    "옵션체인 실패 예산(%d건) 소진 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
+    "(시간 예산은 %.1f초 남아 있었다, 2026-08-11 고도화 A). 적재 %d행 · 컷당한북=%s"
+)
+
 # 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 8 / Fix#8) — 장전에는 지수 스팟을 적재하지 않는다.
 #
 # **KOSPI200 지수는 09:00 이전에 체결되지 않는다.** 그런데 `output3.bstp_nmix_prpr`는 장전에도
@@ -299,7 +347,48 @@ LOG_CHAIN_OVERRUN = (
 LOG_CHAIN_CATCHUP = "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로 채움(밀린 사이클 %s)"
 LOG_CHAIN_BUDGET_EXCEEDED = (
     "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
-    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8)"
+    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8) 컷당한북=%s"
+)
+
+# ===== 2026-08-11 Fix#1 — 연속 타임아웃이면 이번 사이클을 조기에 접는다 =====
+#
+# ## 무엇이 일어났는가 (08-11 15:01~15:22, 22분 연속 적재 0행)
+#
+# KIS 응답이 4초를 넘기기 시작하자 **우리 read 타임아웃(4.0초)이 전 호출을 실패로 바꿨다.**
+# 로그의 느린 호출 줄이 그것을 그대로 적고 있다 — `HTTP 4.03~4.06초`가 못 박혀 있고 페이서
+# 배율은 내내 1.00배였다(즉 우리 쪽 압력이 아니다, 리포트 §17 KIS 귀속).
+#
+#     레그당 비용 = 페이서 1초 + 타임아웃 4초 = 5초
+#     50초 예산 / 5초 = 10레그 시도 → 전부 실패 → 적재 0행
+#
+# ## 왜 예산만으로는 못 빠져나오는가
+#
+# **실패한 호출이 성공한 호출과 똑같이 예산을 먹는다.** 그래서 한 번 이 상태에 들어가면
+# 사이클이 스스로 못 빠져나온다 — 50초를 다 태우고 0행을 남기고, 다음 분이 같은 일을 반복한다.
+# 08-06 고도화#1의 먼슬리 재시도도 여기서는 안 돈다: 그 경로는 **예산이 남았을 때만** 진입하는데
+# 전 레그가 타임아웃되는 분은 정의상 예산이 이미 소진돼 있다(`LOG_CHAIN_CYCLE_EMPTY` 주석).
+#
+# ## 임계를 3으로 고른 근거 (숫자를 보기 전에 정했다)
+#
+# 먼슬리는 설계 10레그다. 1~2회는 단발 지터로 일어나고 실제로 08-11에도 정상 분에서 관측된다.
+# **3회 연속**은 그 분의 KIS가 계속 4초를 넘긴다는 뜻이고, 그때 남은 레그를 더 부르는 것은
+# 예산만 태운다. 3이면 최악의 분에서 15초만 쓰고 35초를 돌려준다.
+#
+# ## 무엇을 얻는가 — 이 fix는 데이터를 늘리지 않는다
+#
+# 조기 포기해도 그 분의 행은 여전히 0이다. 얻는 것은 셋이다:
+#   1. 다음 분 사이클이 정시에 시작한다(밀림 방지 — 08-04 Fix#8과 같은 목적).
+#   2. 확정 실패 호출을 안 쏜다(08-11 22분 x 10레그 = 220콜).
+#   3. **원인이 지표로 남는다** — `조기포기=연속타임아웃`이 로그에 실려 "얇게 끝난 분"과
+#      "KIS가 죽은 분"이 구분된다. 종전에는 둘 다 `LOG_CHAIN_BUDGET_EXCEEDED` 한 줄이었다.
+#
+# **연속 카운터는 성공하면 0으로 되돌린다** — 누적이 아니라 연속이어야 단발 지터에 안 걸린다.
+OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT = 3
+
+LOG_CHAIN_TIMEOUT_ABORT = (
+    "옵션체인 연속 타임아웃 %d회 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
+    "(확정 실패 호출을 안 쏘고 다음 분을 정시에 시작한다, 2026-08-11 Fix#1). "
+    "적재 %d행 · 컷당한북=%s"
 )
 # 2026-08-05(운영점검보고서 §2-6) — 사이클은 정상 실행됐는데 **행이 한 줄도 안 남은** 분.
 #
@@ -465,8 +554,44 @@ class WsLiveness:
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
-# 아니라 오프셋은 순전히 기동 로그 가독성을 위한 것.
+# 아니다.
 SIGNAL_FUSION_POLL_INTERVAL_SECONDS = 60.0
+
+# ===== 2026-08-11 Fix#10 — 이 오프셋은 "로그 가독성용"이 아니었다 (레버, 오늘은 **안 켠다**) =====
+#
+# ## 위 주석이 08-11까지 틀리게 적고 있던 것
+#
+# 종전 주석은 *"오프셋은 순전히 기동 로그 가독성을 위한 것"* 이라고 단언했다. REST를 안 부르므로
+# 레이트리밋과 무관한 것은 맞다. **그런데 이 값은 판단이 「그 분의 체인」을 보는지를 정한다.**
+#
+# 08-11 실측(`signal_decisions.chain_oldest_leg_age_seconds`, 09:00 이후):
+#
+#     홀수분(먼슬리 10레그)   체인 나이 평균 28.0초    폴링 9.2초  < 위상 10초  → 여유 0.8초
+#     짝수분(양 북 20레그)    체인 나이 평균 70.0초    폴링 19.3초 > 위상 10초  → **직전 분 사용**
+#
+# `poll_option_chain`은 :00에 시작해 20레그에 19.3초가 걸린다. 이 폴러가 :10에 판단하므로
+# 짝수분에는 그 분 체인이 아직 안 들어와 **직전 분 스냅샷으로 GEX를 낸다.** 실제로
+# `signal_decisions.gex`가 짝수분마다 직전 값을 반복했다(09:07/08, 09:09/10, 09:11/12 …).
+#
+# **홀수분 여유가 0.8초**라는 것이 더 나쁘다 — 조금만 느려지면 그쪽도 넘어간다. 08-11 종일
+# 집계에서 체인 최고령이 4.2분으로 신선도 경계(3분)를 넘겼고, `2026-08-07-fix1`의
+# `chain_age_seconds_max` 반증이 실은 이 위상 때문이었다(그 가설을 inconclusive로 닫은 근거).
+#
+# ## 왜 오늘 안 옮기는가
+#
+# 08-11에 Fix#1(연속 타임아웃 조기 포기)이 들어간다. **둘 다 체인 나이를 움직인다** — 같은 날
+# 실으면 08-12 실측에서 어느 쪽이 무엇을 바꿨는지 못 가른다(08-04 p4의 교훈).
+#
+# ## 켤 값과 예측치 (숫자를 보기 전에 적는다)
+#
+#   값    25.0초 — 체인 창(0~20초)과 저빈도 폴러 창(30~41초) 사이의 **빈 슬롯**이다
+#         (08-03 위상 재배치 표 참고). 20레그 최악 19.3초보다 뒤이고 만기유동성(:31)보다 앞이다.
+#   주장  짝수분/홀수분 `chain_oldest_leg_age_seconds` 평균 격차 < 10초 (08-11 실측 **42.0초**)
+#   주장  `db.signal_reach.chain_age_seconds_max` <= 150 (08-11 실측 252초)
+#   대가  판단 시각이 15초 늦어진다 — ADVISORY라 무해하지만, 실주문 배선 시에는
+#         진입 지연으로 계산에 넣어야 한다(v6 §13.3 청산 레이어와 같은 축).
+#   대가  `overrun_by_poller["Signal Fusion 폴링"]` 증가 여부 — :25에서 시작해도 60초 안에
+#         끝나야 한다. 늘면 판단 계산 자체가 느린 것이므로 위상이 아니라 그쪽을 봐야 한다.
 SIGNAL_FUSION_PHASE_OFFSET_SECONDS = 10.0
 _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason VARCHAR(50)
 
@@ -1595,6 +1720,20 @@ async def _collect_option_chain_cycle(
     # 2026-08-06 고도화#1 — **놓친 먼슬리 레그**(실패/파싱불가/예산절단 전부). 호출측이 예산이
     # 남았을 때 이것만 다시 부른다. 우선 북 외의 실패는 담지 않는다 — 재시도 대상이 아니다.
     missing_priority: list[tuple[float, str]] = []
+    # 2026-08-11 Fix#2 — **어느 북이 잘렸는가**. 08-06이 "예산 컷이 먼슬리에 닿은 분 3분"을
+    # 손으로 세어 원인을 가렸는데(그 실측이 고도화#1의 방향을 정했다), 그 값이 지표로는 없었다.
+    # 컷은 항상 뒤쪽 북부터 닿으므로(먼슬리 우선 순서) **먼슬리가 여기 들어오면 그 자체가 사건**이다.
+    cut_books: list[str] = []
+    # 2026-08-11 Fix#1 — 연속 read 타임아웃. **성공하면 0으로 되돌린다**(누적이 아니라 연속).
+    consecutive_timeouts = 0
+    # 2026-08-11 고도화 A — 누적 실패. 성공해도 안 줄어든다(연속 카운터가 못 보는 패턴을 잡는다).
+    failed_legs = 0
+    aborted = False
+    abort_reason: str | None = None
+    # `aborted`여도 루프를 빠져나가지 않는다 — 남은 레그를 아래 `aborted` 분기로 흘려보내야
+    # skipped/cut_books/missing_priority 회계가 완전해진다. `break`로 나가면 남은 레그가
+    # **어디에도 안 세어져** 로그가 "남은 1레그"라고 거짓말한다(구현 중 테스트가 잡았다).
+    # 그 경로는 REST를 한 건도 안 부르므로 순회 비용은 무시할 수 있다.
     for subscription_manager, series in books:
         strikes = subscription_manager.desired_strikes
         if not strikes:
@@ -1606,8 +1745,10 @@ async def _collect_option_chain_cycle(
                 symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
                 if symbol is None:
                     continue
-                if deadline is not None and time.monotonic() >= deadline:
+                if aborted or (deadline is not None and time.monotonic() >= deadline):
                     skipped += 1
+                    if series not in cut_books:
+                        cut_books.append(series)
                     if is_priority:
                         missing_priority.append((strike, option_type))
                     continue
@@ -1620,7 +1761,19 @@ async def _collect_option_chain_cycle(
                     )
                     if is_priority:
                         missing_priority.append((strike, option_type))
+                    failed_legs += 1
+                    if isinstance(exc, httpx.ReadTimeout):
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts >= OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT:
+                            aborted, abort_reason = True, "timeout"
+                    else:
+                        consecutive_timeouts = 0
+                    # 고도화 A — 연속이 아니어도 누적이 예산을 넘으면 접는다. 08-11 14시대가
+                    # 이 형태였다(예산 초과 20건 중 전멸은 1건 — 나머지는 섞여서 얇아진 분).
+                    if failed_legs >= OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS and not aborted:
+                        aborted, abort_reason = True, "failure_budget"
                     continue
+                consecutive_timeouts = 0
                 parsed = _parse_option_quote(resp, strike, option_type, poll_time)
                 if parsed is None:
                     if is_priority:
@@ -1631,10 +1784,27 @@ async def _collect_option_chain_cycle(
                 latest_spot = spot
     if skipped:
         # 사이클당 최대 1줄 — 레그마다 남기면 08-04 §2-2의 로그 폭증을 우리 손으로 재현한다.
-        logger.warning(
-            LOG_CHAIN_BUDGET_EXCEEDED,
-            OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows),
-        )
+        # **세 원인은 서로 다른 줄로 낸다**: 시간 예산(우리가 느렸다) / 연속 타임아웃(KIS가
+        # 천장에 닿았다) / 누적 실패(섞여서 죽었다). 08-11 이전에는 셋이 한 줄이었고, 그래서
+        # 22분 전멸과 "조금 잘린 분"이 같은 지표로 보고됐다.
+        cut_label = ",".join(cut_books) or "—"
+        if abort_reason == "timeout":
+            logger.warning(
+                LOG_CHAIN_TIMEOUT_ABORT,
+                consecutive_timeouts, skipped, len(rows), cut_label,
+            )
+        elif abort_reason == "failure_budget":
+            remaining = (deadline - time.monotonic()) if deadline is not None else 0.0
+            logger.warning(
+                LOG_CHAIN_FAILURE_BUDGET,
+                OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS, skipped, max(remaining, 0.0),
+                len(rows), cut_label,
+            )
+        else:
+            logger.warning(
+                LOG_CHAIN_BUDGET_EXCEEDED,
+                OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows), cut_label,
+            )
     return rows, latest_spot, any_strikes, missing_priority
 
 
@@ -3125,7 +3295,20 @@ def _build_signal_inputs(
     # 것을 못 봤다. 바로 위 `chain_leg_count`는 "판단에 실제로 쓴 북 기준"이라고 주석까지 달고
     # 먼슬리만 세는데 나이만 전 북 기준이었던 것 — **한 dict 안에서 두 줄이 서로 다른 것을 쟀다.**
     oldest = min((row["timestamp"] for row in monthly_rows if row.get("timestamp") is not None), default=None)
+    # 2026-08-11 고도화 B — **판단이 「그 분」 체인을 봤는가.** 마이그레이션 029.
+    #
+    # 위 `chain_oldest_leg_age_seconds`는 초 단위 연속값이라 "이 분 것인가 아닌가"라는 **이산**
+    # 질문에 답하지 않는다. 08-06 §2-4가 같은 함정에 빠졌다(격분 설계상수 130초를 신선도로 착각).
+    # 그래서 **가장 새로운** 레그의 분과 판단 분을 직접 비교한다.
+    newest = max((row["timestamp"] for row in monthly_rows if row.get("timestamp") is not None), default=None)
+    if newest is None:
+        chain_input_source = "none"
+    elif newest.replace(tzinfo=None).replace(second=0, microsecond=0) == now.replace(second=0, microsecond=0):
+        chain_input_source = "current"
+    else:
+        chain_input_source = "stale"
     chain_inputs = {
+        "chain_input_source": chain_input_source,
         "gamma_flip": gamma_flip,
         "gex": gex,
         # 레그 수는 **판단에 실제로 쓴 북 기준**이다(Fix#5로 먼슬리 전용이 됐다). 스냅샷 전체
@@ -3388,6 +3571,14 @@ async def poll_signal_fusion_cycle(
                 except Exception:
                     logger.warning("오늘 사용 전략 조회 실패 — 이번 사이클은 상한 없이 진행", exc_info=True)
                     already_used_today = frozenset()
+                # 2026-08-11 고도화 D — 전략별 직전 진입 경과. 위와 **같은 이유로 따로 감싼다**:
+                # 쿨다운도 안전장치이지 판단의 전제가 아니다. 조회가 실패하면 빈 dict가 되어
+                # 아무것도 안 막는다(레버 OFF와 같은 결과).
+                try:
+                    last_entry_minutes = db.minutes_since_last_entry_by_strategy(conn, poll_time)
+                except Exception:
+                    logger.warning("직전 진입 시각 조회 실패 — 이번 사이클은 쿨다운 없이 진행", exc_info=True)
+                    last_entry_minutes = {}
                 # 2026-08-05 — 이벤트 근접도(수기 캘린더). `minutes`가 None인 두 이유를
                 # 가르는 것이 이 모듈의 핵심이다: `no_upcoming`(확인했고 없다)은 조용하고,
                 # `not_covered`/`empty`(모른다)만 경고한다. 어느 쪽이든 페널티는 지어내지 않는다.
@@ -3405,6 +3596,7 @@ async def poll_signal_fusion_cycle(
                     ),
                     vrp=vrp if vrp is not None else 0.0,
                     already_used_strategies_today=already_used_today,
+                    last_entry_minutes_ago=last_entry_minutes,
                 )
 
                 # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)

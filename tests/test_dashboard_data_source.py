@@ -5,6 +5,7 @@ import pytest
 
 from mahdi.data import db
 from mahdi.dashboard.data_source import (
+    DEFAULT_MODEL_PATH,
     FLOW_RADAR_ROW_CAP,
     FLOW_RADAR_WINDOW_MINUTES,
     _rest_demand_check,
@@ -1072,9 +1073,15 @@ def test_schema_integrity_check_ok_when_all_columns_present():
     # information_schema.columns를 대조 — 전부 있으면 ok.
     # 2026-08-05(P1-7): 대상 테이블이 regime_state로 늘었다. 가짜 커서는 테이블 구분 없이 같은
     # 행 목록을 돌려주므로 두 테이블의 컬럼을 합쳐 넣는다.
+    # 2026-08-11(고도화 B): signal_decisions가 추가됐다 — 매분 INSERT라 파급이 가장 크다.
     rows = [
         (c,)
-        for c in (*db.macro_snapshot_columns(), *db.regime_state_columns(), *db.ws_status_columns())
+        for c in (
+            *db.macro_snapshot_columns(),
+            *db.regime_state_columns(),
+            *db.ws_status_columns(),
+            *db.signal_decision_columns(),
+        )
     ]
     conn = _FakeHealthConnection({"schema_columns_rows": rows})
     check = _schema_integrity_check(conn)
@@ -1199,11 +1206,28 @@ def test_regime_fit_progress_check_reports_progress_and_eta():
     assert "10영업일 남음" in check.detail
 
 
-def test_regime_fit_progress_check_ok_when_target_reached():
+def test_regime_fit_progress_check_tells_you_to_train_only_when_no_model_exists(tmp_path, monkeypatch):
+    """2026-08-11 Fix#9 — **행 수만 보고 「실행 가능」이라고 쓰면 안 된다.**
+
+    08-11은 모델이 08-10 16:56에 이미 배포돼 라이브로 predict()를 돌린 날이었는데, 이 배지는
+    종일 *"fit_regime_engine.py 실행 가능"* 이라고 띄웠다 — 이미 한 일을 시키고 있었다.
+    """
+    monkeypatch.setattr("mahdi.dashboard.data_source.PROJECT_ROOT", tmp_path)
     conn = _FakeHealthConnection({"regime_fit_progress_row": (8500, 21)})
+
+    # (1) 모델이 없으면 — 실행을 권한다.
     check = _regime_fit_progress_check(conn, "KOSPI200")
     assert check.status == "ok"
-    assert "fit_regime_engine.py 실행 가능" in check.detail
+    assert "모델 미배포" in check.detail
+    assert "fit_regime_engine.py" in check.detail
+
+    # (2) 모델이 있으면 — 다시 학습하라고 하지 않는다.
+    model = tmp_path / DEFAULT_MODEL_PATH
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_bytes(b"x")
+    check = _regime_fit_progress_check(conn, "KOSPI200")
+    assert "모델 배포됨" in check.detail
+    assert "실행 가능" not in check.detail
 
 
 def test_regime_fit_progress_check_handles_query_error():

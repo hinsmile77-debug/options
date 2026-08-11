@@ -117,6 +117,110 @@ def violates_normalized_claim_rule(role: str, metric: str, expect: str) -> bool:
         return not (op == "==" or (op in (">=", ">") and raw == 0))
     return bool(_RANGE_RE.match(text))
 
+
+# 2026-08-11(§3-2 / Fix#6) — **규약 G: 시장 상태에 의존하는 지표에 무조건부 하한을 걸지 않는다.**
+#
+# 규약 F와 **같은 병의 다른 얼굴**이다. F는 "건수는 구조 변수에 비례한다"였고, G는
+# "어떤 값은 그날 시장이 무엇이었는가에 비례한다"이다. 둘 다 예측을 쓰는 순간에는 그 변수가
+# 상수처럼 느껴진다는 점이 같다.
+#
+# ## 08-11에 무슨 일이 있었는가
+#
+# 레짐 엔진이 25영업일 만에 켜진 날이었다. 검증 기준으로 두 가지를 걸어 뒀다:
+#
+#   §14-3 `regime_hmm` 비영 산출 분 > 0
+#   `db.decisions.member_count.dead_axis_mean` < 1.02
+#
+# **둘 다 반증으로 찍혔다.** 그런데 엔진은 완벽히 돌았다 — 09:14에 WARMUP을 벗고, 3종 레짐을
+# 방문하고, 전이 2회로 채터링도 없었다. 반증의 정체는 이것이다:
+#
+#   `signal_layer._TREND_DIRECTION`은 TREND_UP/DOWN_STRONG **두 상태에만** 방향을 준다.
+#   그날 방문한 셋(VOL_COMPRESSION 372분 / RANGE_BALANCED 29 / RANGE_BREAK_PREP 9)은
+#   v6 §7 정의상 전부 방향이 없다. 그래서 `regime_hmm`은 419분 전량 0점이었다 — **설계대로.**
+#
+# 즉 그 기준은 *"엔진이 도는가"* 와 *"엔진이 추세를 봤는가"* 를 섞었다. 시장이 조용한 날마다
+# 멀쩡한 엔진이 반증으로 찍히고, 그 반증을 믿으면 **고칠 필요 없는 것을 고치게 된다.**
+#
+# ## 무엇을 막는가
+#
+# **주장 역할** + 시장 상태 의존 지표 + **하한**(`>=`/`>`, 0 초과) 조합만 경고한다.
+#   - 상한(`<=`/`<`)은 막지 않는다 — "이것보다 많으면 이상"은 시장이 조용해도 성립한다
+#     (채터링 감시 `전이 <= 20회`가 그 형태다).
+#   - `== 0` 불변식과 `>= 0` 경로 생존 확인은 F와 같은 이유로 통과시킨다.
+#   - `수기 판정`은 사람이 그날 시장을 보고 읽겠다는 선언이므로 대상이 아니다.
+#
+# 정말 하한을 걸어야 하면 **조건을 지표로 만들어 함께 걸면 된다** — 08-11에 실제로 그렇게 했다
+# (`db.regime.trend_minutes`를 전제 조건으로 신설하고, 그 값이 0이면 「판정 불가」).
+_MARKET_STATE_DEPENDENT_METRICS = (
+    # 그날 시장이 추세였는가에 비례한다 — 위 08-11 사고의 당사자들.
+    "member_count.dead_axis_mean",
+    "member_count.effective_mean",
+    "regime.trend_minutes",
+    # 그날 딜러 감마 지형이 단조였는가에 비례한다(08-04 §2-3: 전 구간 단조면 flip이 없다).
+    "gamma_flip_pct",
+    "signal_reach.gamma_flip",
+    # 그날 옵션에 체결이 있었는가에 비례한다(08-07: 얇은 날은 봉 자체가 안 생긴다).
+    "market_raw_1m.rows",
+)
+
+
+def is_market_state_dependent(metric: str) -> bool:
+    """
+    입력: 지표 경로.
+    계산: `_MARKET_STATE_DEPENDENT_METRICS`의 어느 항목이 경로에 포함되는가.
+    해석: 근거는 위 규약 G 주석. **완전한 목록이 목적이 아니다** — 아는 것부터 등록하고,
+         새로 데이는 것이 있으면 그때 추가한다(규약 F의 `_COUNT_METRIC_SUFFIXES`와 같은 방식).
+    실패 조건: 없다.
+    """
+    lowered = metric.lower()
+    return any(token.lower() in lowered for token in _MARKET_STATE_DEPENDENT_METRICS)
+
+
+def violates_market_state_rule(role: str, metric: str, expect: str) -> bool:
+    """
+    입력: 예측의 역할·지표 경로·기대식.
+    계산: 규약 G 위반인가 — **주장** 역할 + 시장 상태 의존 지표 + **0이 아닌 하한**.
+    해석: 상세 근거는 위 규약 G 주석. 상한은 통과시킨다(조용한 날에도 성립하는 방향이다).
+    실패 조건: 없다.
+    """
+    if str(role) != ROLE_CLAIM or not is_market_state_dependent(metric):
+        return False
+    comparison = _COMPARISON_RE.match(str(expect).strip())
+    if not comparison:
+        return False
+    op, raw = comparison.group(1), float(comparison.group(2))
+    # **규약 F와 여기서 갈린다.** F는 `> 0`을 "경로 생존 확인"으로 보아 통과시키는데, G에서는
+    # `> 0`이야말로 08-11 사고의 원형이다 — *"`regime_hmm` 비영 산출 분 > 0"* 이 그 문장이었고,
+    # 그것은 경로가 살았는지가 아니라 **시장이 추세였는지**를 물었다.
+    # `>= 0`만 통과시킨다: 항상 참이라 거짓 반증을 만들 수 없다.
+    return op == ">" or (op == ">=" and raw > 0)
+
+# 2026-08-11(§3-6 / Fix#8) — 확정 대기가 이 일수를 넘으면 **자동으로 강등**한다.
+#
+# ## 왜 자동으로 닫는가 — 규약과 부딪히는 것처럼 보이지만 아니다
+#
+# 이 저장소의 규약은 *"`상태`는 자동으로 안 바뀐다(사람이 확정)"* 이다. 그 규약이 지키려는 것은
+# **판정의 품질**이다 — 기계가 `확인`/`반증`을 찍으면 아무도 그 숫자를 안 읽게 된다.
+#
+# 여기서 하는 것은 판정이 아니라 **포기 선언**이다. 90일이 지나도록 아무도 안 닫은 가설은
+# 그 사이에 코드가 여러 번 바뀌었을 것이고, 그때의 실측을 지금 대조해도 귀속이 안 갈린다.
+# `inconclusive`는 *"판정하지 못했다"* 이지 *"틀렸다/맞았다"* 가 아니므로 규약을 안 어긴다.
+# (08-10에 `2026-08-07-e4`를 사람이 정확히 그렇게 닫았다 — 이건 그 판단의 기계화다.)
+#
+# ## 왜 90일인가
+#
+# 08-11 실측으로 확정 대기가 23건이었고 §0이 그 목록을 매일 인쇄한다. 목록이 길어지면
+# **진짜 반증이 그 소음에 묻힌다** — 규약 F/G가 막으려는 것과 같은 실패 모드다.
+# 90일은 "이 저장소에서 한 분기"이고, 그 사이 영업일이 60일쯤 되므로 어떤 가설도 그보다
+# 오래 살아 있을 이유가 없다. 짧게 잡으면 정당한 장기 관측(며칠 쌓아 본다)을 자른다.
+STALE_PENDING_DAYS = 90
+
+
+def _is_stale_pending(due: date | None, target: date) -> bool:
+    """반환: 확정 대기가 `STALE_PENDING_DAYS`를 넘겼는가. 예정일이 없으면 판단하지 않는다."""
+    return due is not None and (target - due).days > STALE_PENDING_DAYS
+
+
 VERDICT_UNJUDGEABLE = "판정 불가"
 
 # 2026-08-06 §3-1 / Fix#3 — **경로가 애초에 존재하지 않는다.**
@@ -277,6 +381,11 @@ def evaluate(
                         # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에
                         # 섞여 들어가면 놓치기 쉽고 그러면 규약 자체가 무력해진다.
                         "overdue": due is not None and due < target,
+                        # 2026-08-11 Fix#8 — **얼마나** 지났는가. 08-11 §0이 「확정 대기 23건」을
+                        # 이름만 나열했는데, 4일 지난 것과 넉 달 지난 것이 같은 줄로 보이면
+                        # 사람은 목록 전체를 소음으로 취급한다. 정렬 가능한 수를 함께 낸다.
+                        "overdue_days": (target - due).days if due is not None and due < target else 0,
+                        "stale": _is_stale_pending(due, target),
                         "검증예정일": due.isoformat() if due is not None else None,
                     }
                 )

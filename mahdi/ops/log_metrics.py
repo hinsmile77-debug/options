@@ -64,6 +64,20 @@ _OVERRUN_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션 체인 폴링 사이클이 주기\([\d.]+초\)를 초과해 "
     r"스케줄이 ([\d.]+)초 밀렸습니다"
 )
+# 2026-08-11 Fix#7 — **폴러 이름을 잡는** 밀림 정규식.
+#
+# 08-11 리포트 §11이 「overrun 파서 0 / 로그 실재 1」로 계측 감사 실패를 띄웠다. 그런데
+# **파서는 옳았다** — 그 1건은 옵션체인이 아니라 `만기 유동성` 폴러의 밀림이었고, 위
+# `_OVERRUN_RE`는 설계대로 옵션체인만 센다. 틀린 것은 **감사 토큰**(`"스케줄이"`)이었다:
+# 여섯 폴러가 전부 같은 문장을 쓰므로 느슨 검사가 항상 다른 폴러를 주워 왔다.
+#
+# 감사 토큰을 좁히는 것만으로 ⚠는 사라지지만, 그러면 **그 1건이 어디에도 안 남는다.**
+# 옵션체인 밖의 밀림도 실재하는 사건이므로(만기유동성이 밀리면 그 북의 호가가 그만큼 늙는다)
+# 여기서 폴러별로 함께 센다. `overrun`(옵션체인 전용)의 의미는 그대로 둔다 — 그 위에
+# 08-04부터의 가설들이 얹혀 있다.
+_ANY_OVERRUN_RE = re.compile(
+    _TS + r" WARNING:mahdi\.main:(.+?) 사이클이 주기\([\d.]+초\)를 초과해 스케줄이 ([\d.]+)초 밀렸습니다"
+)
 _HTTPX_RE = re.compile(_TS + r' INFO:httpx:HTTP Request: (\w+) (\S+) "HTTP/1\.1 (\d+)')
 _BACKOFF_RE = re.compile(
     _TS + r" INFO:mahdi\.broker\.rest_client:레이트리밋 백오프 (확대|회복): "
@@ -95,8 +109,31 @@ _ATM_ROLL_RE = re.compile(
 # 08-04 실측으로 세 줄은 0.3초 안에 붙어 나왔고, 진짜 재전이는 폴링 주기(60초) 이상 걸린다.
 _ATM_ROLL_DEDUP_SECONDS = 5.0
 # 2026-08-04(Fix#8) — 수집 예산 초과(`mahdi.main.LOG_CHAIN_BUDGET_EXCEEDED`).
+#
+# 2026-08-11 Fix#2 — 꼬리에 `컷당한북=<series[,series]>`가 붙었다. **선택 그룹으로 둔다**:
+# 08-10 이전 로그에는 없고, 없는 날을 `None`으로 두어야 "컷이 없었다"와 "못 쟀다"가 갈린다
+# (규약 C — 라벨이 0이면 count 0은 증명이 아니다).
 _BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 수집 예산\([\d.]+초\) 초과 — 남은 (\d+)레그를 포기하고 (\d+)레그로"
+    r"(?:.* 컷당한북=(\S+))?"
+)
+# 2026-08-11 Fix#1 — 연속 타임아웃 조기 포기(`mahdi.main.LOG_CHAIN_TIMEOUT_ABORT`).
+#
+# **예산 초과와 반드시 나눠 센다.** 둘 다 "레그를 포기했다"지만 원인이 다르다 — 예산 초과는
+# *우리가 느렸다*, 조기 포기는 *KIS가 4초 천장에 닿았다*이다. 08-11에 22분 연속으로 후자가
+# 났는데 종전 로그는 둘을 같은 줄로 냈다.
+_TIMEOUT_ABORT_RE = re.compile(
+    _TS + r" WARNING:mahdi\.main:옵션체인 연속 타임아웃 (\d+)회 — 남은 (\d+)레그를 포기하고"
+    r".*적재 (\d+)행 · 컷당한북=(\S+)"
+)
+# 2026-08-11 고도화 A — 누적 실패 예산 소진(`mahdi.main.LOG_CHAIN_FAILURE_BUDGET`).
+#
+# 연속 타임아웃과 **또 다르다**: 저쪽은 KIS가 천장에 닿아 전멸하는 패턴이고, 이쪽은 성공과
+# 실패가 섞여 절반이 죽는 패턴이다. 08-11 14시대가 후자였다(예산 초과 20건 / 전멸 1건).
+# 셋을 한 지표로 세면 "무엇이 이 분을 얇게 만들었는가"에 답할 수 없다.
+_FAILURE_BUDGET_RE = re.compile(
+    _TS + r" WARNING:mahdi\.main:옵션체인 실패 예산\((\d+)건\) 소진 — 남은 (\d+)레그를 포기하고"
+    r".*적재 (\d+)행 · 컷당한북=(\S+)"
 )
 # 2026-08-06(고도화#1) — 먼슬리 레그 재시도(`mahdi.main.LOG_CHAIN_PRIORITY_RETRY`).
 # **시도와 회복을 둘 다 센다**: 회복 0건은 "KIS가 계속 느렸다"이고, 시도 0건은 "예산이 없었다"라
@@ -105,6 +142,27 @@ _PRIORITY_RETRY_RE = re.compile(
     _TS + r" INFO:mahdi\.main:먼슬리 레그 재시도: (\d+)개 중 (\d+)개 회복"
 )
 _LEVEL_RE = re.compile(_TS + r" (INFO|WARNING|ERROR|CRITICAL|DEBUG):(\S+?):")
+
+# 2026-08-11 Fix#2 — 먼슬리(판단 주입력) 북의 series 라벨.
+#
+# 이 모듈은 `mahdi.main`을 임포트하지 않는다(순수 텍스트 파서라 의도적이다). 그래서 상수를
+# 복제하되 **계약 테스트가 `main.OPTION_CHAIN_PRIORITY_SERIES`와의 일치를 강제**한다
+# (`test_log_metrics_priority_series_matches_main`). 복제 자체가 위험한 게 아니라
+# **복제가 조용히 갈라지는 것**이 위험하고, 그것은 테스트로 막는 편이 임포트보다 싸다.
+PRIORITY_SERIES_LABEL = "regular"
+
+
+def _priority_cut_minutes(events: list[dict]) -> int | None:
+    """
+    입력: `컷당한북` 라벨을 가진 이벤트 목록.
+    계산: 그중 **먼슬리가 잘린 분**의 수. 라벨이 하나도 없으면 `None`(= 못 쟀다).
+    해석: 규약 C — 라벨 없는 구 로그(08-10 이전)에서 0을 돌려주면 "컷이 없었다"는 거짓말이 된다.
+    실패 조건: 없다.
+    """
+    labelled = [e for e in events if e.get("cut_books")]
+    if not labelled:
+        return None
+    return sum(1 for e in labelled if PRIORITY_SERIES_LABEL in e["cut_books"].split(","))
 
 # 2026-08-05(§2-4) — **로그 레코드 한 줄**을 가리는 기준.
 #
@@ -225,13 +283,18 @@ _KIS_ERROR_BODY_TOKEN = '"rt_cd"'
 # 토큰은 포맷이 바뀌어도 살아남을 만큼 짧게 고른다(레벨·수치·엔드포인트를 포함하지 않는다).
 _PARSER_AUDIT_TOKENS = {
     "cycles": "옵션체인 사이클 소요 분해",
-    "overrun": "스케줄이",
+    # 2026-08-11 Fix#7 — `"스케줄이"`에서 좁혔다. 여섯 폴러가 같은 문장을 쓰므로 느슨 검사가
+    # 항상 다른 폴러를 주워 와 **매일 거짓 ⚠**를 냈다(08-11에 실제로 그랬다).
+    # 옵션체인 밖의 밀림은 `overrun_by_poller`가 따로 센다.
+    "overrun": "옵션 체인 폴링 사이클이",
     "backoff": "레이트리밋 백오프",
     "slow_calls": "느린 REST 호출",
     "catchups": "옵션체인 결손 회수",
     "rest_latency": "REST 응답시간",
     "atm_rolls": "ATM 롤링",
     "budget_exceeded": "수집 예산",
+    "timeout_abort": "연속 타임아웃",
+    "failure_budget_abort": "실패 예산",
     "remote_protocol_error": "RemoteProtocolError",
     "read_timeout": "ReadTimeout",
     "connect_error": "ConnectError",
@@ -396,6 +459,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     latency_windows: list[dict] = []
     atm_rolls: list[tuple[float, str, str]] = []  # (초, 이전 창, 새 창) — 북 중복 제거 후
     budget_events: list[dict] = []
+    timeout_aborts: list[dict] = []
+    failure_budget_aborts: list[dict] = []
     failures: collections.Counter = collections.Counter()
     levels: collections.Counter = collections.Counter()
     qualitative: collections.Counter = collections.Counter()
@@ -407,6 +472,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     priority_retries: list[dict] = []
     audit_loose: collections.Counter = collections.Counter()
     overrun_seconds: list[float] = []
+    overrun_by_poller: dict[str, list[float]] = {}
     total_bytes = 0
     httpx_bytes = 0
     total_lines = 0
@@ -488,9 +554,14 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             )
             continue
 
-        m = _OVERRUN_RE.match(line)
+        m = _ANY_OVERRUN_RE.match(line)
         if m:
-            overrun_seconds.append(float(m.group(6)))
+            poller = m.group(6).strip()
+            seconds = float(m.group(7))
+            overrun_by_poller.setdefault(poller, []).append(seconds)
+            # `overrun`(옵션체인 전용)의 의미는 그대로 둔다 — 08-04부터의 가설들이 그 위에 있다.
+            if _OVERRUN_RE.match(line):
+                overrun_seconds.append(seconds)
             continue
 
         m = _BACKOFF_RE.match(line)
@@ -548,7 +619,26 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         m = _BUDGET_RE.match(line)
         if m:
             budget_events.append(
-                {"at": _hhmm(_seconds_of_day(m)), "skipped": int(m.group(6)), "collected": int(m.group(7))}
+                {"at": _hhmm(_seconds_of_day(m)), "skipped": int(m.group(6)),
+                 "collected": int(m.group(7)), "cut_books": m.group(8)}
+            )
+            continue
+
+        m = _TIMEOUT_ABORT_RE.match(line)
+        if m:
+            timeout_aborts.append(
+                {"at": _hhmm(_seconds_of_day(m)), "consecutive": int(m.group(6)),
+                 "skipped": int(m.group(7)), "collected": int(m.group(8)),
+                 "cut_books": m.group(9)}
+            )
+            continue
+
+        m = _FAILURE_BUDGET_RE.match(line)
+        if m:
+            failure_budget_aborts.append(
+                {"at": _hhmm(_seconds_of_day(m)), "failure_budget": int(m.group(6)),
+                 "skipped": int(m.group(7)), "collected": int(m.group(8)),
+                 "cut_books": m.group(9)}
             )
             continue
 
@@ -588,6 +678,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "rest_latency": len(latency_windows),
             "atm_rolls": len(atm_rolls),
             "budget_exceeded": len(budget_events),
+            "timeout_abort": len(timeout_aborts),
+            "failure_budget_abort": len(failure_budget_aborts),
         }
     )
     return {
@@ -603,7 +695,21 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         "budget_exceeded": {
             "count": len(budget_events),
             "skipped_legs_total": sum(e["skipped"] for e in budget_events),
+            # 2026-08-11 Fix#2 — **예산 컷이 먼슬리에 닿은 분**. 08-06이 이 값을 손으로 세어
+            # (그때 3분) "먼슬리를 얇게 만든 것은 예산 컷이 아니라 레그 단위 타임아웃"이라는
+            # 결론을 냈고 그것이 고도화#1의 방향을 정했다. 그 실측이 지표로는 없었다.
+            # 컷은 먼슬리 우선 순서상 뒤쪽 북부터 닿으므로 **여기 먼슬리가 들어오면 그 자체가 사건**이다.
+            "priority_cut_minutes": _priority_cut_minutes(budget_events),
+            "labelled": sum(1 for e in budget_events if e.get("cut_books")),
             "samples": budget_events[:10],
+        },
+        # 2026-08-11 Fix#1 — 연속 타임아웃 조기 포기. **예산 초과와 나눠 센다**(원인이 다르다).
+        "timeout_abort": {
+            "count": len(timeout_aborts),
+            "skipped_legs_total": sum(e["skipped"] for e in timeout_aborts),
+            "priority_cut_minutes": _priority_cut_minutes(timeout_aborts),
+            "minutes": [e["at"] for e in timeout_aborts],
+            "samples": timeout_aborts[:10],
         },
         "catchups": {"count": len(catchups), "minutes": [c["minute"] for c in catchups]},
         # 2026-08-06 고도화#1 — 먼슬리 레그 재시도. 시도/회복을 나눠 두는 이유는
@@ -653,6 +759,23 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "count": len(overrun_seconds),
             "max_seconds": round(max(overrun_seconds), 1) if overrun_seconds else 0.0,
             "total_seconds": round(sum(overrun_seconds), 1),
+        },
+        # 2026-08-11 고도화 A — 누적 실패 예산 소진. 연속 타임아웃과 **나눠 센다**(위 주석).
+        "failure_budget_abort": {
+            "count": len(failure_budget_aborts),
+            "skipped_legs_total": sum(e["skipped"] for e in failure_budget_aborts),
+            "priority_cut_minutes": _priority_cut_minutes(failure_budget_aborts),
+            "minutes": [e["at"] for e in failure_budget_aborts],
+        },
+        # 2026-08-11 Fix#7 — 폴러별 밀림. 상세 근거는 `_ANY_OVERRUN_RE` 주석.
+        # 옵션체인 밖의 밀림은 종전에 **어디에도 안 남았다**(08-11 만기유동성 1건이 그랬다).
+        "overrun_by_poller": {
+            poller: {
+                "count": len(seconds),
+                "max_seconds": round(max(seconds), 1),
+                "total_seconds": round(sum(seconds), 1),
+            }
+            for poller, seconds in sorted(overrun_by_poller.items(), key=lambda kv: -len(kv[1]))
         },
     }
 

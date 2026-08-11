@@ -115,10 +115,27 @@ def summarize(conn: ConnectionLike, target: date) -> dict:
          지평이 길수록 표본이 줄어드는 것이 정상이다.
     실패 조건: 테이블이 없으면 `{"available": False}`.
     """
+    # 2026-08-11 고도화 C — **|이동폭|을 함께 낸다(방향 무관).**
+    #
+    # `hit`은 `direction x (spot_after − entry_spot) > 0`이다 — **방향성 전략을 전제한다.**
+    # 그런데 08-11에 허용된 전략은 `straddle_accumulate`, 즉 **방향 중립**이었다. 스트래들은
+    # 어느 쪽으로든 크게 움직이면 이기고 안 움직이면 진다. 그날 ENTER 281건에 대해
+    # `hit_5m/15m/30m`은 **틀린 질문에 답했다**(5m 48.2% / 15m 43.3% / 30m 57.0%).
+    #
+    # 이동폭은 그 전략에 맞는 축이다. **임계는 걸지 않는다** — 정상 분포를 모르고, 모르는 채
+    # 임계를 정하면 그 임계가 곧 결론이 된다(08-05 스팟 괴리율에서 한 실수).
+    # v6 §11.3 Thompson Sampling은 Phase 3이므로 이 값도 **되먹임이 아니라 평가**다.
+    #
+    # 진입 스팟 대비 **비율**로 낸다: 지수 수준이 969~990을 오간 날과 1,040대였던 날을
+    # 절대 포인트로 비교하면 지수 수준을 재게 된다(규약 F가 건수에 대해 막는 것과 같은 형태다).
+    moves = ", ".join(
+        f"avg(abs(spot_after_{m}m - entry_spot) / nullif(entry_spot, 0)) AS mv_{m}"
+        for m in HORIZON_MINUTES
+    )
     selects = ", ".join(
         f"count(hit_{m}m) AS n_{m}, count(*) FILTER (WHERE hit_{m}m) AS hit_{m}"
         for m in HORIZON_MINUTES
-    )
+    ) + ", " + moves
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -134,12 +151,16 @@ def summarize(conn: ConnectionLike, target: date) -> dict:
         return {"available": False, "reason": "그날 ENTER 판단 없음 또는 미계산"}
 
     out: dict = {"available": True, "entries": int(row[0]), "horizons": {}}
+    move_base = 1 + 2 * len(HORIZON_MINUTES)  # |이동폭| 열은 hit 열들 뒤에 붙는다
     for i, minutes in enumerate(HORIZON_MINUTES):
         sample, hits = int(row[1 + i * 2]), int(row[2 + i * 2])
+        move = row[move_base + i]
         out["horizons"][f"{minutes}m"] = {
             "sample": sample,
             "hits": hits,
             "hit_pct": round(hits / sample * 100, 1) if sample else None,
+            # 고도화 C — 방향 무관 축. 방향성 전략은 `hit_pct`로, 변동성 전략은 이 값으로 읽는다.
+            "abs_move_pct": round(float(move) * 100, 3) if move is not None else None,
         }
     out["control"] = _reject_control_group(conn, target)
     return out

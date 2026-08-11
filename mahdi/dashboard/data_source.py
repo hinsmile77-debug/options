@@ -17,7 +17,11 @@ import numpy as np
 from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel
-from mahdi.engines.regime_pipeline import FEATURE_VERSION, MACRO_SNAPSHOT_MAX_AGE_MINUTES
+from mahdi.engines.regime_pipeline import (
+    DEFAULT_MODEL_PATH,
+    FEATURE_VERSION,
+    MACRO_SNAPSHOT_MAX_AGE_MINUTES,
+)
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute_gamma_walls, signal_book_legs
 from mahdi.ops import db_metrics
@@ -421,6 +425,9 @@ def _schema_integrity_check(conn) -> HealthCheck:
         # `poll_ws_heartbeat`가 그 예외를 삼키므로(관측 자체는 계속돼야 하니 옳은 처리다)
         # WS 배지 3종이 **조용히** 멈춘다.
         "ws_status": db.ws_status_columns(),
+        # 2026-08-11(고도화 B, 마이그레이션 029): **파급이 가장 크다.** 이 표는 매분
+        # INSERT되므로 컬럼 하나가 없으면 그날 판단이 한 줄도 안 남는다.
+        "signal_decisions": db.signal_decision_columns(),
     }
     missing_by_table: dict[str, list[str]] = {}
     try:
@@ -475,6 +482,29 @@ _REGIME_FIT_TARGET_ROWS = 8000
 _REGIME_FIT_TARGET_BUSINESS_DAYS = 20
 
 
+def _regime_model_note() -> str:
+    """
+    반환: 배포된 레짐 모델의 상태를 한 문장으로. 없으면 실행을 권한다.
+    해석: 2026-08-11 Fix#9 — 상세 근거는 호출부 주석. **파일이 있으면 「실행 가능」이라고 쓰지
+         않는다** — 이미 한 일을 매일 시키는 배지는 곧 아무도 안 읽는다.
+         모델이 낡았는지는 **판단하지 않는다**: 며칠마다 재학습해야 하는지 아직 모르고,
+         모르는 상태에서 임계를 정하면 그 임계가 곧 결론이 된다(08-05 스팟 괴리율의 교훈).
+         나이를 인쇄만 하고 사람이 읽는다.
+    실패 조건: 경로 접근 실패는 "확인 불가"로 떨어진다(배지를 죽이지 않는다).
+    """
+    try:
+        # `DEFAULT_MODEL_PATH`는 상대경로다(`data/models/…`). cwd에 기대면 대시보드를 다른
+        # 디렉터리에서 띄운 날 조용히 "미배포"로 뜬다 — `PROJECT_ROOT` 기준으로 고정한다.
+        path = PROJECT_ROOT / DEFAULT_MODEL_PATH
+        if not path.exists():
+            return "**모델 미배포** — `scripts/fit_regime_engine.py` 실행 가능"
+        trained = datetime.fromtimestamp(path.stat().st_mtime)
+        age_days = (datetime.now() - trained).days
+        return f"모델 배포됨({trained:%Y-%m-%d %H:%M}, {age_days}일 전) — 재학습은 필요할 때만"
+    except OSError:
+        return "모델 파일 확인 불가"
+
+
 def _regime_fit_progress_check(conn, underlying: str) -> HealthCheck:
     """
     계산: feature_store에 실제로 데이터가 쌓인 날짜 수(DISTINCT timestamp::date)와 총 행수를
@@ -501,9 +531,20 @@ def _regime_fit_progress_check(conn, underlying: str) -> HealthCheck:
         return HealthCheck(label, "info", "아직 feature_store 데이터 없음")
 
     if total_rows >= _REGIME_FIT_TARGET_ROWS:
+        # 2026-08-11 Fix#9 — **행 수만 보고 「실행 가능」이라고 쓰면 안 된다.**
+        #
+        # 08-11은 레짐 엔진이 25영업일 만에 처음 라이브로 predict()를 돌린 날이었다. 모델은
+        # 08-10 16:56에 이미 학습·배포돼 있었는데, 이 배지는 종일 *"목표 도달,
+        # fit_regime_engine.py 실행 가능"* 이라고 띄우고 있었다 — **이미 한 일을 시키고 있었다.**
+        # 08-03에 배지가 "고장난 지표를 초록으로" 띄운 것과 같은 계열이다(자동 리포트는 맞았다).
+        #
+        # 모델 파일의 존재와 나이를 함께 본다. 학습 시각은 `metadata.trained_at`이 아니라
+        # **파일 mtime**으로 읽는다 — 언피클은 hmmlearn을 로드해야 하고, 대시보드 새로고침마다
+        # 그걸 하면 화면이 느려진다. 배포 여부만 알면 되므로 mtime이면 충분하다.
+        model_note = _regime_model_note()
         return HealthCheck(
             label, "ok",
-            f"{total_rows:,}행 / {distinct_days}영업일 — 목표 도달, scripts/fit_regime_engine.py 실행 가능",
+            f"{total_rows:,}행 / {distinct_days}영업일 — 목표 도달. {model_note}",
         )
 
     remaining_rows = _REGIME_FIT_TARGET_ROWS - total_rows

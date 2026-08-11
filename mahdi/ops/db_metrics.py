@@ -954,6 +954,57 @@ def strike_window_quality(
     }
 
 
+def _chain_input_source_counts(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 판단이 본 체인의 출처별 분 수(`current`/`stale`/`none`)와 stale 비율.
+    해석: 마이그레이션 029 / 2026-08-11 고도화 B. **`stale_pct`가 이 지표의 요점이다** —
+         08-11에 하루의 절반이 직전 분 GEX로 판단했는데(짝수분 20레그 폴링 19.3초 >
+         판단 위상 10초) 그 사실이 어떤 지표에도 없었다. `chain_age_seconds_max` 하나로는
+         "느려졌다"만 알 수 있고 "몇 분이 늙은 값을 봤는가"는 못 센다.
+    실패 조건: 컬럼이 없는 날(029 이전)은 `{"available": False}` — **0을 내면 안 된다**.
+              그러면 08-11 이전 전 이력이 "체인 없음"으로 보인다.
+    """
+    try:
+        rows = _fetchall(
+            conn,
+            "SELECT coalesce(chain_input_source, '(미기록)'), count(*) FROM signal_decisions "
+            "WHERE timestamp::date=%s GROUP BY 1",
+            (target,),
+        )
+    except Exception:
+        return {"available": False, "reason": "chain_input_source 미기록(마이그레이션 029 이전)"}
+    counts = {r[0]: int(r[1]) for r in rows}
+    if not counts or set(counts) == {"(미기록)"}:
+        return {"available": False, "reason": "chain_input_source 미기록(마이그레이션 029 이전)"}
+    judged = sum(v for k, v in counts.items() if k != "(미기록)")
+    return {
+        "available": True,
+        "counts": counts,
+        "stale_pct": round(counts.get("stale", 0) / judged * 100, 1) if judged else None,
+    }
+
+
+def _dead_axis_by_member(conn: ConnectionLike, target: date) -> dict[str, int]:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 멤버별로 **점수가 실렸는데 0이었던 분** 수. 큰 순서로 돌려준다.
+    해석: `dead_axis_mean`의 분해다 — 상세 근거는 호출부 주석. 값이 아니라 **이름**이 중요하다:
+         "죽은 축 1.06"은 매일 같아 보이지만, 그것이 `regime_hmm`(시장이 추세가 아니었다)인지
+         `orderflow_ofi_vpin`(데이터가 없었다)인지는 완전히 다른 사건이다.
+    실패 조건: `member_scores`가 없는 날은 빈 dict — 호출측이 「집계 전」으로 표시한다.
+    """
+    rows = _fetchall(
+        conn,
+        "SELECT member, count(*) FILTER (WHERE raw::double precision = 0) "
+        "FROM signal_decisions, "
+        "     LATERAL jsonb_each_text(risk_gate_state->'member_scores') AS t(member, raw) "
+        "WHERE timestamp::date=%s GROUP BY member",
+        (target,),
+    )
+    return {r[0]: int(r[1]) for r in sorted(rows, key=lambda r: -int(r[1])) if int(r[1]) > 0}
+
+
 def member_score_quality(conn: ConnectionLike, target: date) -> dict:
     """
     입력: DB 커넥션, 대상 날짜.
@@ -1135,6 +1186,16 @@ def decisions(conn: ConnectionLike, target: date) -> dict:
             "dead_axis_mean": round(available_mean - effective_mean, 2),
             "effective_min": int(member_row[2]) if member_row[2] is not None else None,
             "minutes_with_dead_axis": int(member_row[3]),
+            # 2026-08-11 Fix#5 — **누가 죽었는가**를 숫자 옆에 둔다.
+            #
+            # 08-11에 `dead_axis_mean`이 1.06으로 예측(< 1.02)을 반증했는데, 그 1.06의 정체는
+            # `regime_hmm`이 419분 전량 중립이었던 것이다. 그리고 그것은 결함이 아니라
+            # **설계**다 — `_TREND_DIRECTION`은 TREND_UP/DOWN_STRONG에만 방향을 주고, 그날
+            # 방문한 레짐 셋(VOL_COMPRESSION/RANGE_BALANCED/RANGE_BREAK_PREP)은 전부 방향이 없다.
+            #
+            # 즉 이 평균은 **그날 시장이 추세였는가**의 함수다. 총계만 보면 매번 같은 오독을
+            # 반복하게 되므로 분해를 같은 칸에 인쇄한다(규약 F가 절대 건수에 한 것과 같은 처방).
+            "dead_axis_by_member": _dead_axis_by_member(conn, target),
         }
     else:
         # 2026-08-06 이전 판단에는 이 키가 없다 — 0으로 채우면 "전 축이 죽었다"는 거짓 신호가 된다.
@@ -1349,6 +1410,8 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
         "gex_input_missing_minutes": int(row[9]) if row[9] is not None else None,
     }
     out["gamma_flip_out_of_range_count"] = _gamma_flip_out_of_range_count(conn, target)
+    # 2026-08-11 고도화 B — 판단이 **그 분** 체인을 봤는가(마이그레이션 029).
+    out["chain_input_source"] = _chain_input_source_counts(conn, target)
 
     # 2026-08-06(§2-5 / Fix#5) — 표본이 **전부 장전**이면 아래 두 경고는 잴 대상이 아직 없다.
     # 장전에는 스팟이 설계상 없어(`mahdi.session.is_preopen`) `options_flow`가 미가용인 것이
@@ -1425,7 +1488,26 @@ def _risk_gate_distinct(conn: ConnectionLike, target: date) -> int:
     return int(row[0]) if row else 0
 
 
-def _regime(conn: ConnectionLike, target: date) -> list[dict]:
+# 2026-08-11 Fix#4 — 방향이 **있는** 레짐.
+#
+# `fusion/signal_layer._TREND_DIRECTION`이 점수를 주는 두 상태다. 나머지 여섯은 v6 §7 정의상
+# 방향이 무의미해 `regime_hmm` 멤버가 구조적으로 0점을 낸다. `signal_layer`를 임포트하지 않는
+# 이유는 `log_metrics.PRIORITY_SERIES_LABEL`과 같다 — 복제하되 계약 테스트로 일치를 강제한다
+# (`test_directional_regimes_match_the_signal_layer`).
+DIRECTIONAL_REGIMES = (0, 1)  # TREND_UP_STRONG, TREND_DOWN_STRONG
+
+
+def _regime(conn: ConnectionLike, target: date) -> dict:
+    """
+    반환: 레짐 방문 분포 + **추세 레짐 방문 분 수**.
+
+    2026-08-11 Fix#4 — `trend_minutes`가 왜 필요한가: 08-11에 `regime_hmm` 멤버가 419분 전량
+    중립이었고, 그것을 「비영 산출 분 > 0」이라는 무조건부 하한으로 검정해 **반증**이 찍혔다.
+    그런데 엔진은 완벽히 돌았고(3종 방문, 전이 2회) 그날 시장이 추세가 아니었을 뿐이다.
+
+    **「엔진이 도는가」와 「엔진이 추세를 봤는가」는 다른 질문이다.** `trend_minutes == 0`이면
+    `regime_hmm`이 0점인 것은 **정상이고 반증이 아니다** — 그때 판정은 「판정 불가」여야 한다.
+    """
     today = dict(
         (int(r[0]), int(r[1]))
         for r in _fetchall(
@@ -1436,10 +1518,15 @@ def _regime(conn: ConnectionLike, target: date) -> list[dict]:
         conn,
         "SELECT regime, count(*), count(DISTINCT timestamp::date) FROM regime_state GROUP BY 1 ORDER BY 1",
     )
-    return [
-        {"regime": str(regime), "today": today.get(int(regime), 0), "total": int(total), "days": int(days)}
-        for regime, total, days in rows
-    ]
+    return {
+        "visits": [
+            {"regime": str(regime), "today": today.get(int(regime), 0),
+             "total": int(total), "days": int(days)}
+            for regime, total, days in rows
+        ],
+        "today_total": sum(today.values()),
+        "trend_minutes": sum(today.get(r, 0) for r in DIRECTIONAL_REGIMES),
+    }
 
 
 def _feature_store(conn: ConnectionLike, target: date) -> dict:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from mahdi.data import db
 from mahdi.dashboard.data_source import (
     get_account_status_view,
     get_health_summary,
@@ -194,8 +195,21 @@ def render() -> None:
     # 2026-08-05(P1-6) — 시각 없는 가격은 검증할 수 없다. 08-05 화면에는 지수 1,042.85와
     # 선물 1046대가 함께 떠 있었는데 어느 쪽이 언제 것인지 알 방법이 없었다. 장전에는 이 값이
     # 전일 종가인 것이 정상인데(§2 이상점 8), 그 사실도 시각이 있어야 읽힌다.
+    # 2026-08-11(§3-7 / Fix#9) — **날짜가 다르면 날짜를 쓴다.**
+    #
+    # 08-05의 P1-6이 시각을 붙였는데 `%H:%M:%S`뿐이라, 08-11 장전 화면에 전일 종가 979.18이
+    # `15:19:00 기준`으로 떴다. 시각만 있으면 "오늘 15:19"로 읽힌다 — 장전 07:30에 그 시각이
+    # 아직 오지 않았다는 것을 사람이 매번 계산해야 했다.
+    # **매분 날짜를 찍지는 않는다**(같은 날에는 소음이다). 다른 날일 때만 날짜와 경고를 함께 낸다.
+    #
+    # ⚠ 비교 대상은 `snapshot.as_of`가 **아니다.** 그 값은 `regime_state`의 최신 행 시각이라
+    # (`data_source._load_from_db`), 장전에는 스팟도 레짐도 둘 다 전일 것이어서 날짜가 같아진다 —
+    # 즉 가장 위험한 순간에 정확히 침묵한다. 벽시계 오늘과 비교해야 한다.
     if snapshot.spot_asof is not None:
-        col2.caption(f"{snapshot.spot_asof:%H:%M:%S} 기준")
+        if snapshot.spot_asof.date() != db.local_now().date():
+            col2.caption(f"⚠ **{snapshot.spot_asof:%Y-%m-%d %H:%M:%S}** 기준 — 오늘 값이 아니다")
+        else:
+            col2.caption(f"{snapshot.spot_asof:%H:%M:%S} 기준")
     col3.metric("레짐 안정성", "안정" if snapshot.stability_flag else "REGIME_UNSTABLE")
 
     st.subheader("Regime")

@@ -350,10 +350,109 @@ def test_chain_catchup_line_is_parsed():
 
 def test_budget_exceeded_line_is_parsed():
     """2026-08-04 Fix#8 — 이 줄이 없으면 "예산이 실제로 걸렸는가"를 셀 수 없다."""
-    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 6, 14)
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 6, 14, "weekly_mon")
     budget = _parse(line)["budget_exceeded"]
     assert budget["count"] == 1
     assert budget["skipped_legs_total"] == 6
+
+
+# ===== 2026-08-11 Fix#1/#2 — 조기 포기와 컷 귀속 =====
+
+
+def test_timeout_abort_line_is_parsed_and_counted_apart_from_budget():
+    """조기 포기와 예산 초과는 **원인이 다르므로 지표도 갈려야 한다.**
+
+    08-11 15:01~15:22의 22분은 "우리가 느렸다"가 아니라 "KIS가 4초 천장에 닿았다"였는데,
+    종전 로그는 둘을 같은 줄로 냈다.
+    """
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, 17, 0, "regular,weekly_mon")
+    metrics = _parse(line)
+    abort = metrics["timeout_abort"]
+    assert abort["count"] == 1
+    assert abort["skipped_legs_total"] == 17
+    assert abort["minutes"] == ["10:11"]
+    # 예산 초과로 새어 들어가면 안 된다.
+    assert metrics["budget_exceeded"]["count"] == 0
+
+
+def test_failure_budget_abort_is_counted_apart_from_consecutive_timeouts():
+    """고도화 A — 두 조기 종료는 **다른 병**이다.
+
+    연속 타임아웃은 KIS가 천장에 닿아 전멸하는 패턴이고, 누적 실패는 성공/실패가 섞여 절반이
+    죽는 패턴이다. 08-11 14시대가 후자였다(예산 초과 20건 / 전멸 1건) — 한 지표로 세면
+    "무엇이 이 분을 얇게 만들었는가"에 답할 수 없다.
+    """
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_FAILURE_BUDGET, 6, 8, 12.5, 6, "weekly_mon")
+    metrics = _parse(line)
+
+    assert metrics["failure_budget_abort"]["count"] == 1
+    assert metrics["failure_budget_abort"]["skipped_legs_total"] == 8
+    assert metrics["failure_budget_abort"]["priority_cut_minutes"] == 0
+    # 다른 두 지표로 새어 들어가면 안 된다.
+    assert metrics["timeout_abort"]["count"] == 0
+    assert metrics["budget_exceeded"]["count"] == 0
+
+
+def test_cut_books_label_tells_whether_the_monthly_book_was_reached():
+    """Fix#2 — 먼슬리가 컷당한 분을 지표로 센다. 08-06엔 이 값을 사람이 손으로 셌다."""
+    weekly_only = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 4, 16, "weekly_mon")
+    reached_monthly = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 12, 8, "regular,weekly_mon")
+
+    assert _parse(weekly_only)["budget_exceeded"]["priority_cut_minutes"] == 0
+    assert _parse(reached_monthly)["budget_exceeded"]["priority_cut_minutes"] == 1
+    assert _parse(weekly_only, reached_monthly)["budget_exceeded"]["labelled"] == 2
+
+
+def test_unlabelled_old_logs_report_none_not_zero():
+    """규약 C — 라벨이 없는 08-10 이전 로그에서 0을 내면 "컷이 없었다"는 거짓말이 된다."""
+    legacy = (
+        f"{_TS} WARNING:mahdi.main:옵션체인 수집 예산(50초) 초과 — "
+        "남은 6레그를 포기하고 14레그로 이번 분을 마감합니다 (다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8)"
+    )
+    budget = _parse(legacy)["budget_exceeded"]
+    assert budget["count"] == 1  # 줄 자체는 여전히 읽힌다(하위호환)
+    assert budget["priority_cut_minutes"] is None
+    assert budget["labelled"] == 0
+
+
+# ===== 2026-08-11 Fix#7 — 밀림 계측 감사가 매일 거짓 ⚠를 냈다 =====
+
+
+def test_other_pollers_overrun_does_not_trip_the_option_chain_audit():
+    """08-11 실사고 재현 — 만기유동성 밀림 1건이 `overrun` 감사를 «파서 0 / 실재 1»로 띄웠다.
+
+    **파서는 옳았다.** `overrun`은 설계상 옵션체인 전용이고, 그 1건은 다른 폴러 것이다.
+    틀린 것은 느슨 토큰(`"스케줄이"`)이었고 여섯 폴러가 같은 문장을 쓴다.
+    """
+    other = (
+        f"{_TS} WARNING:mahdi.main:만기 유동성 폴링 사이클이 주기(60초)를 초과해 "
+        "스케줄이 1.0초 밀렸습니다 — 위상 격자의 다음 틱까지 59.0초 대기"
+    )
+    metrics = _parse(other)
+
+    assert metrics["overrun"]["count"] == 0, "옵션체인 전용 지표에 다른 폴러가 새어 들어가면 안 된다"
+    # 그런데 그 사건이 사라지면 안 된다 — 종전에는 오경보로만 존재했다.
+    assert metrics["overrun_by_poller"]["만기 유동성 폴링"]["count"] == 1
+    assert metrics["overrun_by_poller"]["만기 유동성 폴링"]["max_seconds"] == 1.0
+    # 감사가 조용해야 한다(이것이 이 fix의 주장 지표다).
+    audit = metrics.get("parser_audit") or {}
+    assert "overrun" not in audit, f"거짓 계측 감사가 남아 있다: {audit}"
+
+
+def test_option_chain_overrun_still_counts_in_both_places():
+    """옵션체인 밀림은 종전 지표와 새 분해에 **둘 다** 잡혀야 한다(하위호환)."""
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_OVERRUN, 60.0, 3.5, 56.5, 20.0, 0.1, 18, "", "0")
+    metrics = _parse(line)
+
+    assert metrics["overrun"]["count"] == 1
+    assert metrics["overrun"]["max_seconds"] == 3.5
+    assert metrics["overrun_by_poller"]["옵션 체인 폴링"]["count"] == 1
+
+
+def test_log_metrics_priority_series_matches_main():
+    """`log_metrics`는 `mahdi.main`을 임포트하지 않는다(순수 파서). 복제한 상수가 갈라지면
+    `priority_cut_minutes`가 조용히 항상 0이 된다 — 그것을 여기서 막는다."""
+    assert log_metrics.PRIORITY_SERIES_LABEL == main.OPTION_CHAIN_PRIORITY_SERIES
 
 
 def test_atm_roll_lines_are_deduplicated_across_books():
@@ -497,7 +596,7 @@ def test_empty_chain_cycle_line_is_counted():
 
 def test_empty_chain_cycle_is_distinguishable_from_a_partial_truncation():
     """"조금 잘렸다"와 "통째로 날아갔다"가 같은 줄로 보고되면 안 된다 — 08-05의 실제 실패다."""
-    truncated = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 3, 17)
+    truncated = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 3, 17, "weekly_mon")
     wiped = _emit("mahdi.main", "ERROR", main.LOG_CHAIN_CYCLE_EMPTY, 20, 53.14, "안 함")
     metrics = _parse(truncated, wiped)
 

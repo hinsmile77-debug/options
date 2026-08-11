@@ -18,7 +18,11 @@ from mahdi.fusion.conflict_resolution import resolve_conflicts
 from mahdi.fusion.ensemble import weighted_consensus
 from mahdi.fusion.meta_label import MetaLabelInputs, TradePermission, classify
 from mahdi.fusion.signal_layer import MEMBER_FIELDS, MemberScores, SignalInputs, build_member_scores
-from mahdi.fusion.strategy_palette import enforce_daily_strategy_cap, select_strategies
+from mahdi.fusion.strategy_palette import (
+    enforce_daily_strategy_cap,
+    enforce_reentry_cooldown,
+    select_strategies,
+)
 
 # 2026-08-03(운영점검보고서 §5-2) — 이 모듈에는 로그가 하나도 없었다.
 #
@@ -90,6 +94,9 @@ class SignalFusionEngine:
         meta_context: MetaLabelContext,
         vrp: float = 0.0,
         already_used_strategies_today: frozenset[str] = frozenset(),
+        # 2026-08-11 고도화 D — 전략별 **직전 진입 이후 경과 분**. 기본값 None은 "기록 없음"이라
+        # 쿨다운이 켜져 있어도 아무것도 안 막는다(레버 OFF와 같은 결과) — 백테스트·테스트 경로 보호.
+        last_entry_minutes_ago: dict[str, float] | None = None,
     ) -> FusionDecision:
         """
         입력: SignalInputs(원재료), MetaLabelContext(슬리피지/감마레짐/이벤트근접/자기강화
@@ -167,6 +174,16 @@ class SignalFusionEngine:
             strategy_gates = self._params.get("strategy_gates", {})
             cap = strategy_gates.get("max_priority_strategies_per_regime_day", 2)
             allowed = enforce_daily_strategy_cap(palette.allowed_strategies, already_used_strategies_today, cap)
+            # 2026-08-11 고도화 D — 동일 전략 재진입 쿨다운. **기본 0(OFF)** 이라 종전과 같다.
+            # 상한(가짓수)과 쿨다운(빈도)은 다른 것을 막는다 — 근거는
+            # `strategy_palette.enforce_reentry_cooldown` 위 주석.
+            cooldown = strategy_gates.get("reentry_cooldown_minutes", 0)
+            before_cooldown = allowed
+            allowed = enforce_reentry_cooldown(allowed, last_entry_minutes_ago or {}, cooldown)
+            if before_cooldown and not allowed:
+                # **왜 진입이 안 났는지**가 사유로 남아야 한다. 이 줄이 없으면 쿨다운이 켜진 날
+                # ENTER 급감이 "신호가 약해서"로 오독된다(08-05에 팔레트가 정확히 그랬다).
+                reject_reasons.append("reentry_cooldown")
 
         decision = FusionDecision(
             direction=ensemble_result.direction,

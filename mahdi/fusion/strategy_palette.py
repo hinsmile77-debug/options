@@ -152,3 +152,64 @@ def enforce_daily_strategy_cap(
     remaining_slots = max(cap - len(already_used_today), 0)
     fresh = [s for s in allowed_strategies if s not in already_used_today][:remaining_slots]
     return continuing + fresh
+
+
+# ===== 2026-08-11 고도화 D — 동일 전략 재진입 쿨다운 (레버, 기본 OFF) =====
+#
+# ## 무엇이 이 항목의 착수 조건을 만들었는가
+#
+# 08-11에 ENTER가 **281건 / 494분**(56.9%)이었고, 형태가 분 단위 연속 스트림이었다
+# (09:03~09:19에 09:05만 빼고 전부). ADVISORY라 무해했지만, `CURRENT_STATE`가
+# *"`ExecutionEngine` 재진입 방지 로직 부재 — 배선 전 선행 해결 필요"* 라고 적어 둔 항목이
+# 그날 **구체적 형태**를 얻었다: 실주문이었다면 16분 연속 진입이다.
+#
+# ## 하루 상한(`enforce_daily_strategy_cap`)이 이것을 못 막는 이유
+#
+# 그 상한은 **가짓수**를 제한한다 — "하루에 벌여놓는 전략군 2개 이하"(v6 §11.4). 같은 전략을
+# 계속 쓰는 것은 `continuing`으로 **의도적으로 면제**돼 있고, 그 면제는 옳다(기존 포지션 유지는
+# 새 알파 원천이 아니다). 즉 두 규칙은 **다른 것을 막는다**:
+#
+#     하루 상한   서로 다른 전략을 몇 개까지 벌일 것인가   (가짓수)
+#     쿨다운      같은 전략에 얼마나 자주 들어갈 것인가     (빈도)
+#
+# ## 왜 기본 OFF인가
+#
+# 켜면 그날 ENTER 계열이 통째로 바뀐다. 08-11은 **레짐 엔진이 처음 라이브로 돈 날**이라
+# 그 기준선이 아직 하루치뿐이고, 정상 진입 빈도가 얼마인지 모른다. **모르는 채 임계를 정하면
+# 그 임계가 곧 결론이 된다** — 08-05 스팟 괴리율에서 한 실수다.
+#
+# 그리고 지금은 ADVISORY라 **막아서 얻는 것이 없다.** 이 레버의 값은 실주문 배선일에
+# "그날 처음 짜는 코드"가 되지 않게 하는 데 있다(워치독이 08-06에 그렇게 만들어졌다가
+# 08-11까지 한 번도 안 돌았다 — 만들어 두는 것과 도는 것은 다르다).
+#
+# ## 켤 조건과 예측치 (숫자를 보기 전에 적는다)
+#
+#   조건  `ExecutionEngine` 실주문 배선 **전에** 켠다. 그 전에 며칠치 ENTER 빈도 분포를 본다.
+#   값    `strategy_gates.reentry_cooldown_minutes` (권고 시작값 15 — v6 §13.3 청산 레이어의
+#         최단 시간 스케일과 같다. 그보다 짧으면 직전 진입의 청산 판단이 아직 안 끝난다)
+#   주장  하루 ENTER 건수 감소 (08-11 기준선 **281건 / 494분 = 56.9%**)
+#   주장  ENTER 사이 최소 간격 >= 쿨다운 (불변식 — 0건이어야 위반)
+#   대가  `decision_outcomes.entries` 감소 → 사후 평가 표본이 준다. 며칠 더 쌓아야 한다.
+#   대가  진입 기회 상실 — **이 값은 재지 않는다.** 놓친 진입의 성과는 정의상 관측 불가이고,
+#         그것을 추정하려 들면 팔레트가 아니라 우리의 상상을 재게 된다.
+REENTRY_COOLDOWN_DISABLED = 0
+
+
+def enforce_reentry_cooldown(
+    allowed_strategies: list[str],
+    last_entry_minutes_ago: dict[str, float],
+    cooldown_minutes: float,
+) -> list[str]:
+    """
+    입력: 상한을 통과한 전략 목록, 전략별 **직전 진입 이후 경과 분**, 쿨다운(분).
+    계산: 경과가 쿨다운보다 짧은 전략을 뺀다. 기록이 없는 전략(오늘 첫 진입)은 통과시킨다.
+    해석: 상세 근거는 위 주석. `cooldown_minutes <= 0`이면 **아무것도 안 한다**(레버 OFF) —
+         종전과 바이트 단위로 같은 동작이어야 한다.
+    실패 조건: 없다(순수 함수).
+    """
+    if cooldown_minutes <= REENTRY_COOLDOWN_DISABLED:
+        return list(allowed_strategies)
+    return [
+        s for s in allowed_strategies
+        if last_entry_minutes_ago.get(s) is None or last_entry_minutes_ago[s] >= cooldown_minutes
+    ]

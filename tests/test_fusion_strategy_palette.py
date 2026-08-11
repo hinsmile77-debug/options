@@ -2,6 +2,7 @@ from mahdi.engines.regime import RegimeLabel
 from mahdi.fusion.strategy_palette import (
     NON_ENTRY_STRATEGIES,
     enforce_daily_strategy_cap,
+    enforce_reentry_cooldown,
     entry_strategies,
     select_strategies,
 )
@@ -150,3 +151,34 @@ def test_matrix_cells_are_single_strategy_which_is_why_the_old_cap_never_bound()
                    RegimeLabel.VOL_EXPANSION, RegimeLabel.VOL_COMPRESSION):
         for vrp in (-0.05, 0.0, 0.1):
             assert len(select_strategies(regime, vrp).allowed_strategies) <= 1
+
+
+# ===== 2026-08-11 고도화 D — 동일 전략 재진입 쿨다운 =====
+#
+# 08-11에 ENTER 281건/494분(56.9%)이 분 단위로 연속했다. 하루 상한은 **가짓수**를 막고
+# 같은 전략의 연속 사용은 `continuing`으로 의도적으로 면제하므로, 이 패턴을 못 막는다.
+
+
+def test_cooldown_is_a_no_op_when_disabled():
+    """레버 OFF(0)는 **종전과 바이트 단위로 같아야** 한다 — 오늘 실린 것은 기계뿐이다."""
+    allowed = ["straddle_accumulate", "small_strangle_buy"]
+    assert enforce_reentry_cooldown(allowed, {"straddle_accumulate": 1.0}, 0) == allowed
+    assert enforce_reentry_cooldown(allowed, {"straddle_accumulate": 1.0}, -5) == allowed
+
+
+def test_cooldown_blocks_only_the_strategy_that_is_still_cooling():
+    allowed = ["straddle_accumulate", "small_strangle_buy"]
+    elapsed = {"straddle_accumulate": 3.0, "small_strangle_buy": 20.0}
+
+    assert enforce_reentry_cooldown(allowed, elapsed, 15) == ["small_strangle_buy"]
+
+
+def test_a_strategy_with_no_prior_entry_passes():
+    """오늘 첫 진입은 막지 않는다 — 쿨다운은 «다시» 들어가는 것을 막는 규칙이다."""
+    assert enforce_reentry_cooldown(["straddle_accumulate"], {}, 15) == ["straddle_accumulate"]
+
+
+def test_elapsed_exactly_at_the_cooldown_passes():
+    """경계는 통과다 — «15분 쿨다운»은 15분 뒤에 다시 들어갈 수 있다는 뜻이다."""
+    assert enforce_reentry_cooldown(["s"], {"s": 15.0}, 15) == ["s"]
+    assert enforce_reentry_cooldown(["s"], {"s": 14.99}, 15) == []
