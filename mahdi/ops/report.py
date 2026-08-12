@@ -138,7 +138,8 @@ def _section(title: str, builder: Callable[[], list[str]]) -> list[str]:
 
 
 def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None = None,
-           hypotheses: list[dict] | None = None, history: list[dict] | None = None) -> str:
+           hypotheses: list[dict] | None = None, history: list[dict] | None = None,
+           levers: dict | None = None, watchdog: dict | None = None) -> str:
     """
     입력: 오늘 로그 지표, (선택) 전일 지표, (선택) DB 지표, (선택) 가설 검정 결과,
          (선택) **직전 영업일들의 지표**(최신순, 2026-08-07 고도화#5).
@@ -156,8 +157,11 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
         "> (`docs/동작점검/YYYY-MM-DD_마흐디_운영점검보고서.md`)의 몫이다 — 여기엔 표와 델타만 있다.",
         "",
     ]
+    if levers:
+        lines += _section("0. 오늘의 레버 상태 (규약 H — 무엇이 실제로 실행됐는가)",
+                          lambda: _render_levers(levers))
     if hypotheses:
-        lines += _section("0. 가설 검정 (구현 시점에 적어둔 예측 vs 오늘 실측)",
+        lines += _section("0-1. 가설 검정 (구현 시점에 적어둔 예측 vs 오늘 실측)",
                           lambda: _render_hypotheses(hypotheses))
     lines += _section("1. 한눈에 (전일 대비)", lambda: _render_headline(metrics, previous))
     lines += _section("2. 시간대별 사이클/밀림", lambda: _render_by_hour(metrics))
@@ -172,6 +176,9 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                       lambda: _render_rest_latency(metrics, previous))
     lines += _section("10. 폴러 실측 위상", lambda: _render_phase(metrics))
     lines += _section("11. 로그 볼륨/정성 항목", lambda: _render_log_volume(metrics))
+    if watchdog is not None:
+        lines += _section("11-1. 워치독 — 감시자가 돌기는 했는가",
+                          lambda: _render_watchdog(watchdog))
     if db_metrics:
         lines += _section("12. DB 적재", lambda: _render_db_tables(db_metrics))
         lines += _section("13. 판단/레짐/피처", lambda: _render_db_judgement(db_metrics))
@@ -189,6 +196,80 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     lines += _section("17. 교차 점검 — 지표끼리 모순되는가",
                       lambda: _render_crosschecks(metrics, db_metrics))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_levers(levers: dict) -> list[str]:
+    """2026-08-12 §1-1 / Fix#6 — **레버 상태를 사람의 기억에서 떼어낸다.**
+
+    08-12에 「오늘 단 하나만 켤 것」으로 지정된 레버가 안 켜졌고, 그런데도 §0-1이 그것을 켜진
+    전제로 판정해 멀쩡한 fix를 반증처럼 보이게 했다. 그날 필요했던 질문(「오늘 F를 켰던가?」)의
+    답은 저장소 안에 있었다 — 아무도 묻지 않았을 뿐이다.
+    """
+    rows = []
+    for lever in levers.get("levers", []):
+        on = lever.get("on")
+        state = "**ON**" if on else ("OFF" if on is False else "⛔ 못 읽음")
+        rows.append([
+            f"`{lever['key']}`", lever.get("위치", "—"),
+            f"`{lever.get('value')!r}`", f"`{lever.get('default')!r}`", state,
+        ])
+    out = _table(["레버", "위치", "오늘 값", "꺼진 값", "상태"], rows)
+    head = levers.get("git_head")
+    out.append(f"> 오늘 돌던 코드: `{head}`" if head else "> 오늘 돌던 코드: (git HEAD를 못 읽었다)")
+    out += [
+        "> **규약 H — 레버가 꺼진 날의 숫자로 그 레버의 가설을 판정하지 않는다.** "
+        "`hypotheses.yaml`의 `전제레버`에 위 이름을 적으면 §0-1이 그 항목을 「미실행」으로 낸다. "
+        "규약 F(건수는 구조 변수에 비례)·G(어떤 값은 그날 시장에 비례)의 셋째다 — "
+        "**어떤 값은 그 코드가 실제로 돌았는가에 비례한다.**",
+        "> `⛔ 못 읽음`은 **OFF가 아니다.** 「꺼져 있었다」와 「상태를 모른다」는 조치가 다르다 — "
+        "후자는 이 표가 그 레버를 놓친 것이므로 `mahdi/ops/levers.py`를 고쳐야 한다.",
+        "",
+    ]
+    return out
+
+
+def _render_watchdog(watchdog: dict) -> list[str]:
+    """2026-08-12 §2-3 / Fix#8 — **감시자의 침묵**을 다음 날이 보게 한다.
+
+    08-12에 워치독은 10:14:01에 판정하고 재기동했는데, 재기동 호출이 상속된 파이프에 물려
+    15:45:02까지 막혔고 그동안 매분 실행이 전부 무시됐다(`MultipleInstances=IgnoreNew`).
+    스케줄러는 `State: Ready` / `LastTaskResult: 0` / `NumberOfMissedRuns: 0`이었다 —
+    **프로세스 생존은 기능 생존의 증거가 아니다.**
+    """
+    silence = watchdog.get("max_silence_minutes")
+    warn_at = watchdog.get("silence_warn_minutes") or 20.0
+    rows = [
+        ["판정 줄 수", _fmt(watchdog.get("checks"), "{}")],
+        ["재기동(RESTART)", _fmt(watchdog.get("restarts"), "{}")],
+        ["재기동 실패 보고", _fmt(watchdog.get("restart_failures"), "{}")],
+        ["상한 도달(ALERT_ONLY)", _fmt(watchdog.get("alert_only"), "{}")],
+        ["첫 판정 / 마지막 판정",
+         f"{watchdog.get('first_at') or '—'} / {watchdog.get('last_at') or '—'}"],
+        ["**최장 무판정 구간**",
+         f"**{_fmt(silence, '{:.0f}')}분** ({watchdog.get('max_silence_window') or '—'})"],
+    ]
+    out = _table(["지표", "값"], rows)
+    if watchdog.get("checks") == 0:
+        out.append(
+            "> ⛔ **그날 워치독이 한 줄도 안 남겼다** — 미등록이거나 통째로 안 돈 날이다. "
+            "08-06~08-11에 6영업일 연속 그랬고 아무도 몰랐다(등록 절차는 "
+            "`docs/dev_memory/CURRENT_STATE.md`)."
+        )
+    elif silence is not None and silence > warn_at:
+        out.append(
+            f"> ⚠ **{silence:.0f}분 동안 워치독이 판정하지 않았다**(경고선 {warn_at:.0f}분 = "
+            "정상 기록 주기 10분의 2배). 그 구간에 관측 루프가 죽었다면 아무도 되살리지 않는다. "
+            "08-12에 이 값이 **331분**이었다."
+        )
+    out += [
+        "> 「재기동 실패 보고」는 **로그 문구를 센 것이지 실패를 센 것이 아니다.** 08-12의 1건은 "
+        "`capture_output` 때문에 뜬 오보였고 재기동은 실제로 성공했다(§2-3). 판정은 "
+        "`premarket_startup.log`와 함께 사람이 한다.",
+        "> 실시간 소비자는 이 표가 아니라 COCKPIT 배지다(`logs/.watchdog_last_check.json`) — "
+        "**다음 날 읽는 지표로는 그날을 못 구한다.**",
+        "",
+    ]
+    return out
 
 
 def _render_headline(metrics: dict, previous: dict | None) -> list[str]:
@@ -1449,6 +1530,35 @@ def _render_hypotheses(results: list[dict]) -> list[str]:
             f"> - `{hid}` — `{metric}`" + (f" (역할: {role})" if role else "")
             for hid, metric, role in dead
         ]
+        out.append("")
+
+    # 2026-08-12 규약 H — **레버가 꺼진 채 판정될 뻔한 항목.** 08-12에 `2026-08-11-eF`가
+    # 그랬다: 레버가 안 켜졌는데 표는 「HIGH_CONVICTION 34 → 91」을 반증처럼 보여줬다.
+    lever_off = sorted({
+        (r["id"], ", ".join(r.get("lever_off") or [])) for r in results if r.get("lever_off")
+    })
+    if lever_off:
+        out += [
+            f"> ⚠ **미실행 {len(lever_off)}건 — 전제 레버가 꺼진 채로 하루가 갔다.** 실측은 "
+            "사실이지만 **그 값은 이 가설과 무관하다**(그 코드가 안 돌았다). 오늘 판정하지 말고 "
+            "레버를 켠 다음 영업일로 미룬다 — 규약 H(§0의 레버 표).",
+            "",
+        ]
+        out += [f"> - `{hid}` — 꺼진 레버: `{keys}`" for hid, keys in lever_off]
+        out.append("")
+
+    lever_unknown = sorted({
+        (r["id"], ", ".join(r.get("lever_unknown") or [])) for r in results if r.get("lever_unknown")
+    })
+    if lever_unknown:
+        out += [
+            f"> ⛔ **전제 레버를 못 읽음 {len(lever_unknown)}건.** `전제레버`에 적힌 이름이 "
+            "`mahdi/ops/levers.py`의 목록에 없다(오타이거나 아직 등록 안 된 레버). "
+            "**「미실행」으로 닫지 않았다** — 그것은 「꺼져 있었다」가 아니라 「모른다」이고, "
+            "오타를 미실행으로 덮으면 영영 안 고쳐진다(08-06의 「경로 없음」과 같은 구분).",
+            "",
+        ]
+        out += [f"> - `{hid}` — 모르는 레버: `{keys}`" for hid, keys in lever_unknown]
         out.append("")
 
     cost_missing = sorted({(r["id"], r.get("대가")) for r in results if r.get("cost_missing")})

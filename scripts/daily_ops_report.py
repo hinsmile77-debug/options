@@ -94,6 +94,33 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
         log_metrics.previous_business_day(target)
     ) else None
 
+    # 2026-08-12 Fix#6(규약 H) — **가설 검정보다 먼저 읽는다.** 검정이 이 값을 받아야
+    # "레버가 꺼진 채 판정하는" 08-12의 오독을 막을 수 있다.
+    lever_state = None
+    try:
+        from mahdi.ops import levers
+
+        lever_state = levers.collect(PROJECT_ROOT)
+    except Exception:
+        logger.warning("레버 상태 수집 건너뜀", exc_info=True)
+
+    # 2026-08-12 Fix#8 — 워치독 자신의 로그. `log_metrics`와 **다른 파일**을 읽는다(§2-3).
+    watchdog_result = None
+    try:
+        from mahdi.ops import watchdog_metrics
+
+        watchdog_result = watchdog_metrics.collect(LOG_DIR, target)
+    except Exception:
+        logger.warning("워치독 지표 건너뜀", exc_info=True)
+
+    # **가설이 참조할 수 있으려면 `metrics` 본체에 실려야 한다.** 사이드카에만 넣으면
+    # `hypotheses._lookup`이 못 찾아 그 가설이 「경로 없음」으로 영원히 검정 불가가 된다
+    # (08-06 §3-1이 정확히 그 사고였고, 도입 당일 `test_ops_hypotheses`가 이것을 잡았다).
+    if lever_state:
+        metrics["levers"] = lever_state
+    if watchdog_result is not None:
+        metrics["watchdog"] = watchdog_result
+
     hypothesis_results = None
     try:
         from mahdi.ops import hypotheses
@@ -103,12 +130,16 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
             target,
             metrics,
             db_metrics_result,
+            levers=lever_state,
         )
     except Exception:
         logger.warning("가설 검정 건너뜀", exc_info=True)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{target.isoformat()}_지표.json"
+    # `metrics`에 이미 `levers`/`watchdog`이 실려 있으므로 사이드카에도 그대로 따라간다 —
+    # **다음날 "어제는 그 레버가 켜져 있었나"를 물을 수 있어야** 규약 H가 하루짜리 장치로
+    # 끝나지 않는다(레버는 그날의 코드 상태라 사후 복원이 불가능하다).
     payload = dict(metrics)
     if db_metrics_result:
         payload["db"] = db_metrics_result
@@ -119,6 +150,7 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
         report.render(
             metrics, previous=previous, db_metrics=db_metrics_result,
             hypotheses=hypothesis_results, history=history,
+            levers=lever_state, watchdog=watchdog_result,
         ),
         encoding="utf-8",
     )

@@ -203,6 +203,94 @@ def startup_marker_path(log_dir: Path) -> Path:
     return log_dir / _STARTUP_MARKER_FILENAME
 
 
+# ===== 2026-08-12 §2-3 / Fix#8 — **감시자를 감시한다** =====
+#
+# 08-12에 워치독은 10:14:01에 정확히 판정하고 정확히 되살렸다. 그런데 재기동 호출이 상속된
+# 파이프에 물려(`scripts/watchdog_observation_loop._restart` docstring) **15:45:02까지 매달렸고**,
+# 작업 스케줄러의 `MultipleInstances=IgnoreNew`가 그동안의 매분 실행을 전부 무시했다.
+# 결과: **10:20~15:40, 5시간 31분 동안 워치독이 한 번도 판정하지 않았다.**
+#
+# ## 왜 기존 신호로는 안 보였는가
+#
+# 셋 다 정상으로 보였다:
+#   - 프로세스: 살아 있었다(막혀 있었을 뿐).
+#   - 스케줄러: `State: Ready`, `LastTaskResult: 0`, `NumberOfMissedRuns: 0`.
+#   - `watchdog.log`: 마지막 줄이 「RESTART」라 **사고 대응 중인 것처럼** 보였다.
+#
+# `watchdog.log`의 침묵으로도 사후에는 알 수 있다 — 실제로 08-12를 그렇게 찾았다. 그러나 그것은
+# **정상일에 OK를 10분에 한 번만 남기기 때문에** 최대 10분 해상도이고, 무엇보다 *다음 날 사람이
+# 읽어야* 보인다. 08-06 Fix#2가 관측 루프에 대해 고친 것과 **똑같은 사각지대**다:
+# 「죽었다는 것을 누군가는 알아야 한다」.
+#
+# ## 규약 D를 워치독 자신에게 적용한다
+#
+# 관측 루프의 하트비트가 그렇듯, 이 파일은 **판정할 때마다** 갱신된다 — `ACTION_IDLE`(감시 창
+# 밖)일 때도 쓴다. 그래야 「감시 창 밖이라 조용하다」와 「막혀서 조용하다」가 갈린다.
+# 로그와 달리 억제가 없다(파일 하나를 덮어쓰는 것이라 볼륨 부담이 없다).
+_WATCHDOG_CHECK_FILENAME = ".watchdog_last_check.json"
+
+# 이 나이를 넘으면 워치독이 판정을 못 하고 있는 것으로 본다.
+#
+# 워치독은 **1분 주기**다. 임계를 2분에 두면 스케줄러 지터 한 번에 오경보가 나고, 3분은
+# 「세 번 연속 못 돌았다」는 뜻이다. 관측 루프 하트비트(30초 주기 / 180초 임계 = 6배)보다
+# 배수가 작은 이유: 이 배지는 **재기동을 유발하지 않는다**(사람에게 보이기만 한다). 규약 D의
+# "오경보 비용이 미탐지 비용보다 훨씬 싸지 않다"는 자동 조치가 붙은 신호에만 해당한다.
+WATCHDOG_CHECK_STALE_SECONDS = 180.0
+
+
+def watchdog_check_path(log_dir: Path) -> Path:
+    return log_dir / _WATCHDOG_CHECK_FILENAME
+
+
+def write_watchdog_check(path: Path, now: datetime, *, action: str, detail: str = "") -> None:
+    """
+    입력: 기록 경로, 판정 시각, 그 판정의 `action`/`detail`.
+    계산: 원자적 교체로 덮어쓴다 — 워치독이 쓰는 도중의 파일을 COCKPIT이 읽어 파싱에 실패하고,
+         그 실패를 "워치독이 멈췄다"로 오독하면 이 배지가 자기가 잡으려는 오경보를 만든다
+         (`write_heartbeat`와 같은 이유).
+    해석: **`action`을 함께 남기는 것이 핵심이다.** 시각만 남기면 「돌긴 했는데 감시 창 밖이라
+         아무것도 안 했다」와 「감시 창 안에서 정상이라고 판정했다」가 구분되지 않는다.
+    실패 조건: 어떤 예외도 밖으로 내지 않는다 — **자기 기록을 못 썼다고 워치독이 멈추면 안 된다.**
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"at": now.isoformat(), "action": action, "detail": detail}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:
+        logger.warning("워치독 판정 기록 실패: %s", path, exc_info=True)
+
+
+def read_watchdog_check(path: Path) -> dict | None:
+    """반환: `{"at": datetime, "action": str, "detail": str}` 또는 None(없음/깨짐).
+
+    **None은 "멈췄다"가 아니라 "모른다"** 이다 — 이 파일이 생기기 전 버전으로 돌던 날과
+    워치독이 미등록인 PC가 둘 다 None이다. 판정은 호출측이 감시 창과 함께 한다.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "at": datetime.fromisoformat(raw["at"]),
+            "action": str(raw.get("action", "")),
+            "detail": str(raw.get("detail", "")),
+        }
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("워치독 판정 기록 읽기 실패: %s", path, exc_info=True)
+        return None
+
+
+def watchdog_check_age_seconds(check: dict | None, now: datetime) -> float | None:
+    """반환: 워치독이 마지막으로 **판정한** 이후 경과 초. 기록이 없으면 None."""
+    if not check:
+        return None
+    return (now - check["at"]).total_seconds()
+
+
 def startup_in_progress(
     path: Path, now: datetime, grace_seconds: float = STARTUP_MARKER_GRACE_SECONDS
 ) -> bool:

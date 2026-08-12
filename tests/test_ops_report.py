@@ -111,7 +111,7 @@ def test_render_includes_db_and_hypothesis_sections_only_when_given():
         "id": "h1", "가설": "버스트 분할", "metric": "overrun.count",
         "actual": 12, "expect": "<= 20", "verdict": "확인",
     }])
-    assert "## 0. 가설 검정" in out
+    assert "## 0-1. 가설 검정" in out
     assert "자동으로 바뀌지 않는다" in out  # 사람이 확정한다는 규약이 표에 붙어야 한다
 
 

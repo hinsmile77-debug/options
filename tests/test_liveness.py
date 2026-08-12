@@ -227,3 +227,77 @@ def test_stale_startup_marker_is_ignored(tmp_path):
     path.write_text("startup", encoding="utf-8")
     much_later = datetime.now() + timedelta(seconds=liveness.STARTUP_MARKER_GRACE_SECONDS + 60)
     assert liveness.startup_in_progress(path, much_later) is False
+
+
+# ===== 2026-08-12 §2-3 / Fix#8 — 감시자를 감시한다 =====
+#
+# 08-12에 워치독은 10:14:01에 정확히 판정하고 정확히 되살렸다. 그런데 재기동 호출이 상속된
+# 파이프에 물려 15:45:02까지 막혔고, 작업 스케줄러가 `MultipleInstances=IgnoreNew`라 그동안
+# 매분 실행이 전부 무시됐다 — **재기동에 성공한 그 순간부터 장 마감까지 감시가 없었다.**
+#
+# 기존 신호로는 셋 다 정상으로 보였다: 프로세스는 살아 있었고(막혀 있었을 뿐), 스케줄러는
+# `State: Ready` / `LastTaskResult: 0` / `NumberOfMissedRuns: 0`, `watchdog.log`의 마지막 줄은
+# 「RESTART」라 사고 대응 중인 것처럼 보였다. **프로세스 생존은 기능 생존의 증거가 아니다.**
+
+
+def test_watchdog_check_roundtrip(tmp_path):
+    path = liveness.watchdog_check_path(tmp_path)
+    now = datetime(2026, 8, 12, 10, 14, 1)
+    liveness.write_watchdog_check(path, now, action=liveness.ACTION_RESTART, detail="stale")
+
+    check = liveness.read_watchdog_check(path)
+    assert check["at"] == now
+    assert check["action"] == liveness.ACTION_RESTART
+    assert check["detail"] == "stale"
+
+
+def test_the_action_is_recorded_not_just_the_time(tmp_path):
+    """시각만 남기면 「감시 창 밖이라 아무것도 안 했다」와 「정상이라고 판정했다」가 안 갈린다."""
+    path = liveness.watchdog_check_path(tmp_path)
+    liveness.write_watchdog_check(path, datetime(2026, 8, 12, 3, 0), action=liveness.ACTION_IDLE)
+    assert liveness.read_watchdog_check(path)["action"] == liveness.ACTION_IDLE
+
+
+def test_missing_watchdog_check_is_unknown_not_dead(tmp_path):
+    """**None은 「멈췄다」가 아니라 「모른다」다** — 이 파일 이전 버전과 미등록 PC가 둘 다 None이다."""
+    assert liveness.read_watchdog_check(liveness.watchdog_check_path(tmp_path)) is None
+
+
+def test_corrupt_watchdog_check_is_none(tmp_path):
+    path = liveness.watchdog_check_path(tmp_path)
+    path.write_text("{깨진", encoding="utf-8")
+    assert liveness.read_watchdog_check(path) is None
+
+
+def test_watchdog_check_write_never_raises(tmp_path):
+    """자기 기록을 못 썼다고 워치독이 멈추면 안 된다 — `write_heartbeat`와 같은 계약."""
+    unusable = tmp_path / "없는디렉터리" / "sub" / "x.json"
+    (tmp_path / "없는디렉터리").write_text("파일이라 mkdir이 실패한다", encoding="utf-8")
+    liveness.write_watchdog_check(unusable, datetime(2026, 8, 12, 10, 0), action="ok")
+
+
+def test_watchdog_check_age(tmp_path):
+    path = liveness.watchdog_check_path(tmp_path)
+    liveness.write_watchdog_check(path, datetime(2026, 8, 12, 10, 0), action="ok")
+    check = liveness.read_watchdog_check(path)
+    age = liveness.watchdog_check_age_seconds(check, datetime(2026, 8, 12, 10, 5))
+    assert age == 300.0
+    assert liveness.watchdog_check_age_seconds(None, datetime(2026, 8, 12, 10, 5)) is None
+
+
+def test_the_watchdog_staleness_threshold_is_a_multiple_of_its_own_period():
+    """워치독은 1분 주기다. 임계가 그보다 작거나 같으면 스케줄러 지터 한 번에 오경보가 난다."""
+    assert liveness.WATCHDOG_CHECK_STALE_SECONDS >= 120.0
+    # 08-12의 공백은 331분이었다 — 이 임계로는 3분 안에 화면에 떴을 것이다.
+    assert liveness.WATCHDOG_CHECK_STALE_SECONDS <= 300.0
+
+
+def test_the_2026_08_12_watchdog_blackout_would_have_been_visible(tmp_path):
+    """그날 10:14:01 이후 판정이 없었다 — 10:20에는 이미 임계를 넘는다."""
+    path = liveness.watchdog_check_path(tmp_path)
+    liveness.write_watchdog_check(
+        path, datetime(2026, 8, 12, 10, 14, 1), action=liveness.ACTION_RESTART
+    )
+    check = liveness.read_watchdog_check(path)
+    age = liveness.watchdog_check_age_seconds(check, datetime(2026, 8, 12, 10, 20, 0))
+    assert age > liveness.WATCHDOG_CHECK_STALE_SECONDS

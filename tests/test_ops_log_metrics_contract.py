@@ -350,7 +350,7 @@ def test_chain_catchup_line_is_parsed():
 
 def test_budget_exceeded_line_is_parsed():
     """2026-08-04 Fix#8 — 이 줄이 없으면 "예산이 실제로 걸렸는가"를 셀 수 없다."""
-    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 6, 14, "weekly_mon")
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 6, 14, "weekly_mon", "아니오")
     budget = _parse(line)["budget_exceeded"]
     assert budget["count"] == 1
     assert budget["skipped_legs_total"] == 6
@@ -365,7 +365,7 @@ def test_timeout_abort_line_is_parsed_and_counted_apart_from_budget():
     08-11 15:01~15:22의 22분은 "우리가 느렸다"가 아니라 "KIS가 4초 천장에 닿았다"였는데,
     종전 로그는 둘을 같은 줄로 냈다.
     """
-    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, 17, 0, "regular,weekly_mon")
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, 17, 0, "regular,weekly_mon", "예")
     metrics = _parse(line)
     abort = metrics["timeout_abort"]
     assert abort["count"] == 1
@@ -382,7 +382,7 @@ def test_failure_budget_abort_is_counted_apart_from_consecutive_timeouts():
     죽는 패턴이다. 08-11 14시대가 후자였다(예산 초과 20건 / 전멸 1건) — 한 지표로 세면
     "무엇이 이 분을 얇게 만들었는가"에 답할 수 없다.
     """
-    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_FAILURE_BUDGET, 6, 8, 12.5, 6, "weekly_mon")
+    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_FAILURE_BUDGET, 6, 8, 12.5, 6, "weekly_mon", "아니오")
     metrics = _parse(line)
 
     assert metrics["failure_budget_abort"]["count"] == 1
@@ -395,8 +395,8 @@ def test_failure_budget_abort_is_counted_apart_from_consecutive_timeouts():
 
 def test_cut_books_label_tells_whether_the_monthly_book_was_reached():
     """Fix#2 — 먼슬리가 컷당한 분을 지표로 센다. 08-06엔 이 값을 사람이 손으로 셌다."""
-    weekly_only = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 4, 16, "weekly_mon")
-    reached_monthly = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 12, 8, "regular,weekly_mon")
+    weekly_only = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 4, 16, "weekly_mon", "아니오")
+    reached_monthly = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 12, 8, "regular,weekly_mon", "예")
 
     assert _parse(weekly_only)["budget_exceeded"]["priority_cut_minutes"] == 0
     assert _parse(reached_monthly)["budget_exceeded"]["priority_cut_minutes"] == 1
@@ -596,7 +596,7 @@ def test_empty_chain_cycle_line_is_counted():
 
 def test_empty_chain_cycle_is_distinguishable_from_a_partial_truncation():
     """"조금 잘렸다"와 "통째로 날아갔다"가 같은 줄로 보고되면 안 된다 — 08-05의 실제 실패다."""
-    truncated = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 3, 17, "weekly_mon")
+    truncated = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 3, 17, "weekly_mon", "아니오")
     wiped = _emit("mahdi.main", "ERROR", main.LOG_CHAIN_CYCLE_EMPTY, 20, 53.14, "안 함")
     metrics = _parse(truncated, wiped)
 
@@ -823,3 +823,56 @@ def test_rest_table_omits_the_per_book_column_without_db_metrics():
     rendered = "\n".join(report._render_rest(metrics))
 
     assert "북당" not in rendered
+
+
+# ===== 2026-08-12 Fix#5 — 「먼슬리가 잘렸다」와 「먼슬리가 **먼저** 잘렸다」는 다른 질문이다 =====
+#
+# 08-12에 `priority_cut_minutes = 2`가 불변식 위반처럼 보고됐다. 실측하니 둘 다(12:49:53 /
+# 13:51:53) **홀수분의 꼬리 컷**이었다 — 그 분에는 위클리가 애초에 due가 아니라 사이클 전체가
+# 먼슬리였고, 50초 예산 끝에서 남은 2~3레그가 잘린 것이다. **자를 것이 먼슬리밖에 없는 분에서
+# 먼슬리를 자르는 것은 순서 문제가 아니다.** 규약 G가 막는 것과 같은 형태의 오류였다.
+
+
+def test_priority_violation_label_separates_the_ordering_breach_from_a_tail_cut():
+    """불변식은 `priority_before_others_minutes`이고, `priority_cut_minutes`는 참고값이다."""
+    tail_cut = _emit(
+        "mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 3, 7, "regular", "아니오"
+    )
+    ordering_breach = _emit(
+        "mahdi.main", "WARNING", main.LOG_CHAIN_BUDGET_EXCEEDED, 50.0, 12, 8,
+        "regular,weekly_mon", "예",
+    )
+
+    only_tail = _parse(tail_cut)["budget_exceeded"]
+    assert only_tail["priority_cut_minutes"] == 1, "먼슬리가 잘린 것은 사실이다(참고값)"
+    assert only_tail["priority_before_others_minutes"] == 0, (
+        "홀수분 꼬리 컷을 위반으로 세면 08-12의 오독이 재현된다"
+    )
+
+    both = _parse(tail_cut, ordering_breach)["budget_exceeded"]
+    assert both["priority_cut_minutes"] == 2
+    assert both["priority_before_others_minutes"] == 1
+
+
+def test_the_violation_label_is_read_from_every_cut_line():
+    """세 컷 로그(예산/연속 타임아웃/실패 예산)가 **같은 라벨**을 실어야 한다."""
+    timeout = _emit(
+        "mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, 17, 0, "regular,weekly_mon", "예"
+    )
+    failure = _emit(
+        "mahdi.main", "WARNING", main.LOG_CHAIN_FAILURE_BUDGET, 6, 8, 12.5, 6, "regular", "예"
+    )
+    assert _parse(timeout)["timeout_abort"]["priority_before_others_minutes"] == 1
+    assert _parse(failure)["failure_budget_abort"]["priority_before_others_minutes"] == 1
+
+
+def test_logs_without_the_violation_label_report_none_not_zero():
+    """규약 C — 08-11 로그에는 이 라벨이 없다. 그때 0을 내면 「위반이 없었다」는 거짓말이 된다."""
+    legacy = (
+        f"{_TS} WARNING:mahdi.main:옵션체인 수집 예산(50초) 초과 — "
+        "남은 6레그를 포기하고 14레그로 이번 분을 마감합니다 "
+        "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8) 컷당한북=regular"
+    )
+    budget = _parse(legacy)["budget_exceeded"]
+    assert budget["priority_cut_minutes"] == 1  # 구 라벨은 여전히 읽힌다
+    assert budget["priority_before_others_minutes"] is None

@@ -6154,3 +6154,260 @@ def test_update_atm_iv_skips_rows_without_expiry():
     recorder = _IvRecorder()
     _update_atm_iv(recorder, [{"strike": 980.0, "iv": 0.5}], latest_spot=980.0)
     assert recorder.ivs == []
+
+
+# =====================================================================================
+# 2026-08-12 Fix#2/#3/#4/#5 — 08-12 사고의 사슬을 끊는 넷
+# =====================================================================================
+#
+# 그날의 인과는 하나로 이어져 있었다:
+#   WS가 31회 끊겼다 → 재연결마다 `run_observation_loop`가 처음부터 돌았다
+#   → 그 첫 줄의 무방비 `get_quote`가 31번 노출됐다 → 31번째에 KIS 500을 만나 프로세스가 죽었다
+# 그리고 같은 재연결이 조용히 레짐 30분을 지웠다(봉 핸들러의 순서 때문에).
+
+
+class _FakeRestClientThatFailsTheOpeningQuote:
+    """기동/재연결 진입부의 스팟 조회만 실패하는 KIS — 08-12 10:10:06의 재현."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls = 0
+
+    def get_quote(self, symbol: str, market_div_code: str) -> dict:
+        self.calls += 1
+        raise self._exc
+
+
+def _run_observation_loop_with(monkeypatch, rest_client, incoming=None):
+    """`run_observation_loop`을 한 번 돌린다. WS 픽스처가 소진되면 ConnectionError로 끝난다."""
+    conn = FakeConnection(incoming or [])
+    ws_client = KISWebSocketClient(approval_key="APV", connection=conn)
+    manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1
+    )
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+    with pytest.raises(ConnectionError):
+        _run(
+            run_observation_loop(
+                ws_client, [manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+            )
+        )
+    return manager
+
+
+def test_a_kis_500_on_the_opening_quote_no_longer_kills_the_process(monkeypatch, caplog):
+    """**08-12 10:10:06 재현.** 진입부 스팟 조회의 HTTP 오류가 밖으로 새면 안 된다.
+
+    그날 이 예외는 `run_observation_loop_forever`의 `except _WS_DISCONNECT_ERRORS`를 통과해
+    `asyncio.gather`까지 올라갔고 **모든 폴러 태스크가 함께 죽었다**(결손 5분).
+    되돌리면(try/except 제거) 이 테스트가 HTTPStatusError로 깨진다.
+    """
+    error = httpx.HTTPStatusError(
+        "Server error '500'", request=httpx.Request("GET", "https://kis/inquire-price"),
+        response=httpx.Response(500),
+    )
+    rest_client = _FakeRestClientThatFailsTheOpeningQuote(error)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        manager = _run_observation_loop_with(monkeypatch, rest_client)
+
+    assert rest_client.calls == 1
+    # 스팟이 없으면 롤링을 건너뛴다 — 그 분기는 이 fix 이전부터 있었다(`if spot > 0`).
+    assert not manager.desired_strikes
+    assert [r for r in caplog.records if "기동 스팟 조회 실패" in r.getMessage()]
+
+
+def test_a_read_timeout_on_the_opening_quote_is_survivable_too(monkeypatch):
+    """`ReadTimeout`도 같은 취급 — 08-12에 하루 346건 났고 어느 것이든 재연결 직후일 수 있다."""
+    rest_client = _FakeRestClientThatFailsTheOpeningQuote(httpx.ReadTimeout("timed out"))
+    _run_observation_loop_with(monkeypatch, rest_client)  # 예외가 밖으로 새면 여기서 실패한다
+
+
+def test_a_non_http_error_on_the_opening_quote_still_propagates(monkeypatch):
+    """**넓게 잡지 않는다.** 07-19가 지키려던 것(코드/설정 오류는 사람이 본다)은 그대로다.
+
+    `except Exception`으로 바꾸면 이 테스트가 깨진다 — 그것이 이 테스트의 목적이다.
+    """
+    rest_client = _FakeRestClientThatFailsTheOpeningQuote(ValueError("설정 오류"))
+    conn = FakeConnection([])
+    ws_client = KISWebSocketClient(approval_key="APV", connection=conn)
+    manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1
+    )
+    with pytest.raises(ValueError, match="설정 오류"):
+        _run(
+            run_observation_loop(
+                ws_client, [manager], rest_client, futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+            )
+        )
+
+
+def test_regime_is_written_even_when_the_reroll_hits_a_dead_socket(monkeypatch):
+    """**08-12 §2-2 재현.** 봉은 있는데 레짐이 없는 30분을 만든 순서 문제.
+
+    그날 `market_raw_1m`의 선물봉은 09:13~09:29 17분이 전부 있었는데 `regime_state`는 0분이었다.
+    원인은 `적재 → _reroll_books_to_spot(WS I/O) → 레짐` 순서였다 — 끊긴 소켓에서 재롤링이
+    예외를 던지면 레짐이 **도달조차 못 한다.**
+
+    순서를 되돌리면 이 테스트가 «레짐 0건»으로 깨진다.
+    """
+    import websockets
+
+    incoming = [
+        _make_h0ifcnt0("090000", 350.0, 10, 350.05, 349.95, 100, 100),
+        _make_h0ifcnt0("090100", 351.0, 8, 351.05, 350.95, 100, 100),  # 다음 분 → flush 트리거
+    ]
+    written_regimes = []
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    async def dead_socket_reroll(*args, **kwargs):
+        raise websockets.exceptions.ConnectionClosedError(None, None)
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_market_raw_1m", lambda conn, row: None)
+    monkeypatch.setattr("mahdi.main.db.insert_regime_state",
+                        lambda conn, **kwargs: written_regimes.append(kwargs))
+    monkeypatch.setattr("mahdi.main.db.upsert_active_futures_symbol", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main.db.upsert_market_halt_state", lambda *a, **k: None)
+    monkeypatch.setattr("mahdi.main._reroll_books_to_spot", dead_socket_reroll)
+
+    conn = FakeConnection(incoming)
+    ws_client = KISWebSocketClient(approval_key="APV", connection=conn)
+    manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1
+    )
+    # 재롤링 실패는 **여전히 밖으로 나간다** — 단절 감지를 삼키면 08-12보다 나쁜 고장이 된다.
+    with pytest.raises(websockets.exceptions.ConnectionClosedError):
+        _run(
+            run_observation_loop(
+                ws_client, [manager],
+                _FakeRestClientThatFailsTheOpeningQuote(httpx.ReadTimeout("timed out")),
+                futures_symbol="101S03",
+                regime_state_machine=_FakeRegimeStateMachine(),
+                market_halt_monitor=MarketHaltMonitor(),
+            )
+        )
+
+    assert len(written_regimes) == 1, (
+        "선물봉이 완성됐는데 레짐이 안 남았다 — 재롤링 예외 앞에서 레짐이 확정돼야 한다(Fix#3)."
+    )
+
+
+# --- Fix#4/#5: 조기 포기의 북 우선순위 -------------------------------------------------------
+
+
+def _abort_with_books(monkeypatch, books, budget=50.0, seconds_per_call=1.0):
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientAlwaysTimingOut(clock, seconds_per_call=seconds_per_call)
+    rows, _spot, _any, missing = _run(
+        _collect_option_chain_cycle(
+            rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 12, 10, 15),
+            WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=clock[0] + budget,
+        )
+    )
+    return rest_client, rows, missing
+
+
+def test_timeout_abort_drops_the_weekly_book_before_the_monthly(monkeypatch, caplog):
+    """**08-12 §2-6 재현.** 조기 포기가 먼슬리부터 자르던 것을 위클리부터 자르게 바꾼다.
+
+    그날 조기 포기 50회 **전부**가 컷당한북에 `regular`를 담았다. 시간 예산 경로에는 순서가
+    있었는데(74회 중 먼슬리에 닿은 것 2회) 조기 포기에는 없었다.
+
+    여기서는 먼슬리 5행사가(10레그) + 위클리 5행사가(10레그)가 전부 타임아웃된다:
+      - 3레그째에 1단계가 서서 **위클리 10레그가 통째로 버려지고**
+      - 먼슬리는 카운터가 초기화돼 계속 불린다(3레그 더 → 총 6레그 호출).
+    되돌리면 호출이 3건에서 멈추고 위클리가 먼슬리와 함께 죽는다.
+    """
+    books = [
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "weekly_mon"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rest_client, rows, _missing = _abort_with_books(monkeypatch, books)
+
+    assert rows == []
+    # 1단계에서 3건, 먼슬리 재개 후 다시 3건 = 6건.
+    assert len(rest_client.calls) == 2 * mahdi_main.OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT
+
+    aborts = [r for r in caplog.records if "연속 타임아웃" in r.getMessage()]
+    assert len(aborts) == 1  # 여전히 사이클당 1줄
+    message = aborts[0].getMessage()
+    # 두 북이 다 잘리긴 했다(먼슬리 잔여 + 위클리 전부). **순서가 지켜졌는지**는 컷당한북이
+    # 아니라 아래 라벨이 답한다 — 그것이 Fix#5의 존재 이유다.
+    assert "우선순위위반=아니오" in message
+
+
+def test_a_monthly_only_cycle_still_aborts_immediately(monkeypatch, caplog):
+    """**Fix#1을 되돌리지 않는다.** 버릴 위클리가 없으면 종전대로 즉시 전부 접는다.
+
+    08-12의 조기 포기 50회 중 26회가 이 형태(홀수분 = 먼슬리 단독)였고, **그 26회는 위반이
+    아니다** — 자를 것이 먼슬리밖에 없는 사이클에서 먼슬리를 자르는 것은 순서 문제가 아니다.
+    여기서 먼슬리에 두 번째 기회를 주면 Fix#1이 어제 실측으로 포기한 것을 하루 만에 되돌린다.
+    """
+    books = [(_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular")]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rest_client, rows, missing = _abort_with_books(monkeypatch, books)
+
+    assert len(rest_client.calls) == mahdi_main.OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT
+    assert rows == []
+    assert len(missing) == 10  # 재시도 경로는 그대로 살아 있다
+    message = [r for r in caplog.records if "연속 타임아웃" in r.getMessage()][0].getMessage()
+    assert "컷당한북=regular" in message
+    assert "우선순위위반=아니오" in message, (
+        "먼슬리 단독 사이클의 꼬리 컷을 위반으로 세면 08-12의 오독(priority_cut_minutes=2)이 재현된다."
+    )
+
+
+def test_the_escalation_never_extends_the_time_budget(monkeypatch, caplog):
+    """**1단계가 사이클을 늘리지 않는다.** 시간 예산은 스코프와 독립이다.
+
+    조기 포기가 돌려주던 시간을 위클리가 아니라 먼슬리에 쓰는 것이지 예산을 늘리는 것이 아니다 —
+    그 구분이 깨지면 08-04 Fix#8이 막은 «다음 분 밀림»이 돌아온다.
+    """
+    books = [
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "weekly_mon"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        # 레그당 2초 · 예산 5초 → 1단계로 살아난 먼슬리도 시계 앞에서는 즉시 멈춘다.
+        rest_client, _rows, _missing = _abort_with_books(
+            monkeypatch, books, budget=5.0, seconds_per_call=2.0
+        )
+
+    assert len(rest_client.calls) <= 3, "예산을 넘겨서까지 먼슬리를 부르면 안 된다"
+
+
+def test_priority_violation_label_fires_when_the_monthly_is_cut_with_weeklies_pending(monkeypatch, caplog):
+    """라벨이 **진짜 순서 위반**에서는 켜져야 한다 — 안 켜지면 불변식이 무의미하다.
+
+    시간 예산이 먼슬리 도중에 끝나면 아직 안 부른 위클리를 두고 먼슬리가 잘린다. 그것은
+    Fix#4가 못 막는 종류다(예산은 시계이지 스코프가 아니다) — **그래서 라벨이 필요하다.**
+    """
+    books = [
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({995.0})), "weekly_mon"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        _collect_with_budget_books(monkeypatch, books, seconds_per_call=10.0, budget=30.0)
+
+    cut = [r for r in caplog.records if "수집 예산" in r.getMessage()]
+    assert len(cut) == 1
+    assert "우선순위위반=예" in cut[0].getMessage()

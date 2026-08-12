@@ -216,6 +216,10 @@ _METRIC_ROOTS = {
     "timeout_abort", "failure_budget_abort",
     # 2026-08-11 Fix#7 — 폴러별 밀림. `overrun`은 옵션체인 전용이라 다른 폴러가 안 잡혔다.
     "overrun_by_poller",
+    # 2026-08-12 Fix#6/#8 — 로그 축이 아니라 **그날의 코드 상태**(레버)와 **감시자 자신의 로그**.
+    # 둘 다 `daily_ops_report.build`가 `metrics`에 실어 넣는다. 사이드카에만 넣으면
+    # `hypotheses._lookup`이 못 찾아 그 가설이 영원히 「경로 없음」이 된다(08-06 §3-1의 사고).
+    "levers", "watchdog",
 }
 
 
@@ -356,7 +360,7 @@ def test_report_surfaces_overdue_entries_above_the_table():
             "overdue": True, "검증예정일": "2026-08-03",
         }],
     )
-    section = out.split("## 0. 가설 검정", 1)[1].split("\n## ", 1)[0]
+    section = out.split("## 0-1. 가설 검정", 1)[1].split("\n## ", 1)[0]
     callout, table = section.split("| id |", 1)
     assert "확정 대기 1건" in callout
     assert "2026-08-01-p1" in callout

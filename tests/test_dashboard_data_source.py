@@ -1524,6 +1524,9 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_stability_check", make_check("regime"))
     monkeypatch.setattr("mahdi.dashboard.data_source._regime_fit_progress_check", make_check("regime_fit_progress"))
     monkeypatch.setattr("mahdi.dashboard.data_source._shutdown_reliability_check", make_check("shutdown"))
+    # 2026-08-12(§2-3 / Fix#8) 워치독 판정 신선도 — 08-12에 감시자가 5시간 31분 막혀 있었는데
+    # 화면에는 아무 표시도 없었다. 종료 신뢰성 배지 옆 자리다.
+    monkeypatch.setattr("mahdi.dashboard.data_source._watchdog_liveness_check", make_check("watchdog"))
     monkeypatch.setattr("mahdi.dashboard.data_source._rate_limiter_health_check", make_check("rate_limiter"))
     # 2026-08-01(§5-5) 관측 품질 5종
     monkeypatch.setattr("mahdi.dashboard.data_source._rest_demand_check", make_check("rest_demand"))
@@ -1543,7 +1546,7 @@ def test_get_health_summary_runs_all_checks_in_order(monkeypatch):
     assert calls == [
         "market_halt", "option_chain", "futures", "leg_balance", "cbot", "macro_freshness",
         "schema", "fossil",
-        "regime", "regime_fit_progress", "shutdown", "rate_limiter",
+        "regime", "regime_fit_progress", "shutdown", "watchdog", "rate_limiter",
         "rest_demand", "backoff_headroom", "monthly_coverage", "overrun_count", "ws_liveness",
         "atm_roll",
         "signal_reach",

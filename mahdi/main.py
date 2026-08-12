@@ -289,7 +289,7 @@ OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS = 6
 
 LOG_CHAIN_FAILURE_BUDGET = (
     "옵션체인 실패 예산(%d건) 소진 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
-    "(시간 예산은 %.1f초 남아 있었다, 2026-08-11 고도화 A). 적재 %d행 · 컷당한북=%s"
+    "(시간 예산은 %.1f초 남아 있었다, 2026-08-11 고도화 A). 적재 %d행 · 컷당한북=%s · 우선순위위반=%s"
 )
 
 # 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 8 / Fix#8) — 장전에는 지수 스팟을 적재하지 않는다.
@@ -345,9 +345,22 @@ LOG_CHAIN_OVERRUN = (
     "(REST수집 %.2f초, DB적재 %.2f초, rows=%d%s, 타폴러동시호출추정=%s)"
 )
 LOG_CHAIN_CATCHUP = "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로 채움(밀린 사이클 %s)"
+# 2026-08-12 Fix#5 — 꼬리에 `· 우선순위위반=예|아니오`가 붙는다(세 컷 로그 공통).
+#
+# **`컷당한북`만으로는 판정할 수 없다는 것이 08-12의 발견이다.** 그날 `priority_cut_minutes`가
+# 2로 나와 불변식 위반처럼 보였는데, 실측하니 둘 다 **홀수분(먼슬리 단독 사이클)의 꼬리 컷**
+# 이었다 — 자를 것이 먼슬리밖에 없는 사이클이라 순서 위반이 성립할 수 없는 분이다. 규약 G와
+# 같은 형태의 오류였다(성립할 수 없는 상황에 무조건부 임계를 걸었다).
+#
+# 그래서 **판정을 로그를 내는 쪽에서 한다** — 그 시점에만 "아직 안 부른 위클리가 남아 있었는가"를
+# 알 수 있고, 파서는 그것을 사후에 복원할 수 없다(그 분에 위클리가 due였는지는 위상 설정에
+# 달렸고, 설정은 바뀐다).
+#
+# 파서 안전: 새 필드는 **공백 뒤에** 붙는다. `컷당한북=(\S+)`가 `\S+`로 끊기므로 기존 정규식
+# 셋(`_BUDGET_RE`/`_TIMEOUT_ABORT_RE`/`_FAILURE_BUDGET_RE`)이 그대로 통과한다.
 LOG_CHAIN_BUDGET_EXCEEDED = (
     "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
-    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8) 컷당한북=%s"
+    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8) 컷당한북=%s · 우선순위위반=%s"
 )
 
 # ===== 2026-08-11 Fix#1 — 연속 타임아웃이면 이번 사이클을 조기에 접는다 =====
@@ -388,7 +401,7 @@ OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT = 3
 LOG_CHAIN_TIMEOUT_ABORT = (
     "옵션체인 연속 타임아웃 %d회 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
     "(확정 실패 호출을 안 쏘고 다음 분을 정시에 시작한다, 2026-08-11 Fix#1). "
-    "적재 %d행 · 컷당한북=%s"
+    "적재 %d행 · 컷당한북=%s · 우선순위위반=%s"
 )
 # 2026-08-05(운영점검보고서 §2-6) — 사이클은 정상 실행됐는데 **행이 한 줄도 안 남은** 분.
 #
@@ -1142,8 +1155,42 @@ async def run_observation_loop(
     실패 조건: DB 연결 실패·WS 단절 시 예외가 위로 전파된다. WS 단절(재연결)은
               run_observation_loop_forever가 감싸서 처리하므로, 이 함수 자체는 여전히 "한 번의
               연결이 끊기면 예외를 던지고 끝"으로 단순하게 남겨둔다(2026-07-19).
+
+    2026-08-12(§2-1 / Fix#2) **첫 줄의 스팟 조회는 예외를 밖으로 내지 않는다.** 상세 근거는
+              바로 아래 주석 — 이 함수의 진입부는 기동 경로일 뿐 아니라 **재연결 경로**이기도
+              하다는 것이 그날의 교훈이다.
     """
-    quote = rest_client.get_quote(futures_symbol, market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
+    # ===== 2026-08-12 §2-1 / Fix#2 — 재연결 경로의 REST가 프로세스를 죽였다 =====
+    #
+    # 10:10:06, 이 한 줄이 KIS로부터 HTTP 500을 받았고 관측 루프 **프로세스 전체가 죽었다**.
+    # `run_observation_loop_forever`의 재연결 루프는 `_WS_DISCONNECT_ERRORS`만 잡으므로
+    # `httpx.HTTPStatusError`는 `asyncio.gather`까지 올라가 모든 폴러 태스크를 함께 접는다.
+    #
+    # ## 07-19의 설계는 틀리지 않았다 — 전제가 깨졌다
+    #
+    # *"연결 문제가 아닌 예외는 재시도 없이 전파한다 — 사람이 봐야 하는 코드/설정 문제이므로"*
+    # 는 이 함수가 **하루 한 번** 도는 기동 경로라는 전제 위에 있었다. 08-12에 WS가 09:13~10:10
+    # 사이 31회 끊겼고, 재연결마다 이 함수가 처음부터 다시 돌아 **이 호출이 31번 노출됐다.**
+    # KIS의 500은 그날 24건(전체의 0.26%)으로 정상 범위다 — 치명이 된 것은 500이 아니라 노출
+    # 횟수다. 500은 "사람이 봐야 하는 코드/설정 문제"가 아니라 다음 호출에 사라지는 일과성이다.
+    #
+    # ## 삼켜도 되는 이유 — 폴백이 **이미 있다**
+    #
+    # 바로 아래 `if spot > 0:`이 그것이다. 스팟이 없으면 롤링을 건너뛰고 그대로 구독/listen으로
+    # 들어가며, 구독은 직전 창을 유지한다(`rebind()` 직후라면 다음 선물봉 완성 때
+    # `_reroll_books_to_spot`이 정상 롤링을 회복한다 — 최대 손실은 롤링 1분 지연이다).
+    #
+    # **`Exception`이 아니라 `httpx.HTTPError`만 잡는다.** 여기서 넓게 잡으면 07-19가 지키려던
+    # 것(코드/설정 오류는 사람이 본다)을 통째로 없앤다 — 바로 아래 `float()` 파싱 오류나 DB
+    # 오류는 여전히 전파돼야 한다.
+    try:
+        quote = rest_client.get_quote(futures_symbol, market_div_code=tr_codes.FID_MRKT_DIV_INDEX_FUTURES)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "기동 스팟 조회 실패 — 롤링 없이 관측을 시작한다(다음 선물봉에서 회복, 2026-08-12 Fix#2): %r",
+            exc,
+        )
+        quote = {}
     # output3 = KOSPI200 지수 자체, output1 = 조회한 선물 계약가(베이시스 존재) — 지수 우선, 없으면 선물가로 폴백
     spot = float(quote.get("output3", {}).get("bstp_nmix_prpr") or quote.get("output1", {}).get("futs_prpr") or 0.0)
     if spot > 0:
@@ -1369,7 +1416,34 @@ async def run_observation_loop(
                 },
             )
             if tick_symbol == futures_symbol:
-                await _reroll_books_to_spot(subscription_managers, bar.close, ws_liveness)
+                # ===== 2026-08-12 §2-2 / Fix#3 — 레짐이 WS I/O **앞**에 온다 =====
+                #
+                # 종전 순서는 `적재 → _reroll_books_to_spot → 레짐`이었다. 재롤링은 WS로
+                # subscribe/unsubscribe를 보내므로 **끊긴 소켓에서 예외를 던진다**. 그러면
+                # 그 예외가 `listen()`을 뚫고 `run_observation_loop_forever`의 재연결 핸들러로
+                # 올라가고, 이 아래에 있던 레짐은 **도달조차 못 한다.**
+                #
+                # 08-12 실측이 그 형태를 그대로 남겼다 — 선물봉(`market_raw_1m` A01609)은
+                # 09:13~09:29 17분이 **전부 있는데** `regime_state`는 그 구간이 **0분**이다.
+                # 같은 날 09:35~09:38(4분)·10:01~10:09(9분)까지 **30분**이 이렇게 사라졌고,
+                # 로그에는 그 사실을 말하는 줄이 하나도 없었다(「WS 재연결 후 다시 끊김」 30줄이
+                # 전부다). 트레이스백이 `_reroll_books_to_spot → ensure_free → unsubscribe`를
+                # 정확히 가리키고 있었지만, 그것이 레짐 결손을 뜻한다는 것은 DB를 대조해야만
+                # 보였다.
+                #
+                # ## 순서만 바꾼다 — 예외를 삼키지 않는다
+                #
+                # 재롤링 실패는 여전히 위로 전파돼 재연결을 태운다. **단절 감지는 그대로**이고,
+                # 레짐만 그 예외 앞에서 확정된다. 예외를 여기서 삼키면 끊긴 소켓을 붙든 채
+                # 계속 도는 상태가 되는데, 그것은 08-12보다 나쁜 고장이다.
+                #
+                # ## 대가 — 얇은 봉으로 레짐이 돈다
+                #
+                # 끊김 직전/직후의 봉은 틱이 빠져 얇다(08-12 09:13 봉은 volume 71, 평시 ~200).
+                # 그 봉으로 레짐을 돌리는 것이 이 순서의 대가다. **새 위험은 아니다** — 그 봉은
+                # 종전에도 `market_raw_1m`에 그대로 적재됐고, `quality_flag`가 이미 그것을
+                # 표시한다. 바뀌는 것은 「얇은 봉으로 계산한 레짐」과 「레짐이 아예 없는 분」 중
+                # 어느 쪽을 남기느냐이고, 후자는 그 사실조차 안 남는다.
                 regime_state_machine.update_bar(bar)
                 state = regime_state_machine.step(conn, bar.minute)
                 db.insert_regime_state(
@@ -1385,6 +1459,7 @@ async def run_observation_loop(
                     # 구분하지 못하고 "평균회귀 100%"로 그렸다.
                     is_warmup=state.is_warmup,
                 )
+                await _reroll_books_to_spot(subscription_managers, bar.close, ws_liveness)
 
     await ws_client.listen(handle_message)
 
@@ -1712,7 +1787,47 @@ async def _collect_option_chain_cycle(
               `OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS` 주석. 북 순서가 먼슬리 우선이므로
               (`_books_due_this_cycle`) 잘려나가는 쪽은 항상 위클리 뒤쪽이다 — 판단 입력인
               먼슬리가 먼저 채워지는 것이 이 순서의 존재 이유다.
+
+    2026-08-12(§2-6 / Fix#4) **조기 포기에도 그 순서를 적용한다.** 상세 근거는 아래
+              `_ABORT_SCOPE_*` 주석 — 시간 예산은 순서를 지켰는데 조기 포기(Fix#1/고도화 A)는
+              사이클을 통째로 접어 **먼슬리부터 잘랐다.**
     """
+    # ===== 2026-08-12 §2-6 / Fix#4 — 조기 포기가 먼슬리를 먼저 잘랐다 =====
+    #
+    # ## 08-12 실측
+    #
+    #     조기 포기(연속 타임아웃) 발동            50회
+    #     그중 컷당한북에 `regular`(먼슬리) 포함    50회 (전부)
+    #     그중 `regular` **단독**                   26회
+    #     예산 컷(Fix#8) 발동                       74회
+    #     그중 먼슬리에 닿은 것                      2회
+    #
+    # 시간 예산 경로에는 순서가 있고(먼슬리를 먼저 채우므로 뒤에서 잘린다), **조기 포기 경로에는
+    # 없었다.** `aborted`가 서면 남은 레그를 북 구분 없이 전부 건너뛰므로, 먼슬리 폴링 도중에
+    # 걸리면 아직 시작도 안 한 위클리와 함께 **먼슬리 잔여분이 같이 죽는다.**
+    #
+    # ## 무엇을 바꾸는가 — 두 단계로 접는다
+    #
+    #     1단계 `non_priority`  아직 안 부른 **비우선 북이 남아 있을 때만** 발동. 그 북들을
+    #                           버리고 먼슬리는 계속 부른다. 트리거 카운터를 초기화해 먼슬리에
+    #                           같은 크기의 예산을 새로 준다.
+    #     2단계 `all`           1단계 뒤에 또 걸리면 그때 전부 접는다.
+    #
+    # ## 무엇을 **안** 바꾸는가 — 홀수분(먼슬리 단독 사이클)
+    #
+    # 버릴 비우선 북이 없으면 1단계를 건너뛰고 종전대로 즉시 전부 접는다. 08-12의 「`regular`
+    # 단독 26회」가 그것이고, **그 26회는 위반이 아니다** — 자를 것이 먼슬리밖에 없는 사이클에서
+    # 먼슬리를 자르는 것은 순서 문제가 아니다. 여기서 먼슬리에 두 번째 기회를 주면 Fix#1이
+    # 어제 실측을 근거로 포기한 것(*"확정 실패 호출을 안 쏜다"*)을 하루 만에 되돌리게 된다.
+    #
+    # ## 왜 사이클이 길어지지 않는가
+    #
+    # `deadline`(50초) 검사는 이 스코프와 **독립**이다. 1단계로 살아난 먼슬리 폴링도 그 시각을
+    # 넘기면 즉시 잘린다 — 즉 최악의 경우가 종전과 같은 50초다. 조기 포기가 돌려주던 시간을
+    # 위클리가 아니라 **먼슬리에 쓰는 것**이지 예산을 늘리는 것이 아니다.
+    _ABORT_SCOPE_NON_PRIORITY = "non_priority"
+    _ABORT_SCOPE_ALL = "all"
+
     latest_spot: float | None = None
     rows: list[dict] = []
     any_strikes = False
@@ -1722,18 +1837,27 @@ async def _collect_option_chain_cycle(
     missing_priority: list[tuple[float, str]] = []
     # 2026-08-11 Fix#2 — **어느 북이 잘렸는가**. 08-06이 "예산 컷이 먼슬리에 닿은 분 3분"을
     # 손으로 세어 원인을 가렸는데(그 실측이 고도화#1의 방향을 정했다), 그 값이 지표로는 없었다.
-    # 컷은 항상 뒤쪽 북부터 닿으므로(먼슬리 우선 순서) **먼슬리가 여기 들어오면 그 자체가 사건**이다.
     cut_books: list[str] = []
     # 2026-08-11 Fix#1 — 연속 read 타임아웃. **성공하면 0으로 되돌린다**(누적이 아니라 연속).
     consecutive_timeouts = 0
     # 2026-08-11 고도화 A — 누적 실패. 성공해도 안 줄어든다(연속 카운터가 못 보는 패턴을 잡는다).
     failed_legs = 0
-    aborted = False
+    # Fix#4 1단계에서 먼슬리에 새 실패 예산을 주기 위한 기준점(그 시점의 누적 실패 수).
+    failure_budget_base = 0
+    abort_scope: str | None = None
     abort_reason: str | None = None
-    # `aborted`여도 루프를 빠져나가지 않는다 — 남은 레그를 아래 `aborted` 분기로 흘려보내야
-    # skipped/cut_books/missing_priority 회계가 완전해진다. `break`로 나가면 남은 레그가
-    # **어디에도 안 세어져** 로그가 "남은 1레그"라고 거짓말한다(구현 중 테스트가 잡았다).
-    # 그 경로는 REST를 한 건도 안 부르므로 순회 비용은 무시할 수 있다.
+    # 1단계를 **거쳤는가**. `abort_scope`는 2단계에서 덮이므로 그것만으로는 못 본다.
+    # 이 값이 True면 위클리는 **먼저 의도적으로 버려진 것**이고, 그 뒤의 먼슬리 컷은 순서
+    # 위반이 아니다(순서를 지킨 결과다). 구현 중 테스트가 이 구분을 잡았다.
+    dropped_non_priority_first = False
+    # 2026-08-12 Fix#5 — **순서 위반의 실측**. "먼슬리가 잘렸다"가 아니라 **"아직 안 부른 위클리를
+    # 두고 먼슬리를 잘랐다"**. Fix#4가 들어가면 구조적으로 0이어야 하는 불변식이고, 먼슬리 단독
+    # 사이클의 꼬리 컷과 갈린다(상세 근거는 `log_metrics._priority_before_others_minutes`).
+    priority_cut_before_others = False
+
+    # 레그를 **먼저 펼친다.** 「지금 이 레그 뒤에 비우선 북이 남아 있는가」를 알아야 1단계를
+    # 판단할 수 있는데, 중첩 루프 안에서는 그 질문에 답할 수 없다(앞을 못 본다).
+    legs: list[tuple[str, bool, float, str, str]] = []  # (series, is_priority, strike, type, symbol)
     for subscription_manager, series in books:
         strikes = subscription_manager.desired_strikes
         if not strikes:
@@ -1745,65 +1869,105 @@ async def _collect_option_chain_cycle(
                 symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
                 if symbol is None:
                     continue
-                if aborted or (deadline is not None and time.monotonic() >= deadline):
-                    skipped += 1
-                    if series not in cut_books:
-                        cut_books.append(series)
-                    if is_priority:
-                        missing_priority.append((strike, option_type))
-                    continue
-                try:
-                    resp = await asyncio.to_thread(rest_client.get_quote, symbol)
-                except Exception as exc:
-                    _log_kis_call_failure(
-                        f"옵션 체인 폴링 실패: {symbol}", exc,
-                        throttle=warning_throttle, category="option_chain_leg_fetch_failure",
-                    )
-                    if is_priority:
-                        missing_priority.append((strike, option_type))
-                    failed_legs += 1
-                    if isinstance(exc, httpx.ReadTimeout):
-                        consecutive_timeouts += 1
-                        if consecutive_timeouts >= OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT:
-                            aborted, abort_reason = True, "timeout"
-                    else:
-                        consecutive_timeouts = 0
-                    # 고도화 A — 연속이 아니어도 누적이 예산을 넘으면 접는다. 08-11 14시대가
-                    # 이 형태였다(예산 초과 20건 중 전멸은 1건 — 나머지는 섞여서 얇아진 분).
-                    if failed_legs >= OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS and not aborted:
-                        aborted, abort_reason = True, "failure_budget"
-                    continue
+                legs.append((series, is_priority, strike, option_type, symbol))
+    # `non_priority_ahead[i]` = i번째 레그 **뒤에** 아직 안 부른 비우선 레그가 있는가.
+    non_priority_ahead = [False] * (len(legs) + 1)
+    for i in range(len(legs) - 1, -1, -1):
+        non_priority_ahead[i] = non_priority_ahead[i + 1] or not legs[i][1]
+
+    # 스코프가 서도 루프를 빠져나가지 않는다 — 남은 레그를 아래 건너뛰기 분기로 흘려보내야
+    # skipped/cut_books/missing_priority 회계가 완전해진다. `break`로 나가면 남은 레그가
+    # **어디에도 안 세어져** 로그가 "남은 1레그"라고 거짓말한다(구현 중 테스트가 잡았다).
+    # 그 경로는 REST를 한 건도 안 부르므로 순회 비용은 무시할 수 있다.
+    for index, (series, is_priority, strike, option_type, symbol) in enumerate(legs):
+        def _trigger(reason: str) -> None:
+            """조기 포기 트리거 — 1단계(비우선만)로 접을 수 있으면 그렇게 하고, 아니면 전부 접는다."""
+            nonlocal abort_scope, abort_reason, consecutive_timeouts, failure_budget_base
+            nonlocal dropped_non_priority_first
+            if abort_scope is None and is_priority and non_priority_ahead[index + 1]:
+                abort_scope = _ABORT_SCOPE_NON_PRIORITY
+                dropped_non_priority_first = True
+                # 먼슬리에 같은 크기의 예산을 새로 준다 — 1단계는 "위클리를 버리고 먼슬리를
+                # 계속한다"이므로, 방금 그 트리거를 먼슬리에도 그대로 물리면 즉시 2단계가 된다.
                 consecutive_timeouts = 0
-                parsed = _parse_option_quote(resp, strike, option_type, poll_time)
-                if parsed is None:
-                    if is_priority:
-                        missing_priority.append((strike, option_type))
-                    continue
-                row, spot = parsed
-                rows.append(row)
-                latest_spot = spot
+                failure_budget_base = failed_legs
+            else:
+                abort_scope = _ABORT_SCOPE_ALL
+            # **처음 선 이유를 유지한다.** 컷이 시작된 원인이 그것이고, 한 사이클은 한 줄만
+            # 남기므로(아래) 두 이유를 표현할 자리가 없다. 2단계 이유로 덮으면 08-11이 갈라놓은
+            # 「KIS가 천장에 닿았다」와 「섞여서 죽었다」의 귀속이 다시 흐려진다.
+            if abort_reason is None:
+                abort_reason = reason
+
+        cut_by_scope = abort_scope == _ABORT_SCOPE_ALL or (
+            abort_scope == _ABORT_SCOPE_NON_PRIORITY and not is_priority
+        )
+        if cut_by_scope or (deadline is not None and time.monotonic() >= deadline):
+            skipped += 1
+            if series not in cut_books:
+                cut_books.append(series)
+            if is_priority:
+                missing_priority.append((strike, option_type))
+                # **위클리를 이미 버린 뒤라면 위반이 아니다.** 그때 먼슬리가 잘리는 것은 순서를
+                # 지킨 결과이지 어긴 결과가 아니다 — 이 조건이 빠지면 Fix#4가 제대로 동작한
+                # 사이클까지 위반으로 세어져, 불변식이 자기가 고친 것을 반증으로 찍는다.
+                if non_priority_ahead[index + 1] and not dropped_non_priority_first:
+                    priority_cut_before_others = True
+            continue
+        try:
+            resp = await asyncio.to_thread(rest_client.get_quote, symbol)
+        except Exception as exc:
+            _log_kis_call_failure(
+                f"옵션 체인 폴링 실패: {symbol}", exc,
+                throttle=warning_throttle, category="option_chain_leg_fetch_failure",
+            )
+            if is_priority:
+                missing_priority.append((strike, option_type))
+            failed_legs += 1
+            if isinstance(exc, httpx.ReadTimeout):
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT:
+                    _trigger("timeout")
+            else:
+                consecutive_timeouts = 0
+            # 고도화 A — 연속이 아니어도 누적이 예산을 넘으면 접는다. 08-11 14시대가
+            # 이 형태였다(예산 초과 20건 중 전멸은 1건 — 나머지는 섞여서 얇아진 분).
+            if failed_legs - failure_budget_base >= OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS:
+                _trigger("failure_budget")
+            continue
+        consecutive_timeouts = 0
+        parsed = _parse_option_quote(resp, strike, option_type, poll_time)
+        if parsed is None:
+            if is_priority:
+                missing_priority.append((strike, option_type))
+            continue
+        row, spot = parsed
+        rows.append(row)
+        latest_spot = spot
     if skipped:
         # 사이클당 최대 1줄 — 레그마다 남기면 08-04 §2-2의 로그 폭증을 우리 손으로 재현한다.
         # **세 원인은 서로 다른 줄로 낸다**: 시간 예산(우리가 느렸다) / 연속 타임아웃(KIS가
         # 천장에 닿았다) / 누적 실패(섞여서 죽었다). 08-11 이전에는 셋이 한 줄이었고, 그래서
         # 22분 전멸과 "조금 잘린 분"이 같은 지표로 보고됐다.
         cut_label = ",".join(cut_books) or "—"
+        violation_label = "예" if priority_cut_before_others else "아니오"
         if abort_reason == "timeout":
             logger.warning(
                 LOG_CHAIN_TIMEOUT_ABORT,
-                consecutive_timeouts, skipped, len(rows), cut_label,
+                consecutive_timeouts, skipped, len(rows), cut_label, violation_label,
             )
         elif abort_reason == "failure_budget":
             remaining = (deadline - time.monotonic()) if deadline is not None else 0.0
             logger.warning(
                 LOG_CHAIN_FAILURE_BUDGET,
                 OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS, skipped, max(remaining, 0.0),
-                len(rows), cut_label,
+                len(rows), cut_label, violation_label,
             )
         else:
             logger.warning(
                 LOG_CHAIN_BUDGET_EXCEEDED,
-                OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows), cut_label,
+                OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS, skipped, len(rows),
+                cut_label, violation_label,
             )
     return rows, latest_spot, any_strikes, missing_priority
 
@@ -3864,6 +4028,14 @@ async def main() -> None:
     rest_client = KISRestClient(kis_settings, token_daemon)
     approval_key = ApprovalKeyIssuer(kis_settings).issue()
     regime_state_machine = RegimeStateMachine(underlying=UNDERLYING, futures_symbol=futures_symbol)
+    # 2026-08-12 Fix#7 — 오늘 이미 쌓인 피처가 있으면 세션 창을 되살린다(레버가 꺼져 있으면
+    # 아무 일도 안 하고 0을 반환한다). 08-12 재기동이 레짐을 29분 WARMUP으로 되돌렸다.
+    # **조회 실패는 삼킨다** — 복원은 있으면 좋은 것이지 기동 조건이 아니다.
+    try:
+        with db.get_connection() as conn:
+            regime_state_machine.restore_session_window(conn, db.local_now().date())
+    except Exception:
+        logger.warning("레짐 세션 창 복원 건너뜀 — warmup부터 시작한다", exc_info=True)
     market_halt_monitor = MarketHaltMonitor()
     ws_liveness = WsLiveness()
 

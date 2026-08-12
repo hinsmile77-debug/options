@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -297,6 +297,45 @@ def replay_live_predictions(
     return labels
 
 
+# ===== 2026-08-12 §2-4 / Fix#7 — 재기동이 레짐을 WARMUP으로 되돌린다 (레버, 기본 OFF) =====
+#
+# ## 08-12에 무슨 일이 있었는가
+#
+#     08:45  warmup 시작
+#     09:31  predict 진입
+#     10:14  ← 워치독 재기동. **warmup 복귀**
+#     10:43  predict 재개
+#
+# **29분의 판단이 `regime_hmm` 없이 갔다.** 원인은 아래 `_predict_window`/`_bar_count`가
+# in-memory라 프로세스와 함께 사라지는 것이다 — 클래스 docstring이 *"세션 경계 초기화는 프로세스
+# 재기동이 담당한다"* 고 적어 둔 그 계약이, 계획에 없던 재기동에서는 손실이 된다.
+#
+# ## 복원할 재료는 DB에 이미 있다
+#
+# `step()`이 매분 `feature_store`에 그날 피처를 적재한다. 재기동 시 그 행들을 시간순으로 읽어
+# 창을 다시 채우면 predict가 즉시 가능해진다.
+#
+# ## 왜 기본 OFF인가 — 검증이 먼저다
+#
+# 복원해도 `feature_builder`의 롤링 창(closes/highs/lows/spreads/ivs)은 비어 있다. 즉 재기동
+# **직후의 몇 봉**은 연속 실행했을 때와 다른 피처 값을 낸다(그 자체는 종전에도 같았고, 그 값들은
+# 이미 `feature_store`에 그대로 적재됐다). 바뀌는 것은 **그 값들 위에서 predict를 도느냐**다.
+#
+# 이 저장소가 08-10에 데인 지점이 정확히 여기다: **오프라인 재계산이 라이브와 갈라지는 분기.**
+# 그래서 켜기 전에 오프라인 재생으로 「복원한 창의 예측 == 연속 실행의 예측」을 확인한다
+# (`replay_live_predictions`가 그 비교의 기준이다).
+#
+# ## 켜는 법과 예측치 (숫자를 보기 전에 적는다)
+#
+#   값    `REGIME_RESTORE_SESSION_WINDOW = True`
+#   주장  재기동이 있는 날의 warmup 재진입이 **29분 → 5분 이하**
+#   참고  `regime_state`의 `is_warmup=false` 분 수 — 재기동이 없는 날에는 **안 바뀐다**
+#         (이 경로는 그런 날 아예 안 탄다. 안 바뀌는 것으로 반증하지 말 것)
+#   대가  재기동 직후 얇은 `feature_builder` 위에서 predict가 돈다 — 그 분들의 레짐이
+#         연속 실행과 다를 수 있다. 감시는 `db.regime` 전이 횟수(채터링 회귀 = 08-10의 병)
+REGIME_RESTORE_SESSION_WINDOW = False
+
+
 class RegimeStateMachine:
     """세션 하나(프로세스 하나)당 1개 — main.py가 선물봉마다 step()을 호출한다."""
 
@@ -318,6 +357,46 @@ class RegimeStateMachine:
             self.engine: RegimeEngine | None = RegimeEngine.load(model_path)
         except FileNotFoundError:
             self.engine = None
+
+    def restore_session_window(self, conn, today: date) -> int:
+        """
+        입력: DB 커넥션, 오늘 날짜.
+        계산: 오늘 `feature_store`에 이미 적재된 행으로 `_predict_window`와 `_bar_count`를
+             되살린다. 반환은 복원한 봉 수(0이면 복원할 것이 없었다 = 그날 첫 기동).
+        해석: 상세 근거는 `REGIME_RESTORE_SESSION_WINDOW` 위 주석. **레버가 꺼져 있으면
+             아무것도 하지 않고 0을 반환한다** — 호출측이 분기를 갖지 않게 하기 위해서다
+             (분기가 호출측에 있으면 레버를 켤 때 그 자리를 다시 짜게 된다).
+        실패 조건: 조회/파싱 실패는 로그만 남기고 0 — **복원에 실패했다고 관측이 멈추면 안 된다.**
+                  그때는 종전과 완전히 같은 동작(warmup부터)이 된다.
+        """
+        if not REGIME_RESTORE_SESSION_WINDOW:
+            return 0
+        try:
+            history = db.get_feature_history(conn, self.underlying, FEATURE_VERSION)
+        except Exception:
+            logger.warning("레짐 세션 창 복원 실패 — warmup부터 시작한다", exc_info=True)
+            return 0
+        restored = 0
+        for timestamp, named in history:
+            if timestamp.date() != today:
+                continue
+            # **`step()`과 같은 순서·같은 필터로 채운다.** 여기서 규칙이 갈리면 복원한 날과
+            # 연속 실행한 날의 창이 달라지고, 그 분기가 08-10 사고의 구조다.
+            try:
+                features = [float(named[name]) for name in FEATURE_NAMES]
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._bar_count += 1
+            restored += 1
+            if all(math.isfinite(v) and abs(v) <= _MAX_ABS_PREDICT_FEATURE for v in features):
+                self._predict_window.append(features)
+        if restored:
+            logger.info(
+                "레짐 세션 창 복원: 오늘 %d봉(예측 창 %d분) — 재기동이 WARMUP을 되돌리는 것을 막는다"
+                "(2026-08-12 Fix#7)",
+                restored, len(self._predict_window),
+            )
+        return restored
 
     def update_bar(self, bar: "MinuteBar") -> None:
         self.feature_builder.update_bar(bar)

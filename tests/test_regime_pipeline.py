@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -435,3 +435,105 @@ def test_replay_live_predictions_does_not_bleed_across_sessions():
 
     # 세션마다 창이 워밍업 길이에서 다시 시작한다.
     assert engine.lengths.count(_MIN_WARMUP_BARS) == 3
+
+
+# ===== 2026-08-12 §2-4 / Fix#7 — 재기동이 레짐을 WARMUP으로 되돌린다 (레버, 기본 OFF) =====
+#
+#     08:45  warmup 시작 / 09:31  predict 진입
+#     10:14  ← 워치독 재기동. **warmup 복귀**
+#     10:43  predict 재개
+#
+# 29분의 판단이 `regime_hmm` 없이 갔다. 복원할 재료(`feature_store`의 그날 행)는 DB에 이미 있다.
+
+
+def _feature_row(value: float) -> dict:
+    return {name: value for name in FEATURE_NAMES}
+
+
+def _history_for(day: datetime, count: int) -> list[tuple[datetime, dict]]:
+    return [
+        (datetime(day.year, day.month, day.day, 9, 0) + timedelta(minutes=i), _feature_row(0.1))
+        for i in range(count)
+    ]
+
+
+def test_session_window_restore_is_off_by_default(monkeypatch, tmp_path):
+    """**기본 OFF다.** 켜기 전에 오프라인 재생으로 「복원한 창 == 연속 실행」을 확인해야 한다 —
+    오프라인과 라이브가 갈리는 분기가 08-10 사고의 구조였다."""
+    assert regime_pipeline.REGIME_RESTORE_SESSION_WINDOW is False
+
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    monkeypatch.setattr(
+        db, "get_feature_history", lambda conn, symbol, version: _history_for(datetime(2026, 8, 12), 60)
+    )
+    assert machine.restore_session_window(conn=None, today=date(2026, 8, 12)) == 0
+    assert machine._bar_count == 0
+
+
+def test_restoring_the_session_window_skips_the_warmup(monkeypatch, tmp_path):
+    """레버를 켜면 오늘 행으로 창이 되살아나고 **predict가 즉시 가능**해진다.
+
+    08-12에는 이것이 없어 재기동 뒤 29분을 warmup_fallback으로 갔다.
+    """
+    monkeypatch.setattr(regime_pipeline, "REGIME_RESTORE_SESSION_WINDOW", True)
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    monkeypatch.setattr(
+        db, "get_feature_history", lambda conn, symbol, version: _history_for(datetime(2026, 8, 12), 60)
+    )
+
+    restored = machine.restore_session_window(conn=None, today=date(2026, 8, 12))
+
+    assert restored == 60
+    assert machine._bar_count >= _MIN_WARMUP_BARS
+    assert len(machine._predict_window) == 60
+
+
+def test_only_todays_rows_are_restored(monkeypatch, tmp_path):
+    """**세션 창이지 전체 이력이 아니다.** 어제 행을 섞으면 08-10에 격리한 모델과 같은 병이 된다."""
+    monkeypatch.setattr(regime_pipeline, "REGIME_RESTORE_SESSION_WINDOW", True)
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    history = _history_for(datetime(2026, 8, 11), 40) + _history_for(datetime(2026, 8, 12), 10)
+    monkeypatch.setattr(db, "get_feature_history", lambda conn, symbol, version: history)
+
+    assert machine.restore_session_window(conn=None, today=date(2026, 8, 12)) == 10
+
+
+def test_restore_applies_the_same_filter_as_step(monkeypatch, tmp_path):
+    """`step()`과 **같은 규칙**으로 채운다 — 규칙이 갈리면 복원한 날과 연속 실행한 날이 달라진다."""
+    monkeypatch.setattr(regime_pipeline, "REGIME_RESTORE_SESSION_WINDOW", True)
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+    huge = regime_pipeline._MAX_ABS_PREDICT_FEATURE * 10
+    history = [
+        (datetime(2026, 8, 12, 9, 0), _feature_row(0.1)),
+        (datetime(2026, 8, 12, 9, 1), _feature_row(huge)),   # 학습 범위 밖 — 창에는 안 들어간다
+        (datetime(2026, 8, 12, 9, 2), _feature_row(0.2)),
+    ]
+    monkeypatch.setattr(db, "get_feature_history", lambda conn, symbol, version: history)
+
+    restored = machine.restore_session_window(conn=None, today=date(2026, 8, 12))
+
+    assert restored == 3, "봉 수는 세 개 전부다(그날 실제로 계산된 봉이므로)"
+    assert len(machine._predict_window) == 2, "예측 창에는 범위 안의 둘만 들어간다"
+
+
+def test_a_failed_restore_falls_back_to_the_old_behaviour(monkeypatch, tmp_path):
+    """복원 실패로 관측이 멈추면 안 된다 — 그때는 종전과 완전히 같은 동작(warmup부터)이다."""
+    monkeypatch.setattr(regime_pipeline, "REGIME_RESTORE_SESSION_WINDOW", True)
+    machine = RegimeStateMachine(
+        underlying="KOSPI200", futures_symbol="101S03", model_path=tmp_path / "missing.pkl"
+    )
+
+    def broken(conn, symbol, version):
+        raise ConnectionError("DB 없음")
+
+    monkeypatch.setattr(db, "get_feature_history", broken)
+    assert machine.restore_session_window(conn=None, today=date(2026, 8, 12)) == 0
+    assert machine._bar_count == 0

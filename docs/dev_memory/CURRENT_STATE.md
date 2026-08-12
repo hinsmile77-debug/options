@@ -1,7 +1,44 @@
 # CURRENT_STATE — 마흐디(options) 현재 개발 상태
 
-_최종 갱신: **2026-08-07** (운영점검 + Fix 6종 + 고도화 5종 구현). 아래 절은 **날짜가 최신인
-것이 우선한다** — 이 "2026-08-07 갱신"이 그 아래 모든 절보다 우선한다._
+_최종 갱신: **2026-08-12 저녁** (운영점검 + Fix 8종 구현). 아래 절은 **날짜가 최신인 것이
+우선한다** — 맨 위 "2026-08-12 저녁 갱신"이 그 아래 모든 절보다 우선한다._
+
+---
+
+## 2026-08-12 **저녁** 갱신 — 감시자가 자기 일을 한 순간에 스스로를 꺼 버렸다 (Fix 8종)
+
+> 상세: `docs/동작점검/2026-08-12_마흐디_운영점검보고서.md` / `DECISION_LOG.md` 2026-08-12 저녁
+> **08-13 07:30 기동부터 실린다.** 예측치는 `hypotheses.yaml` `2026-08-12-fix1~fix8`.
+
+| Fix | 무엇을 고쳤나 | 되돌리면 깨지는 테스트 |
+|---|---|---|
+| #1 P0 | 워치독 `_restart()`에서 `capture_output` 제거(→ `DEVNULL`) | `test_watchdog_observation_loop.py` 3건 |
+| #2 P0 | 관측 루프 진입부 `get_quote`를 `httpx.HTTPError`에서 격리 | `test_main.py::test_a_kis_500_on_the_opening_quote_*` |
+| #3 P0 | 봉 완성 핸들러에서 **레짐을 WS 재롤링 앞으로** | `test_main.py::test_regime_is_written_even_when_the_reroll_hits_a_dead_socket` |
+| #4 P1 | 조기 포기를 2단계로(비우선 북 → 전부) | `test_main.py::test_timeout_abort_drops_the_weekly_book_before_the_monthly` |
+| #5 P1 | 우선순위 위반을 「먼슬리가 **먼저** 잘렸다」로 재정의 | `test_ops_log_metrics_contract.py::test_priority_violation_label_*` |
+| #6 P1 | §0 레버 표 + **규약 H**(`전제레버` → 「미실행」) | `test_ops_levers.py` 9건 |
+| #7 P2 | 레짐 세션 창 복원 — **레버 OFF**(검증 전) | `test_regime_pipeline.py::test_session_window_restore_*` |
+| #8 P2 | 워치독 판정 기록 + COCKPIT 배지 + §11-1 | `test_liveness.py` 8건 · `test_ops_watchdog_metrics.py` |
+
+### 새로 생긴 것
+
+- `mahdi/ops/levers.py` — 그날 어떤 레버가 켜져 있었는가 + git HEAD.
+- `mahdi/ops/watchdog_metrics.py` — `logs/watchdog.log`의 **침묵**을 잰다(`silence_over_cadence_ratio`).
+- `logs/.watchdog_last_check.json` — 워치독이 **판정할 때마다**(IDLE 포함) 갱신. COCKPIT 배지
+  「워치독 판정 신선도」가 3분 임계로 읽는다. **실시간 소비자는 §11-1이 아니라 이 배지다.**
+- 컷 로그 세 줄에 `· 우선순위위반=예|아니오`가 붙었다(파서 계약 갱신 완료).
+
+### 켜지 않은 레버 (§0 표가 매일 인쇄한다)
+
+`use_effective_member_count` · `reentry_cooldown_minutes` · `SIGNAL_FUSION_PHASE_OFFSET_SECONDS`
+· `OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS` · `OPTION_CHAIN_READ_TIMEOUT_SECONDS`
+· `REGIME_RESTORE_SESSION_WINDOW` — **전부 OFF.**
+
+### ⚠ 이 PC 밖으로 안 따라가는 것
+
+`Mahdi-Watchdog`의 `ExecutionTimeLimit = PT10M`은 **OS에 있다.** 저장소를 pull해도 안 따라오므로
+새 PC에서는 아래 「워치독 등록」 절의 절차를 다시 밟아야 Fix#1의 백스톱이 성립한다.
 
 ---
 
@@ -254,6 +291,26 @@ schtasks /Run /TN "Mahdi-Watchdog"                                       # 즉�
 최종 확인은 `logs/watchdog.log`다 — 매 `:x0`분에 `OK` 줄이 붙는다(정상은 10분에 한 번만 기록).
 
 **2026-08-11 08:40 이 PC(MW0601) 등록·검증 완료** — `[2026-08-11 08:40:48] OK — 정상`.
+
+**2026-08-12 추가 — `ExecutionTimeLimit`을 반드시 낮출 것(PC별 1회).** 기본값 `PT72H`는
+막힌 워치독을 **3일간** 안 죽인다. 08-12에 재기동 호출이 상속된 파이프에 물려 5시간 31분
+매달렸고, `MultipleInstances=IgnoreNew`라 그동안 매분 실행이 전부 무시됐다(§2-3).
+
+```powershell
+$t = Get-ScheduledTask -TaskName 'Mahdi-Watchdog'
+$t.Settings.ExecutionTimeLimit = 'PT10M'
+Set-ScheduledTask -TaskName 'Mahdi-Watchdog' -Settings $t.Settings
+(Get-ScheduledTask -TaskName 'Mahdi-Watchdog').Settings.ExecutionTimeLimit   # PT10M 이어야 한다
+```
+
+- **`PT5M`이 아니라 `PT10M`이다.** 보고서 초안은 5분을 적었는데 그러면 재기동 타임아웃
+  (`_RESTART_TIMEOUT_SECONDS = 300초`)과 **정확히 같아져** 정상적인 느린 기동을 OS가 중간에
+  자른다. 백스톱은 그 두 배여야 한다.
+- **`MultipleInstances`는 `IgnoreNew` 그대로 둔다.** 중복 기동이 더 위험하다 —
+  막힘은 위 상한과 `capture_output` 제거(Fix#1)가 함께 막는다.
+- 이 값은 저장소가 아니라 **OS에 있다.** 워치독을 새로 등록하는 PC마다 다시 해야 한다.
+
+**2026-08-12 16:5x 이 PC(MW0601) `PT10M` 적용·되읽기 확인 완료.**
 
 ---
 

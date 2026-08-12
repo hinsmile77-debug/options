@@ -986,6 +986,62 @@ def _overrun_count_check(conn, now: datetime) -> HealthCheck:
     return HealthCheck(label, status, detail, group="관측 품질")
 
 
+def _watchdog_liveness_check(now: datetime) -> HealthCheck:
+    """감시자를 감시한다 — 2026-08-12 §2-3 / Fix#8.
+
+    ## 왜 이 배지가 필요한가
+
+    08-12에 워치독은 10:14:01에 정확히 판정하고 정확히 되살렸다. 그런데 재기동 호출이 상속된
+    파이프에 물려 **15:45:02까지 막혔고**, 작업 스케줄러가 `MultipleInstances=IgnoreNew`라
+    그동안 매분 실행이 전부 무시됐다 — **재기동에 성공한 그 순간부터 장 마감까지 감시가 없었다.**
+
+    기존 신호로는 셋 다 정상으로 보였다: 프로세스는 살아 있었고(막혀 있었을 뿐),
+    스케줄러는 `State: Ready` / `LastTaskResult: 0` / `NumberOfMissedRuns: 0`,
+    `watchdog.log`의 마지막 줄은 「RESTART」라 사고 대응 중인 것처럼 보였다.
+    **프로세스 생존은 기능 생존의 증거가 아니다.**
+
+    ## DB가 아니라 파일을 읽는다
+
+    다른 배지와 달리 `conn`을 안 받는다. 워치독은 관측 루프와 **독립한 프로세스**라 DB에
+    아무것도 안 쓰고, 쓰게 만들면 DB가 죽은 날 워치독까지 못 도는 결합이 생긴다
+    (규약 D — 감시자는 감시 대상과 독립해야 한다). COCKPIT은 같은 PC에서 도므로 파일로 충분하다.
+
+    ## 판정
+
+    감시 창(`liveness.WATCH_WINDOW_*`) **안에서만** 임계를 건다. 창 밖에는 워치독이 IDLE로
+    돌며 기록만 갱신하므로 정상이고, 여기에 임계를 걸면 매일 밤 오경보가 된다.
+    """
+    from mahdi import liveness
+
+    label = "워치독 판정 신선도"
+    check = liveness.read_watchdog_check(liveness.watchdog_check_path(PROJECT_ROOT / "logs"))
+    if check is None:
+        if not liveness.in_watch_window(now):
+            return HealthCheck(label, "info", "감시 창 밖 — 기록 없음", group="인프라")
+        return HealthCheck(
+            label, "warning",
+            "워치독 판정 기록 없음 — 작업 스케줄러 등록 확인 필요"
+            "(절차: docs/dev_memory/CURRENT_STATE.md)",
+            group="인프라",
+        )
+    age = liveness.watchdog_check_age_seconds(check, now) or 0.0
+    action = check.get("action") or "?"
+    if not liveness.in_watch_window(now):
+        return HealthCheck(label, "info", f"감시 창 밖 — 마지막 판정 {age / 60:.0f}분 전", group="인프라")
+    if age > liveness.WATCHDOG_CHECK_STALE_SECONDS:
+        # **`restart`는 예외가 아니다.** 재기동 중이라 늦은 것이라도 그 시간 동안 판정이 없는
+        # 것은 사실이고, 08-12에 늦은 이유가 정확히 그것이었다. 다만 사람이 원인을 바로 알 수
+        # 있게 마지막 action을 함께 낸다.
+        return HealthCheck(
+            label, "warning",
+            f"워치독이 {age / 60:.0f}분째 판정하지 않음(임계 "
+            f"{liveness.WATCHDOG_CHECK_STALE_SECONDS / 60:.0f}분, 마지막 판정 {action}) — "
+            "이 구간에 관측 루프가 죽으면 아무도 되살리지 않는다",
+            group="인프라",
+        )
+    return HealthCheck(label, "ok", f"정상 — {age:.0f}초 전 판정({action})", group="인프라")
+
+
 def _ws_liveness_check(conn, now: datetime) -> HealthCheck:
     """
     해석: 2026-08-01 §5-4 — 07-31 WS 재연결 **0회**였지만 재연결 로직이 살아있는지는 증명되지
@@ -1149,6 +1205,10 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
                 _regime_stability_check(conn, now),
                 _regime_fit_progress_check(conn, underlying),
                 _shutdown_reliability_check(conn),
+                # 2026-08-12(§2-3 / Fix#8) — 종료 신뢰성 배지 옆. 그 배지가 「어제 제대로
+                # 껐는가」라면 이것은 **「지금 감시자가 돌고 있는가」**다. 08-12에 워치독이
+                # 5시간 31분 막혀 있었는데 화면에는 아무 표시도 없었다.
+                _watchdog_liveness_check(now),
                 _rate_limiter_health_check(conn),
                 # 2026-08-01(§5-5) 관측 품질 — 인프라 지표가 좋아져도 판단 입력 품질은 나빠질 수
                 # 있다(07-31 실측). 두 그룹을 나란히 봐야 그 어긋남이 보인다.

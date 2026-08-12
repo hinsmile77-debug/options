@@ -38,6 +38,10 @@ STATE_FILE = LOG_DIR / ".watchdog_state.json"
 START_SCRIPT = PROJECT_ROOT / "scripts" / "start_mahdi_premarket.bat"
 
 # 기동 스크립트는 Docker 데몬을 최대 180초까지 기다린다 — 그보다 넉넉히 잡되 무한은 아니다.
+#
+# **이 값을 줄이지 말 것.** 2026-08-12 보고서 초안이 "실측 10초니까 120초로 줄이자"고 적었는데
+# 그것은 틀렸다 — Docker 대기 180초는 `cmd /c bat`의 **안**에서 흐르므로 이 타임아웃에 그대로
+# 포함된다. 120초로 줄이면 Docker가 느린 아침마다 기동을 마이그레이션 중간에 죽인다.
 _RESTART_TIMEOUT_SECONDS = 300
 
 
@@ -70,13 +74,44 @@ def _write_state(state: dict) -> None:
 
 
 def _restart() -> tuple[bool, str]:
-    """기동 스크립트를 실행한다. 반환: (성공 여부, 요약)."""
+    """기동 스크립트를 실행한다. 반환: (성공 여부, 요약).
+
+    ## 표준 출력을 **캡처하지 않는다** (2026-08-12 §2-3 / Fix#1)
+
+    종전에는 `capture_output=True`였다. 그 한 인자가 08-12에 워치독을 **5시간 31분** 세웠다.
+
+    기동 스크립트는 `start "..." cmd /k ...`로 COCKPIT과 관측 루프를 새 창에 띄운다. 캡처를
+    켜면 파이썬이 파이프를 만들어 자식(`cmd /c bat`)에 물리는데, 그 핸들이 **손자(새 창의
+    프로세스)에게까지 상속된다.** bat이 끝나도 손자가 파이프 쓰기 끝을 쥐고 있으므로 부모는
+    EOF를 못 받는다. 더 나쁜 것은 `timeout`조차 상한이 못 된다는 점이다 — `subprocess.run`은
+    `TimeoutExpired` 처리에서 자식을 죽인 뒤 `communicate()`를 **다시** 부르고, 그것이 같은
+    파이프에서 또 막힌다.
+
+    08-12 실측(같은 PC에서 재현):
+
+        capture_output=True   timeout=8 인데 **350.1초** 만에 반환
+        capture_output=False  **0.1초**
+
+    운영에서는 관측 루프가 15:45 종료될 때까지 파이프가 안 닫혀, 워치독이 10:14:01부터
+    15:45:02까지 매달려 있었다. 작업 스케줄러가 `MultipleInstances=IgnoreNew`라 그동안 매분
+    실행이 전부 무시됐다 — **재기동에 성공한 그 순간부터 장 마감까지 감시가 없었다.**
+
+    ## 캡처를 없애도 잃는 것이 없다
+
+    기동 스크립트는 자기 출력을 전부 `logs/premarket_startup.log`에 적는다. 08-12에 「300초
+    안에 끝나지 않음」이 오보임을 증명한 것도 그 로그였다(10:14:02 시작 → 10:14:12 종료).
+    워치독이 그 출력을 읽은 적은 한 번도 없다 — `result.stdout`은 어디서도 안 쓰인다.
+
+    `DEVNULL`을 쓰는 이유(상속을 그냥 두지 않고): 상속하면 워치독을 띄운 숨김 콘솔로 bat의
+    출력이 흘러들어 간다. 지금은 아무도 안 보지만, 언제 무엇이 그 핸들을 붙들지는 우리가
+    통제하지 못한다 — **이 함수가 다시는 남의 수명에 묶이지 않게** 명시적으로 끊는다.
+    """
     if not START_SCRIPT.exists():
         return False, f"기동 스크립트를 찾지 못함: {START_SCRIPT}"
     try:
         result = subprocess.run(
             ["cmd", "/c", str(START_SCRIPT)],
-            capture_output=True, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=_RESTART_TIMEOUT_SECONDS,
             cwd=str(PROJECT_ROOT),
         )
@@ -97,6 +132,16 @@ def main() -> None:
         beat, now, state,
         # 기동 스크립트가 도는 중이면 판정을 보류한다 — 안 그러면 기동이 서로를 덮어쓴다.
         starting=liveness.startup_in_progress(liveness.startup_marker_path(LOG_DIR), now),
+    )
+
+    # 2026-08-12 Fix#8 — **판정했다는 사실 자체를 남긴다.** 로그보다 먼저, 그리고 IDLE에도 쓴다:
+    # 08-12에 워치독이 5시간 31분 막혀 있었는데 `watchdog.log`의 마지막 줄이 「RESTART」라
+    # 사고 대응 중인 것처럼 보였고, 그 침묵을 아무도 실시간으로 못 봤다. 상세 근거는
+    # `liveness.watchdog_check_path` 위 주석. **`_restart()` 앞에 두는 것이 중요하다** —
+    # 재기동은 최대 300초가 걸리고, 그 300초는 실제로 "판정하지 않은 시간"이 맞다.
+    liveness.write_watchdog_check(
+        liveness.watchdog_check_path(LOG_DIR), now,
+        action=decision.action, detail=decision.detail,
     )
 
     if decision.action == liveness.ACTION_IDLE:

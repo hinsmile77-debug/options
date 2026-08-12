@@ -247,6 +247,63 @@ VERDICT_UNJUDGEABLE = "판정 불가"
 # 그러나 부모(`db.decisions.reject_reason`)는 **구조**라 항상 있어야 한다. 부모가 없으면 오타다.
 VERDICT_PATH_DEAD = "경로 없음"
 
+# 2026-08-12(§1-1 / Fix#6) — **규약 H: 레버가 꺼진 날의 숫자로 그 레버의 가설을 판정하지 않는다.**
+#
+# 규약 F/G의 셋째다. F는 *"건수는 구조 변수에 비례한다"*, G는 *"어떤 값은 그날 시장에 비례한다"*,
+# H는 **"어떤 값은 그 코드가 실제로 돌았는가에 비례한다"** 이다. 셋 다 예측을 쓰는 순간에는 그
+# 변수가 상수처럼 느껴지고, 셋 다 결과가 같다 — 멀쩡한 fix가 반증으로 찍힌다.
+#
+# ## 08-12에 무슨 일이 있었는가
+#
+# 그날 `NEXT_TODO`의 「켤 것 — 오늘 단 하나만」은 확신도 분모 레버(`use_effective_member_count`)
+# 였다. **안 켜졌다** — 키가 `strategy_params.yaml`에 없었고 커밋도 0건이었다. 그런데 §0은
+# `2026-08-11-eF`를 켜진 전제로 판정해 「HIGH_CONVICTION이 34건보다 줄어야 한다」 옆에 91건을
+# 찍었다. 표만 보면 분모 전환이 **반대로 작동한 것처럼** 보인다.
+#
+# ## F/G와 검사 시점이 다르다
+#
+# F/G는 예측을 **쓸 때** 형태를 보고 막는다(부등식의 모양). H는 막을 것이 없다 — 예측 자체는
+# 옳았고 그날 실행되지 않았을 뿐이다. 그래서 H는 **읽을 때** 거는 조건이고, 검사 대상은 yaml
+# 문법이 아니라 **그날의 코드 상태**(`mahdi.ops.levers`)다.
+#
+# ## 쓰는 법
+#
+# `hypotheses.yaml` 항목에 `전제레버: use_effective_member_count`를 적는다(리스트도 된다 —
+# 전부 켜져 있어야 판정한다). 레버가 꺼져 있으면 그 항목의 모든 예측이 「미실행」이 되고
+# 확인/반증 어느 쪽으로도 세지 않는다.
+#
+# **레버 이름을 모르면(오타·미등록) 「미실행」으로 닫지 않는다.** 그것은 「꺼져 있었다」가 아니라
+# 「못 읽었다」이고, 조치가 다르다 — 08-06이 「실측 없음」과 「경로 없음」을 가른 것과 같은 구분이다.
+VERDICT_LEVER_OFF = "미실행"
+
+
+def lever_gate(entry: dict, levers: dict | None) -> tuple[bool, list[str], list[str]]:
+    """
+    입력: 가설 항목, `mahdi.ops.levers.collect()` 결과.
+    반환: `(전부 켜져 있는가, 꺼진 레버 목록, 상태를 모르는 레버 목록)`.
+    해석: `전제레버`가 없으면 항상 `(True, [], [])` — 레버와 무관한 가설이 대다수다.
+         집계 자체가 없으면(`levers is None`) **판정을 막지 않는다**: 레버를 못 읽은 날에
+         전 가설이 「미실행」이 되면 이 규약이 08-06 「경로 없음」 사고를 그대로 재현한다.
+    실패 조건: 없다.
+    """
+    from mahdi.ops.levers import lever_state
+
+    required = entry.get("전제레버")
+    if not required:
+        return True, [], []
+    if isinstance(required, str):
+        required = [required]
+    if levers is None:
+        return True, [], [str(k) for k in required]
+    off, unknown = [], []
+    for key in required:
+        state = lever_state(levers, str(key))
+        if state is None:
+            unknown.append(str(key))
+        elif not state:
+            off.append(str(key))
+    return (not off), off, unknown
+
 
 def load(path: Path) -> list[dict]:
     """
@@ -318,10 +375,12 @@ def _verdict(actual: Any, expect: str) -> str:
 
 
 def evaluate(
-    entries: list[dict], target: date, metrics: dict | None, db_metrics: dict | None = None
+    entries: list[dict], target: date, metrics: dict | None, db_metrics: dict | None = None,
+    levers: dict | None = None,
 ) -> list[dict]:
     """
-    입력: 가설 목록, 대상 날짜, 로그 지표, (선택) DB 지표.
+    입력: 가설 목록, 대상 날짜, 로그 지표, (선택) DB 지표, (선택) 그날의 레버 상태
+         (`mahdi.ops.levers.collect()` — 2026-08-12 규약 H).
     계산: `검증예정일`이 대상 날짜 **이하**이고 `상태`가 `pending`인 가설만 골라 예측과 실측을
          나란히 낸다 — 예정일이 지났는데 아직 확정 안 된 항목이 계속 보이는 편이, 하루 놓치면
          영영 사라지는 것보다 낫다. 예정일이 **지난** 항목에는 `overdue=True`를 달아 리포트가
@@ -347,6 +406,9 @@ def evaluate(
             # 규약 E — `대가:` 문구로 트레이드오프를 선언해 놓고 그것을 재는 지표가 없으면
             # "무엇을 포기했는지 모르는 채 개선을 주장하는" 상태다.
             cost_missing = bool(entry.get("대가")) and ROLE_COST not in roles
+            # 2026-08-12 규약 H — 전제 레버가 꺼져 있으면 **그 코드가 오늘 안 돌았다.**
+            # 실측/예측은 사실이므로 그대로 두고 **판정만** 무효화한다(주장 지표 없음과 같은 처리).
+            levers_on, levers_off, levers_unknown = lever_gate(entry, levers)
             for prediction, role in zip(predictions, roles):
                 path = prediction["metric"]
                 actual = _lookup(metrics, db_metrics, path)
@@ -372,8 +434,14 @@ def evaluate(
                         "cost_missing": cost_missing,
                         "path_dead": dead_path,
                         "대가": entry.get("대가"),
+                        # 규약 H — 리포트가 표 위로 따로 띄운다(§0). `lever_unknown`은
+                        # 「꺼져 있었다」가 아니라 「그 이름의 레버가 없다」이므로 판정을 막지
+                        # 않고 경고만 낸다 — 오타를 「미실행」으로 덮으면 영영 안 고쳐진다.
+                        "lever_off": levers_off,
+                        "lever_unknown": levers_unknown,
                         "verdict": (
-                            VERDICT_UNJUDGEABLE if claim_missing
+                            VERDICT_LEVER_OFF if not levers_on
+                            else VERDICT_UNJUDGEABLE if claim_missing
                             else VERDICT_PATH_DEAD if dead_path
                             else _verdict(actual, expect)
                         ),

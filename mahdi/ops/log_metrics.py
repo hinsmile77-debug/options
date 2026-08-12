@@ -113,9 +113,11 @@ _ATM_ROLL_DEDUP_SECONDS = 5.0
 # 2026-08-11 Fix#2 — 꼬리에 `컷당한북=<series[,series]>`가 붙었다. **선택 그룹으로 둔다**:
 # 08-10 이전 로그에는 없고, 없는 날을 `None`으로 두어야 "컷이 없었다"와 "못 쟀다"가 갈린다
 # (규약 C — 라벨이 0이면 count 0은 증명이 아니다).
+# 2026-08-12 Fix#5 — 그 뒤에 `· 우선순위위반=예|아니오`가 하나 더 붙었다. **역시 선택 그룹**이다
+# (08-11 로그에는 없다). 없는 날은 `None`이고, 그때 「위반 0건」이라고 말하면 안 된다 — 규약 C.
 _BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 수집 예산\([\d.]+초\) 초과 — 남은 (\d+)레그를 포기하고 (\d+)레그로"
-    r"(?:.* 컷당한북=(\S+))?"
+    r"(?:.* 컷당한북=(\S+))?(?:.* 우선순위위반=(\S+))?"
 )
 # 2026-08-11 Fix#1 — 연속 타임아웃 조기 포기(`mahdi.main.LOG_CHAIN_TIMEOUT_ABORT`).
 #
@@ -124,7 +126,7 @@ _BUDGET_RE = re.compile(
 # 났는데 종전 로그는 둘을 같은 줄로 냈다.
 _TIMEOUT_ABORT_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 연속 타임아웃 (\d+)회 — 남은 (\d+)레그를 포기하고"
-    r".*적재 (\d+)행 · 컷당한북=(\S+)"
+    r".*적재 (\d+)행 · 컷당한북=(\S+)(?: · 우선순위위반=(\S+))?"
 )
 # 2026-08-11 고도화 A — 누적 실패 예산 소진(`mahdi.main.LOG_CHAIN_FAILURE_BUDGET`).
 #
@@ -133,7 +135,7 @@ _TIMEOUT_ABORT_RE = re.compile(
 # 셋을 한 지표로 세면 "무엇이 이 분을 얇게 만들었는가"에 답할 수 없다.
 _FAILURE_BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 실패 예산\((\d+)건\) 소진 — 남은 (\d+)레그를 포기하고"
-    r".*적재 (\d+)행 · 컷당한북=(\S+)"
+    r".*적재 (\d+)행 · 컷당한북=(\S+)(?: · 우선순위위반=(\S+))?"
 )
 # 2026-08-06(고도화#1) — 먼슬리 레그 재시도(`mahdi.main.LOG_CHAIN_PRIORITY_RETRY`).
 # **시도와 회복을 둘 다 센다**: 회복 0건은 "KIS가 계속 느렸다"이고, 시도 0건은 "예산이 없었다"라
@@ -163,6 +165,35 @@ def _priority_cut_minutes(events: list[dict]) -> int | None:
     if not labelled:
         return None
     return sum(1 for e in labelled if PRIORITY_SERIES_LABEL in e["cut_books"].split(","))
+
+
+# 2026-08-12 Fix#5 — 로그가 실어 보내는 순서 위반 라벨.
+PRIORITY_VIOLATION_LABEL = "예"
+
+
+def _priority_before_others_minutes(events: list[dict]) -> int | None:
+    """
+    입력: 컷 이벤트 목록.
+    계산: **아직 안 부른 위클리를 두고 먼슬리를 자른 분**의 수. 라벨이 하나도 없으면 `None`.
+    해석: `_priority_cut_minutes`와 **다른 질문**이다. 저쪽은 「먼슬리가 잘렸는가」이고
+         이쪽은 「먼슬리가 위클리보다 **먼저** 잘렸는가」다 — 불변식은 후자다.
+
+         08-12에 이 구분이 없어 `priority_cut_minutes = 2`가 불변식 위반으로 보고됐다.
+         실측하니 둘 다(12:49:53 / 13:51:53) **홀수분의 꼬리 컷**이었다: 그 분에는 위클리가
+         애초에 due가 아니라 사이클 전체가 먼슬리였고, 50초 예산 끝에서 남은 2~3레그가 잘린
+         것이다. **자를 것이 먼슬리밖에 없는 분에서 먼슬리를 자르는 것은 순서 문제가 아니다.**
+         규약 G가 막는 것과 같은 형태의 오류였다 — 성립할 수 없는 상황에 임계를 걸었다.
+
+         판정은 **로그를 내는 쪽**이 한다(`mahdi.main._collect_option_chain_cycle`). 그 시점에만
+         "아직 안 부른 비우선 레그가 남아 있었는가"를 알 수 있고, 파서는 사후에 그것을 복원할
+         수 없다 — 그 분에 위클리가 due였는지는 위상 설정(`OPTION_CHAIN_SLOW_SERIES_PHASE`)에
+         달렸고 그 설정은 바뀐다.
+    실패 조건: 없다.
+    """
+    labelled = [e for e in events if e.get("priority_violation")]
+    if not labelled:
+        return None
+    return sum(1 for e in labelled if e["priority_violation"] == PRIORITY_VIOLATION_LABEL)
 
 # 2026-08-05(§2-4) — **로그 레코드 한 줄**을 가리는 기준.
 #
@@ -620,7 +651,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         if m:
             budget_events.append(
                 {"at": _hhmm(_seconds_of_day(m)), "skipped": int(m.group(6)),
-                 "collected": int(m.group(7)), "cut_books": m.group(8)}
+                 "collected": int(m.group(7)), "cut_books": m.group(8),
+                 "priority_violation": m.group(9)}
             )
             continue
 
@@ -629,7 +661,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             timeout_aborts.append(
                 {"at": _hhmm(_seconds_of_day(m)), "consecutive": int(m.group(6)),
                  "skipped": int(m.group(7)), "collected": int(m.group(8)),
-                 "cut_books": m.group(9)}
+                 "cut_books": m.group(9), "priority_violation": m.group(10)}
             )
             continue
 
@@ -638,7 +670,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             failure_budget_aborts.append(
                 {"at": _hhmm(_seconds_of_day(m)), "failure_budget": int(m.group(6)),
                  "skipped": int(m.group(7)), "collected": int(m.group(8)),
-                 "cut_books": m.group(9)}
+                 "cut_books": m.group(9), "priority_violation": m.group(10)}
             )
             continue
 
@@ -700,6 +732,9 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             # 결론을 냈고 그것이 고도화#1의 방향을 정했다. 그 실측이 지표로는 없었다.
             # 컷은 먼슬리 우선 순서상 뒤쪽 북부터 닿으므로 **여기 먼슬리가 들어오면 그 자체가 사건**이다.
             "priority_cut_minutes": _priority_cut_minutes(budget_events),
+            # 2026-08-12 Fix#5 — **불변식은 이쪽이다**(위는 참고값). 근거는
+            # `_priority_before_others_minutes` docstring.
+            "priority_before_others_minutes": _priority_before_others_minutes(budget_events),
             "labelled": sum(1 for e in budget_events if e.get("cut_books")),
             "samples": budget_events[:10],
         },
@@ -708,6 +743,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "count": len(timeout_aborts),
             "skipped_legs_total": sum(e["skipped"] for e in timeout_aborts),
             "priority_cut_minutes": _priority_cut_minutes(timeout_aborts),
+            "priority_before_others_minutes": _priority_before_others_minutes(timeout_aborts),
+            "labelled": sum(1 for e in timeout_aborts if e.get("cut_books")),
             "minutes": [e["at"] for e in timeout_aborts],
             "samples": timeout_aborts[:10],
         },
@@ -765,6 +802,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "count": len(failure_budget_aborts),
             "skipped_legs_total": sum(e["skipped"] for e in failure_budget_aborts),
             "priority_cut_minutes": _priority_cut_minutes(failure_budget_aborts),
+            "priority_before_others_minutes": _priority_before_others_minutes(failure_budget_aborts),
+            "labelled": sum(1 for e in failure_budget_aborts if e.get("cut_books")),
             "minutes": [e["at"] for e in failure_budget_aborts],
         },
         # 2026-08-11 Fix#7 — 폴러별 밀림. 상세 근거는 `_ANY_OVERRUN_RE` 주석.
