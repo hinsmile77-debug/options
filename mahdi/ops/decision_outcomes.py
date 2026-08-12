@@ -163,6 +163,78 @@ def summarize(conn: ConnectionLike, target: date) -> dict:
             "abs_move_pct": round(float(move) * 100, 3) if move is not None else None,
         }
     out["control"] = _reject_control_group(conn, target)
+    # 2026-08-12 고도화 5 — **그 판단이 무엇을 보고 내려졌는가**로 성적을 가른다.
+    out["by_chain_input"] = _by_chain_input_source(conn, target)
+    return out
+
+
+def _by_chain_input_source(conn: ConnectionLike, target: date) -> dict:
+    """
+    반환: `chain_input_source`(current / stale / none)별 지평 성적. 표본이 없으면 그 칸이 빈다.
+
+    ## 이 절이 Fix#10(fusion 위상)을 켤 가치 자체를 판정한다 (2026-08-12 고도화 5)
+
+    08-12에 `chain_input_source`가 처음 기록됐고(08-11 eB), 정규장 판단의 **96%가 stale**
+    이었다 — 짝수분은 188분 전량, 홀수분도 current가 18분뿐이다. 그 발견이 "위상을 옮겨
+    그 분 체인을 보게 하자"(Fix#10)로 이어졌는데, **그 레버가 값어치가 있는지는 아직 아무도
+    재지 않았다.**
+
+    질문은 이것이다: **늙은 체인을 본 판단이 그 분 체인을 본 판단보다 실제로 못 맞혔는가.**
+
+      · 못 맞혔다면 → 위상 레버는 판단 품질 레버다. 켠다.
+      · 차이가 없다면 → **그 레버의 가치는 우리가 생각한 것보다 작다.** 신선도는
+        「보기 좋은 값」이었지 성과의 원인이 아니었다는 뜻이고, 그때는 켜는 대가(다른 폴러와의
+        위상 충돌)를 다시 저울질해야 한다.
+
+    ## 임계를 걸지 않는다 · 하루로 결론 내지 않는다
+
+    08-12 표본은 current 71분 / stale 414분으로 **한쪽이 6배 크다.** 그리고 두 그룹은
+    시간대 분포도 다를 수 있다(current는 폴링이 빨랐던 분에 몰린다 = 그날 KIS가 한가했던 분).
+    즉 이 비교에는 `_reject_control_group`이 겪은 것과 **같은 교란**이 있다. 그래서 여기서는
+    **숫자를 나란히 놓기만 하고 판정하지 않는다** — 며칠 쌓아 부호가 고착되는지부터 본다.
+
+    실패 조건: 컬럼이 없거나(마이그레이션 029 이전) 조회 실패면 `{"available": False}`.
+    """
+    selects = ", ".join(
+        f"count(o.hit_{m}m) AS n_{m}, count(*) FILTER (WHERE o.hit_{m}m) AS hit_{m}"
+        for m in HORIZON_MINUTES
+    )
+    moves = ", ".join(
+        f"avg(abs(o.spot_after_{m}m - o.entry_spot) / nullif(o.entry_spot, 0)) AS mv_{m}"
+        for m in HORIZON_MINUTES
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT coalesce(d.chain_input_source, '(미기록)'), count(*), {selects}, {moves}"
+                " FROM decision_outcomes o"
+                " JOIN signal_decisions d ON d.decision_id = o.decision_id"
+                " WHERE o.timestamp::date = %s"
+                " GROUP BY 1 ORDER BY 1",
+                (target,),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        conn.rollback()
+        logger.warning("체인 입력 출처별 사후 평가 집계 실패", exc_info=True)
+        return {"available": False}
+    if not rows:
+        return {"available": False, "reason": "그날 ENTER 판단 없음 또는 chain_input_source 미기록"}
+
+    move_base = 2 + 2 * len(HORIZON_MINUTES)
+    out: dict = {"available": True, "sources": {}}
+    for row in rows:
+        source, entries = str(row[0]), int(row[1])
+        horizons = {}
+        for i, minutes in enumerate(HORIZON_MINUTES):
+            sample, hits = int(row[2 + i * 2]), int(row[3 + i * 2])
+            move = row[move_base + i]
+            horizons[f"{minutes}m"] = {
+                "sample": sample,
+                "hit_pct": round(hits / sample * 100, 1) if sample else None,
+                "abs_move_pct": round(float(move) * 100, 3) if move is not None else None,
+            }
+        out["sources"][source] = {"entries": entries, "horizons": horizons}
     return out
 
 

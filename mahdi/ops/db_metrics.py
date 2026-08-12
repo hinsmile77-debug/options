@@ -127,6 +127,8 @@ def collect(
         ("decision_outcomes", _decision_outcomes),
         ("risk_gate_distinct", _risk_gate_distinct),
         ("regime", _regime),
+        # 2026-08-12 고도화 1 — 선물봉 분 수 vs 레짐 분 수. Fix#3의 유일한 직접 지표.
+        ("regime_vs_futures_bars", regime_vs_futures_bars),
         ("feature_store", _feature_store),
         ("macro", _macro),
         ("market_halt", _market_halt),
@@ -1526,6 +1528,71 @@ def _regime(conn: ConnectionLike, target: date) -> dict:
         ],
         "today_total": sum(today.values()),
         "trend_minutes": sum(today.get(r, 0) for r in DIRECTIONAL_REGIMES),
+    }
+
+
+def regime_vs_futures_bars(
+    conn: ConnectionLike, target: date, underlying: str = "KOSPI200"
+) -> dict:
+    """
+    반환: 그날 **선물봉이 완성된 분 수**와 **레짐이 남은 분 수**, 그리고 그 차이.
+
+    ## 왜 이 둘을 나란히 세는가 (2026-08-12 고도화 1 · Fix#3의 유일한 직접 지표)
+
+    `regime_state`는 선물봉이 완성될 때만 쓰인다(`main.handle_message`). 따라서 정상이라면
+    **두 값이 같아야 한다.** 08-12에 376 vs 406으로 **30분이 어긋났고**, 그 30분은 어디에도
+    기록되지 않았다 — 봉은 멀쩡히 적재됐고 레짐만 조용히 빠졌다.
+
+    원인은 핸들러의 순서였다: `적재 → _reroll_books_to_spot(WS I/O) → 레짐`. 끊긴 소켓에서
+    재롤링이 예외를 던지면 레짐은 도달조차 못 한다. Fix#3이 순서를 뒤집었고, **이 지표가
+    그것을 검정하는 유일한 축**이다(로그에는 그 결손을 말하는 줄이 하나도 없다).
+
+    `per_reconnect`는 그 손실을 재연결 1회당으로 환산한다 — 08-12는 30분 / 31회 ≈ 0.97이다.
+    Fix#3 뒤에는 **0으로 가야 한다.**
+
+    ⚠ **재연결이 0인 날에는 이 지표가 fix를 검정하지 못한다**(경로가 안 돈다). 그때 `gap == 0`은
+      「fix가 일했다」가 아니라 「일할 일이 없었다」이다 — 판정은 `ws_disconnect.count`와 함께 한다.
+
+    실패 조건: 선물 심볼을 모르면 `{"available": False}`.
+    """
+    symbol_row = _fetchone(
+        conn, "SELECT symbol FROM active_futures_symbol WHERE underlying=%s", (underlying,)
+    )
+    if not symbol_row or not symbol_row[0]:
+        return {"available": False, "reason": "active_futures_symbol 없음"}
+    symbol = symbol_row[0]
+    bar_row = _fetchone(
+        conn,
+        "SELECT count(DISTINCT timestamp) FROM market_raw_1m "
+        "WHERE timestamp::date=%s AND symbol=%s",
+        (target, symbol),
+    )
+    regime_row = _fetchone(
+        conn,
+        "SELECT count(DISTINCT timestamp) FROM regime_state WHERE timestamp::date=%s",
+        (target,),
+    )
+    bars = int(bar_row[0]) if bar_row else 0
+    regimes = int(regime_row[0]) if regime_row else 0
+    # **선물봉이 있는데 레짐이 없는 분**만 센다. 반대(레짐이 있는데 봉이 없는 분)는 구조상
+    # 불가능하고, 혹시 생기면 그것은 다른 사고이므로 음수로 뭉개지 않는다.
+    missing = _fetchall(
+        conn,
+        "SELECT to_char(b.timestamp,'HH24:MI') FROM ("
+        "  SELECT DISTINCT timestamp FROM market_raw_1m WHERE timestamp::date=%s AND symbol=%s"
+        ") b LEFT JOIN regime_state r ON r.timestamp=b.timestamp "
+        "WHERE r.timestamp IS NULL ORDER BY 1",
+        # 조인이 **정확한 타임스탬프**로 붙으므로 `regime_state`에 날짜 조건을 또 걸지 않는다
+        # (걸면 플레이스홀더 수가 어긋난다 — 도입 당일 실제로 그렇게 틀렸다).
+        (target, symbol),
+    )
+    return {
+        "available": True,
+        "futures_symbol": symbol,
+        "futures_bar_minutes": bars,
+        "regime_minutes": regimes,
+        "gap": len(missing),
+        "minutes": [row[0] for row in missing][:60],
     }
 
 

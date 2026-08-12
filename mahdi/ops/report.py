@@ -179,6 +179,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     if watchdog is not None:
         lines += _section("11-1. 워치독 — 감시자가 돌기는 했는가",
                           lambda: _render_watchdog(watchdog))
+    lines += _section("11-2. WS 재연결 — 비용으로 읽는다",
+                      lambda: _render_ws_disconnects(metrics, db_metrics))
     if db_metrics:
         lines += _section("12. DB 적재", lambda: _render_db_tables(db_metrics))
         lines += _section("13. 판단/레짐/피처", lambda: _render_db_judgement(db_metrics))
@@ -190,6 +192,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                           lambda: _render_strike_window(db_metrics, metrics))
         lines += _section("14-3. 판단 품질 — 멤버가 무엇을 말했는가",
                           lambda: _render_member_scores(db_metrics, history))
+        lines += _section("14-4. 사후 평가 × 체인 입력 출처 — 늙은 체인이 실제로 못 맞혔는가",
+                          lambda: _render_outcomes_by_chain_input(db_metrics))
         lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
                           lambda: _render_book_gamma_map(db_metrics, previous))
         lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
@@ -267,6 +271,63 @@ def _render_watchdog(watchdog: dict) -> list[str]:
         "`premarket_startup.log`와 함께 사람이 한다.",
         "> 실시간 소비자는 이 표가 아니라 COCKPIT 배지다(`logs/.watchdog_last_check.json`) — "
         "**다음 날 읽는 지표로는 그날을 못 구한다.**",
+        "",
+    ]
+    return out
+
+
+def _render_ws_disconnects(metrics: dict, db_metrics: dict | None) -> list[str]:
+    """2026-08-12 고도화 1 — **재연결을 비용으로 읽는다.**
+
+    종전에 재연결은 로그 줄일 뿐 지표가 아니었다. 08-12에 31회가 레짐 30분을 먹었는데
+    그 환율을 아무도 세지 않았고, 31회가 09~10시에 몰렸다는 사실도 사람이 손으로 훑어서 알았다.
+    """
+    ws = dig(metrics, "ws_disconnect") or {}
+    count = ws.get("count", 0)
+    out = [f"- WS 단절 **{count}회**" + (
+        f" — 첫 {ws.get('first_at')} / 마지막 {ws.get('last_at')}" if count else " (조용한 날)"
+    )]
+    by_hour = ws.get("by_hour") or {}
+    if by_hour:
+        out += _table(
+            ["시간대", "단절"],
+            [[hour, str(n)] for hour, n in sorted(by_hour.items())],
+        )
+        out.append(
+            f"> 가장 몰린 시간대: **{ws.get('busiest_hour')} {ws.get('busiest_hour_count')}회**. "
+            "**편중이 곧 진단이다** — 08-12는 09~10시에 31회가 몰렸고, 그것은 KIS가 아니라 "
+            "09:13의 단 한 번이 연 **자기지속 루프**였다(§7-1, 유지 풀이 죽은 클라이언트를 쥐고 있었다)."
+        )
+
+    gap = dig(db_metrics or {}, "regime_vs_futures_bars") or {}
+    if gap.get("available"):
+        bars, regimes, missing = gap["futures_bar_minutes"], gap["regime_minutes"], gap["gap"]
+        out += _table(
+            ["지표", "값"],
+            [
+                ["선물봉 분", str(bars)],
+                ["레짐 분", str(regimes)],
+                ["**봉은 있는데 레짐이 없는 분**", f"**{missing}**"],
+                ["재연결 1회당 잃은 분", f"{missing / count:.2f}" if count else "— (재연결 0회)"],
+            ],
+        )
+        if missing:
+            out.append(
+                f"> ⚠ **{missing}분의 선물봉이 레짐을 못 남겼다.** 정상이면 두 값은 같아야 한다 — "
+                "`regime_state`는 선물봉 완성 시에만 쓰이기 때문이다. 08-12에 376 vs 406(−30)이었고, "
+                "원인은 봉 핸들러가 `적재 → WS 재롤링 → 레짐` 순서라 끊긴 소켓에서 레짐이 "
+                "**도달조차 못 한 것**이었다(Fix#3이 순서를 뒤집었다)."
+            )
+            if gap.get("minutes"):
+                out.append("> 해당 분: `" + " ".join(gap["minutes"]) + "`")
+        else:
+            out.append(
+                "> 두 값이 같다 — 봉이 생긴 분에는 레짐도 남았다. "
+                "⚠ **재연결이 0인 날에는 이것이 fix를 검정하지 못한다**(경로가 안 돈다)."
+            )
+    out += [
+        "> **임계를 걸지 않는다.** 정상 재연결 횟수의 분포를 모른다 — 표본이 08-04 1회 / "
+        "08-11 1회 / 08-12 31회로 셋뿐이다. 모르는 채 임계를 정하면 그 임계가 곧 결론이 된다.",
         "",
     ]
     return out
@@ -1275,6 +1336,54 @@ def _render_outcome_control(control: dict) -> list[str]:
         "표본이 100건 안팎이고, 방향이 0인 판단은 양쪽 모두 분모에서 빠진다. 며칠 쌓아 부호가 "
         "고착되는지부터 본다.",
         "> 이 값도 **되먹임이 아니다**(위 주석과 같다).",
+        "",
+    ]
+    return out
+
+
+def _render_outcomes_by_chain_input(db: dict) -> list[str]:
+    """2026-08-12 고도화 5 — **Fix#10(위상 레버)을 켤 가치 자체를 이 표가 판정한다.**
+
+    08-12에 정규장 판단의 96%가 stale이었다는 발견이 「위상을 옮기자」로 이어졌는데,
+    **늙은 체인을 본 판단이 실제로 못 맞혔는지는 아무도 재지 않았다.** 차이가 없다면 그 레버의
+    가치는 우리가 생각한 것보다 작다.
+    """
+    split = dig(db, "decision_outcomes.by_chain_input") or {}
+    if not split.get("available"):
+        return [f"- 집계 없음 — {split.get('reason', 'chain_input_source 미기록')}", ""]
+
+    sources = split.get("sources") or {}
+    horizons = sorted(
+        {h for s in sources.values() for h in (s.get("horizons") or {})},
+        key=lambda h: int(h.rstrip("m")),
+    )
+    # ⚠ 헤더에 `|이동폭|` 같은 **파이프 문자를 쓰지 않는다** — 마크다운 표의 열 구분자와
+    # 충돌해 헤더 셀 수가 구분선과 어긋난다(도입 당일 실제로 그렇게 깨졌다).
+    headers = ["체인 입력", "진입"] + [f"{h} 적중률(표본)" for h in horizons] + [
+        f"{h} 이동폭(절대)" for h in horizons
+    ]
+    rows = []
+    for source in sorted(sources):
+        info = sources[source]
+        hz = info.get("horizons") or {}
+        row = [f"`{source}`", str(info.get("entries", 0))]
+        for h in horizons:
+            cell = hz.get(h) or {}
+            pct, sample = cell.get("hit_pct"), cell.get("sample", 0)
+            row.append(f"{pct:.1f}% ({sample})" if pct is not None else f"— ({sample})")
+        for h in horizons:
+            move = (hz.get(h) or {}).get("abs_move_pct")
+            row.append(f"{move:.3f}%" if move is not None else "—")
+        rows.append(row)
+    out = _table(headers, rows)
+    out += [
+        "> **읽는 법**: `current`는 그 분 체인을 본 판단, `stale`은 직전 분 이상의 스냅샷을 본 "
+        "판단이다. **stale이 current보다 낮지 않다면 위상 레버(Fix#10)의 가치는 우리가 생각한 "
+        "것보다 작다** — 신선도가 「보기 좋은 값」이었지 성과의 원인은 아니었다는 뜻이다.",
+        "> ⚠ **하루로 결론 내지 않는다. 임계도 안 건다.** 08-12 표본은 current 11건 / stale 258건으로 "
+        "**한쪽이 20배 크고**, 두 그룹의 시간대 분포도 다를 수 있다(current는 폴링이 빨랐던 분 = "
+        "그날 KIS가 한가했던 분에 몰린다). `_reject_control_group`이 08-07에 겪은 것과 **같은 교란**이다.",
+        "> ⚠ **표본 수를 반드시 함께 읽는다** — 괄호 안이 그것이다. 10건짜리 적중률로 레버를 켜지 말 것.",
         "",
     ]
     return out

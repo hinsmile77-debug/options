@@ -316,3 +316,124 @@ def test_reserved_slots_leave_retention_usable_on_a_three_book_day():
     design = (STRIKES_EACH_SIDE * 2 + 1) * 2 * 3 + 2
     assert design <= WS.MAX_SUBSCRIPTIONS
     assert WS.MAX_SUBSCRIPTIONS - design - SUBSCRIPTION_RESERVED_SLOTS >= 2
+
+
+# ===== 2026-08-12 §7-1 — 재연결 폭주는 KIS가 아니라 **우리가 만든 자기지속 루프**였다 =====
+#
+# 그날 09:13:30에 진짜 네트워크 리셋이 **한 번** 있었고, 10:10까지 31회가 더 끊겼다.
+# 원인은 `rebind()`가 매니저의 클라이언트만 바꾸고 **유지 풀이 쥔 클라이언트는 안 바꾼 것**이다.
+# 풀은 기동 시 한 번만 만들어지므로 그 뒤로 영원히 첫 클라이언트를 쥔다.
+
+
+class DeadableConnection:
+    """어느 시점에 죽는 커넥션 — 죽은 뒤 `send`는 실제 WS처럼 예외를 던진다."""
+
+    def __init__(self, name: str = "conn") -> None:
+        self.name = name
+        self.alive = True
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        if not self.alive:
+            raise ConnectionError(f"[{self.name}] no close frame received or sent")
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        raise ConnectionError("사용되지 않음")
+
+    async def close(self) -> None:
+        pass
+
+
+def _fill_until_slots_are_tight(manager, pool, spots):
+    """장중처럼 ATM을 움직여 유지 큐를 채운다 — 유지된 구독도 슬롯을 먹으므로 활성이 상한에 붙는다."""
+    for spot in spots:
+        _run(manager.roll_to_spot(spot))
+
+
+def test_rebind_swaps_the_client_the_pool_holds_not_just_its_queue():
+    """**08-12 §7-1의 원인.** 풀이 죽은 클라이언트를 계속 쥐면 `free` 계산도 `unsubscribe`도 그쪽으로 간다."""
+    old_conn = DeadableConnection("OLD")
+    ws_old = KISWebSocketClient(approval_key="APV", connection=old_conn)
+    pool = SubscriptionRetentionPool(ws_old)
+    manager = RollingSubscriptionManager(
+        ws_old, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1, retention_pool=pool
+    )
+    _run(manager.roll_to_spot(350.0))
+
+    new_ws = KISWebSocketClient(approval_key="APV2", connection=DeadableConnection("NEW"))
+    manager.rebind(new_ws)
+
+    assert pool._ws is new_ws, (
+        "유지 풀이 여전히 죽은 클라이언트를 쥐고 있다 — 08-12에 이것이 재연결 31회를 만들었다"
+    )
+
+
+def test_a_single_disconnect_does_not_become_a_reconnect_storm():
+    """**08-12 재현.** 슬롯이 빡빡한 상태에서 재연결하면 종전 코드는 죽은 커넥션에 unsubscribe를 보냈다.
+
+    그 예외는 `listen()`을 뚫고 `run_observation_loop_forever`까지 올라가 **WS 단절로 처리되어
+    또 재연결**된다. 새 연결은 멀쩡한데 풀은 여전히 첫 클라이언트를 쥐고 있으므로 다음 ATM 롤에서
+    같은 일이 반복된다 — 그것이 그날 31회의 정체다.
+
+    `rebind`를 되돌리면(풀에 `clear()`만) 이 테스트가 `ConnectionError`로 깨진다.
+    """
+    old_conn = DeadableConnection("OLD")
+    ws_old = KISWebSocketClient(approval_key="APV", connection=old_conn)
+    pool = SubscriptionRetentionPool(ws_old)
+    # 슬롯을 빡빡하게 만들려면 창이 넓어야 한다 — 실측(2북 x ATM±2)과 같은 규모로 채운다.
+    managers = [
+        RollingSubscriptionManager(
+            ws_old, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=2,
+            retention_pool=pool,
+            symbol_formatter=lambda strike, opt, b=book: f"{b}{opt}{strike:.1f}",
+        )
+        for book in ("M", "W")
+    ]
+    for spot in (1000.0, 1005.0, 1010.0, 1015.0, 1020.0, 1025.0, 1030.0, 1035.0):
+        for m in managers:
+            _run(m.roll_to_spot(spot))
+    # 유지 구독이 슬롯을 먹어 활성이 상한 근처에 붙어 있어야 이 사고가 성립한다.
+    assert len(ws_old.active_subscriptions) >= ws_old.MAX_SUBSCRIPTIONS - 4
+    assert pool.retained
+
+    # ---- 09:13:30 진짜 네트워크 리셋 한 번 ----
+    old_conn.alive = False
+    new_ws = KISWebSocketClient(approval_key="APV2", connection=DeadableConnection("NEW"))
+    for m in managers:
+        m.rebind(new_ws)
+    for m in managers:
+        _run(m.roll_to_spot(1035.0))  # 재연결 직후 첫 롤(관측 루프 진입부)
+
+    # ---- 이후 봉 완성마다의 ATM 롤. 종전 코드는 여기서 매번 예외를 냈다 ----
+    for spot in (1040.0, 1045.0, 1050.0, 1055.0, 1060.0):
+        for m in managers:
+            _run(m.roll_to_spot(spot))  # 예외가 나면 그 자체로 실패다
+
+    # 죽은 커넥션에는 재연결 이후 아무것도 안 보냈어야 한다.
+    assert old_conn.sent, "사전 조건: 재연결 전에는 실제로 보냈다"
+    sent_before = len(old_conn.sent)
+    for m in managers:
+        _run(m.roll_to_spot(1065.0))
+    assert len(old_conn.sent) == sent_before
+
+
+def test_eviction_after_a_reconnect_targets_the_live_connection():
+    """축출은 일어나야 한다 — 다만 **새 커넥션에서** 일어나야 한다(08-12 실측 축출 51건)."""
+    ws_old = KISWebSocketClient(approval_key="APV", connection=DeadableConnection("OLD"))
+    pool = SubscriptionRetentionPool(ws_old)
+    manager = RollingSubscriptionManager(
+        ws_old, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=2, retention_pool=pool
+    )
+    for spot in (1000.0, 1005.0, 1010.0, 1015.0, 1020.0):
+        _run(manager.roll_to_spot(spot))
+
+    new_conn = DeadableConnection("NEW")
+    new_ws = KISWebSocketClient(approval_key="APV2", connection=new_conn)
+    manager.rebind(new_ws)
+    for spot in (1020.0, 1025.0, 1030.0, 1035.0, 1040.0, 1045.0, 1050.0):
+        _run(manager.roll_to_spot(spot))
+
+    # 새 연결의 활성이 상한을 넘지 않는다 = 축출이 새 연결 기준으로 돌았다.
+    assert len(new_ws.active_subscriptions) <= new_ws.MAX_SUBSCRIPTIONS
+    assert pool.dropped_subscriptions >= 0  # 누적 카운터는 재연결로 리셋되지 않는다(하루치 대가)

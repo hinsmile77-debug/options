@@ -220,6 +220,8 @@ _METRIC_ROOTS = {
     # 둘 다 `daily_ops_report.build`가 `metrics`에 실어 넣는다. 사이드카에만 넣으면
     # `hypotheses._lookup`이 못 찾아 그 가설이 영원히 「경로 없음」이 된다(08-06 §3-1의 사고).
     "levers", "watchdog",
+    # 2026-08-12 고도화 1 — WS 단절을 **비용**으로 재는 축(시각·시간대별 분포).
+    "ws_disconnect",
 }
 
 
@@ -234,6 +236,8 @@ _DB_METRIC_ROOTS = {
     "member_availability", "member_score_quality", "strike_window_quality",
     "signal_decisions", "decisions", "decision_outcomes", "signal_reach", "risk_gate_distinct", "regime",
     "feature_store", "macro", "market_halt", "ws_status", "remaining_processes", "rate_limiter",
+    # 2026-08-12 고도화 1 — 선물봉 vs 레짐 분 수(Fix#3의 직접 지표).
+    "regime_vs_futures_bars",
 }
 
 

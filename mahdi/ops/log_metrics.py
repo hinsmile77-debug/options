@@ -143,6 +143,21 @@ _FAILURE_BUDGET_RE = re.compile(
 _PRIORITY_RETRY_RE = re.compile(
     _TS + r" INFO:mahdi\.main:먼슬리 레그 재시도: (\d+)개 중 (\d+)개 회복"
 )
+# ===== 2026-08-12 고도화 1 — 재연결을 **비용**으로 계량한다 =====
+#
+# 종전에 재연결은 `qualitative.ws_reconnect`(최초 끊김만)와 `failures`(재연결 후 재단절)로
+# **나뉘어** 세어졌고, 시각이 없어 「언제 몰렸는가」를 물을 수 없었다. 08-12에 31회가
+# 09:13~10:10에 집중됐다는 사실은 사람이 로그를 손으로 훑어서 알았다.
+#
+# 두 줄을 **한 축으로** 모은다 — 둘 다 「연결이 끊겼다」는 같은 사건이고, 최초인지 반복인지는
+# 원인 규명에 쓰이지 **비용 계산에는 안 쓰인다**(둘 다 재구독과 관측 공백을 만든다).
+#
+# 「WS 재연결 시도 실패」는 **세지 않는다**: 그것은 이미 끊긴 상태에서 붙기를 시도하다 실패한
+# 것이라 새 단절이 아니다(`WarningThrottle`이 60초당 1건으로 누르기까지 한다 — 세면 억제
+# 정책이 곧 지표가 된다).
+_WS_DISCONNECT_RE = re.compile(
+    _TS + r" WARNING:mahdi\.main:WS (연결 끊김|재연결 후 다시 끊김) — "
+)
 _LEVEL_RE = re.compile(_TS + r" (INFO|WARNING|ERROR|CRITICAL|DEBUG):(\S+?):")
 
 # 2026-08-11 Fix#2 — 먼슬리(판단 주입력) 북의 series 라벨.
@@ -169,6 +184,33 @@ def _priority_cut_minutes(events: list[dict]) -> int | None:
 
 # 2026-08-12 Fix#5 — 로그가 실어 보내는 순서 위반 라벨.
 PRIORITY_VIOLATION_LABEL = "예"
+
+
+def _ws_disconnect_metrics(seconds_of_day: list[float]) -> dict:
+    """
+    입력: WS 단절이 관측된 시각들(자정 기준 초).
+    계산: 총 횟수 · **시간대별 분포** · 가장 몰린 시간대 · 최초/최종 시각.
+    해석: 2026-08-12 고도화 1. 08-12에 31회가 09~10시에 몰렸는데 종전 지표로는 그 편중이
+         안 보였다(`qualitative.ws_reconnect`는 최초 끊김 1건만 세고 나머지는 `failures`로
+         흩어졌다). **편중이 곧 진단이다** — 그날 09:13의 단 한 번이 자기지속 루프를 열었고
+         나머지 30회는 그 결과였다(§7-1).
+    실패 조건: 없다. 빈 입력이면 count 0 / by_hour 빈 dict.
+
+    ⚠ **임계를 걸지 않는다.** 정상 재연결 횟수의 분포를 모른다 — 표본이 08-04 1회, 08-11 1회,
+      08-12 31회로 셋뿐이다. 모르는 채 임계를 정하면 그 임계가 곧 결론이 된다.
+    """
+    by_hour: dict[str, int] = {}
+    for at in sorted(seconds_of_day):
+        by_hour[f"{int(at // 3600):02d}시"] = by_hour.get(f"{int(at // 3600):02d}시", 0) + 1
+    busiest = max(by_hour.items(), key=lambda kv: (kv[1], kv[0]), default=None)
+    return {
+        "count": len(seconds_of_day),
+        "by_hour": by_hour,
+        "busiest_hour": busiest[0] if busiest else None,
+        "busiest_hour_count": busiest[1] if busiest else 0,
+        "first_at": _hhmm(min(seconds_of_day)) if seconds_of_day else None,
+        "last_at": _hhmm(max(seconds_of_day)) if seconds_of_day else None,
+    }
 
 
 def _priority_before_others_minutes(events: list[dict]) -> int | None:
@@ -490,6 +532,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
     latency_windows: list[dict] = []
     atm_rolls: list[tuple[float, str, str]] = []  # (초, 이전 창, 새 창) — 북 중복 제거 후
     budget_events: list[dict] = []
+    # 2026-08-12 고도화 1 — WS 단절 시각(자정 기준 초). 최초/반복을 한 축으로 모은다.
+    ws_disconnects: list[float] = []
     timeout_aborts: list[dict] = []
     failure_budget_aborts: list[dict] = []
     failures: collections.Counter = collections.Counter()
@@ -674,6 +718,12 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             )
             continue
 
+        m = _WS_DISCONNECT_RE.match(line)
+        if m:
+            ws_disconnects.append(_seconds_of_day(m))
+            # `continue` 하지 않는다 — 이 줄은 `qualitative`/`by_level` 집계에도 그대로 들어가야
+            # 한다(종전 지표를 깨지 않는다). 아래 마커 매칭이 「WS 연결 끊김」을 계속 센다.
+
         m = _PRIORITY_RETRY_RE.match(line)
         if m:
             priority_retries.append(
@@ -763,6 +813,8 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
                 if sum(r["attempted"] for r in priority_retries) else None
             ),
         },
+        # 2026-08-12 고도화 1 — **재연결을 비용으로 잰다.** 근거는 `_WS_DISCONNECT_RE` 위 주석.
+        "ws_disconnect": _ws_disconnect_metrics(ws_disconnects),
         "poller_phase": _phase_metrics(calls),
         "log_volume": {
             "total_bytes": total_bytes,

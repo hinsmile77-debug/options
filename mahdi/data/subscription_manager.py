@@ -190,11 +190,51 @@ class SubscriptionRetentionPool:
 
     def clear(self) -> None:
         """
-        WS 재연결 시 호출 — 서버 쪽 구독 상태가 전부 초기화되므로 유지 큐도 의미를 잃는다.
-        `RollingSubscriptionManager.rebind()`가 `_desired_strikes`를 비우는 것과 같은 이유다:
-        살아 있다고 믿는 구독이 실제로는 없는 상태를 만들면 안 된다.
+        유지 큐만 비운다. **재연결 경로는 `clear()`가 아니라 `rebind()`를 부른다** — 이유는
+        바로 아래 docstring(2026-08-12 §7-1). 이 메서드는 그 안에서 쓰이고, 테스트가 유지 큐만
+        따로 비울 때도 쓴다.
         """
         self._retained.clear()
+
+    def rebind(self, ws_client: KISWebSocketClient) -> None:
+        """
+        입력: 재연결로 새로 만들어진 WS 클라이언트.
+        계산: **풀이 쥔 클라이언트를 교체하고** 유지 큐를 비운다.
+
+        ## 왜 이것이 없어서 08-12에 재연결이 31회 났는가 (§7-1의 답)
+
+        08-12 09:13:30에 **진짜 네트워크 리셋이 한 번** 있었다(WinError 64). 그 뒤 10:10까지
+        31회가 더 끊겼는데, 그것은 KIS도 네트워크도 아니라 **우리가 만든 자기지속 루프**였다.
+
+        종전 `RollingSubscriptionManager.rebind()`는 매니저의 `_ws`만 새 클라이언트로 바꾸고
+        풀에는 `clear()`만 불렀다. 풀은 `main.py`에서 **기동 시 한 번** 생성되므로
+        (`SubscriptionRetentionPool(ws_client)`), 그 뒤로 영원히 **첫 클라이언트**를 쥔다.
+
+        유지된 구독은 슬롯을 그대로 먹으므로 장중 활성은 상한 근처(실측 39/41)까지 찬다.
+        그래서 재연결 뒤 풀의 셈은 이렇게 된다:
+
+            free = MAX(41) - len(죽은 클라의 active)  =  41 - 39  =  2      ← 얼어붙은 값
+            ensure_free(needed)  →  2 < needed + reserved  →  축출 루프 진입
+            await self._ws.unsubscribe(sub)   ← **죽은 커넥션에 send** → ConnectionClosedError
+
+        그 예외가 `listen()`을 뚫고 `run_observation_loop_forever`까지 올라가면 그것은
+        **WS 단절로 처리되어 또 재연결**된다. 새 연결은 멀쩡한데 풀은 여전히 첫 클라이언트를
+        쥐고 있으므로 **다음 ATM 롤에서 같은 일이 반복된다.**
+
+        관측된 사실이 전부 이 설명과 맞는다:
+          · 끊김이 ATM 롤이 있는 분에만 몰렸다(창이 안 움직이면 `ensure_free`가 안 불린다) —
+            09:29~09:35, 09:38~10:01의 조용한 구간이 그것이다.
+          · 10:14 재기동 뒤 **0회**다. 프로세스가 새로 뜨면 풀도 클라이언트도 새것이다.
+          · 08-04·08-11은 각 1회였다 — 그날은 첫 단절 뒤 이 경로를 다시 밟지 않았다.
+
+        ## 왜 `clear()`만으로는 안 됐나
+
+        `clear()`가 지키려던 것은 *"살아 있다고 믿는 구독이 실제로는 없는 상태를 만들지 않는다"*
+        이고 그것은 옳다. 놓친 것은 **풀이 쥔 클라이언트 자체**다 — 큐를 비워도 `free` 계산과
+        `unsubscribe`의 수신자는 여전히 죽은 커넥션이었다.
+        """
+        self._ws = ws_client
+        self.clear()
 
 
 class RollingSubscriptionManager:
@@ -306,8 +346,14 @@ class RollingSubscriptionManager:
         # "창 밖이지만 살아 있다"고 믿던 구독이 실제로는 없다 — 그대로 두면 `reclaim()`이
         # 없는 구독을 회수했다고 판정해 **그 행사가가 새 연결에 영영 등록되지 않는다**
         # (바로 아래 `_current_atm = None`이 막으려는 것과 같은 계열의 상태 불일치).
+        #
+        # 2026-08-12(§7-1) — **`clear()`가 아니라 `rebind()`다.** 종전에는 큐만 비우고 풀이 쥔
+        # 클라이언트는 그대로 뒀는데, 풀은 기동 시 한 번만 만들어지므로 그 뒤로 영원히 **첫**
+        # 클라이언트를 쥐었다. 그 결과 `ensure_free()`가 죽은 커넥션에 `unsubscribe`를 보내
+        # 예외를 냈고, 그 예외가 다시 재연결을 태워 **자기지속 루프**가 됐다(08-12 31회).
+        # 상세 근거는 `SubscriptionRetentionPool.rebind` docstring.
         if self._retention is not None:
-            self._retention.clear()
+            self._retention.rebind(ws_client)
         # 2026-08-04(Fix#6): 히스테리시스도 함께 초기화한다 — 안 그러면 재연결 직후
         # `should_roll_atm()`이 "이미 그 ATM이다"로 판정해 **새 연결에 구독을 하나도 안 보낸다**
         # (위 `_desired_strikes = set()`이 막으려던 바로 그 상태를 다른 경로로 다시 만든다).
