@@ -8,8 +8,30 @@
 | `auto/YYYY-MM-DD_지표.md` | `scripts/daily_ops_report.py` | 표와 전일 델타만. **해석 없음** |
 | `auto/YYYY-MM-DD_지표.json` | 위와 동일 | 기계 판독용 — 다음날 델타 계산에 쓴다 |
 | `hypotheses.yaml` | **사람(fix 구현 시점)** | 예측치 — 다음 거래일 리포트가 자동 대조 |
+| `tools/` | 점검 세션 | 증거 수집기와 참조 문서 (아래) |
 
 자동 산출은 `auto/`에만 두고 **사람 보고서가 그것을 인용한다.** 도구는 판정하지 않는다.
+
+## `tools/` — 점검 세션이 쓰는 것
+
+`daily_ops_report.py`는 **장마감 후** 하루가 완결된 뒤의 **지표**를 낸다. `tools/`는 그 앞을 메운다 —
+장전·장중에는 자동 집계가 없고, 장후에도 지표에 안 실리는 것(기동 시퀀스·워치독 자신의 생사·
+크래시·커밋·가설 도래분)은 매번 사람이 손으로 훑고 있었다.
+
+| 파일 | 무엇 |
+|---|---|
+| `tools/collect_evidence.py` | 3국면 공통 증거 다이제스트. **stdlib only** — Docker/DB 없이도 돈다 |
+| `tools/phases.md` | 국면별 점검 체크리스트 |
+| `tools/evidence_map.md` | 어떤 파일이 무엇의 증거인가 |
+| `tools/report_template.md` | 보고서 형식(기존 19편과 같은 구조) |
+
+```
+python docs/동작점검/tools/collect_evidence.py --phase pre|intra|post [--date YYYY-MM-DD] [--out 경로]
+```
+
+**역할 경계를 지킨다**: 지표는 `mahdi/ops/`(pytest로 강제되는 곳)에 있고, `tools/`는 그것을
+**인용만** 한다. 새 *지표*가 필요하면 `mahdi/ops/`에 넣는다 — `tools/`에 넣으면 그 숫자는
+테스트도 델타도 없는 채로 보고서에 실린다.
 
 ## 규약 — 예측치를 먼저 적는다
 

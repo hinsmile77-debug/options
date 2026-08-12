@@ -46,6 +46,20 @@ REM 문서화해 뒀는데 stop 쪽에는 그 대책이 빠져 있었다. 프로
 set PYTHONIOENCODING=utf-8
 uv run python scripts\daily_ops_report.py >> "%LOG_FILE%" 2>&1
 
+REM 2026-08-13: 증거 다이제스트. 위 지표(daily_ops_report)가 **하루치 숫자**라면 이쪽은
+REM **하루의 뼈대와 사건**이다 — 기동/종료 시퀀스, 관측 루프 생사, 워치독 자신의 무기록 구간,
+REM 크래시, 커밋 선후, 레버 상태, 오늘 판정할 가설, 자동 적신호. 지표에 안 실리는 것들이라
+REM 그동안 점검 세션이 매번 손으로 훑던 부분이다.
+REM
+REM **반드시 daily_ops_report 뒤에 온다** — 이 스크립트의 §10이 방금 만들어진 지표의 §0/§1을
+REM 발췌해 싣기 때문이다. 앞에 두면 그 절이 "없음"으로 비고, 그 빈 자리는 조용하다.
+REM
+REM stdlib만 쓰므로 DB/Docker가 꺼져 있어도 돈다. 실패해도 아래 종료 로그는 정상 진행된다
+REM (배치는 오류에서 멈추지 않는다) — **종료 절차를 막지 않는 것이 이 자리의 조건**이다.
+REM 날짜는 스크립트가 KST로 계산한다(`--out-dir`). `%date%`는 OS 로캘을 따라 형식이 바뀌어
+REM PC마다 다른 파일명을 만든다 — daily_ops_report.py가 `--out-dir`을 두는 것과 같은 이유다.
+uv run python "docs\동작점검\tools\collect_evidence.py" --phase post --out-dir "docs\동작점검\auto" >> "%LOG_FILE%" 2>&1
+
 echo [%date% %time%] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"
 
 endlocal
