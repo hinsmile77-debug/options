@@ -59,6 +59,37 @@ def _shout(lines: list[str]) -> None:
         print(line)
     print(_BAR)
     print("")
+    _also_write_to_startup_log(lines)
+
+
+def _also_write_to_startup_log(lines: list[str]) -> None:
+    """같은 경고를 `logs/premarket_startup.log`에도 남긴다.
+
+    ## 왜 콘솔만으로는 부족한가 (2026-08-16 통합 리허설에서 확인)
+
+    배치는 이 스크립트를 **의도적으로 리다이렉트하지 않는다** — 그 자리에
+    *"콘솔에 그대로 찍는다: 로그 파일로 보내면 아침에 아무도 안 본다"* 는 주석이 있다.
+    맞는 판단이지만 절반이다: 기동이 **작업 스케줄러**로 돌면 그 콘솔을 보는 사람이 없고,
+    리허설에서 실제로 확인한 대로 `premarket_startup.log`에는 배치 자신의
+    `레버 발동일 점검` 한 줄만 남고 **경고 내용은 어디에도 없다.**
+
+    그래서 콘솔 출력을 **없애지 않고** 로그를 더한다(리다이렉트로 하면 콘솔이 죽으므로
+    파이썬 쪽에서 해야 한다 — R15: 배치는 호출 한 줄, 로직은 파이썬). 장전 점검과
+    `collect_evidence.py`가 읽는 파일이 이것이므로, 사후에 「그날 아침 무엇이 경고됐나」를
+    답할 수 있게 된다.
+    실패 조건: 쓰기에 실패해도 **조용히 넘어간다** — 로그를 못 써서 기동이 막히면 그 대가가
+              경고를 못 남기는 것보다 크다(이 파일의 「기동을 막지 않는다」 규약).
+    """
+    try:
+        path = PROJECT_ROOT / "logs" / "premarket_startup.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = db.local_now().strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] --- check_lever_due 경고 ---\n")
+            for line in lines:
+                f.write(f"[{stamp}] {line}\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _event_calendar_warning(today) -> list[str]:

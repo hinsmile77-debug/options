@@ -495,6 +495,27 @@ def _percentile(ordered: list[float], q: float) -> float:
     return ordered[max(index, 0)]
 
 
+def extract_order_no(response: dict) -> str | None:
+    """
+    입력: `submit_order()` / `cancel_order()`의 응답.
+    반환: KIS가 부여한 **주문번호**(`ODNO`). 못 찾으면 None.
+    해석: 2026-08-16 (통합 리허설) — 제출 응답의 `output`은 **array**이고 필드는 **대문자**다
+         (`tr_codes.ORDER_SUBMIT_ORDER_NO_FIELD`). 조회 응답은 소문자 `odno`라 둘을 섞으면
+         조용히 못 찾는다. dict로 오는 경우까지 받는 이유는 KIS가 단건에서 array를 벗기는
+         사례가 있고, 그것을 여기서 흡수하는 편이 호출측마다 분기하는 것보다 안전하기 때문이다.
+    실패 조건: 없음 — 못 찾으면 None이고 호출측이 경고한다(주문번호 없이는 조회도 취소도 못 한다).
+    """
+    output = response.get("output")
+    rows = output if isinstance(output, list) else [output] if isinstance(output, dict) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = str(row.get(tr_codes.ORDER_SUBMIT_ORDER_NO_FIELD, "") or "").strip()
+        if value:
+            return value
+    return None
+
+
 def format_order_price(price: float) -> str:
     """
     입력: 주문가격(float).
