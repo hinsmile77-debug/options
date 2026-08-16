@@ -3281,6 +3281,10 @@ def test_build_signal_inputs_computes_gex_and_gamma_flip_from_chain_and_spot(mon
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
     monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: 350.5)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, -100.0, -200.0))
+    # 위 만기(2026-08-13)가 지나면 `signal_book_legs()`가 이 북을 떨어뜨려 gex가 None이 된다 —
+    # 코드 변경 없이 실패하는 픽스처 부패다. 근거는 `_CHAIN_FIXTURE_NOW` 주석.
+    # 이 테스트는 `_patch_chain`을 쓰지 않으므로 여기서 직접 고정한다.
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: _CHAIN_FIXTURE_NOW)
 
     regime_state = RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=(1.0,) + (0.0,) * 7)
     inputs, chain_inputs = _build_signal_inputs(
@@ -3326,7 +3330,21 @@ def _two_book_chain() -> list[dict]:
     ]
 
 
-def _patch_chain(monkeypatch, chain_rows, spot=350.5, micro=None):
+# 이 픽스처들의 만기(`_MONTHLY`/`_WEEKLY`)는 **고정 날짜**이고 `_build_signal_inputs()`는
+# `signal_book_legs(chain_rows, now.date())`로 만기 지난 북을 떨어뜨린다. 그래서 `local_now()`를
+# 막지 않으면 이 테스트들은 **2026-08-13이 지난 날부터 조용히 실패한다** — 실제로 그렇게 됐다
+# (2026-08-16에 `gex_expiry`가 None이 되어 3건 실패, 원인은 코드가 아니라 픽스처의 부패였다).
+#
+# 개별 테스트가 자기 시각을 쓰려면 `now=`로 넘기거나 이 헬퍼 **뒤에** 직접 setattr 하면 된다
+# (뒤에 부른 monkeypatch가 이긴다 — 현재 그렇게 하는 테스트 셋이 있다).
+#
+# 같은 함정을 이 파일이 이미 두 번 주석으로 경고했다(§3420 "기본값을 `db.local_now()`로 두면"·
+# §3460 "테스트를 오후에 돌렸는지에 따라 ENTER가 REJECT로 바뀐다") — 그 경고를 **헬퍼로 강제**한다.
+_CHAIN_FIXTURE_NOW = datetime(2026, 8, 5, 10, 0)
+
+
+def _patch_chain(monkeypatch, chain_rows, spot=350.5, micro=None, now=_CHAIN_FIXTURE_NOW):
+    monkeypatch.setattr("mahdi.main.db.local_now", lambda: now)
     monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
     monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: spot)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
@@ -3392,8 +3410,9 @@ def test_build_signal_inputs_fills_charm_and_gamma_wall(monkeypatch):
       (`option_analysis_1m.charm` 컬럼은 존재하지만 08-04에 9,288행 전부 NULL).
     - 감마플립 경로: 이 북에서 flip이 구조적으로 안 나온다(§2-3) → 감마 월로 폴백한다.
     """
-    monkeypatch.setattr("mahdi.main.db.local_now", lambda: datetime(2026, 8, 5, 14, 30))
-    _patch_chain(monkeypatch, _two_book_chain())
+    # 시각은 `_patch_chain`에 넘긴다 — 헬퍼가 `local_now()`를 고정하므로 **앞에서** 따로
+    # setattr 하면 헬퍼가 그것을 덮어쓴다(그렇게 뒀다가 charm_active가 False로 떨어졌다).
+    _patch_chain(monkeypatch, _two_book_chain(), now=datetime(2026, 8, 5, 14, 30))
 
     inputs, _ = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
 
@@ -5222,6 +5241,43 @@ def test_build_signal_inputs_keeps_vrp_none_when_chain_is_empty(monkeypatch):
 
     assert chain_inputs["vrp"] is None
     assert chain_inputs["gex_expiry"] is None
+
+
+def test_empty_chain_kills_options_flow_and_is_recorded_as_such(monkeypatch):
+    """2026-08-14 §2-1 회귀 방지 — **체인 전멸 분의 판단은 감마 지형을 못 봤다고 말해야 한다.**
+
+    그날 14:00~15:23 84분 연속으로 옵션체인이 0행이었다. 5분 신선도 창
+    (`db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES`, SQL 경계는 `test_chain_snapshot_bounds_freshness_and_expiry`가
+    검사한다)이 그 구간의 스냅샷을 비우므로 이 함수에는 **빈 목록**이 들어온다 — 즉 08-14
+    보고서 Fix#1이 걱정한 *"창 밖에서도 계속 쓴다"*는 실제로 일어나지 않는다. 이 테스트가
+    그 사실을 못박는다(그 전제가 다시 흔들리면 여기가 깨진다).
+
+    **그러나 이 테스트가 함께 기록하는 것이 더 중요하다**: 체인이 비어도 판단 자체는 계속
+    나온다(다른 멤버가 살아 있으므로). 08-14에 84분 내내 `signal_decisions`가 적재되고 ENTER가
+    297건 나온 이유가 이것이다. 주문이 배선되는 날 이 성질은 **사람 확인(CONFIRM) 없이는
+    안전하지 않다** — 확신도 분모가 가용 멤버 수라서 정보가 줄면 확신도가 오히려 오를 수 있다.
+    """
+    _patch_chain(monkeypatch, [], spot=350.5)
+
+    inputs, chain_inputs = _build_signal_inputs(
+        conn=object(), regime_state=None, underlying="KOSPI200"
+    )
+
+    # ① 체인에서 오는 것 전부가 None이고, 그 사실이 판단 행에 남는다.
+    assert chain_inputs["chain_input_source"] == "none"
+    assert chain_inputs["chain_leg_count"] == 0
+    assert chain_inputs["chain_oldest_leg_age_seconds"] is None
+    assert (inputs.gex, inputs.gamma_flip, inputs.gamma_wall) == (None, None, None)
+
+    # ② `options_flow`가 죽고, **왜** 죽었는지가 이름으로 남는다(장전/현물마감 사유가 아니다).
+    assert build_member_scores(inputs).options_flow is None
+    from mahdi.main import _member_unavailable_reasons
+
+    reason = _member_unavailable_reasons(inputs, _CHAIN_FIXTURE_NOW)["options_flow"]
+    assert "gex" in reason and "기준선" in reason
+
+    # ③ 그런데 다른 멤버는 살아 있다 — 판단은 계속 나온다. 이것이 08-14의 위험 지점이다.
+    assert build_member_scores(inputs).flow_position is not None
 
 
 def test_poll_signal_fusion_cycle_passes_vrp_to_the_strategy_palette(monkeypatch):

@@ -3412,7 +3412,9 @@ def _build_signal_inputs(
     legs, gex_expiry = signal_book_legs(chain_rows, now.date()) if chain_rows else ([], None)
     if legs and spot is not None:
         gex = calculate_gex(legs, spot)
-        gamma_flip = find_gamma_flip(legs, spot)
+        # 2026-08-13 고도화 1 — `today`/`expiry`를 넘겨야 만기 당일 북이 **계산 전에** 빠지고
+        # 매분 WARNING 대신 하루 1회 INFO가 남는다(08-13에 그 한 문장이 WARNING의 54.5%였다).
+        gamma_flip = find_gamma_flip(legs, spot, today=now.date(), expiry=gex_expiry)
         # 2026-08-04 Fix#3 — 감마 월은 **노출이 0보다 클 때만** 기준선으로 쓴다.
         # `gamma_walls()`는 행사가별 |gamma x OI x ...| 합을 내림차순으로 줄 뿐이라, OI가 전부
         # 0인 북(08-04 weekly_mon이 그랬다)에서도 "노출 0짜리 1등 행사가"를 돌려준다. 그것을

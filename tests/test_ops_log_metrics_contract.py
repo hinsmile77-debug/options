@@ -455,6 +455,28 @@ def test_log_metrics_priority_series_matches_main():
     assert log_metrics.PRIORITY_SERIES_LABEL == main.OPTION_CHAIN_PRIORITY_SERIES
 
 
+def test_global_read_timeout_copy_matches_rest_client():
+    """2026-08-14 Fix#3 — p50과 비교하는 임계가 **실제로 걸려 있는 타임아웃**이어야 한다.
+
+    이 값이 갈라지면 §9-1의 교차표가 계속 초록을 내면서 절벽을 놓친다 —
+    08-14에 p50 4.05초가 4.0초를 넘은 그 순간을 못 보는 것과 같은 결과다.
+    """
+    assert log_metrics.GLOBAL_HTTP_READ_TIMEOUT_SECONDS == rest_client._HTTP_READ_TIMEOUT_SECONDS
+
+
+def test_rest_latency_yields_p50_grid_beside_p95():
+    """같은 창에서 두 격자가 나와야 한다 — 다른 창에서 오면 교차표의 두 값이 다른 시각의 것이 된다."""
+    line = (
+        "2026-08-14 14:36:13,001 INFO:mahdi.main:REST 응답시간(300초 창): "
+        "inquire-price=53건 4.05/4.06/4.06/4.06초"
+    )
+    lat = log_metrics.parse_day([line], date(2026, 8, 14))["rest_latency"]
+    assert lat["p50_by_hour"]["14"]["inquire-price"] == pytest.approx(4.05)
+    assert lat["p95_by_hour"]["14"]["inquire-price"] == pytest.approx(4.06)
+    # 08-14 실측: 이 값이 전역 타임아웃(4.0초)을 넘었고 그 순간 적재가 0이 됐다.
+    assert lat["p50_by_hour"]["14"]["inquire-price"] > lat["global_read_timeout_seconds"]
+
+
 def test_atm_roll_lines_are_deduplicated_across_books():
     """회귀 방지 §2-2 / 고도화#3: 롤링은 **북마다 1줄**이라 한 이벤트가 3줄로 나온다.
 
@@ -738,6 +760,56 @@ def test_zero_row_cause_split_flags_rows_written_to_a_neighbour_minute():
 
     assert causes["written_elsewhere"] == ["15:15"]
     assert causes["collection_wiped"] == []
+
+
+# ===== 최장 연속 0행 구간 (2026-08-14 §2-1 / Fix#3) =====
+#
+# 08-14의 0행 분은 86분이고 그중 84분이 14:00~15:23에 **연속으로** 붙어 있었다. 흩어진 86분과
+# 붙어 있는 84분은 완전히 다른 사건인데 종전 표는 둘을 같은 숫자로 인쇄했다.
+
+
+def test_longest_zero_row_run_finds_the_08_14_cliff():
+    """08-14 재현 — 앞쪽에 흩어진 세 분이 있어도 뒤쪽의 긴 구간이 답이어야 한다."""
+    scattered = ["12:07", "13:30", "13:50"]
+    cliff = [f"14:{m:02d}" for m in range(0, 60)] + [f"15:{m:02d}" for m in range(0, 24)]
+
+    run = db_metrics._longest_run(scattered + cliff)
+
+    assert run == {"length": 84, "start": "14:00", "end": "15:23"}
+
+
+def test_a_single_recovered_minute_breaks_the_run():
+    """08-14 실측 — 14:32 한 분만 행이 남았고, 그 한 분은 **진짜 회복**이었다.
+
+    신선도 창이 5분이라 그 분의 행은 뒤 5분간 판단에 실린다. 이 지표는 「0행이 이어진 길이」가
+    아니라 「판단이 체인을 못 본 길이」를 재므로 여기서 끊는 것이 맞다.
+    """
+    minutes = (
+        [f"14:{m:02d}" for m in range(0, 32)]          # 14:00~14:31
+        + [f"14:{m:02d}" for m in range(33, 60)]       # 14:32 회복 → 끊긴다
+        + [f"15:{m:02d}" for m in range(0, 24)]
+    )
+
+    run = db_metrics._longest_run(minutes)
+
+    assert run == {"length": 51, "start": "14:33", "end": "15:23"}
+
+
+def test_longest_zero_row_run_crosses_the_hour_boundary():
+    """09:59와 10:00은 붙어 있다 — 문자열로 비교하면 여기서 끊긴다."""
+    assert db_metrics._longest_run(["09:58", "09:59", "10:00"])["length"] == 3
+
+
+def test_longest_zero_row_run_is_absent_not_zero_when_there_are_no_gaps():
+    """규약 C — 「0행 분이 없었다」와 「이 키가 없다」를 소비측이 갈라야 한다."""
+    assert db_metrics._longest_run([]) is None
+
+
+def test_zero_row_run_threshold_is_longer_than_the_freshness_window():
+    """임계는 신선도 창(5분)보다 넉넉히 길어야 한다 — 그보다 짧으면 평시 딸꾹질마다 울린다."""
+    from mahdi.data import db as db_module
+
+    assert db_metrics.ZERO_ROW_RUN_ALERT_MINUTES > db_module.CHAIN_SNAPSHOT_MAX_AGE_MINUTES
 
 
 def test_zero_row_cause_split_returns_none_without_both_axes():

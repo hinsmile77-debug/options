@@ -223,6 +223,48 @@ def _is_stale_pending(due: date | None, target: date) -> bool:
 
 VERDICT_UNJUDGEABLE = "판정 불가"
 
+
+# ===== 2026-08-14 §5 / 고도화 4 — **「기제가 달랐다」는 확인도 반증도 아니다** =====
+#
+# 08-14 장중 점검이 이렇게 외삽했다: *"시간당 +5.6초가 유지되면 13시 ≈53초, 14시 ≈58초로
+# 수집 예산 50초를 상시 초과한다. 그때부터 매분 레그가 잘리고, 컷 대상이 위클리를 소진하면
+# 먼슬리로 넘어간다."*
+#
+# 그날 저녁 실측은 이랬다: 13시 **50.5초** / 14시 **49.9초**. 소요는 예산 천장에 눌려 **안 늘었고**,
+# 대신 **적재가 0이 됐다**(84분). 컷 대상이 먼슬리로 넘어간 것은 맞았다(regular 컷 13시 15회 →
+# 14시 94회). 우선순위 불변식이 시험받으리라는 것은 틀렸다 — 전멸한 분에는 위클리도 안 남아
+# **정의상 위반이 성립할 수 없었다.**
+#
+# 이것을 `확인`으로 닫으면 「예산 초과가 는다」는 틀린 기제가 살아남고, `반증`으로 닫으면
+# 「오후에 수집이 무너진다」는 맞은 방향이 죽는다. **둘 다 그날 배운 것을 지운다.**
+#
+# 오늘 최대 수확은 «예측이 틀린 방식» 그 자체였다 — 열화는 연속량이 아니라 **임계 현상**이고,
+# 연속 지표는 절벽 직전까지 완만하게 오르다 **절벽에서 오히려 좋아진다**(14시 소요가 13시보다
+# 낮았다). 그 교훈은 확인/반증 어느 칸에도 안 들어간다.
+#
+# ## 쓰는 법
+#
+# `상태: mechanism_differed`로 닫고, **판정근거에 두 기제를 나란히 적는다** — 예측한 기제와
+# 실제 기제. 하나만 적으면 다음 사람이 「그래서 맞았다는 건가 틀렸다는 건가」를 다시 묻는다.
+#
+# ## 남용 방지
+#
+# 이 상태는 **방향이 맞았을 때만** 쓴다. 방향까지 틀렸으면 그냥 `refuted`다. 아무 반증에나
+# 「기제가 달랐다」를 붙이면 이 저장소에 반증이 한 건도 없게 되고, 그 순간 예측 규약 전체가
+# 장식이 된다 — 규약 F/G/H가 막으려는 것과 정확히 같은 실패 모드다.
+STATUS_MECHANISM_DIFFERED = "mechanism_differed"
+
+# `상태`가 가질 수 있는 값의 **유일한 출처**. 테스트가 이 집합을 그대로 쓴다 —
+# 어휘를 두 곳에 적으면 한쪽이 조용히 뒤처지고, 그때 새 상태는 「오타」로 판정된다.
+STATUSES = frozenset({
+    "pending",              # 아직 예정일 전이거나 사람이 안 닫았다
+    "confirmed",            # 예측대로였다
+    "refuted",              # 예측과 달랐다 — **방향까지** 달랐다
+    "inconclusive",         # 판정하지 못했다(대조군 없음·교란·전제 미충족)
+    "untested",             # 그날 프로세스에 fix가 안 실려 검증 자체가 성립 안 됐다
+    STATUS_MECHANISM_DIFFERED,  # 방향은 맞고 **기제가 달랐다**(2026-08-14 고도화 4)
+})
+
 # 2026-08-06 §3-1 / Fix#3 — **경로가 애초에 존재하지 않는다.**
 #
 # 08-05에 세운 예측 13건 중 **6건이 주장 지표를 하나도 못 받았다.** `db.decisions.…`,
@@ -303,6 +345,87 @@ def lever_gate(entry: dict, levers: dict | None) -> tuple[bool, list[str], list[
         elif not state:
             off.append(str(key))
     return (not off), off, unknown
+
+
+# ===== 2026-08-13 고도화 4 + 2026-08-14 고도화 5 — **유예를 무행동으로 성립시키지 않는다** =====
+#
+# 레버 F(`use_effective_member_count`)는 08-12·08-13·08-14 **세 번** 「오늘 켤 것」으로 지정되고
+# 세 번 다 안 켜졌다. 레버 E(`OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`)는 **일곱 번** 미뤄졌다.
+# 열 번 중 한 번도 「안 켜기로 했다」고 적힌 적이 없다 — 전부 **아침에 잊은 것**이다.
+#
+# 규약 H는 「꺼진 날의 숫자로 판정하지 않는다」를 보장할 뿐 **켜지는 것을 보장하지 않는다.**
+# 그 빈자리를 메우는 것이 아래 두 필드다:
+#
+#   발동일:       그날 아침 기동 스크립트가 콘솔에 크게 경고한다(`scripts/check_lever_due.py`).
+#   무조건발동일: 이 날짜가 지났는데 레버가 꺼져 있으면 **테스트가 실패한다.**
+#
+# 경고만으로는 세 번 실패했다. 테스트 실패가 이 장치의 전부이고, 경고는 그 앞에 두는 예고편이다.
+#
+# **자동으로 켜지는 않는다** — 판단은 사람이 한다(2026-07-08 페이서 자동 적응이 500 폭주로
+# 203분을 태운 전례). 이 장치가 강제하는 것은 「켜라」가 아니라 **「켜거나, 사유를 적고 날짜를
+# 옮겨라」**이다. 후자도 사람의 한 줄이면 끝난다.
+FIELD_ACTIVATE_ON = "발동일"
+FIELD_DEADLINE = "무조건발동일"
+FIELD_DEFERRALS = "유예횟수"
+
+
+def lever_deadline_breaches(entries: list[dict], today: date, levers: dict | None) -> list[dict]:
+    """
+    입력: 가설 목록, 오늘 날짜, `levers.collect()` 결과.
+    반환: **`무조건발동일`이 지났는데 전제레버가 아직 꺼져 있는** 항목들
+          `[{id, 무조건발동일, 지난일수, off}]`.
+    해석: 빈 리스트가 정상이다. 한 건이라도 있으면 그것은 「유예가 또 무행동으로 성립했다」는
+         뜻이고, 테스트와 기동 경고가 같은 이 함수를 본다 — **두 곳이 다른 규칙을 쓰면
+         한쪽이 조용히 틀린다.**
+    실패 조건: 없다. 날짜 형식이 깨진 항목은 건너뛴다(그 오타는 YAML 검증이 잡을 일이다).
+              **레버 상태를 못 읽었으면(`unknown`) 위반으로 세지 않는다** — 「꺼져 있었다」와
+              「못 읽었다」의 조치가 다르다(규약 G와 같은 구분).
+    """
+    out = []
+    for entry in entries:
+        raw = entry.get(FIELD_DEADLINE)
+        if not raw:
+            continue
+        try:
+            deadline = date.fromisoformat(str(raw).strip())
+        except ValueError:
+            continue
+        if deadline > today:
+            continue
+        _ok, off, _unknown = lever_gate(entry, levers)
+        if off:
+            out.append({
+                "id": entry.get("id"),
+                FIELD_DEADLINE: deadline.isoformat(),
+                "지난일수": (today - deadline).days,
+                "off": off,
+                FIELD_DEFERRALS: entry.get(FIELD_DEFERRALS),
+            })
+    return out
+
+
+def levers_due_today(entries: list[dict], today: date, levers: dict | None) -> list[dict]:
+    """반환: **오늘이 `발동일`인데 아직 꺼져 있는** 레버 항목들 — 기동 전 경고의 재료.
+
+    `lever_deadline_breaches`와 나눠 두는 이유: 이쪽은 «오늘 켤 차례다»(예고), 저쪽은
+    «기한이 지났다»(위반)이다. 한 함수로 합치면 경고와 실패가 같은 세기로 울려서
+    **매일 울리는 경고**가 되고, 그런 경고는 곧 무시된다.
+    """
+    out = []
+    for entry in entries:
+        raw = entry.get(FIELD_ACTIVATE_ON)
+        if not raw:
+            continue
+        try:
+            when = date.fromisoformat(str(raw).strip())
+        except ValueError:
+            continue
+        if when != today:
+            continue
+        _ok, off, _unknown = lever_gate(entry, levers)
+        if off:
+            out.append({"id": entry.get("id"), FIELD_ACTIVATE_ON: when.isoformat(), "off": off})
+    return out
 
 
 def load(path: Path) -> list[dict]:

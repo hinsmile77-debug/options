@@ -119,3 +119,47 @@ def test_report_shouts_when_the_watchdog_never_ran():
         },
     )
     assert "한 줄도 안 남겼다" in out
+
+
+# ===== 적재 정지 판정 (2026-08-14 §2-1 / Fix#2) =====
+
+
+def test_degraded_lines_are_counted_apart_from_restarts():
+    """**RESTART와 섞지 않는다.** 저쪽은 「조치했다」, 이쪽은 「조치하지 않기로 했다」이다.
+
+    08-14 14:00~15:23의 84분은 재기동으로 고칠 수 있는 사건이 아니었다(원인은 KIS 지연이고,
+    재기동은 관측만 12~14초 끊는다). 둘을 한 칸에 세면 다음날 "워치독이 몇 번 개입했나"에
+    답할 수 없다.
+    """
+    lines = _healthy_day() + [
+        "[2026-08-12 14:10:01] DEGRADED — 관측 루프 적재 정지(no_ingest) — 직전 10분 동안 "
+        "옵션체인 적재가 **0분**이다",
+        "[2026-08-12 14:20:01] DEGRADED — 관측 루프 적재 정지(no_ingest) — 직전 10분 동안 "
+        "옵션체인 적재가 **0분**이다",
+    ]
+
+    metrics = watchdog_metrics.parse(lines, _TARGET)
+
+    assert metrics["degraded_checks"] == 2
+    assert metrics["restarts"] == 0
+    assert metrics["alert_only"] == 0
+
+
+def test_a_quiet_day_reports_zero_degraded_not_a_missing_key():
+    """규약 C — 「적재가 끊긴 분이 없었다」와 「이 판정이 없던 버전이다」를 소비측이 갈라야 한다."""
+    assert watchdog_metrics.parse(_healthy_day(), _TARGET)["degraded_checks"] == 0
+
+
+def test_report_shouts_when_the_loop_was_alive_but_empty():
+    out = report.render(
+        {"date": "2026-08-14"},
+        watchdog={
+            "checks": 49, "restarts": 0, "restart_failures": 0, "alert_only": 0,
+            "degraded_checks": 7,
+            "max_silence_minutes": 10.0, "max_silence_window": "08:50~09:00",
+            "first_at": "07:40:02", "last_at": "15:40:01",
+            "silence_warn_minutes": watchdog_metrics.SILENCE_WARN_MINUTES,
+        },
+    )
+    assert "적재 정지(DEGRADED)" in out
+    assert "재기동은 하지 않는다" in out

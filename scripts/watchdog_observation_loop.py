@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -43,6 +44,15 @@ START_SCRIPT = PROJECT_ROOT / "scripts" / "start_mahdi_premarket.bat"
 # 그것은 틀렸다 — Docker 대기 180초는 `cmd /c bat`의 **안**에서 흐르므로 이 타임아웃에 그대로
 # 포함된다. 120초로 줄이면 Docker가 느린 아침마다 기동을 마이그레이션 중간에 죽인다.
 _RESTART_TIMEOUT_SECONDS = 300
+
+# 적재 조회의 상한 (2026-08-14 Fix#2).
+#
+# **2초를 넘기지 않는다.** 워치독은 1분 주기이고, DB가 굳은 날 여기서 오래 매달리면 08-12에
+# 겪은 무력화가 그대로 재현된다(그때는 상속된 파이프였고 이번엔 DB다 — 원인은 달라도 결과는
+# 같다: 작업 스케줄러의 `MultipleInstances=IgnoreNew`가 그 사이 매분 실행을 전부 버린다).
+#
+# connect와 statement 양쪽에 건다 — 붙는 데서 막히는 것과 쿼리에서 막히는 것은 다른 경로다.
+_INGEST_QUERY_TIMEOUT_SECONDS = 2
 
 
 def _log(line: str) -> None:
@@ -124,14 +134,62 @@ def _restart() -> tuple[bool, str]:
     return True, "기동 스크립트 실행 완료"
 
 
+def _recent_ingest_minutes(now: datetime) -> int | None:
+    """반환: 직전 `liveness.INGEST_STALE_MINUTES`분 동안 `option_analysis_1m`에 **행이 있던 분 수**.
+             못 읽으면 **None("모른다")** — 0이 아니다.
+
+    2026-08-14 Fix#2. 워치독이 「가져오고 있는가」를 보는 유일한 창이다.
+
+    ## 왜 `mahdi.data.db.get_connection()`을 안 쓰는가
+
+    그 헬퍼는 타임아웃 없이 `psycopg.connect(dsn)`을 부른다. 감시자가 감시 대상의 DB에
+    무제한으로 매달리는 것이 정확히 규약 D가 금지하는 결합이다 — 여기서만 상한을 걸어 연다.
+
+    ## 왜 `underlying`으로 안 거르는가
+
+    이 함수가 답하는 질문은 「이 시스템이 무엇이든 가져오고 있는가」다. 기초자산을 걸면 그
+    상수가 워치독과 수집기 사이에서 조용히 갈라질 수 있고(08-11 `PRIORITY_SERIES_LABEL`이
+    그래서 계약 테스트를 얻었다), 그 대가로 얻는 정밀도는 여기서 쓸모가 없다 —
+    **어느 북이든 한 행이라도 들어왔으면 수집 경로는 살아 있다.**
+
+    실패 조건: 어떤 예외도 밖으로 내지 않는다. DB가 죽었다고 워치독이 죽으면 안 된다.
+    """
+    since = now - timedelta(minutes=liveness.INGEST_STALE_MINUTES)
+    try:
+        import psycopg
+
+        from mahdi.config.settings import get_db_settings
+
+        with psycopg.connect(
+            get_db_settings().dsn,
+            connect_timeout=_INGEST_QUERY_TIMEOUT_SECONDS,
+            options=f"-c statement_timeout={_INGEST_QUERY_TIMEOUT_SECONDS * 1000}",
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(DISTINCT date_trunc('minute', timestamp)) "
+                    "FROM option_analysis_1m WHERE timestamp >= %s AND timestamp <= %s",
+                    (since, now),
+                )
+                row = cur.fetchone()
+    except Exception as exc:  # noqa: BLE001 — 못 읽은 것은 「모른다」다
+        _log(f"[{now:%Y-%m-%d %H:%M:%S}] 적재 조회 실패(판정은 박동 축으로만 한다): {exc!r}")
+        return None
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def main() -> None:
     now = db.local_now()
     beat = liveness.read_heartbeat(liveness.heartbeat_path(LOG_DIR))
     state = _read_state()
+    # 적재 감시 창 밖에서는 **DB를 아예 안 연다** — 밤새 매분 커넥션을 만들 이유가 없고,
+    # 창 밖의 「적재 0분」은 이상이 아니라 정상이다(`liveness.INGEST_WATCH_*` 주석).
+    ingest = _recent_ingest_minutes(now) if liveness.in_ingest_window(now) else None
     decision = liveness.decide(
         beat, now, state,
         # 기동 스크립트가 도는 중이면 판정을 보류한다 — 안 그러면 기동이 서로를 덮어쓴다.
         starting=liveness.startup_in_progress(liveness.startup_marker_path(LOG_DIR), now),
+        ingest_minutes_recent=ingest,
     )
 
     # 2026-08-12 Fix#8 — **판정했다는 사실 자체를 남긴다.** 로그보다 먼저, 그리고 IDLE에도 쓴다:
@@ -155,7 +213,12 @@ def main() -> None:
             _log(f"{stamp} OK — {decision.detail}")
         return
 
-    message = f"관측 루프 생존 신호 이상({decision.reason}) — {decision.detail}"
+    if decision.action == liveness.ACTION_DEGRADED:
+        # **생존 신호 이상이 아니다** — 박동은 정상이고 적재만 끊겼다. 문구를 갈라 두지 않으면
+        # 다음날 로그를 읽는 사람이 08-14의 「살아 있는데 비어 있다」를 죽음으로 오독한다.
+        message = f"관측 루프 적재 정지({decision.reason}) — {decision.detail}"
+    else:
+        message = f"관측 루프 생존 신호 이상({decision.reason}) — {decision.detail}"
     _log(f"{stamp} {decision.action.upper()} — {message}")
 
     if decision.action == liveness.ACTION_RESTART:

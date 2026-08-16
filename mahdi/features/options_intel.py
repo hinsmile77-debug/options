@@ -61,6 +61,60 @@ LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE = (
     "탐색 그리드(스팟 ±%.0f%%)가 레그 범위 밖에서 주운 부호 전환이다"
 )
 
+# ===== 2026-08-13 §5 / 고도화 1 — **만기 당일 북은 계산을 시도하지 않는다** =====
+#
+# 08-13 WARNING 703건 중 **383건(54.5%)**이 09:01:10~15:23:10 매분 1건씩 찍힌 같은 문장이었다:
+# 「감마플립 산출 불가 — BS 계산 가능 레그 0개」. 내용은 **설계상 당연한 사실**이다 —
+# 그날 먼슬리는 만기 당일이라 잔존만기가 0이고, Black-Scholes는 t=0에서 정의되지 않는다.
+#
+# 경고 채널의 절반이 「알고 있는 사실」로 차 있으면 **진짜 이상이 그 안에 묻힌다.**
+#
+# ## 레벨만 내리지 않는다
+#
+# 2026-08-04에 「느린 REST 호출」을 WARNING → INFO로 내렸다가 집계 정규식이 통째로 눈이 멀어
+# **362건이 0건으로 보고된** 사고가 있다. 그래서 여기서는 세 가지를 함께 한다:
+#
+#   1. 만기 당일 북은 **계산 시도 전에** 제외한다(경고를 억누르는 것이 아니라 일을 안 하는 것).
+#   2. 제외 사실을 **하루 1회 INFO**로 남긴다 — 매분이 아니라 그 북에 대해 한 번.
+#   3. 제외한 북 수를 **지표로 내보낸다**(`excluded_expiring_books`) — 0건이 「계측이 없다」가
+#      아니라 「제외할 북이 없었다」임을 증명하기 위해서다(규약 C).
+#
+# 셋 중 3번이 핵심이다. 1·2번만 하면 이 사건은 그냥 조용해지고, 조용해진 것과 사라진 것을
+# 다음 사람이 구분할 수 없다.
+LOG_EXPIRING_BOOK_EXCLUDED = (
+    "만기 당일 북 제외 — 잔존만기 0인 레그 %d개(만기 %s), 감마플립 미산출. "
+    "설계상 당연하며 이상이 아니다(BS는 t=0에서 정의되지 않는다)"
+)
+
+# 「하루 1회」의 상태. 키는 (기준일, 만기일)이라 **날이 바뀌면 자동으로 다시 한 번 찍힌다.**
+# 프로세스가 하루 단위라 무한히 자라지 않는다(하루에 북 3개 = 최대 3개 항목).
+_expiring_book_logged: set[tuple[date, date | None]] = set()
+
+# 그날 제외한 만기일들. 지표(`gamma_flip.excluded_expiring_books`)의 원천이다.
+_excluded_expiries: dict[date, set[date | None]] = {}
+
+
+def note_expiring_book(today: date, expiry: date | None, leg_count: int) -> None:
+    """만기 당일 북을 제외했다는 사실을 **하루 1회** 남기고 지표에 센다.
+
+    호출측(`find_gamma_flip`)이 이미 「쓸 수 있는 레그가 하나도 없다」를 확인한 뒤에 부른다 —
+    이 함수는 판정하지 않고 기록만 한다.
+    """
+    _excluded_expiries.setdefault(today, set()).add(expiry)
+    key = (today, expiry)
+    if key in _expiring_book_logged:
+        return
+    _expiring_book_logged.add(key)
+    logger.info(LOG_EXPIRING_BOOK_EXCLUDED, leg_count, expiry or "미상")
+
+
+def excluded_expiring_books(today: date) -> int:
+    """반환: 그날 감마플립 대상에서 제외한 **북 수**. 제외가 없었으면 0.
+
+    **0은 「계측이 없다」가 아니다** — 이 함수가 있는 한 0은 「제외할 북이 없었다」이다.
+    """
+    return len(_excluded_expiries.get(today, ()))
+
 
 @dataclass(frozen=True, slots=True)
 class OptionLeg:
@@ -360,6 +414,9 @@ def find_gamma_flip(
     risk_free_rate: float = 0.035,
     search_pct: float = 0.05,
     steps: int = 41,
+    *,
+    today: date | None = None,
+    expiry: date | None = None,
 ) -> float | None:
     """
     GEX 부호가 바뀌는 기초자산 레벨(Gamma Flip) — 이탈 시 urgency 모드.
@@ -387,12 +444,22 @@ def find_gamma_flip(
     """
     usable = [leg for leg in legs if usable_for_black_scholes(leg)]
     if len(usable) < GAMMA_FLIP_MIN_LEGS:
+        expiring = sum(1 for leg in legs if leg.t_years <= 0)
+        # 2026-08-13 고도화 1 — **북 전체가 만기 당일이면 그것은 이상이 아니다.**
+        # 상세 근거는 `LOG_EXPIRING_BOOK_EXCLUDED` 주석. 조건을 「전부」로 좁게 잡는 이유:
+        # 일부만 t=0인 상황(북이 섞였다)은 여전히 진짜 이상이고, 그건 아래 WARNING이 잡아야 한다.
+        # `today`가 없으면 종전 경로를 그대로 탄다 — 「하루 1회」의 키를 만들 수 없는데
+        # 조용히 넘기면 그 호출측은 영원히 아무 기록도 안 남기게 된다(백테스트·단위 테스트가
+        # 그 경우다). **모르면 시끄러운 쪽으로 넘어진다.**
+        if today is not None and legs and expiring == len(legs):
+            note_expiring_book(today, expiry, expiring)
+            return None
         logger.warning(
             "감마플립 산출 불가 — BS 계산 가능 레그 %d개(전체 %d개, 최소 %d 필요). "
             "iv=0 %d개 / 잔존만기<=0 %d개",
             len(usable), len(legs), GAMMA_FLIP_MIN_LEGS,
             sum(1 for leg in legs if leg.iv <= 0),
-            sum(1 for leg in legs if leg.t_years <= 0),
+            expiring,
         )
         return None
 

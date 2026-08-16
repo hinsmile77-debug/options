@@ -267,6 +267,14 @@ _QUALITATIVE_MARKERS = {
     # 포맷 원본: `mahdi.main.LOG_EVENT_CALENDAR_NOT_COVERED`
     # (계약은 tests/test_ops_log_metrics_contract.py가 지킨다 — 이 모듈은 순수 파서로 남긴다.)
     "event_calendar_not_covered": "이벤트 캘린더 미기입",
+    # 2026-08-13 §5 / 고도화 1 — 만기 당일 북을 감마플립 대상에서 제외한 사실.
+    # **하루 1회 INFO**라(`options_intel.note_expiring_book`) 건수가 곧 「제외한 북 수」다.
+    #
+    # 여기 등록하는 것이 이 고도화의 핵심이다. 제외만 하고 이 줄이 없으면 08-13의 383건이
+    # 그냥 **사라지고**, 사라진 것과 「그날은 만기일이 아니었다」를 다음 사람이 구분할 수 없다 —
+    # 2026-08-04에 WARNING→INFO 강등으로 362건이 0건으로 보고된 사고와 같은 실패 모드다.
+    # 포맷 원본: `mahdi.features.options_intel.LOG_EXPIRING_BOOK_EXCLUDED`
+    "excluded_expiring_books": "만기 당일 북 제외",
     # 2026-08-05(§2-5) — 감마플립이 수집 행사가 범위 밖이라 기각된 건수.
     # **이 값이 0이라고 안심하지 말 것**: 0은 "기각할 것이 없었다"이지 "flip이 잘 나온다"가
     # 아니다. 반드시 §14의 `gamma_flip_out_of_range_count`(DB 기준 불변식)와 나란히 읽는다 —
@@ -618,6 +626,10 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             cycles.append(
                 {
                     "start": end - (rest + db_s + state_s + other_s),
+                    # 2026-08-14 장중 §3 / 고도화 2 — **사이클이 끝난 초.** `start`는 파생값
+                    # (종료 − 소요 합)이라 반올림 오차가 있지만 이쪽은 로그 타임스탬프 그 자체다.
+                    # 위상은 이 값으로 재야 한다(§10 `poller_phase`와 같은 축).
+                    "end": end,
                     "rest": rest,
                     "db": db_s,
                     "rows": int(m.group(10)),
@@ -883,6 +895,33 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
 #   판단 입력이다). 총량 축소보다 손실이 작은 순서로 가는 것이 2026-07-31 결정의 원칙이다.
 REST_LATENCY_P95_WARN_SECONDS = 2.5
 
+# ===== 2026-08-14 §2-2 / Fix#3 — **절벽을 만드는 것은 p95가 아니라 p50과 타임아웃의 교차다** =====
+#
+# 08-14 14:00~15:23 옵션체인이 84분 연속 전멸했다. 그 구간의 REST 수집 시간은 평균 49.9초로
+# 12·13시보다 **오히려 낮았다** — 느려진 것이 아니라 비어 있었다. 원인은 `inquire-price`의
+# **p50이 4.05초**가 되어 전역 read timeout **4.0초**를 추월한 것이다. 중앙값 호출이
+# 타임아웃되면 20레그 순차 수집의 기대 성공 수는 0에 수렴하고, 재시도도 같은 벽에 부딪힌다.
+#
+# **p95 임계(2.5초)로는 이것을 예고하지 못했다.** 그날 p95는 09시부터 종일 붉었고, 그 상태로
+# 다섯 시간 동안 아무 일도 없었다. 열화는 연속량이 아니라 **임계 현상**이다 —
+# 임계를 재려면 임계값과 관측값을 **같은 줄에** 놓아야 한다.
+#
+# 0.8의 근거: 08-14 13:36 창의 p50이 3.08초 = 타임아웃의 **0.77배**였고, 그로부터 24분 뒤
+# 절벽이 왔다. 0.8을 넘는 순간은 "중앙값 호출이 타임아웃 한 뼘 앞"이라는 뜻이고, 그 뒤로는
+# 분포가 조금만 밀려도 절반이 죽는다. **하루 전 실측에 맞춘 값이 아니라 절벽 앞의 여유폭이다.**
+REST_LATENCY_P50_TIMEOUT_RATIO_WARN = 0.8
+
+# 전역 HTTP read 타임아웃의 **복제본**이다(`mahdi/broker/rest_client._HTTP_READ_TIMEOUT_SECONDS`).
+#
+# 이 모듈은 순수 텍스트 파서라 `mahdi.broker`를 임포트하지 않는다 — `PRIORITY_SERIES_LABEL`과
+# 같은 규약이고, 같은 이유로 **계약 테스트가 두 값의 일치를 강제한다**
+# (`tests/test_ops_log_metrics_contract.py`). 복제 자체가 위험한 게 아니라 복제가 조용히
+# 갈라지는 것이 위험하고, 그것은 테스트로 막는 편이 임포트보다 싸다.
+#
+# 레버(`OPTION_CHAIN_READ_TIMEOUT_SECONDS`)가 켜진 날은 옵션체인만 값이 다르다 —
+# 그때는 리포트가 레버 값을 넘겨받아 쓴다(`report._render_rest_latency`).
+GLOBAL_HTTP_READ_TIMEOUT_SECONDS = 4.0
+
 
 def _rest_latency_metrics(windows: list[dict]) -> dict:
     """
@@ -920,11 +959,20 @@ def _rest_latency_metrics(windows: list[dict]) -> dict:
     }
 
     grid: dict[str, dict[str, float]] = collections.defaultdict(dict)
+    # 2026-08-14 Fix#3 — p50 격자를 **p95와 같은 방식으로** 함께 낸다. 해석(타임아웃과의
+    # 교차)은 리포트가 하고, 여기서는 값만 만든다 — 이 모듈은 판정하지 않는다.
+    grid_p50: dict[str, dict[str, float]] = collections.defaultdict(dict)
     hourly: dict[tuple[int, str], list[dict]] = collections.defaultdict(list)
     for w in windows:
         hourly[(int(w["at"] // 3600), w["endpoint"])].append(w)
+    # 시간대 **안에서 가장 나빴던 창**. 가중평균과 반드시 함께 낸다 — 평균은 절벽을 눌러 없앤다:
+    # 08-14 13시의 가중평균 p50은 2.18초(비율 0.55 — 조용하다)인데 그 시간대의 창 최대는
+    # 3.53초(**0.88** — 경고선 초과)였고, **그 20~60분 뒤에 절벽이 왔다.** 평균만 보면 선행 신호가 사라진다.
+    grid_p50_max: dict[str, dict[str, float]] = collections.defaultdict(dict)
     for (hour, endpoint), items in hourly.items():
         grid[str(hour)][endpoint] = weighted(items, "p95")
+        grid_p50[str(hour)][endpoint] = weighted(items, "p50")
+        grid_p50_max[str(hour)][endpoint] = round(max(i["p50"] for i in items), 3)
 
     warnings = [
         {"hour": hour, "endpoint": endpoint, "p95": p95}
@@ -935,7 +983,15 @@ def _rest_latency_metrics(windows: list[dict]) -> dict:
     return {
         "endpoints": endpoints,
         "p95_by_hour": {h: dict(sorted(row.items())) for h, row in sorted(grid.items(), key=lambda kv: int(kv[0]))},
+        "p50_by_hour": {
+            h: dict(sorted(row.items())) for h, row in sorted(grid_p50.items(), key=lambda kv: int(kv[0]))
+        },
+        "p50_max_by_hour": {
+            h: dict(sorted(row.items())) for h, row in sorted(grid_p50_max.items(), key=lambda kv: int(kv[0]))
+        },
         "p95_warn_threshold": REST_LATENCY_P95_WARN_SECONDS,
+        "p50_timeout_ratio_warn": REST_LATENCY_P50_TIMEOUT_RATIO_WARN,
+        "global_read_timeout_seconds": GLOBAL_HTTP_READ_TIMEOUT_SECONDS,
         "warnings": warnings,
     }
 
@@ -1015,6 +1071,16 @@ def _cycle_metrics(
                 "over_60s": sum(1 for x in r if x > 60),
                 "slip_max": round(max(c["slip"] for c in group), 1),
                 "foreign_sum": sum(c["foreign"] for c in group),
+                # 2026-08-14 장중 §3 / 고도화 2 — **위상 이동을 사고가 아니라 지표로.**
+                #
+                # 사이클이 분 안의 몇 초에 끝나는가. 08-14는 07·08시 :19 → 09시 :25 → 10시 :30
+                # → 11시 :45 → 12시 :50으로 밀렸고, 그 곡선 위에 **예산 초과 138건 · 조기 포기
+                # 26건 · 전멸 86분이 전부 올라앉아 있었다.** 지금까지 우리는 그 세 결과를 각각
+                # 세면서 공통 원인인 이 한 줄은 안 쟀다.
+                #
+                # 평균이 아니라 중앙값인 이유: 밀린 사이클 한 건이 60초를 넘기면 평균이 다음 분으로
+                # 넘어가 위상이 **거꾸로 돌아간 것처럼** 보인다(:55 → :05). 중앙값은 안 흔들린다.
+                "end_second_median": round(statistics.median(c["end"] % 60 for c in group), 1),
             }
         )
 

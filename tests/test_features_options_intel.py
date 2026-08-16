@@ -1,9 +1,11 @@
 import contextlib
 import io
+import logging
 from datetime import date, time
 
 import pytest
 
+from mahdi.features import options_intel
 from mahdi.features.options_intel import (
     GammaMapEngine,
     OptionLeg,
@@ -540,3 +542,79 @@ def test_atm_straddle_vrp_sign_maps_to_palette_columns():
     assert _vrp_state(overpriced, 0.02) == "overpriced"
     assert _vrp_state(underpriced, 0.02) == "underpriced"
     assert _vrp_state(fair, 0.02) == "fair"
+
+
+# ===== 만기 당일 북 제외 (2026-08-13 §5 / 고도화 1) =====
+#
+# 08-13 WARNING 703건 중 383건(54.5%)이 「감마플립 산출 불가」 한 문장이었다. 내용은 설계상
+# 당연한 사실이고(만기 당일 북은 t=0이라 BS가 정의되지 않는다), 경고 채널의 절반이 그것으로
+# 차 있으면 진짜 이상이 묻힌다.
+
+
+def _expired_book(today):
+    """잔존만기가 정확히 0인 6레그 — 만기 당일 먼슬리의 모양이다."""
+    return options_intel.legs_from_chain_rows(
+        [{"strike": k, "option_type": t, "oi": 100, "iv": 0.18, "gamma": 0.02, "expiry": today}
+         for k in (345.0, 350.0, 355.0) for t in ("C", "P")],
+        today,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_expiring_state():
+    options_intel._expiring_book_logged.clear()
+    options_intel._excluded_expiries.clear()
+    yield
+    options_intel._expiring_book_logged.clear()
+    options_intel._excluded_expiries.clear()
+
+
+def test_an_expiring_book_is_logged_once_a_day_not_once_a_minute(caplog):
+    today = date(2026, 8, 13)
+    legs = _expired_book(today)
+
+    with caplog.at_level(logging.INFO, logger="mahdi.features.options_intel"):
+        for _minute in range(383):   # 08-13에 실제로 찍힌 횟수
+            assert options_intel.find_gamma_flip(legs, 350.0, today=today, expiry=today) is None
+
+    records = [r for r in caplog.records if "만기 당일 북 제외" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    # **경고는 한 건도 나오면 안 된다** — 그것이 이 고도화의 전부다.
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_the_exclusion_is_counted_so_zero_is_not_a_measurement_gap():
+    """규약 C — 「0건」이 「제외할 북이 없었다」임을 증명하는 것이 이 카운터의 존재 이유다."""
+    today = date(2026, 8, 13)
+    assert options_intel.excluded_expiring_books(today) == 0
+
+    options_intel.find_gamma_flip(_expired_book(today), 350.0, today=today, expiry=today)
+
+    assert options_intel.excluded_expiring_books(today) == 1
+    assert options_intel.excluded_expiring_books(date(2026, 8, 14)) == 0   # 날이 다르면 따로 센다
+
+
+def test_a_partially_expired_book_still_warns(caplog):
+    """일부만 t=0인 것은 **북이 섞였다**는 뜻이고 그건 여전히 진짜 이상이다."""
+    today = date(2026, 8, 13)
+    mixed = _expired_book(today) + options_intel.legs_from_chain_rows(
+        [{"strike": 350.0, "option_type": "C", "oi": 100, "iv": 0.18, "gamma": 0.02,
+          "expiry": date(2026, 9, 10)}],
+        today,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.features.options_intel"):
+        options_intel.find_gamma_flip(mixed, 350.0, today=today, expiry=today)
+
+    assert [r for r in caplog.records if "감마플립 산출 불가" in r.getMessage()]
+
+
+def test_without_a_date_the_old_noisy_path_is_kept(caplog):
+    """모르면 시끄러운 쪽으로 넘어진다 — 조용히 넘기면 그 호출측은 영원히 기록을 안 남긴다."""
+    today = date(2026, 8, 13)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.features.options_intel"):
+        options_intel.find_gamma_flip(_expired_book(today), 350.0)
+
+    assert [r for r in caplog.records if "감마플립 산출 불가" in r.getMessage()]

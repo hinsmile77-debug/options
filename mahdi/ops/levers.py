@@ -139,6 +139,23 @@ def collect(project_root: Path | None = None) -> dict:
     return {"levers": levers, "git_head": _git_head(project_root)}
 
 
+def lever_value(levers: dict | None, key: str) -> Any:
+    """반환: 그 레버의 **현재 값**. 못 읽었거나 미등록이면 None.
+
+    `lever_state()`가 「켜졌는가」에 답한다면 이쪽은 「무슨 값이었는가」에 답한다 —
+    2026-08-14 Fix#3이 `OPTION_CHAIN_READ_TIMEOUT_SECONDS`의 실제 값을 필요로 하면서 생겼다.
+    p50과 비교할 임계는 **그날 실제로 걸려 있던 타임아웃**이어야 하고, 그것은 레버가 켜진 날
+    전역값(4.0초)과 다르다.
+
+    ⚠ 여기서도 `None`을 기본값으로 접지 않는다 — 이 레버는 **꺼진 상태의 값 자체가 `None`**
+    (= 전역값 사용)이라, 「모른다」와 「꺼져 있었다」가 같은 표현이 된다. 호출측이 폴백을 정한다.
+    """
+    for lever in (levers or {}).get("levers", []):
+        if lever.get("key") == key:
+            return lever.get("value")
+    return None
+
+
 def lever_state(levers: dict | None, key: str) -> bool | None:
     """반환: 그 레버가 켜져 있었는가. 모르면(집계 없음/못 읽음/미등록) None.
 

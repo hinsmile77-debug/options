@@ -187,9 +187,9 @@ def test_repository_hypotheses_file_is_valid_and_uses_resolvable_metric_paths():
         # 08-03 p4가 그랬다 — fix 커밋 07:45, 관측 루프 기동 07:30으로 15분 차이였다.
         # 이걸 `refuted`로 적으면 멀쩡한 fix를 되돌리게 되고, `pending`으로 두면 "검증했는데
         # 아직 판단 못 함"과 섞인다. 세 번째 상태가 필요하다.
-        assert str(entry.get("상태")).lower() in {
-            "pending", "confirmed", "refuted", "inconclusive", "untested"
-        }
+        # 2026-08-14 고도화 4 — 어휘의 출처는 `hypotheses.STATUSES` **하나**다.
+        # 여기에 집합을 다시 적으면 새 상태가 추가된 날 이 테스트가 그것을 「오타」로 잡는다.
+        assert str(entry.get("상태")).lower() in hypotheses.STATUSES
         for prediction in entry["예측"]:
             assert "metric" in prediction and "expect" in prediction
 
@@ -580,3 +580,96 @@ def test_repo_pending_hypotheses_obey_the_normalized_claim_rule():
         "주장 지표를 절대 건수 부등식으로 걸었다 — 그 건수를 만드는 구조 변수(관측 길이·북 수·"
         f"스팟 이동거리)가 바뀌면 멀쩡한 fix가 반증으로 찍힌다: {offenders}"
     )
+
+
+# ===== 무조건발동일 (2026-08-13 고도화 4 + 2026-08-14 고도화 5) =====
+#
+# 레버 F는 세 번 「오늘 켤 것」으로 지정되고 세 번 다 안 켜졌다. 레버 E는 일곱 번 미뤄졌고
+# 열 번 중 한 번도 「안 켜기로 했다」고 적힌 적이 없다 — 전부 아침에 잊은 것이다.
+# 경고만으로는 세 번 실패했으므로, **강제력은 이 테스트가 갖는다.**
+
+
+def _levers(**state):
+    return {"levers": [
+        {"key": k, "위치": "테스트", "value": v, "default": False, "on": v}
+        for k, v in state.items()
+    ]}
+
+
+def test_a_passed_deadline_with_the_lever_still_off_is_a_breach():
+    entries = [{"id": "eE", "전제레버": "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS",
+                "무조건발동일": "2026-08-18", "유예횟수": 7}]
+
+    breaches = hypotheses.lever_deadline_breaches(
+        entries, date(2026, 8, 19), _levers(OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS=False)
+    )
+
+    assert len(breaches) == 1
+    assert breaches[0]["지난일수"] == 1
+    assert breaches[0]["유예횟수"] == 7
+
+
+def test_the_deadline_is_silent_before_it_arrives_and_after_the_lever_is_on():
+    entries = [{"id": "eE", "전제레버": "L", "무조건발동일": "2026-08-18"}]
+    assert hypotheses.lever_deadline_breaches(entries, date(2026, 8, 17), _levers(L=False)) == []
+    assert hypotheses.lever_deadline_breaches(entries, date(2026, 8, 19), _levers(L=True)) == []
+
+
+def test_an_unreadable_lever_is_not_counted_as_a_breach():
+    """「꺼져 있었다」와 「못 읽었다」의 조치가 다르다 — 후자로 테스트를 깨면 그 실패는 곧 무시된다."""
+    entries = [{"id": "eE", "전제레버": "이름이_틀린_레버", "무조건발동일": "2026-08-18"}]
+    assert hypotheses.lever_deadline_breaches(entries, date(2026, 8, 19), _levers(L=False)) == []
+
+
+def test_levers_due_today_fires_only_on_the_named_day():
+    entries = [{"id": "eF", "전제레버": "L", "발동일": "2026-08-17"}]
+    assert hypotheses.levers_due_today(entries, date(2026, 8, 17), _levers(L=False))
+    assert hypotheses.levers_due_today(entries, date(2026, 8, 18), _levers(L=False)) == []
+    assert hypotheses.levers_due_today(entries, date(2026, 8, 17), _levers(L=True)) == []
+
+
+def test_repo_levers_have_not_blown_their_unconditional_deadline():
+    """**이 테스트가 이 장치의 전부다.**
+
+    `무조건발동일`이 지났는데 레버가 꺼져 있으면 여기서 빨간불이 뜬다. 고치는 길은 둘뿐이고
+    **둘 다 사람의 한 줄이면 끝난다**:
+
+        (a) 레버를 켠다 — 그날 아침 기동 전에.
+        (b) 날짜를 옮기고 **유예 사유를 문자로 적는다** — 그것이 규약이 요구한 전부다.
+
+    자동으로 켜지 않는 이유는 `scripts/check_lever_due.py` docstring 참고(결정 7).
+    """
+    from mahdi.ops import levers as levers_module
+
+    entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
+    breaches = hypotheses.lever_deadline_breaches(
+        entries, date.today(), levers_module.collect(PROJECT_ROOT)
+    )
+
+    assert not breaches, (
+        "무조건발동일이 지났는데 레버가 꺼져 있다: "
+        + "; ".join(
+            f"{b['id']}(기한 {b['무조건발동일']}, {b['지난일수']}일 지남, 꺼진 레버 {b['off']})"
+            for b in breaches
+        )
+        + " — 켜거나, 날짜를 옮기고 유예 사유를 yaml에 적을 것"
+    )
+
+
+# ===== mechanism_differed (2026-08-14 §5 / 고도화 4) =====
+
+
+def test_mechanism_differed_is_a_closed_state_not_a_pending_one():
+    """08-14 장중 외삽이 이 형태였다 — 방향은 맞고 기제가 달랐다.
+
+    `확인`으로 닫으면 틀린 기제가 살아남고 `반증`으로 닫으면 맞은 방향이 죽는다.
+    닫힌 상태이므로 평가기가 더 이상 매일 인쇄하지 않아야 한다.
+    """
+    entry = _entry(상태=hypotheses.STATUS_MECHANISM_DIFFERED)
+    assert hypotheses.evaluate([entry], date(2026, 8, 20), _METRICS) == []
+
+
+def test_the_status_vocabulary_has_a_single_source():
+    """어휘를 두 곳에 적으면 한쪽이 뒤처지고, 그때 새 상태는 「오타」로 판정된다."""
+    assert hypotheses.STATUS_MECHANISM_DIFFERED in hypotheses.STATUSES
+    assert {"pending", "confirmed", "refuted", "inconclusive", "untested"} <= hypotheses.STATUSES

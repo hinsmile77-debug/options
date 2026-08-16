@@ -9,7 +9,7 @@ from datetime import date
 
 import pytest
 
-from mahdi.ops import report
+from mahdi.ops import db_metrics, log_metrics, report
 
 _TODAY = {
     "date": "2026-08-03",
@@ -652,3 +652,216 @@ def test_member_sign_agreement_delta_is_blank_without_yesterday():
         if line.startswith("| flow_position ↔")
     )
     assert row.split("|")[5].strip() == "—"
+
+
+# ===== 최장 연속 0행 구간 (2026-08-14 §2-1 / Fix#3) =====
+
+
+def _coverage(zero_minutes, run):
+    return {
+        "available": True, "span_minutes": 493, "minutes_with_rows": 407,
+        "zero_row_minutes": zero_minutes, "zero_row_count": len(zero_minutes),
+        "zero_row_longest_run": run,
+        "zero_row_run_alert_minutes": db_metrics.ZERO_ROW_RUN_ALERT_MINUTES,
+        "over_design_count": 0, "over_design_minutes": [],
+    }
+
+
+def test_a_long_zero_row_run_is_shouted_not_just_counted():
+    """08-14 재현 — 「0행 86분」만으로는 흩어진 날과 무너진 날이 구별되지 않는다."""
+    text = "\n".join(report._render_zero_row_run(
+        _coverage(["14:33"], {"length": 51, "start": "14:33", "end": "15:23"})
+    ))
+
+    assert "51분" in text and "14:33~15:23" in text
+    assert "⛔" in text
+    assert "판단이 감마 지형 없이 간 시간" in text
+
+
+def test_a_short_zero_row_run_is_reported_without_an_alarm():
+    """평시 딸꾹질까지 붉게 하면 그 표시는 곧 무시된다."""
+    text = "\n".join(report._render_zero_row_run(
+        _coverage(["13:30", "13:31"], {"length": 2, "start": "13:30", "end": "13:31"})
+    ))
+
+    assert "2분" in text
+    assert "⛔" not in text
+
+
+def test_a_legacy_coverage_says_unmeasurable_not_zero():
+    """규약 C — 키가 없는 날을 「연속 0분」으로 인쇄하면 그 0이 증거처럼 읽힌다."""
+    coverage = _coverage(["13:30"], None)
+    coverage.pop("zero_row_longest_run")
+    assert "측정 불가" in "\n".join(report._render_zero_row_run(coverage))
+
+
+# ===== p50 × read timeout 교차 (2026-08-14 §2-2 / Fix#3) =====
+
+
+def _latency_metrics(p50_by_hour):
+    return {
+        "endpoints": {}, "p95_by_hour": {}, "p50_by_hour": p50_by_hour,
+        "p95_warn_threshold": log_metrics.REST_LATENCY_P95_WARN_SECONDS,
+        "p50_timeout_ratio_warn": log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN,
+        "global_read_timeout_seconds": log_metrics.GLOBAL_HTTP_READ_TIMEOUT_SECONDS,
+        "warnings": [],
+    }
+
+
+def test_the_p50_timeout_crossing_is_shouted():
+    """08-14 14시 재현 — 중앙값 호출이 타임아웃을 넘으면 수집은 느려지지 않고 **비어 버린다**."""
+    lat = _latency_metrics({"13": {"inquire-price": 3.08}, "14": {"inquire-price": 4.05}})
+
+    text = "\n".join(report._render_p50_timeout_cross({}, lat))
+
+    assert "1.01" in text          # 4.05 / 4.00
+    assert "0.77" in text          # 13시 — 절벽 24분 전에 이미 경고선을 넘었다
+    assert "⛔" in text
+    assert "최장 연속 0행 구간" in text
+
+
+def test_the_window_max_wins_over_the_hourly_average():
+    """**평균은 절벽을 눌러 없앤다.** 08-14 13시가 정확히 그 형태였다.
+
+    가중평균 2.18초(비율 0.55)만 보면 조용한 시간대인데, 그 안의 창 최대는 3.53초(0.88)로
+    이미 경고선을 넘었고 그 20~60분 뒤 84분 전멸이 시작됐다. 판정은 최대로 해야 한다.
+    """
+    lat = _latency_metrics({"13": {"inquire-price": 2.18}})
+    lat["p50_max_by_hour"] = {"13": {"inquire-price": 3.53}}
+
+    text = "\n".join(report._render_p50_timeout_cross({}, lat))
+
+    assert "0.88" in text and "⚠" in text
+    assert "2.18" in text and "3.53" in text   # 두 값을 **함께** 보여 준다
+
+
+def test_the_crossing_uses_the_lever_value_when_the_lever_is_on():
+    """레버가 켜진 날 전역값(4.0)으로 비교하면 이 표가 통째로 거짓말을 한다."""
+    lat = _latency_metrics({"14": {"inquire-price": 4.05}})
+    metrics = {"levers": {"levers": [
+        {"key": "OPTION_CHAIN_READ_TIMEOUT_SECONDS", "value": 6.0, "default": None, "on": True},
+    ]}}
+
+    text = "\n".join(report._render_p50_timeout_cross(metrics, lat))
+
+    assert "6.00" in text
+    assert "⛔" not in text        # 4.05 / 6.0 = 0.68 — 절벽이 아니다
+    assert "레버" in text
+
+
+def test_a_calm_day_says_so_explicitly():
+    lat = _latency_metrics({"10": {"inquire-price": 0.03}})
+    assert "✅" in "\n".join(report._render_p50_timeout_cross({}, lat))
+
+
+def test_the_hourly_table_carries_yesterdays_same_hour():
+    """08-14 장중 §3 — 단독으로 보면 「12시 47.2초」는 어제의 29.2초와 구별되지 않는다."""
+    metrics = {"cycles": {"by_hour": [
+        {"hour": 12, "cycles": 60, "rest_mean": 47.2, "rest_max": 52.3,
+         "over_60s": 0, "slip_max": 0.0, "foreign_sum": 6},
+    ]}}
+    previous = {"cycles": {"by_hour": [
+        {"hour": 12, "cycles": 60, "rest_mean": 29.2, "rest_max": 33.0,
+         "over_60s": 0, "slip_max": 0.0, "foreign_sum": 4},
+    ]}}
+
+    text = "\n".join(report._render_by_hour(metrics, previous))
+
+    assert "29.2 (+18.0)" in text
+    assert "같은 시간대" in text
+
+
+def test_the_hourly_table_does_not_invent_a_delta_without_yesterday():
+    metrics = {"cycles": {"by_hour": [
+        {"hour": 12, "cycles": 60, "rest_mean": 47.2, "rest_max": 52.3,
+         "over_60s": 0, "slip_max": 0.0, "foreign_sum": 6},
+    ]}}
+    row = next(line for line in report._render_by_hour(metrics, None) if line.startswith("| 12시"))
+    assert row.split("|")[4].strip() == "—"
+
+
+# ===== §1 판단 입력 3행 (2026-08-14 §1 / 고도화 1) =====
+
+
+def _judgement_input_db(**overrides):
+    db = {
+        "monthly_coverage": {"coverage_pct": 82.6},
+        "signal_reach": {"gex_input_missing_minutes": 78},
+        "chain_minute_coverage": {"zero_row_longest_run": {"length": 51}},
+    }
+    db.update(overrides)
+    return db
+
+
+def test_headline_puts_judgement_inputs_beside_the_green_infrastructure():
+    """08-14 재현 — 인프라가 전부 초록인 채로 판단 입력의 5분의 1이 사라질 수 있다."""
+    text = "\n".join(report._render_headline(_TODAY, None, _judgement_input_db()))
+
+    assert "82.6%" in text and "78분" in text and "51분" in text
+    assert "판단이 볼 것을 봤는가" in text
+
+
+def test_headline_judgement_inputs_carry_the_previous_day_delta():
+    previous = {
+        "date": "2026-08-13",
+        **_TODAY,
+        "db": _judgement_input_db(
+            monthly_coverage={"coverage_pct": 96.4},
+            signal_reach={"gex_input_missing_minutes": 4},
+        ),
+    }
+
+    text = "\n".join(report._render_headline(_TODAY, previous, _judgement_input_db()))
+
+    assert "96.4%" in text            # 전일 열
+    assert "▼13.8" in text or "▼13.80" in text
+
+
+def test_headline_omits_a_judgement_row_it_cannot_measure():
+    """규약 C — 「82.6%」 자리에 「—」를 그리면 그 대시가 「나쁘지 않았다」로 읽힌다."""
+    db = _judgement_input_db()
+    db.pop("signal_reach")
+
+    text = "\n".join(report._render_headline(_TODAY, None, db))
+
+    assert "82.6%" in text
+    assert "`db.signal_reach.gex_input_missing_minutes`" in text
+    assert "재지 않았다" in text
+
+
+def test_headline_says_nothing_was_measured_when_all_three_are_absent():
+    text = "\n".join(report._render_headline(_TODAY, None, {"tables": []}))
+    assert "판단 입력 3행이 이 집계에 없다" in text
+
+
+# ===== 위상 이동 (2026-08-14 장중 §3 / 고도화 2) =====
+
+
+def _hour_row(hour, phase, rest_mean=30.0):
+    return {"hour": hour, "cycles": 60, "rest_mean": rest_mean, "rest_max": rest_mean + 5,
+            "over_60s": 0, "slip_max": 0.0, "foreign_sum": 0, "end_second_median": phase}
+
+
+def test_phase_drift_is_shown_against_the_first_hour():
+    """08-14 재현 — :19에서 :50까지 31초 밀렸고, 그 곡선 위에 예산초과·컷·전멸이 다 올라앉았다."""
+    metrics = {"cycles": {"by_hour": [
+        _hour_row(7, 19.0), _hour_row(9, 25.0), _hour_row(12, 50.0),
+    ]}}
+
+    text = "\n".join(report._render_by_hour(metrics, None))
+
+    assert ":19.0 (+0초)" in text
+    assert ":50.0 (+31초)" in text
+    assert "사이클 종료 위상" in text
+    assert "공통 원인인 이 한 줄은 안 쟀다" in text
+
+
+def test_phase_column_is_a_dash_not_a_zero_on_legacy_metrics():
+    """규약 C — 「:00에 끝났다」와 「그 집계에는 이 값이 없다」는 다르다."""
+    metrics = {"cycles": {"by_hour": [{"hour": 9, "cycles": 60, "rest_mean": 30.0,
+                                       "rest_max": 35.0, "over_60s": 0, "slip_max": 0.0,
+                                       "foreign_sum": 0}]}}
+
+    row = next(line for line in report._render_by_hour(metrics, None) if line.startswith("| 09시"))
+
+    assert row.split("|")[7].strip() == "—"

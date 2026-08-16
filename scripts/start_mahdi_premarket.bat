@@ -112,6 +112,13 @@ move /y "%COCKPIT_LOG%" "%COCKPIT_LOG%.1" >nul
 
 :cockpit_log_rotate_skip
 
+REM 2026-08-14 고도화 5 — 오늘 발동일인 레버가 꺼진 채 뜨려는지 여기서 알린다.
+REM 설정은 기동 시 로드되므로 이 줄을 지나면 오늘 그 레버를 켤 창이 닫힌다.
+REM 이 점검은 기동을 막지 않는다(항상 종료 코드 0) — 상세 근거는 scripts\check_lever_due.py.
+REM 콘솔에 그대로 찍는다: 로그 파일로 보내면 아침에 아무도 안 본다.
+echo [%date% %time%] 레버 발동일 점검 >> "%LOG_FILE%"
+call uv run python scripts\check_lever_due.py
+
 echo [%date% %time%] COCKPIT 대시보드 실행 (새 창) >> "%LOG_FILE%"
 start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && uv run streamlit run mahdi/dashboard/app.py >> logs\cockpit.log 2>&1"
 

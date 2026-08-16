@@ -261,6 +261,58 @@ def observed_span_minutes(conn: ConnectionLike, target: date, underlying: str = 
     return int((row[1] - row[0]).total_seconds() // 60) + 1
 
 
+# 2026-08-14 §2-1 / Fix#3 — **흩어진 N분과 붙어 있는 N분은 완전히 다른 사건이다.**
+#
+# 08-14의 0행 분은 86분이고 그중 84분이 14:00~15:23에 **연속으로** 붙어 있었다. 그런데 그날
+# 자동 적신호가 낸 문장은 "ERROR 86건 / 2종"뿐이었다 — 하루에 흩어진 86분과 정규장 마지막
+# 80분을 통째로 삼킨 84분이 **같은 숫자로 인쇄된다.** 뒤쪽만 판단 입력을 죽인다.
+#
+# 임계 20분의 근거: 체인 신선도 창이 5분(`db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES`)이므로 6분을
+# 넘긴 시점부터 그 분의 판단은 체인을 **아예 못 본다**(`chain_input_source = none`). 20분이면
+# 그런 분이 15분 가까이 쌓였다는 뜻이고, 우연한 KIS 딸꾹질로는 잘 안 나오는 길이다
+# (08-14 이전 최장은 08-13의 2분이었다).
+ZERO_ROW_RUN_ALERT_MINUTES = 20
+
+
+def _longest_run(minutes: list[str]) -> dict | None:
+    """입력: `HH:MM` 문자열의 **오름차순** 목록. 반환: 가장 긴 연속 구간 `{length, start, end}`.
+
+    분 문자열을 정수로 되돌려 인접을 판정한다 — 문자열 비교로는 09:59와 10:00이 안 붙는다.
+
+    ## 한 분이라도 회복되면 구간은 **끊긴다**
+
+    08-14의 사람 보고서는 14:00~15:23을 「84분」으로 적었다(14:32 한 분만 행이 남았다).
+    이 함수는 같은 날을 **32분 + 51분**으로 가른다. 엄격해 보이지만 **이쪽이 맞다**:
+    체인 스냅샷 신선도 창이 5분이라(`db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES`) 14:32에 들어온 행은
+    그 뒤 5분간 판단에 실제로 실린다. 그 한 분은 진짜 회복이었다.
+
+    이 값이 재는 것은 「0행이 몇 분 이어졌는가」가 아니라 **「판단이 체인을 못 본 채로 몇 분을
+    갔는가」**이고, `ZERO_ROW_RUN_ALERT_MINUTES`도 그 뜻으로 정해져 있다.
+    """
+    if not minutes:
+        return None
+    def to_min(s: str) -> int:
+        return int(s[:2]) * 60 + int(s[3:])
+
+    cur_start = prev = best_start = to_min(minutes[0])
+    best_len = cur_len = 1
+    for label in minutes[1:]:
+        m = to_min(label)
+        if m == prev + 1:
+            cur_len += 1
+        else:
+            cur_start, cur_len = m, 1
+        if cur_len > best_len:
+            best_len, best_start = cur_len, cur_start
+        prev = m
+    last = best_start + best_len - 1
+    return {
+        "length": best_len,
+        "start": f"{best_start // 60:02d}:{best_start % 60:02d}",
+        "end": f"{last // 60:02d}:{last % 60:02d}",
+    }
+
+
 def chain_minute_coverage(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> dict:
     """
     입력: DB 커넥션, 대상 날짜.
@@ -306,12 +358,18 @@ def chain_minute_coverage(conn: ConnectionLike, target: date, underlying: str = 
         ") q WHERE n > %s ORDER BY t",
         (underlying, target, CHAIN_LEGS_PER_CYCLE_DESIGN),
     )
+    zero_minutes = [r[0] for r in missing]
     return {
         "available": True,
         "span_minutes": span,
         "minutes_with_rows": with_rows,
-        "zero_row_minutes": [r[0] for r in missing],
+        "zero_row_minutes": zero_minutes,
         "zero_row_count": len(missing),
+        # 2026-08-14 Fix#3 — 상세 근거는 `ZERO_ROW_RUN_ALERT_MINUTES` 주석.
+        # **없을 때는 `None`이 아니라 length 0**으로 둔다: 0행 분이 하나도 없는 날과
+        # 이 키가 없던 날(구버전)을 소비측이 갈라야 하기 때문이다(규약 C).
+        "zero_row_longest_run": _longest_run(zero_minutes) or {"length": 0, "start": None, "end": None},
+        "zero_row_run_alert_minutes": ZERO_ROW_RUN_ALERT_MINUTES,
         "over_design_minutes": [[r[0], int(r[1])] for r in over],
         "over_design_count": len(over),
     }

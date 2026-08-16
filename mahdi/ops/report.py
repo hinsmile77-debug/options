@@ -13,6 +13,8 @@ from typing import Any, Callable
 from mahdi.broker.rest_client import SLOW_CALL_LOG_THRESHOLD_SECONDS
 from mahdi.ops import db_metrics as db_metrics_module  # 임계를 리포트에 그대로 인용하기 위함
 from mahdi.ops import crosscheck
+from mahdi.ops import levers as levers_module  # 그날 실제로 걸려 있던 레버 값(2026-08-14 Fix#3)
+from mahdi.ops import log_metrics  # 임계 상수를 리포트에 그대로 인용하기 위함
 from mahdi.ops import hypotheses as hypotheses_module  # 역할 상수를 같은 곳에서 가져온다
 
 # 전일 대비 델타를 붙일 핵심 지표. (라벨, 지표 경로, 포맷, 개선 방향)
@@ -41,6 +43,25 @@ HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
     ("백오프 최대 배율", "backoff.max_multiplier", "{:.2f}배", "down"),
     ("느린 REST 호출", "slow_calls.count", "{:,.0f}건", "down"),
     ("사람이 읽는 로그 줄", "log_volume.human_lines", "{:,.0f}줄", "down"),
+]
+
+
+# ===== 2026-08-14 §1 / 고도화 1 — **판단 입력을 같은 화면에 올린다** =====
+#
+# 08-14의 §1은 밀림 0건 · 결손 0분 · 초당 수요 ▼0.082 ✅ · 적자 배율 ▲0.6 ✅ 를 인쇄했다.
+# 같은 날 GEX 입력이 **78분** 없었고 먼슬리 절대 커버리지는 **82.6%**(전날까지 95% 이상)였으며
+# 옵션체인이 51분 연속 비어 있었다. **§1만 읽으면 완벽한 하루로 보인다.**
+#
+# 위 `HEADLINE_METRICS`는 전부 «우리 인프라가 잘 돌았는가»를 잰다. 그것이 전부 초록인 채로
+# 판단 입력의 5분의 1이 사라질 수 있다는 것이 08-14의 발견이고, 그래서 아래 세 줄을
+# **같은 절에** 올린다 — 다른 절에 두면 그날처럼 아무도 겹쳐 읽지 않는다.
+#
+# 경로가 `db.`로 시작하지 않는 이유: 이 값들은 `db_metrics` dict에서 직접 꺼낸다.
+# 전일 값은 사이드카의 `db` 하위에 있으므로 조회할 때만 접두사를 붙인다.
+HEADLINE_DB_METRICS: list[tuple[str, str, str, str | None]] = [
+    ("**먼슬리 절대 커버리지**", "monthly_coverage.coverage_pct", "{:.1f}%", "up"),
+    ("**GEX 입력 없던 분**", "signal_reach.gex_input_missing_minutes", "{:,.0f}분", "down"),
+    ("**최장 연속 0행 구간**", "chain_minute_coverage.zero_row_longest_run.length", "{:,.0f}분", "down"),
 ]
 
 
@@ -163,8 +184,10 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     if hypotheses:
         lines += _section("0-1. 가설 검정 (구현 시점에 적어둔 예측 vs 오늘 실측)",
                           lambda: _render_hypotheses(hypotheses))
-    lines += _section("1. 한눈에 (전일 대비)", lambda: _render_headline(metrics, previous))
-    lines += _section("2. 시간대별 사이클/밀림", lambda: _render_by_hour(metrics))
+    lines += _section("1. 한눈에 (전일 대비) — 인프라와 **판단 입력**을 같은 화면에",
+                      lambda: _render_headline(metrics, previous, db_metrics))
+    lines += _section("2. 시간대별 사이클/밀림 (전일 같은 시간대 대비)",
+                      lambda: _render_by_hour(metrics, previous))
     lines += _section("3. 시작분 mod10 — 폴러 충돌", lambda: _render_by_mod10(metrics))
     lines += _section("4. 결손 분 — 로그 기준과 DB 기준", lambda: _render_missing(metrics, db_metrics))
     lines += _section("5. REST 수요/응답", lambda: _render_rest(metrics, db_metrics, previous))
@@ -247,6 +270,10 @@ def _render_watchdog(watchdog: dict) -> list[str]:
         ["재기동(RESTART)", _fmt(watchdog.get("restarts"), "{}")],
         ["재기동 실패 보고", _fmt(watchdog.get("restart_failures"), "{}")],
         ["상한 도달(ALERT_ONLY)", _fmt(watchdog.get("alert_only"), "{}")],
+        # 2026-08-14 Fix#2 — **재기동 건수와 같은 표에 두되 같은 줄에 섞지 않는다.**
+        # RESTART는 「조치했다」이고 DEGRADED는 「조치하지 않기로 했다」이다(원인이 KIS 쪽이면
+        # 재기동은 관측만 끊는다). 둘을 합치면 다음날 "워치독이 몇 번 개입했나"에 답할 수 없다.
+        ["적재 정지(DEGRADED)", _fmt(watchdog.get("degraded_checks"), "{}")],
         ["첫 판정 / 마지막 판정",
          f"{watchdog.get('first_at') or '—'} / {watchdog.get('last_at') or '—'}"],
         ["**최장 무판정 구간**",
@@ -258,6 +285,13 @@ def _render_watchdog(watchdog: dict) -> list[str]:
             "> ⛔ **그날 워치독이 한 줄도 안 남겼다** — 미등록이거나 통째로 안 돈 날이다. "
             "08-06~08-11에 6영업일 연속 그랬고 아무도 몰랐다(등록 절차는 "
             "`docs/dev_memory/CURRENT_STATE.md`)."
+        )
+    elif watchdog.get("degraded_checks"):
+        out.append(
+            f"> ⛔ **적재 정지 판정 {watchdog['degraded_checks']}건** — 관측 루프는 살아 있는데 "
+            "직전 10분 적재가 0분이었다. **재기동은 하지 않는다**(08-14의 원인은 KIS 지연이었고, "
+            "재기동은 아무것도 안 고치고 관측만 끊는다). §4의 「최장 연속 0행 구간」·§9-1의 "
+            "「p50 ÷ read timeout」과 함께 읽어 원인을 우리 쪽/KIS 쪽으로 가를 것."
         )
     elif silence is not None and silence > warn_at:
         out.append(
@@ -333,35 +367,111 @@ def _render_ws_disconnects(metrics: dict, db_metrics: dict | None) -> list[str]:
     return out
 
 
-def _render_headline(metrics: dict, previous: dict | None) -> list[str]:
+def _render_headline(metrics: dict, previous: dict | None, db_metrics: dict | None = None) -> list[str]:
     headers = ["지표", "오늘"]
     if previous:
         headers += [f"전일({previous.get('date', '?')})", "Δ"]
-    rows = []
-    for label, path, spec, direction in HEADLINE_METRICS:
-        value = dig(metrics, path)
-        row = [label, _fmt(value, spec)]
-        if previous:
-            prev_value = dig(previous, path)
-            row += [_fmt(prev_value, spec), _delta(value, prev_value, direction)]
-        rows.append(row)
-    out = _table(headers, rows)
+
+    def build_rows(source: dict | None, spec_list, prev_prefix: str):
+        out_rows = []
+        for label, path, spec, direction in spec_list:
+            value = dig(source or {}, path)
+            row = [label, _fmt(value, spec)]
+            if previous:
+                prev_value = dig(previous, prev_prefix + path)
+                row += [_fmt(prev_value, spec), _delta(value, prev_value, direction)]
+            out_rows.append(row)
+        return out_rows
+
+    out = _table(headers, build_rows(metrics, HEADLINE_METRICS, ""))
     if not previous:
         out += ["> 전일 지표 사이드카가 없어 델타를 생략했다.", ""]
+
+    # 2026-08-14 고도화 1 — 상세 근거는 `HEADLINE_DB_METRICS` 주석.
+    #
+    # **값이 없는 줄은 아예 안 그린다.** 「82.6%」가 있어야 할 자리에 「—」를 그리면 그 대시를
+    # 「나쁘지 않았다」로 읽게 된다 — 규약 C가 금지하는 바로 그 형태다. 대신 무엇이 빠졌는지를
+    # 문장으로 남겨 「측정하지 않았다」와 「측정했는데 좋았다」를 가른다.
+    if db_metrics:
+        available = [spec for spec in HEADLINE_DB_METRICS if dig(db_metrics, spec[1]) is not None]
+        # 빠진 줄은 **사람 라벨이 아니라 집계 키**로 적는다 — 라벨을 적으면 「그 지표를 말하지
+        # 않는다」는 다른 절의 계약(§12의 절대 커버리지 줄)과 문자열이 충돌하고, 무엇보다
+        # 「무엇을 고쳐야 이 줄이 생기는가」에 답하는 것은 키 쪽이다.
+        missing = [f"`db.{spec[1]}`" for spec in HEADLINE_DB_METRICS if spec not in available]
+        if not available:
+            return out + [
+                f"> **판단 입력 {len(missing)}행이 이 집계에 없다** — {', '.join(missing)}. "
+                "「좋았다」가 아니라 **「재지 않았다」**이다(규약 C).",
+                "",
+            ]
+        out += ["**판단 입력** — 위 표가 전부 초록이어도 여기가 비면 그날 판단은 눈을 감고 났다.", ""]
+        out += _table(headers, build_rows(db_metrics, available, "db."))
+        if missing:
+            out += [f"> ⚠ 이 집계에 없어 뺀 줄: {', '.join(missing)} — 「좋았다」가 아니라 「재지 않았다」이다.", ""]
+        out += [
+            "> 위 표는 «우리 인프라가 잘 돌았는가»를, 이 표는 «판단이 볼 것을 봤는가»를 잰다. "
+            "**둘은 같은 날 반대 방향으로 갈 수 있다** — 08-14가 그랬다: 밀림 0건 · 결손 0분 · "
+            "REST 수요 전일의 80%인 채로 GEX 입력이 78분 사라졌고 먼슬리 커버리지가 82.6%로 내려갔다. "
+            "그날 §1만 읽은 대시보드는 그 하루를 **완벽한 하루**로 인쇄했다.",
+            "",
+        ]
     return out
 
 
-def _render_by_hour(metrics: dict) -> list[str]:
-    rows = [
-        [
-            f"{r['hour']:02d}시", str(r["cycles"]), f"{r['rest_mean']:.1f}", f"{r['rest_max']:.1f}",
-            str(r["over_60s"]), f"{r['slip_max']:.1f}", str(r["foreign_sum"]),
-        ]
-        for r in dig(metrics, "cycles.by_hour") or []
-    ]
-    return _table(
-        ["시간대", "사이클", "REST평균(초)", "REST최대(초)", "60초초과", "최대밀림(초)", "창안 타폴러호출"], rows
+def _render_by_hour(metrics: dict, previous: dict | None = None) -> list[str]:
+    """2026-08-14 장중 §3 / Fix#3 — **전일 같은 시간대를 나란히 놓는다.**
+
+    08-14의 유일한 신규 발견(수집 소요가 시간마다 계단식으로 오른다)은 사람이 이틀치 로그를
+    손으로 겹쳐 읽어서 나왔다. 단독으로 보면 「12시 47.2초」는 어제의 29.2초와 구별되지 않는다 —
+    같은 표에 두 날이 있으면 0초에 보인다. 전일 사이드카(`auto/<전일>_지표.json`)는 이미 있다.
+    """
+    prev_by_hour = {r["hour"]: r for r in (dig(previous or {}, "cycles.by_hour") or [])}
+    hours = dig(metrics, "cycles.by_hour") or []
+    # 2026-08-14 장중 §3 / 고도화 2 — 위상은 **절대 초가 아니라 그날 첫 시간대 대비 이동**으로
+    # 읽는다. :19라는 숫자 자체에는 의미가 없고(폴러 기동 시각이 정하는 상수다), 하루 안에서
+    # 그 값이 **얼마나 밀렸는가**가 예산 초과·컷·전멸을 선행한다.
+    base_phase = next((r.get("end_second_median") for r in hours if r.get("end_second_median") is not None), None)
+    rows = []
+    for r in hours:
+        prev = prev_by_hour.get(r["hour"])
+        if prev is None:
+            delta = "—"
+        else:
+            diff = r["rest_mean"] - prev["rest_mean"]
+            # 부호를 항상 붙인다 — 「29.2」와 「+29.2」가 표에서 같아 보이면 델타가 아니다.
+            delta = f"{prev['rest_mean']:.1f} ({diff:+.1f})"
+        phase = r.get("end_second_median")
+        if phase is None:
+            phase_cell = "—"          # 구버전 집계 — 「:00에 끝났다」가 아니다(규약 C)
+        elif base_phase is None:
+            phase_cell = f":{phase:04.1f}"
+        else:
+            phase_cell = f":{phase:04.1f} ({phase - base_phase:+.0f}초)"
+        rows.append([
+            f"{r['hour']:02d}시", str(r["cycles"]), f"{r['rest_mean']:.1f}", delta,
+            f"{r['rest_max']:.1f}", str(r["over_60s"]), phase_cell,
+            f"{r['slip_max']:.1f}", str(r["foreign_sum"]),
+        ])
+    out = _table(
+        ["시간대", "사이클", "REST평균(초)", "전일 같은 시간대", "REST최대(초)", "60초초과",
+         "사이클 종료 위상", "최대밀림(초)", "창안 타폴러호출"],
+        rows,
     )
+    if prev_by_hour:
+        out += [
+            "> **전일 열은 「같은 시간대」끼리 비교한 값이다.** 하루 평균끼리 비교하면 시간대 분포가 "
+            "다른 두 날이 같은 숫자를 낸다 — 08-14가 그랬다(하루 평균은 평범했고, 오후만 갈렸다).",
+        ]
+    if base_phase is not None:
+        out += [
+            "> **사이클 종료 위상**은 사이클이 분 안의 몇 초에 끝나는가의 **중앙값**이고, 괄호는 "
+            "그날 첫 시간대 대비 이동이다. 08-14는 :19 → :50으로 31초 밀렸고 **예산 초과 138건 · "
+            "조기 포기 26건 · 전멸 86분이 전부 그 곡선 위에 올라앉아 있었다** — 지금까지 우리는 "
+            "결과 셋을 각각 세면서 공통 원인인 이 한 줄은 안 쟀다.",
+            "> 평균이 아니라 중앙값인 이유: 60초를 넘긴 사이클 하나가 평균을 다음 분으로 넘겨 "
+            "**위상이 거꾸로 돈 것처럼**(:55 → :05) 보이게 만든다.",
+        ]
+    return out + [""] if out and out[-1] != "" else out
 
 
 def _render_by_mod10(metrics: dict) -> list[str]:
@@ -434,6 +544,7 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
     ]
     if coverage["zero_row_minutes"]:
         out += ["", "```", " ".join(coverage["zero_row_minutes"]), "```"]
+    out += _render_zero_row_run(coverage)
     out += _render_zero_row_causes(coverage.get("zero_row_by_cause"))
     if coverage["over_design_count"]:
         over = ", ".join(f"{t}({n}행)" for t, n in coverage["over_design_minutes"])
@@ -474,6 +585,34 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
         out += ["", "- 같은 분 라벨 중복: **측정 불가** — 이 로그에는 `분=` 라벨이 없다(08-07 Fix#3 이전)"]
     out.append("")
     return out
+
+
+def _render_zero_row_run(coverage: dict) -> list[str]:
+    """2026-08-14 §2-1 / Fix#3 — **0행 분이 몇 개인가**가 아니라 **몇 분 붙어 있었는가**.
+
+    08-14에 이 자리가 낸 것은 「DB 기준 0행 86분」 한 줄이었다. 그 86분 중 84분이
+    14:00~15:23에 연속으로 붙어 있었고 — 정규장 마지막 80분, 감마가 가장 중요한 구간이다 —
+    그 사실은 사람이 0행 분 목록을 눈으로 훑어서 알았다. 흩어진 86분이었다면 그날은
+    아무 일도 없는 날이다. **같은 숫자가 두 사건을 가린다.**
+    """
+    run = coverage.get("zero_row_longest_run")
+    if not run:
+        # 규약 C — 이 키가 없는 것은 「연속 구간이 없었다」가 아니라 「구버전 집계다」이다.
+        return ["", "- 최장 연속 0행 구간: **측정 불가** — 이 집계에는 그 키가 없다(08-14 Fix#3 이전)"]
+    length = run.get("length") or 0
+    threshold = coverage.get("zero_row_run_alert_minutes") or db_metrics_module.ZERO_ROW_RUN_ALERT_MINUTES
+    if not length:
+        return ["", f"- 최장 연속 0행 구간: **0분** (임계 {threshold}분)"]
+    span = f"{run.get('start')}~{run.get('end')}"
+    if length >= threshold:
+        return [
+            "",
+            f"- ⛔ **최장 연속 0행 구간 {length}분** ({span}) — 임계 {threshold}분 초과.",
+            "> 흩어진 0행 분과 **완전히 다른 사건이다.** 체인 신선도 창은 5분이므로 6분째부터 "
+            "그 분의 판단은 체인을 아예 못 본다(`chain_input_source = none`) — 이 구간의 길이가 "
+            "곧 **판단이 감마 지형 없이 간 시간**이다. §14의 「GEX 입력 없던 분」과 나란히 읽을 것.",
+        ]
+    return ["", f"- 최장 연속 0행 구간: **{length}분** ({span}, 임계 {threshold}분)"]
 
 
 _ZERO_ROW_CAUSE_LABELS = (
@@ -820,6 +959,7 @@ def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[st
              for h, row in grid.items()],
         )
         out += ["> 시간대별 **p95**(초). 매일 같은 시간대가 붉으면 KIS 쪽 혼잡 패턴이다.", ""]
+    out += _render_p50_timeout_cross(metrics, lat)
     warnings = lat.get("warnings") or []
     threshold = lat.get("p95_warn_threshold")
     if warnings:
@@ -839,6 +979,87 @@ def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[st
         out += _render_latency_streak(warnings, previous, threshold)
     else:
         out += [f"> ✅ p95가 임계({threshold}초)를 넘은 (시간대, 엔드포인트) 없음.", ""]
+    return out
+
+
+# 이 교차표가 보는 엔드포인트. 옵션체인 20레그를 실제로 부르는 호출이고, 08-14에 절벽을
+# 만든 것도 이것이다. 다른 엔드포인트는 타임아웃이 따로(10초) 걸려 있어 같은 줄에 놓으면 틀린다
+# (`rest_client._ENDPOINT_READ_TIMEOUT_SECONDS`).
+_CHAIN_ENDPOINT = "inquire-price"
+
+
+def _render_p50_timeout_cross(metrics: dict, lat: dict) -> list[str]:
+    """2026-08-14 §2-2 / Fix#3 — **p50과 read timeout을 한 줄에 놓는다.**
+
+    08-14의 절벽을 예고할 수 있었던 유일한 값이다. 그날 13:36 창에서 p50/timeout = 0.77로
+    임계(0.8)에 닿았고, 24분 뒤 84분 전멸이 시작됐다. 같은 시각 p95 임계는 이미 다섯 시간째
+    붉었으므로 **아무것도 구별해 주지 못했다.**
+
+    임계값은 「그날 실제로 걸려 있던 타임아웃」이어야 한다 — 레버가 켜진 날은 전역값과 다르다.
+    """
+    grid = lat.get("p50_by_hour") or {}
+    if not grid:
+        return []
+    fallback = lat.get("global_read_timeout_seconds") or log_metrics.GLOBAL_HTTP_READ_TIMEOUT_SECONDS
+    lever = levers_module.lever_value(metrics.get("levers"), "OPTION_CHAIN_READ_TIMEOUT_SECONDS")
+    # 이 레버는 **꺼진 값이 `None`**(= 전역값 사용)이라 None을 폴백으로 접는 것이 정확하다.
+    timeout = float(lever) if lever is not None else float(fallback)
+    source = "레버" if lever is not None else "전역"
+    ratio_warn = lat.get("p50_timeout_ratio_warn") or log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN
+
+    # **판정은 창 최대값으로 한다.** 시간대 가중평균은 절벽을 눌러 없앤다(08-14 13시:
+    # 평균 2.18초 → 비율 0.55로 조용한데, 그 안의 창들은 3.08~3.53초 = 0.77~0.88로 이미
+    # 경고선이었고 그 20~60분 뒤 전멸이 시작됐다). 평균은 «그 시간대가 전반적으로 어땠나»에만 답한다.
+    grid_max = lat.get("p50_max_by_hour") or {}
+    rows, breached, approached = [], [], []
+    for hour, row in grid.items():
+        p50 = row.get(_CHAIN_ENDPOINT)
+        if p50 is None:
+            continue
+        p50_max = (grid_max.get(hour) or {}).get(_CHAIN_ENDPOINT, p50)
+        ratio = p50_max / timeout if timeout else 0.0
+        mark = "⛔" if ratio >= 1.0 else ("⚠" if ratio >= ratio_warn else "")
+        rows.append([
+            f"{hour}시", f"{p50:.2f}", f"{p50_max:.2f}", f"{timeout:.2f}", f"{ratio:.2f}", mark or "—",
+        ])
+        if ratio >= 1.0:
+            breached.append((hour, p50_max, ratio))
+        elif ratio >= ratio_warn:
+            approached.append((hour, p50_max, ratio))
+    if not rows:
+        return []
+
+    out = _table(
+        ["시간대", f"`{_CHAIN_ENDPOINT}` p50 평균(초)", "창 최대 p50(초)",
+         f"read timeout(초, {source})", "최대/timeout", ""],
+        rows,
+    )
+    out += [
+        f"> **창 최대 p50 ÷ read timeout.** 이 비율이 1.0에 닿는 순간 «그 창의 호출 절반 이상이 "
+        "타임아웃»이고, 20레그 순차 수집의 기대 성공 수는 0에 수렴한다 — 수집이 "
+        f"**느려지는 것이 아니라 비어 버린다.** 경고선 {ratio_warn}.",
+        "> **평균이 아니라 최대로 판정하는 이유**: 08-14 13시는 평균 2.18초(비율 0.55)로 조용했는데 "
+        "그 안의 창들은 3.08~3.53초(0.77~0.88)였고 **그 20~60분 뒤 84분 전멸이 시작됐다.** "
+        "평균은 선행 신호를 평탄화해 없앤다.",
+        "",
+    ]
+    if breached:
+        hits = ", ".join(f"{h}시 {p:.2f}초(비율 {r:.2f})" for h, p, r in breached)
+        out += [
+            f"- ⛔ **중앙값 호출이 타임아웃을 넘긴 시간대 {len(breached)}개** — {hits}.",
+            "> 이 시간대의 옵션체인은 «얇았던» 것이 아니라 **비어 있었을** 가능성이 높다. "
+            "§4의 「최장 연속 0행 구간」과 §14의 「GEX 입력 없던 분」을 반드시 함께 읽을 것.",
+            "",
+        ]
+    elif approached:
+        hits = ", ".join(f"{h}시 {p:.2f}초(비율 {r:.2f})" for h, p, r in approached)
+        out += [
+            f"- ⚠ **경고선({ratio_warn})을 넘은 시간대 {len(approached)}개** — {hits}. "
+            "중앙값 호출이 타임아웃 한 뼘 앞이다.",
+            "",
+        ]
+    else:
+        out += [f"> ✅ 비율이 경고선({ratio_warn})을 넘은 시간대 없음.", ""]
     return out
 
 

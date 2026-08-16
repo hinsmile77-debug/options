@@ -71,6 +71,7 @@ def parse(lines: list[str], target: date) -> dict:
     restarts = 0
     restart_failures = 0
     alert_only = 0
+    degraded = 0
     for line in lines:
         m = _LINE_RE.match(line.rstrip("\n"))
         if not m:
@@ -86,6 +87,11 @@ def parse(lines: list[str], target: date) -> dict:
             restarts += 1
         elif body.startswith("ALERT_ONLY"):
             alert_only += 1
+        elif body.startswith("DEGRADED"):
+            # 2026-08-14 Fix#2 — **살아 있는데 적재가 0인 분.** 재기동을 유발하지 않으므로
+            # `restarts`와 섞으면 안 된다: 저쪽은 「조치했다」이고 이쪽은 「조치하지 않기로
+            # 했다」이다. 08-14에 이 판정이 있었다면 14:10에 첫 줄이 남았을 것이다.
+            degraded += 1
         elif body.startswith("재기동 시도:") and "실행 완료" not in body:
             # 08-12의 「300초 안에 끝나지 않음」이 이것이다 — 재기동은 **성공했는데** 실패로
             # 보고됐다. 건수만 세고 판정은 사람이 한다(로그 문구로 성패를 단정하지 않는다).
@@ -106,6 +112,9 @@ def parse(lines: list[str], target: date) -> dict:
         "restarts": restarts,
         "restart_failures": restart_failures,
         "alert_only": alert_only,
+        # 2026-08-14 Fix#2. **0은 두 가지다**(규약 C): 이 키가 있고 0이면 「적재가 끊긴 분이
+        # 없었다」이고, 키가 아예 없으면 「그날은 이 판정 자체가 없던 버전이다」이다.
+        "degraded_checks": degraded,
         "max_silence_minutes": round(max_gap, 1),
         # 2026-08-12 규약 F — **주장 지표는 절대 건수로 세우지 않는다.**
         #

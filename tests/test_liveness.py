@@ -183,6 +183,84 @@ def test_corrupt_state_does_not_silence_the_watchdog():
     assert decision.should_alert is True
 
 
+# ===== 적재 감시 (2026-08-14 §2-1 / Fix#2) =====
+#
+# 08-14 14:00~15:23, 옵션체인이 84분 연속으로 비었는데 워치독 판정은 49건 전부 OK였다.
+# 아래 다섯 중 넷은 **오경보를 막는 쪽**이다 — 이 배지는 재기동을 유발하지 않는 대신
+# 사람이 매일 보는 것이라, 한 번 무시되기 시작하면 없는 배지와 같아진다.
+
+
+_AFTERNOON = datetime(2026, 8, 14, 14, 10)
+
+
+def test_a_live_loop_that_ingests_nothing_is_degraded():
+    """**이 절의 존재 이유.** 박동은 30초마다 정확했고 적재는 84분간 0이었다."""
+    decision = liveness.decide(
+        _beat(_AFTERNOON - timedelta(seconds=20)), _AFTERNOON, ingest_minutes_recent=0
+    )
+    assert decision.action == liveness.ACTION_DEGRADED
+    assert decision.reason == liveness.REASON_NO_INGEST
+    assert decision.should_alert is True
+    assert "적재" in decision.detail
+
+
+def test_degraded_never_restarts():
+    """08-14의 원인은 KIS 지연이었다 — 재기동은 아무것도 안 고치고 관측만 끊는다."""
+    now = _AFTERNOON
+    decision = liveness.decide(_beat(now - timedelta(seconds=20)), now, ingest_minutes_recent=0)
+    state = liveness.next_state({"date": "2026-08-14", "restarts": 0}, now, decision)
+    assert decision.action != liveness.ACTION_RESTART
+    assert state["restarts"] == 0
+
+
+def test_unknown_ingest_falls_back_to_the_old_judgement():
+    """DB를 못 읽은 것은 「적재 0」이 아니라 **「모른다」**다.
+
+    여기서 None을 0으로 접으면 DB가 죽은 날 워치독이 매분 degraded를 외친다
+    (2026-08-12 Fix#1: 감시자를 감시 대상에 묶지 마라).
+    """
+    decision = liveness.decide(
+        _beat(_AFTERNOON - timedelta(seconds=20)), _AFTERNOON, ingest_minutes_recent=None
+    )
+    assert decision.action == liveness.ACTION_OK
+
+
+def test_ingest_outside_the_regular_session_is_not_an_alert():
+    """15:20 마감과 15:45 종료 사이는 폴링이 잦아드는 정상 구간이다 — 여기서 울리면 매일 운다."""
+    late = datetime(2026, 8, 14, 15, 30)
+    assert liveness.decide(_beat(late), late, ingest_minutes_recent=0).action == liveness.ACTION_OK
+    early = datetime(2026, 8, 14, 8, 30)
+    assert liveness.decide(_beat(early), early, ingest_minutes_recent=0).action == liveness.ACTION_OK
+
+
+def test_a_dead_heartbeat_still_wins_over_the_ingest_check():
+    """둘 다 이상이면 **조치가 있는 쪽**이 이겨야 한다 — 죽은 루프는 되살려야 한다."""
+    died = datetime(2026, 8, 14, 14, 0)
+    decision = liveness.decide(
+        _beat(died), died + timedelta(seconds=181), ingest_minutes_recent=0
+    )
+    assert decision.action == liveness.ACTION_RESTART
+    assert decision.reason == liveness.REASON_STALE
+
+
+def test_degraded_alerts_are_throttled_like_the_others():
+    now = _AFTERNOON
+    state = {"date": "2026-08-14", "restarts": 0, "last_alert_at": (now - timedelta(seconds=60)).isoformat()}
+    decision = liveness.decide(
+        _beat(now - timedelta(seconds=20)), now, state, ingest_minutes_recent=0
+    )
+    assert decision.action == liveness.ACTION_DEGRADED
+    assert decision.should_alert is False
+
+
+def test_ingest_window_sits_inside_the_watch_window():
+    """적재 창은 감시 창보다 좁아야 한다 — 넓으면 기동·종료 경계에서 매일 오경보가 난다."""
+    assert liveness.WATCH_WINDOW_START <= liveness.INGEST_WATCH_START
+    assert liveness.INGEST_WATCH_END <= liveness.WATCH_WINDOW_END
+    # 08-14의 절벽(14:00 시작)은 이 창 안이다.
+    assert liveness.in_ingest_window(datetime(2026, 8, 14, 14, 10))
+
+
 # ===== 상태 전이 =====
 
 

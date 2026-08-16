@@ -1039,6 +1039,17 @@ def _watchdog_liveness_check(now: datetime) -> HealthCheck:
             "이 구간에 관측 루프가 죽으면 아무도 되살리지 않는다",
             group="인프라",
         )
+    # 2026-08-14 Fix#2 — **판정이 최신이라는 것과 그 판정이 정상이라는 것은 다르다.**
+    #
+    # 종전에는 나이만 보고 초록을 냈다. 그래서 워치독이 `degraded`(적재 0분)를 낸 순간에도
+    # 이 배지는 "정상 — 5초 전 판정(degraded)"이라고 인쇄했을 것이다. 08-14에 84분간 판단
+    # 입력이 사라졌는데 COCKPIT이 종일 초록이었던 것과 **같은 종류의 침묵**이다.
+    if action == liveness.ACTION_DEGRADED:
+        return HealthCheck(
+            label, "warning",
+            f"관측 루프가 살아 있지만 **적재가 없다** — {check.get('detail') or '적재 0분'}",
+            group="인프라",
+        )
     return HealthCheck(label, "ok", f"정상 — {age:.0f}초 전 판정({action})", group="인프라")
 
 

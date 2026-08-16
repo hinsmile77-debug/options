@@ -1,0 +1,6 @@
+docker compose up -d
+docker compose ps    # 확인
+
+uv run streamlit run mahdi/dashboard/app.py
+
+uv run python -m mahdi.main

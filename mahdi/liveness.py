@@ -166,13 +166,46 @@ MAX_RESTARTS_PER_DAY = 3
 # 같은 조건으로 다시 알리기까지의 최소 간격 — 1분 주기 워치독이 매분 같은 말을 하면 곧 무시된다.
 ALERT_COOLDOWN_SECONDS = 600.0
 
+# ===== 2026-08-14 §2-1·§3-3 / Fix#2 — **살아 있는데 아무것도 못 가져오는 상태** =====
+#
+# 08-14 14:00~15:23, 옵션체인이 **84분 연속으로 한 행도 적재되지 않았다.** 그 84분 동안
+# 워치독 판정은 49건 **전부 OK**였고 재기동 0회였다 — 박동이 30초마다 정확히 찍혔기 때문이다.
+# 감시 대상이 「이벤트 루프가 도는가」 하나로 정의돼 있어서 **그 84분은 정의상 정상**이었다.
+# 당일 로그에 `slack`·`경보` 문구는 0건이고, ERROR 86건은 파일에만 남았다.
+#
+# 08-06이 「프로세스가 죽은 것을 아무도 몰랐다」였다면 08-14는 **「프로세스가 살아서 아무것도
+# 못 가져오는 것을 아무도 몰랐다」**이다. 같은 파일의 다른 결함이고, 고치는 자리도 같다.
+#
+# ## 재기동하지 않는다
+#
+# 08-14의 원인은 우리 쪽이 아니었다 — KIS `inquire-price`의 p50이 4.05초로 전역 read
+# timeout(4.0초)을 넘어섰고(§2-2), 그 순간 20레그 순차 수집의 기대 성공 수가 0에 수렴했다.
+# 우리 REST 수요는 오히려 전일의 80%였다. **재기동은 아무것도 안 고치고 관측만 12~14초
+# 끊는다**(08-06 실측). 그래서 이 판정은 **알림 전용**이다 — 조치는 사람이 정한다
+# (`DECISION_LOG` 결정 7: 레버 발동은 사람이 한다).
+INGEST_STALE_MINUTES = 10
+
+# 적재 감시 창 — **정규장 안쪽으로 좁게** 잡는다.
+#
+# 09:00 이전: 장전에도 사이클은 돌지만(08-14 장전 62분 연속 관측) 기동 직후에는 마스터 파일
+#            다운로드·토큰·WS 구독 32건이 앞에 있어 적재가 비는 분이 정상적으로 존재한다.
+# 15:15 이후: 15:20 정규장 마감과 15:45 종료 배치 사이는 폴링이 자연스럽게 잦아드는 구간이다.
+#            여기에 임계를 걸면 **매일** 오경보가 난다 — 규약 D의 "오경보 비용이 미탐지 비용보다
+#            훨씬 싸지 않다"가 그대로 적용된다. 무시되기 시작한 배지는 없는 배지와 같다.
+#
+# 08-14의 84분은 14:00에 시작했으므로 이 창으로 잡힌다(14:10에 첫 `degraded`).
+INGEST_WATCH_START = dtime(9, 0)
+INGEST_WATCH_END = dtime(15, 15)
+
 ACTION_OK = "ok"
 ACTION_IDLE = "idle"  # 감시 창 밖 — 아무것도 하지 않는다
 ACTION_RESTART = "restart"
 ACTION_ALERT_ONLY = "alert_only"  # 이상은 맞는데 재기동 상한을 썼다
+ACTION_DEGRADED = "degraded"  # 살아 있는데 적재가 없다 — 알림만, 재기동은 하지 않는다
 
 REASON_MISSING = "missing"
 REASON_STALE = "stale"
+REASON_NO_INGEST = "no_ingest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +218,15 @@ class WatchdogDecision:
 
 def in_watch_window(now: datetime) -> bool:
     return WATCH_WINDOW_START <= now.time() <= WATCH_WINDOW_END
+
+
+def in_ingest_window(now: datetime) -> bool:
+    """반환: 지금이 **적재가 있어야 하는** 시간대인가(`INGEST_WATCH_*` 주석 참고).
+
+    감시 창(`in_watch_window`)보다 좁다 — 워치독은 07:40~15:45에 판정하지만 「적재 0분」을
+    이상으로 볼 수 있는 것은 정규장 안쪽뿐이다.
+    """
+    return INGEST_WATCH_START <= now.time() <= INGEST_WATCH_END
 
 
 # 기동 진행 중 표식 — 기동 스크립트가 시작할 때 만들고 끝날 때 지운다.
@@ -313,18 +355,24 @@ def decide(
     *,
     stale_seconds: float = HEARTBEAT_STALE_SECONDS,
     starting: bool = False,
+    ingest_minutes_recent: int | None = None,
 ) -> WatchdogDecision:
     """
     입력: 마지막 박동(`read_heartbeat()` 결과), 현재 시각, 워치독 상태
-         (`{"date": "YYYY-MM-DD", "restarts": int, "last_alert_at": iso}`).
+         (`{"date": "YYYY-MM-DD", "restarts": int, "last_alert_at": iso}`),
+         (선택) 직전 `INGEST_STALE_MINUTES`분 동안 옵션체인이 **적재된 분 수**.
     계산: 감시 창 안에서 박동이 **없거나 늙었으면** 재기동을 지시한다. 하루 상한을 넘겼으면
-         알림만 낸다. 알림은 `ALERT_COOLDOWN_SECONDS`로 눌러 같은 말을 반복하지 않는다.
+         알림만 낸다. 박동이 정상이어도 정규장 안에서 **적재가 0분이면** `ACTION_DEGRADED`를
+         낸다(2026-08-14 Fix#2). 알림은 `ALERT_COOLDOWN_SECONDS`로 눌러 같은 말을 반복하지 않는다.
     해석: **"없음"과 "늙음"을 구분해서 사유로 남긴다.** 없음은 *아예 안 떴다*(08-06 10:20의
          중단된 기동이 그 예다), 늙음은 *떴다가 죽었다*(10:04)이다. 조치는 같지만 다음날
          원인을 찾을 때 이 구분이 출발점이 된다.
+         세 번째 사유 `no_ingest`는 *살아 있는데 못 가져온다*(08-14 14:00~15:23)이고,
+         **조치가 다르다** — 재기동하지 않는다.
          상태의 `date`가 오늘이 아니면 재기동 카운터를 0으로 본다 — 프로세스가 하루 단위라
          상한도 하루 단위다.
     실패 조건: 없다(순수 함수). 시각 판단만 하고 파일도 프로세스도 건드리지 않는다.
+              `ingest_minutes_recent=None`은 **「모른다」**이고 종전과 완전히 같은 판정을 낸다.
     """
     if not in_watch_window(now):
         return WatchdogDecision(ACTION_IDLE, detail="감시 창 밖")
@@ -341,6 +389,14 @@ def decide(
             f"PID {beat.get('pid')})"
         )
     else:
+        # 박동은 정상이다. 여기서 **한 겹 더 본다** — 08-14의 84분이 이 자리에서 OK로 닫혔다.
+        no_ingest = _no_ingest_detail(ingest_minutes_recent, now)
+        if no_ingest is not None:
+            return WatchdogDecision(
+                ACTION_DEGRADED, REASON_NO_INGEST,
+                detail=f"{no_ingest}(마지막 박동 {age:.0f}초 전 — 프로세스는 살아 있다)",
+                should_alert=_alert_due(state, now),
+            )
         return WatchdogDecision(ACTION_OK, detail=f"정상 — 마지막 박동 {age:.0f}초 전")
 
     restarts = _restarts_today(state, now)
@@ -353,6 +409,30 @@ def decide(
             should_alert=should_alert,
         )
     return WatchdogDecision(ACTION_RESTART, reason, detail=detail, should_alert=should_alert)
+
+
+def _no_ingest_detail(
+    ingest_minutes_recent: int | None,
+    now: datetime,
+    window_minutes: int = INGEST_STALE_MINUTES,
+) -> str | None:
+    """반환: 적재가 끊겼다고 볼 만하면 사유 문자열, 아니면 None.
+
+    **`None` 입력은 「정상」이 아니라 「모른다」다.** DB를 못 읽은 워치독은 종전과 똑같이
+    판정해야 한다 — 여기서 `None`을 0으로 접으면 **DB가 죽은 날 워치독이 매분 `degraded`를
+    외치고**, 그 순간 이 배지는 아무도 안 보는 배지가 된다. 2026-08-12 Fix#1이 남긴 교훈이
+    정확히 이것이다: 감시자를 감시 대상에 묶지 마라.
+    """
+    if ingest_minutes_recent is None:
+        return None
+    if not in_ingest_window(now):
+        return None
+    if ingest_minutes_recent > 0:
+        return None
+    return (
+        f"직전 {window_minutes}분 동안 옵션체인 적재가 **0분**이다 — 살아 있지만 아무것도 "
+        "가져오지 못하고 있다. 자동 재기동은 하지 않는다(원인이 우리 쪽이 아닐 수 있다)"
+    )
 
 
 def _restarts_today(state: dict | None, now: datetime) -> int:

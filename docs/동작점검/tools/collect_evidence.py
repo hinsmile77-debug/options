@@ -52,6 +52,69 @@ ANCHORS = [
 ]
 ANCHOR_WINDOW_MIN = 5
 
+# ===== 점검 자신의 시간표 (2026-08-13 고도화 3 + 2026-08-14 고도화 6) =====
+#
+# 위 ANCHORS가 「시스템이 무엇을 할 시각」이라면 이쪽은 **「사람이 점검할 시각」**이다.
+#
+# ## 왜 장중이 두 회차인가
+#
+# 08-14의 사건은 **14:00~15:23**에 일어났다. 그날 12:34 장중 점검은 「P0 없음」으로 **옳게**
+# 닫혔고 — 그 시각에는 정말 아무 일도 없었다 — 15:45 장후 집계가 나왔을 때는 이미 84분을
+# 잃은 뒤였다. **12:30 1회 주기는 오후를 구조적으로 못 본다.**
+# 14:30인 이유: v6 §4.2의 14:50 신규 진입 컷오프 직전이라 「오늘 남은 시간에 개입할 것인가」에
+# 답할 수 있는 **마지막 시각**이다. 그보다 늦으면 알아도 할 수 있는 일이 없다.
+#
+# ## 왜 장전이 08:30이 아니라 08:00인가
+#
+# 08-14 장전 점검은 08:35에 돌았고 P0가 둘이었는데 개장까지 25분이었다. 그중 하나(레버 F)는
+# **재기동을 수반**하므로 25분은 빠듯하다. 기동(07:31)과 첫 사이클 안정화(07:36 REST 응답시간
+# 첫 인쇄)를 지나면 08:00에 이미 판단 재료가 다 있다 — 그날 07:36 이후 08:33까지 새로 나타난
+# 사건이 **0건**이었다(사이클 로그만 반복). 30분을 앞당겨도 잃는 것이 없다.
+#
+# ⚠ **진실원천은 Claude 앱의 예약 작업이다 — Windows 작업 스케줄러가 아니다.**
+#
+# 두 스케줄러가 각각 다른 것을 돌린다. 섞으면 시각이 안 맞는다:
+#
+#   Windows 작업 스케줄러 (시스템 작업 3개)
+#     Mahdi-PreMarket-Startup     start_mahdi_premarket.bat    07:30
+#     Mahdi-MarketClose-Shutdown  stop_mahdi_marketclose.bat   15:45  ← 장후 증거·지표를 만든다
+#     Mahdi-Watchdog              watchdog_mahdi_hidden.vbs    1분 주기
+#
+#   Claude 앱 예약 작업 (점검 세션 — `mahdi-daily-check` 스킬, 로컬 실행)
+#     장전 점검 / 장중 점검 / 장후 점검(「Mahdi postmarket check」, 평일 16:00)
+#
+# 08-14 실측이 그 분업을 그대로 보여 준다:
+#     08:31 `_증거_pre.md`   → 08:37 `_점검_pre.md`     (장전 세션이 둘 다 만든다)
+#     12:34 `_증거_intra.md` → 12:40 `_점검_intra.md`   (장중 세션)
+#     15:45 `_증거_post.md`·`_지표.md`                  (**종료 배치**가 만든다)
+#     16:19 `_마흐디_운영점검보고서.md`                  (장후 세션이 위 산출물을 읽어 쓴다)
+#
+# 그래서 아래 `post`는 **15:45**다 — 이 스크립트가 `--phase post`로 도는 시각은 종료 배치
+# 안이지 16:00 세션이 아니다. `pre`/`intra`는 세션이 이 스크립트를 직접 돌리므로 세션 시각과 같다.
+#
+# ⚠ 이 표를 바꿔도 예약 작업은 안 바뀐다. **Claude 앱에서 따로 고쳐야 한다** —
+# 어긋나면 아래 회차 판정이 첫 줄에 「N분 밀렸다」로 적어 그 사실을 드러낸다.
+PHASE_SCHEDULE = {
+    "pre": ["08:00"],
+    "intra": ["12:30", "14:30"],
+    "post": ["15:45"],
+}
+# 이만큼까지는 「정시」로 본다. 점검은 사람이 시작하므로 몇 분 오차는 정상이고, 여기에 임계를
+# 좁게 걸면 매일 ⚠가 떠서 진짜로 밀린 날을 못 알아본다.
+# 이만큼까지는 「정시」로 본다. **예약 작업은 지터를 포함해 발화한다** — 08-14 실측으로
+# 장전 슬롯 08:30 → 08:31, 장중 12:30 → 12:34였고, 14:30 회차는 등록 시점 확인으로 **14:39**다.
+# 9분짜리 지터에 10분 임계를 걸면 여유가 1분뿐이라 며칠 안에 거짓 ⚠가 뜬다.
+# 좁게 잡아 매일 우는 것보다 넓게 잡아 진짜로 밀린 날만 잡는 편이 낫다.
+PHASE_LATE_TOLERANCE_MIN = 15
+
+# 장중 14:30 회차(`mahdi-intraday-check-1430`)가 등록된 첫 영업일. 그 이전 날짜를 재집계할 때
+# 14:30 산출물을 기대하면 거짓 누락이 뜬다 — 규약이 생기기 전의 날은 없는 게 정상이다.
+INTRA_1430_SINCE = _date(2026, 8, 17)
+# 이보다 더 늦으면 「밀린 점검」이 아니라 **사후 재집계**로 본다. 다음 회차(장중 12:30 → 14:30,
+# 간격 120분)를 이미 지나쳤다면 그 회차가 대신 돌았어야 하므로, 이 실행은 그날의 정규 점검이
+# 아니라 나중에 다시 돌린 것이다. 실제로 이 스크립트의 `--date`가 그 용도다.
+PHASE_RERUN_MIN = 120
+
 # 관측 루프가 살아 있어야 하는 구간과, 그 안에서 이만큼 끊기면 의심한다.
 GAP_SCAN = ("07:30", "15:45")
 # 3분인 이유: 사이클이 분마다 도므로 정상 간격은 1분이고, **08-12의 프로세스 사망은 4분**
@@ -76,6 +139,54 @@ PROCESS_START_MARKER = "직전 정상 기동"
 # 사이클 한 바퀴. 이 줄의 유무가 "그 분에 관측이 있었는가"의 1차 증거다.
 CYCLE_TOKEN = "옵션체인 사이클 소요 분해"
 
+# ===== 2026-08-14 §2-1·§2-2 / Fix#3 — **절벽의 선행 지표를 장중에 보이게 한다** =====
+#
+# 08-14 14:00~15:23 옵션체인이 84분 연속 전멸했다. 12:34 장중 점검은 이 사건을 **구조적으로
+# 못 봤고**(아직 안 일어났다), 15:45 장후 집계는 「ERROR 86건 / 2종」만 냈다. 그 사이를 메우는
+# 것이 이 절이다 — 세 값이 전부 **결과보다 앞선다**:
+#
+#   (a) 시간대별 REST수집 평균 ÷ 예산      12시 47.2/50 = 94.4% (12:34에 이미 걸렸다)
+#   (b) `inquire-price` p50 ÷ read timeout 13:36 3.08/4.0 = 0.77 (절벽 24분 전)
+#   (c) rows=0이 **연속된** 분 수           14:00부터 매분 (그날 84분)
+#
+# 셋 다 한 줄짜리 숫자인데 종전에는 어디에도 인쇄되지 않았다. 08-14를 찾은 것은 사람이
+# 이틀치 로그를 손으로 겹쳐 읽었기 때문이다.
+CYCLE_RE = re.compile(
+    r"REST수집 ([\d.]+)초.*?\(rows=(\d+),.*?\)(?: 분=(\d\d:\d\d))?"
+)
+# `엔드포인트=N건 p50/p95/p99/max초`. `mahdi/ops/log_metrics._REST_LATENCY_ITEM_RE`와 같은 모양이다
+# (이 파일은 stdlib 전용이라 임포트하지 않고 복제한다 — 그 규약은 파일 헤더 참고).
+LATENCY_TOKEN = "REST 응답시간"
+LATENCY_ITEM_RE = re.compile(r"([\w-]+)=(\d+)건 ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)초")
+
+# 옵션체인 20레그를 실제로 부르는 엔드포인트. 다른 엔드포인트는 read 타임아웃이 따로(10초)
+# 걸려 있어 같은 줄에 놓으면 틀린다(`rest_client._ENDPOINT_READ_TIMEOUT_SECONDS`).
+CHAIN_ENDPOINT = "inquire-price"
+
+# 아래 셋은 코드의 복제본이다. **원천은 주석에 적힌 상수이고, 값이 갈라지면 이 파일이 틀린 것이다**
+# (ANCHORS와 같은 규약). 파서 쪽 복제는 `tests/test_ops_log_metrics_contract.py`가 지키지만
+# 이 파일은 리포에서 독립 실행되는 스크립트라 테스트 대신 이 주석이 계약이다.
+# ===== 2026-08-13 고도화 2 — **축 가용성을 추론이 아니라 인용으로 판정한다** =====
+#
+# 08-13 장전은 `options_flow` 축의 사망을 **감마플립 로그만 보고** 예측했고, 09:01:10 실측이
+# 그것을 뒤집었다(그 멤버는 살아 있었다). 반대로 08-14에는 넉 달 만에 살아난 그 멤버가
+# 오후에 다시 죽었는데, 그 사실은 사람이 「판단 형태 전이」 줄을 손으로 훑어서 알았다.
+#
+# 이 줄에 답이 그대로 들어 있다 — 가용 멤버 집합과 최초 편입 시각. 세면 끝나는 일이었다.
+MEMBER_TOKEN = "판단 형태 전이"
+MEMBER_RE = re.compile(r"가용멤버 \[(.*?)\]\((\d+)/(\d+)\)(?: · (\w+))?")
+MEMBER_NAME_RE = re.compile(r"'([\w]+)'")
+# 마지막 관측이 로그 끝보다 이만큼 이르면 「도중에 빠졌다」로 본다.
+# 30분인 이유: 판단은 분마다 나지만 **형태 전이 줄은 형태가 바뀔 때만** 찍힌다 — 안정된 구간은
+# 조용한 것이 정상이다. 08-14 오후의 `options_flow` 이탈은 81분이었으므로 이 임계로 잡힌다.
+MEMBER_DROPOUT_ALERT_MIN = 30
+
+CHAIN_COLLECT_BUDGET_SECONDS = 50.0      # mahdi/main.OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS
+GLOBAL_READ_TIMEOUT_SECONDS = 4.0        # mahdi/broker/rest_client._HTTP_READ_TIMEOUT_SECONDS
+BUDGET_WARN_RATIO = 0.90                 # 시간대 평균이 예산의 이만큼을 넘으면 적신호
+P50_TIMEOUT_WARN_RATIO = 0.80            # mahdi/ops/log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN
+ZERO_ROW_RUN_ALERT_MINUTES = 20          # mahdi/ops/db_metrics.ZERO_ROW_RUN_ALERT_MINUTES
+
 # 조용히 지나가면 안 되는 사건들. 태그가 없는 로그라 **문구로 식별한다** —
 # 레벨은 사람이 읽는 우선순위일 뿐 계측의 정체성이 아니다(2026-08-04 §2-1: 레벨이
 # WARNING→INFO로 내려가며 정규식이 통째로 눈이 멀어 362건을 0건으로 보고했다).
@@ -96,6 +207,38 @@ ALWAYS_QUOTE = {
     "vi": ("VI ",),
 }
 QUOTE_SAMPLES = 6
+
+# ===== 2026-08-14 장중 §8 / 고도화 3 — **계측 부재를 수집기가 스스로 신고한다** =====
+#
+# 08-14 장중 점검이 답하지 못한 항목이 셋이었다(stale 비율 · 레짐 분당 갱신 · ATM 왕복).
+# 셋 다 「0건」이나 「판정 불가」로 **조용히** 지나갔다 — 규약 C가 말하는 두 가지 0 중
+# 나쁜 쪽인데, 그것을 알아채려면 사람이 `phases.md`를 옆에 펴 놓고 하나씩 대조해야 했다.
+#
+# 여기서 `phases.md`의 체크 항목과 **그 항목에 답하는 로그 문구**를 짝지어 둔다. 그 문구가
+# 하루 0줄이면 「계측 없음 ⚠」으로 인쇄한다 — 「그 일이 안 일어났다」와 구별해서.
+#
+# `대체축`이 있는 항목은 **적신호로 올리지 않는다.** 로그에 없다고 못 재는 것이 아니기 때문이다
+# (08-14 장중 §4-3이 stale 비율을 「계측이 없다」로 적었는데, 실제로는 DB 축이 84.2%를 내고
+# 있었다 — 그 부분 정정이 장후 §2-6에 남아 있다). **틀린 경보는 진짜 경보를 죽인다.**
+MEASUREMENT_MAP = [
+    # (phases.md 항목, 그 항목에 답하는 로그 문구, 대체 축 or None)
+    ("B-2 예산 초과", "옵션체인 수집 예산", None),
+    ("B-2 연속 타임아웃 조기 포기", "옵션체인 연속 타임아웃", None),
+    ("B-2 실패 예산 소진", "옵션체인 실패 예산", None),
+    ("B-2 먼슬리 레그 재시도", "먼슬리 레그 재시도", None),
+    ("B-2 WS 단절", "WS 연결 끊김", "DB 축 `ws_status`"),
+    ("B-2 ATM 롤링 왕복", "ATM 롤링", "지표 §? `atm_rolls.round_trip_pct`"),
+    ("B-3 앙상블 멤버 가용성", MEMBER_TOKEN, "DB 축 §14-1 `member_availability`"),
+    ("B-3 레짐 갱신", "레짐 전이", "DB 축 §11-2 `regime_vs_futures_bars`"),
+    # 문구를 「신선도」로 두면 안 된다 — 전멸 줄의 *서술*("신선도 창 안의 직전 스냅샷을 쓴다")에
+    # 걸려 계측이 살아 있는 것처럼 보인다. 08-14 장중 §4-3이 셌던 것이 정확히 그 서술이었다.
+    # **비율을 인쇄하는 줄은 아직 없고**, 그 사실이 이 칸에 그대로 보여야 한다.
+    ("B-3 체인 신선도(stale 비율)", "체인 신선도 비율", "DB 축 §14 `chain_input_source`"),
+    ("B-3 이벤트 캘린더 미기입", "이벤트 캘린더 미기입", None),
+    # 사이클 줄은 분마다 나온다 — **0이면 그날 관측이 없었거나 파서가 눈이 먼 것**이고,
+    # 둘 다 이 표에서 가장 먼저 보여야 하는 사실이다.
+    ("B-1 사이클 관측", "옵션체인 사이클 소요 분해", None),
+]
 
 # 레버 — `mahdi/ops/levers.py`의 `_SPEC`과 같은 이름을 쓴다. 값 해석은 하지 않고
 # **어디에 어떤 줄이 있는가**만 보여 준다(판정은 그 레버의 가설이 할 일이다).
@@ -226,6 +369,43 @@ def iter_day_lines(log_dir: Path, target: _date, stem="observation_loop.log"):
             eprint(f"[collect_evidence] {path} 읽기 실패: {e}")
 
 
+def tokens_seen_on_other_days(log_dir: Path, target: _date, tokens, stem="observation_loop.log"):
+    """반환: `{문구: (다른 날 줄 수, 그 날짜)}` — **대상 날짜를 제외한** 잔여 로그 전체 기준.
+
+    2026-08-14 고도화 3. 「그 문구가 오늘 0줄」에서 **「계측이 없다」와 「진짜 안 일어났다」**를
+    가르는 유일한 기계적 방법이다. 08-14 장중 점검이 손으로 한 것이 정확히 이것이다:
+
+        *"「실패 예산 소진 0건」은 계측 없음이 아니라 진짜 0이다. 같은 로그 파일에 08-13자로
+          1건 남아 있어 이 경로가 로깅된다는 것이 확인된다(규약 C — 0은 두 가지다)."*
+
+    로테이션이 10MB×10이라 보통 이틀치가 남는다 — **못 찾았다고 「계측 없음」이 확정되는 것은
+    아니다**(그 사건이 이틀 내내 없었을 수도 있다). 그래서 결과는 「확인됨」과 「미확인」이지
+    「없음」이 아니다.
+    """
+    found = {t: (0, None) for t in tokens}
+    backups = sorted(
+        (p for p in log_dir.glob(f"{stem}.*") if p.suffix.lstrip(".").isdigit()),
+        key=lambda p: int(p.suffix.lstrip(".")),
+        reverse=True,
+    )
+    prefix = target.isoformat()
+    for path in [*backups, log_dir / stem]:
+        if not path.exists():
+            continue
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if len(line) < 10 or not line[:4].isdigit() or line.startswith(prefix):
+                        continue
+                    for token in tokens:
+                        if token in line:
+                            n, _when = found[token]
+                            found[token] = (n + 1, line[:10])
+        except OSError as e:
+            eprint(f"[collect_evidence] {path} 읽기 실패: {e}")
+    return found
+
+
 def bracket_day_lines(path: Path, target: _date):
     """`[2026-08-12 10:14:01] ...` 형식(워치독·장전 배치) 중 대상 날짜 줄."""
     if not path.exists():
@@ -258,6 +438,20 @@ class LoopScan:
         self.minutes_seen = set()
         self.first = None
         self.last = None
+        # 2026-08-14 Fix#3 — 시간대별 수집 소요·rows / 시간대별 p50. 상세 근거는 `CYCLE_RE` 주석.
+        self.cycle_rest = collections.defaultdict(list)   # 시(hour) -> [REST수집 초]
+        self.cycle_rows = collections.defaultdict(list)   # 시(hour) -> [rows]
+        self.zero_row_minutes = set()                     # rows=0인 분(분 단위 정수)
+        self.latency_p50 = collections.defaultdict(list)  # 시(hour) -> [(건수, p50)]
+        # 2026-08-13 고도화 2 — 축 가용성. 상세 근거는 `MEMBER_TOKEN` 주석.
+        self.member_first_seen = {}                       # 멤버 -> 최초 편입 시각
+        self.member_last_seen = {}                        # 멤버 -> 마지막 관측 시각
+        self.member_transitions = 0
+        self.member_shape = collections.Counter()         # "4/6" -> 전이 건수
+        self.member_conviction = collections.Counter()
+        self.member_total = None                          # 분모(6) — 로그가 알려 준다
+        # 2026-08-14 고도화 3 — 계측 부재 신고. 상세 근거는 `MEASUREMENT_MAP` 주석.
+        self.measurement_hits = collections.Counter()
 
     def feed(self, line):
         m = RECORD_RE.match(line)
@@ -289,15 +483,95 @@ class LoopScan:
             self.process_starts.append((hhmmss, truncate(msg, 160)))
         if CYCLE_TOKEN in msg:
             self.cycle_minutes.add(minute)
+            c = CYCLE_RE.search(msg)
+            if c:
+                rows = int(c.group(2))
+                self.cycle_rest[hh].append(float(c.group(1)))
+                self.cycle_rows[hh].append(rows)
+                if rows == 0:
+                    # 적재 분은 **`분=` 라벨 축**으로 잡는다 — 그 라벨이 그 사이클이 실제로
+                    # 적재한 분이다(08-10에 파생 축이 반올림으로 허위 결손 2건을 냈다).
+                    # 라벨이 없는 구 로그(08-07 이전)에서는 레코드 시각으로 폴백한다.
+                    label = c.group(3)
+                    self.zero_row_minutes.add(hhmm_to_min(label) if label else minute)
+        if MEMBER_TOKEN in msg:
+            mm = MEMBER_RE.search(msg)
+            if mm:
+                self.member_transitions += 1
+                self.member_total = int(mm.group(3))
+                self.member_shape[f"{mm.group(2)}/{mm.group(3)}"] += 1
+                if mm.group(4):
+                    self.member_conviction[mm.group(4)] += 1
+                for name in MEMBER_NAME_RE.findall(mm.group(1)):
+                    self.member_first_seen.setdefault(name, hhmmss)
+                    self.member_last_seen[name] = hhmmss
+        if LATENCY_TOKEN in msg:
+            for it in LATENCY_ITEM_RE.finditer(msg):
+                if it.group(1) == CHAIN_ENDPOINT:
+                    self.latency_p50[hh].append((int(it.group(2)), float(it.group(3))))
 
         for key, tokens in ALWAYS_QUOTE.items():
             if any(t in msg for t in tokens):
                 self.quoted[key].append((hhmmss, level, truncate(msg, 240)))
 
+        # **`ALWAYS_QUOTE`와 따로 센다.** 저쪽은 「인용할 사건」의 목록이고 이쪽은 「이 체크
+        # 항목에 답할 계측이 살아 있는가」의 목록이다 — 겹치는 문구가 많지만 목적이 달라서,
+        # 한쪽을 고치다 다른 쪽이 조용히 눈머는 것이 08-04에 실제로 일어난 사고다.
+        for _item, token, _alt in MEASUREMENT_MAP:
+            if token in msg:
+                self.measurement_hits[token] += 1
+
     def gaps(self):
         lo, hi = hhmm_to_min(GAP_SCAN[0]), hhmm_to_min(GAP_SCAN[1])
         pts = sorted(x for x in self.minutes_seen if lo <= x <= hi)
         return [(a, b, b - a) for a, b in zip(pts, pts[1:]) if b - a >= GAP_THRESHOLD_MIN]
+
+    def longest_zero_row_run(self):
+        """반환: rows=0이 **연속된** 최장 구간 `(길이, 시작, 끝)`. 없으면 None.
+
+        「0행 86분」이라는 한 숫자로는 08-14와 평범한 날이 구별되지 않는다 — 흩어진 86분과
+        붙어 있는 84분은 완전히 다른 사건이고, 뒤쪽만 판단 입력을 죽인다.
+
+        ## 한 분이라도 회복되면 구간은 **끊긴다**
+
+        08-14의 사람 보고서는 14:00~15:23을 「84분」으로 적었다(14:32 한 분만 행이 남았다).
+        이 함수는 같은 날을 **32분 + 51분**으로 가른다. 관대해 보이는 쪽이 아니라 **이쪽이
+        맞다**: 체인 스냅샷의 신선도 창은 5분이므로(`db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES`)
+        14:32에 들어온 행은 그 뒤 5분간 판단에 실제로 실린다. 즉 그 한 분은 진짜로 회복이었다.
+
+        이 지표가 재는 것은 「0행이 몇 분 이어졌는가」가 아니라 **「판단이 체인을 못 본 채로
+        몇 분을 갔는가」**다. 임계(20분)도 그 뜻으로 정해져 있다.
+        """
+        pts = sorted(self.zero_row_minutes)
+        if not pts:
+            return None
+        best = (1, pts[0])
+        cur_start, cur_len = pts[0], 1
+        for prev, m in zip(pts, pts[1:]):
+            cur_len = cur_len + 1 if m == prev + 1 else 1
+            if m != prev + 1:
+                cur_start = m
+            if cur_len > best[0]:
+                best = (cur_len, cur_start)
+        return best[0], m2hhmm(best[1]), m2hhmm(best[1] + best[0] - 1)
+
+    def hourly_latency_p50(self, hour):
+        """반환: 그 시간대 `inquire-price` p50의 `(호출 수 가중 평균, 창 최대)`. 창이 없으면 `(None, None)`.
+
+        **둘 다 낸다. 판정은 최대로 한다.**
+
+        가중 평균인 이유: 5분 창마다 호출 수가 다르다(08-14 14시 53건 vs 15시 103건).
+        가중하지 않으면 한산한 창이 붐비는 창과 같은 무게를 갖는다.
+
+        최대를 함께 내는 이유: **평균은 절벽을 눌러 없앤다.** 08-14 13시의 가중 평균은 2.18초
+        (비율 0.55 — 조용하다)인데 그 시간대의 창 최대는 3.53초(**0.88** — 경고선 초과)였고,
+        **그 20~60분 뒤 84분 전멸이 시작됐다.** 평균만 보는 눈은 선행 신호를 평탄화해 버린다.
+        """
+        items = self.latency_p50.get(hour) or []
+        total = sum(n for n, _ in items)
+        if not total:
+            return None, None
+        return round(sum(n * p for n, p in items) / total, 2), round(max(p for _, p in items), 2)
 
     def anchor_hits(self, phases):
         out = []
@@ -308,6 +582,113 @@ class LoopScan:
             hits = sum(1 for x in self.minutes_seen if abs(x - t) <= ANCHOR_WINDOW_MIN)
             out.append((at, label, hits))
         return out
+
+
+def effective_read_timeout(root: Path) -> float:
+    """반환: 그날 옵션체인 호출에 **실제로 걸려 있던** read 타임아웃(초).
+
+    레버 `OPTION_CHAIN_READ_TIMEOUT_SECONDS`가 켜져 있으면 그 값, `None`(=OFF)이면 전역값이다.
+    p50과 비교할 임계는 반드시 그날 실제 값이어야 한다 — 레버를 켠 날 전역값(4.0)으로 비교하면
+    이 표가 통째로 거짓말을 한다.
+
+    이 파일은 stdlib 전용이라 `rest_client`를 임포트하지 않고 **소스를 읽는다**(§7 레버 표와
+    같은 방식). 읽지 못하면 전역값으로 폴백하고, 그 사실은 표 머리의 값으로 드러난다.
+    """
+    src = read_text(root / "mahdi" / "broker" / "rest_client.py")
+    m = re.search(r"^OPTION_CHAIN_READ_TIMEOUT_SECONDS[^=]*=\s*([\d.]+)", src, re.M)
+    return float(m.group(1)) if m else GLOBAL_READ_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------- 전일 지시 대조
+# 2026-08-14 장전 §6 / 고도화 1. 상세 근거는 §8-1 절 말미의 인용.
+_REPORT_GLOB = "*_마흐디_운영점검보고서.md"
+# 보고서 본문에 등장하는 가설 id. yaml의 `- id:` 규약(`YYYY-MM-DD-슬러그`)과 같은 모양이다.
+HYPOTHESIS_ID_RE = re.compile(r"\b(20\d\d-\d\d-\d\d-[a-z0-9][a-z0-9-]*)\b")
+
+
+def matched_phase_slot(phase: str, day: _date, now: datetime):
+    """반환: `(예정 슬롯 'HH:MM', 밀린 분, 첫 슬롯인가)` — 지난 슬롯이 없으면 `(None, None, True)`.
+
+    2026-08-14 고도화 3·6. 한 국면에 회차가 여럿이라(장중 12:30 / 14:30) **이번 실행이 어느
+    회차인지**를 한 곳에서 정한다 — 본문의 「N분 밀렸다」 판정과 파일명이 **같은 답을 써야**
+    12:30 산출물과 14:30 산출물이 어긋나지 않는다.
+
+    과거 날짜 재집계(`--date`)에서는 슬롯을 안 고른다. 그때의 「지금」은 그날의 시각이 아니라
+    다시 돌리는 시각이라, 회차를 고르면 엉뚱한 슬롯이 붙는다.
+    """
+    slots = PHASE_SCHEDULE.get(phase) or []
+    if not slots or day != now.date():
+        return None, None, True
+    minute_now = now.hour * 60 + now.minute
+    passed = [s for s in slots if minute_now >= hhmm_to_min(s)]
+    if not passed:
+        return None, None, True
+    planned = passed[-1]
+    return planned, minute_now - hhmm_to_min(planned), planned == slots[0]
+
+
+def latest_report_before(root: Path, day: _date):
+    """반환: `day`보다 **이전** 날짜의 운영점검보고서 중 가장 최근 것(없으면 None).
+
+    「전 영업일」을 달력으로 계산하지 않는 이유: 공휴일·미가동일이 있으면 그 날짜의 파일이
+    아예 없고, 그때 달력 계산은 존재하지 않는 파일을 가리킨다. **파일이 진실원천이다.**
+    """
+    found = []
+    for p in (root / "docs" / "동작점검").glob(_REPORT_GLOB):
+        try:
+            when = _date.fromisoformat(p.name[:10])
+        except ValueError:
+            continue
+        if when < day:
+            found.append((when, p))
+    return max(found)[1] if found else None
+
+
+def report_hypothesis_ids(text: str):
+    """반환: 보고서 본문이 언급한 가설 id 집합."""
+    return set(HYPOTHESIS_ID_RE.findall(text))
+
+
+def lever_schedule(root: Path):
+    """반환: `{레버 이름: {"유예횟수": n, "무조건발동일": "YYYY-MM-DD", "발동일": ...}}`.
+
+    2026-08-14 고도화 5. YAML 파서 없이 필드만 긁는다(`due_hypotheses`와 같은 이유 —
+    이 파일은 stdlib 전용이다). 한 레버를 여러 가설이 물고 있으면 **가장 이른 기한**이 이긴다:
+    누구 하나라도 그 날짜에 켜져야 한다고 적었으면 그날이 마지노선이다.
+    """
+    p = root / "docs" / "동작점검" / "hypotheses.yaml"
+    if not p.exists():
+        return {}
+    out, cur = {}, {}
+    for raw in read_text(p).splitlines():
+        if raw.startswith("- id:"):
+            cur = {}
+            continue
+        m = re.match(r"^  (전제레버|발동일|무조건발동일|유예횟수):\s*(.*)$", raw)
+        if not m:
+            continue
+        cur[m.group(1)] = m.group(2).strip().strip('"')
+        lever = cur.get("전제레버")
+        if not lever:
+            continue
+        slot = out.setdefault(lever, {})
+        for field in ("발동일", "무조건발동일"):
+            if cur.get(field) and (not slot.get(field) or cur[field] < slot[field]):
+                slot[field] = cur[field]
+        if cur.get("유예횟수"):
+            slot["유예횟수"] = cur["유예횟수"]
+    return out
+
+
+def registered_hypothesis_ids(root: Path):
+    """반환: `hypotheses.yaml`에 실제로 등재된 id 집합(상태 무관)."""
+    p = root / "docs" / "동작점검" / "hypotheses.yaml"
+    if not p.exists():
+        return set()
+    return {
+        ln.split("id:", 1)[1].strip().strip('"')
+        for ln in read_text(p).splitlines() if ln.startswith("- id:")
+    }
 
 
 # ---------------------------------------------------------------- 가설
@@ -371,6 +752,33 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     A("")
     A(f"- 생성 {now:%Y-%m-%d %H:%M:%S} KST · 리포 `{root}`")
     A(f"- 점검 범위: {', '.join(cfg_phases)} (장전=pre / 장중=intra / 장후=post)")
+    # 2026-08-14 고도화 5·6 — **밀린 실행인지 기계가 답한다.** 보고서 첫 줄의
+    # 「실행 08:35 · 예정 08:30 — 정시 실행」은 지금까지 사람이 손으로 적던 것이다.
+    slots = PHASE_SCHEDULE.get(phase) or []
+    if slots and day == now.date():
+        planned, late, _first = matched_phase_slot(phase, day, now)
+        if planned is not None:
+            if late <= PHASE_LATE_TOLERANCE_MIN:
+                verdict = "**정시 실행**"
+            elif late > PHASE_RERUN_MIN:
+                # **늦은 점검과 사후 재집계를 가른다.** 저녁에 그날 것을 다시 돌리는 일은
+                # 흔하고(이 파일의 `--date`가 그 용도다), 그때마다 ⚠가 뜨면 진짜로 밀린 날을
+                # 못 알아본다 — 거짓 경보가 진짜 경보를 죽이는 그 형태다.
+                verdict = f"{late}분 뒤 실행 — **사후 재집계로 본다**(점검 지연 아님)"
+            else:
+                verdict = f"**{late}분 밀렸다 ⚠**"
+            A(f"- 회차: 예정 {planned} · 실행 {now:%H:%M} — {verdict}"
+              f" (이 국면의 예정 회차: {', '.join(slots)})")
+            if PHASE_LATE_TOLERANCE_MIN < late <= PHASE_RERUN_MIN:
+                flags.append(
+                    f"{phase} 점검이 예정({planned})보다 **{late}분 밀렸다** — "
+                    "장전이 밀리면 개장 전 조치 시간이, 장중이 밀리면 개입 창이 그만큼 준다"
+                )
+        else:
+            A(f"- 회차: 이 국면의 첫 예정 시각({slots[0]}) 이전에 실행됐다 "
+              f"(예정 회차: {', '.join(slots)})")
+    elif slots:
+        A(f"- 회차: 과거 날짜 재집계 (이 국면의 예정 회차: {', '.join(slots)})")
     A("- 이 파일은 **요약이지 원본이 아니다.** 걸린 지점만 원본으로 되짚을 것.")
     A("")
 
@@ -547,6 +955,149 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     if len(ws) >= 5:
         flags.append(f"WS 단절 {len(ws)}회 — 재연결 1회당 재구독·관측 공백이 따라온다(2026-08-12 §2-1 사슬)")
 
+    # ---- 5-1. 수집 소요와 KIS 응답시간 (2026-08-14 Fix#3) ----
+    A("## 5-1. 수집 소요 × KIS 응답시간 — 절벽의 선행 지표")
+    A("")
+    if not scan.cycle_rest:
+        A("(사이클 소요 줄 없음 — 관측 루프가 안 돌았거나 로그 형식이 다르다)")
+        A("")
+    else:
+        timeout = effective_read_timeout(root)
+        A(f"수집 예산 **{CHAIN_COLLECT_BUDGET_SECONDS:.0f}초** · "
+          f"`{CHAIN_ENDPOINT}` read timeout **{timeout:.1f}초**")
+        A("")
+        A("| 시간대 | 사이클 | rows=0 | REST수집 평균(초) | 예산 대비 | p50 평균 | 창 최대 p50 | 최대/timeout | |")
+        A("|---|---|---|---|---|---|---|---|---|")
+        for hh in sorted(scan.cycle_rest):
+            rests = scan.cycle_rest[hh]
+            rows = scan.cycle_rows[hh]
+            mean = sum(rests) / len(rests)
+            budget_ratio = mean / CHAIN_COLLECT_BUDGET_SECONDS
+            p50, p50_max = scan.hourly_latency_p50(hh)
+            # **판정은 창 최대로 한다** — 근거는 `hourly_latency_p50` docstring.
+            ratio = (p50_max / timeout) if (p50_max is not None and timeout) else None
+            mark = ""
+            if ratio is not None and ratio >= 1.0:
+                mark = "⛔"
+            elif (ratio is not None and ratio >= P50_TIMEOUT_WARN_RATIO) or budget_ratio >= BUDGET_WARN_RATIO:
+                mark = "⚠"
+            A(f"| {hh:02d}시 | {len(rests)} | {sum(1 for r in rows if r == 0)} | {mean:.1f} | "
+              f"{budget_ratio * 100:.0f}% | {'—' if p50 is None else f'{p50:.2f}'} | "
+              f"{'—' if p50_max is None else f'{p50_max:.2f}'} | "
+              f"{'—' if ratio is None else f'{ratio:.2f}'} | {mark or '—'} |")
+            if ratio is not None and ratio >= 1.0:
+                flags.append(
+                    f"{hh}시 `{CHAIN_ENDPOINT}` 창 최대 p50 {p50_max:.2f}초가 read timeout "
+                    f"{timeout:.1f}초를 **넘었다**(비율 {ratio:.2f}) — 중앙값 호출이 타임아웃되면 "
+                    "수집은 느려지는 것이 아니라 **비어 버린다**"
+                )
+            elif ratio is not None and ratio >= P50_TIMEOUT_WARN_RATIO:
+                flags.append(
+                    f"{hh}시 창 최대 p50/timeout {ratio:.2f} — 경고선({P50_TIMEOUT_WARN_RATIO}) 초과. "
+                    "중앙값 호출이 타임아웃 한 뼘 앞이다(08-14는 0.77에서 24분 뒤 절벽이 왔다)"
+                )
+            if budget_ratio >= BUDGET_WARN_RATIO:
+                flags.append(
+                    f"{hh}시 REST수집 평균 {mean:.1f}초 = 예산의 {budget_ratio * 100:.0f}% "
+                    f"(경고선 {BUDGET_WARN_RATIO * 100:.0f}%)"
+                )
+        A("")
+        A("> **판정은 「창 최대」로 한다** — 시간대 평균은 절벽을 눌러 없앤다. 08-14 13시는 평균")
+        A("> 2.18초(0.55)로 조용했는데 창 최대는 3.53초(**0.88**)였고 그 20~60분 뒤 전멸이 시작됐다.")
+        A("")
+        A("> **창 최대 p50 ÷ read timeout이 1.0에 닿으면 그 창의 호출 절반 이상이 타임아웃**이고, 20레그 순차")
+        A("> 수집의 기대 성공 수는 0에 수렴한다. 이때 수집 **소요는 예산 천장에 눌려 오히려 안 늘고**")
+        A("> 적재만 0이 된다 — 08-14 14시가 그랬다(평균 49.9초로 13시보다 낮았고 rows는 0이었다).")
+        A("> 소요만 보는 눈은 이 절벽을 **구조적으로 못 본다.**")
+        A("")
+        run = scan.longest_zero_row_run()
+        if run is None:
+            A("- 최장 연속 `rows=0` 구간: **없음** (0행 사이클 0개)")
+        else:
+            length, lo, hi = run
+            A(f"- 최장 연속 `rows=0` 구간: **{length}분** ({lo}~{hi}, 임계 {ZERO_ROW_RUN_ALERT_MINUTES}분)")
+            if length >= ZERO_ROW_RUN_ALERT_MINUTES:
+                flags.append(
+                    f"`rows=0`이 **{length}분 연속**({lo}~{hi}) — 흩어진 0행 분과 다른 사건이다. "
+                    "신선도 창(5분)을 넘긴 분의 판단은 체인을 아예 못 본다"
+                )
+        A("")
+
+    # ---- 5-2. 앙상블 멤버 가용성 (2026-08-13 고도화 2) ----
+    A("## 5-2. 앙상블 멤버 가용성 — 「축이 죽었다」를 추론이 아니라 인용으로")
+    A("")
+    if not scan.member_transitions:
+        A(f"(`{MEMBER_TOKEN}` 줄 없음 — 판단 경로가 안 돌았거나 로그 형식이 다르다. "
+          "**「멤버가 다 살아 있었다」가 아니다.**)")
+        A("")
+    else:
+        A(f"판단 형태 전이 **{scan.member_transitions}건** · 분모 {scan.member_total}종")
+        A("")
+        A("| 멤버 | 최초 편입 | 마지막 관측 |")
+        A("|---|---|---|")
+        for name in sorted(scan.member_first_seen):
+            A(f"| `{name}` | {scan.member_first_seen[name]} | {scan.member_last_seen[name]} |")
+        A("")
+        shapes = ", ".join(f"{k} ×{v}" for k, v in sorted(scan.member_shape.items(), reverse=True))
+        A(f"- 형태 분포: {shapes}")
+        if scan.member_conviction:
+            A("- 확신도: " + ", ".join(f"{k} ×{v}" for k, v in scan.member_conviction.most_common()))
+        A("")
+        A("> **최초 편입 시각이 09:00보다 한참 뒤면 그 멤버는 장전 내내 죽어 있었던 것이다.**")
+        A("> 08-14에 `options_flow`가 넉 달 만에 09:01:10에 합류했고, 같은 날 오후 입력 고갈로")
+        A("> 다시 빠졌다 — 두 사건 다 이 표 한 줄로 보인다.")
+        A("")
+        # **마지막 관측이 로그 끝보다 한참 이르면 그 멤버는 도중에 빠진 것이다.**
+        # 08-14 오후의 `options_flow`가 정확히 그 형태였고, 그날 아무 카운터에도 안 걸렸다.
+        if scan.last:
+            end_min = hhmm_to_min(scan.last[0][:5])
+            dropped = [
+                (n, t) for n, t in scan.member_last_seen.items()
+                if end_min - hhmm_to_min(t[:5]) >= MEMBER_DROPOUT_ALERT_MIN
+            ]
+            for name, seen in sorted(dropped):
+                gap = end_min - hhmm_to_min(seen[:5])
+                flags.append(
+                    f"앙상블 멤버 `{name}`가 {seen} 이후 **{gap}분째 미관측** — 축이 도중에 빠졌다. "
+                    "그 멤버가 죽은 이유가 자기 자신인지 **입력 고갈**인지 갈라야 한다(08-14 오후가 후자였다)"
+                )
+
+    # ---- 5-3. 계측 부재 신고 (2026-08-14 장중 §8 / 고도화 3) ----
+    A("## 5-3. 계측 부재 — 「0건」인가 「재는 눈이 없는가」")
+    A("")
+    zero_tokens = [t for _i, t, _a in MEASUREMENT_MAP if not scan.measurement_hits.get(t)]
+    # **당일 0줄인 문구만** 잔여 로그를 다시 훑는다 — 이미 오늘 나온 문구는 계측이 살아 있는
+    # 것이 증명됐고, 로그 전체를 무조건 재훑는 것은 10MB×10에 대해 낭비다.
+    elsewhere = tokens_seen_on_other_days(logs, day, zero_tokens) if zero_tokens else {}
+    A("| phases 항목 | 로그 문구 | 당일 줄 | 판정 |")
+    A("|---|---|---|---|")
+    blind = []
+    for item, token, alt in MEASUREMENT_MAP:
+        n = scan.measurement_hits.get(token, 0)
+        other_n, other_day = elsewhere.get(token, (0, None))
+        if n:
+            verdict = "계측 살아 있음"
+        elif other_n:
+            # 규약 C — 이것이 「진짜 0」이다. 다른 날 같은 문구가 남아 있으므로 경로는 살아 있다.
+            verdict = f"**진짜 0** — {other_day}에 {other_n}줄(경로 살아 있음)"
+        elif alt:
+            verdict = f"로그 축 없음 — **{alt}**가 답한다"
+        else:
+            verdict = "**계측 미확인 ⚠**"
+            blind.append((item, token))
+        A(f"| {item} | `{token}` | {n} | {verdict} |")
+    A("")
+    A("> **「당일 줄 0」은 「그 일이 안 일어났다」가 아니다.** 문구가 바뀌거나 로그 레벨이")
+    A("> 내려가면 파서는 조용히 눈이 먼다 — 2026-08-04에 WARNING→INFO 강등으로 362건이")
+    A("> 0건으로 보고된 전례가 있다. **대체 축이 있는 항목은 경보로 올리지 않는다**(로그에")
+    A("> 없다고 못 재는 것이 아니다 — 08-14 장중 §4-3이 그 오판이었고 장후 §2-6이 정정했다).")
+    A("")
+    for item, token in blind:
+        flags.append(
+            f"계측 없음 — `{item}`에 답할 문구 `{token}`가 당일 **0줄**이다. "
+            "「안 일어났다」로 읽기 전에 **그 문구가 아직 존재하는지** 먼저 확인할 것"
+        )
+
     # ---- 6. 워치독 ----
     A("## 6. 워치독 — 감시자 자신의 생사")
     A("")
@@ -615,8 +1166,11 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     # ---- 7. 레버 ----
     A("## 7. 레버 상태 — 오늘 그 코드가 실제로 돌았는가")
     A("")
-    A("| 레버 | 위치 | 현재 줄 |")
-    A("|---|---|---|")
+    # 2026-08-14 고도화 5 — 레버마다 **유예 회차와 무조건발동일**을 나란히 둔다.
+    # 「지금 꺼져 있다」만으로는 그것이 오늘 결정된 유예인지 열 번째 망각인지 알 수 없다.
+    schedule = lever_schedule(root)
+    A("| 레버 | 위치 | 현재 줄 | 유예 | 무조건발동일 |")
+    A("|---|---|---|---|---|")
     for key, rel in LEVER_KEYS:
         p = root / rel
         found = "**파일 없음**"
@@ -624,10 +1178,30 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
             hits = [ln.strip() for ln in read_text(p).splitlines()
                     if key in ln and not ln.strip().startswith("#")]
             found = truncate(hits[0], 90) if hits else "**키 없음(기본값으로 동작)**"
-        A(f"| `{key}` | `{rel}` | {found} |")
+        info = schedule.get(key, {})
+        deferrals = info.get("유예횟수")
+        deadline = info.get("무조건발동일")
+        if deadline:
+            left = (_date.fromisoformat(deadline) - day).days
+            when = f"{deadline} (D{left:+d})" if left else f"{deadline} (**오늘**)"
+            if left < 0:
+                when = f"{deadline} (**{-left}일 지남 ⚠**)"
+                flags.append(
+                    f"레버 `{key}`의 무조건발동일({deadline})이 {-left}일 지났다 — "
+                    "켜거나 날짜를 옮기고 사유를 적을 것(테스트가 실패 중일 것이다)"
+                )
+        else:
+            # 규약 C — 「기한이 없다」는 「여유가 있다」가 아니라 **「강제력이 없다」**이다.
+            when = "— (강제력 없음)"
+        A(f"| `{key}` | `{rel}` | {found} | {deferrals + '회' if deferrals else '—'} | {when} |")
     A("")
     A("> **규약 H — 레버가 꺼진 날의 숫자로 그 레버의 가설을 판정하지 않는다.**")
     A("> 2026-08-12에 「오늘 켤 유일한 레버」가 안 켜졌는데 지표는 켜진 전제로 판정했다(§1-1).")
+    A("")
+    A("> **무조건발동일이 비어 있으면 그 레버의 유예는 영원히 조용히 성립한다.** 레버 F는")
+    A("> 그렇게 세 번, 레버 E는 일곱 번 미뤄졌고 **열 번 중 한 번도 사유가 적히지 않았다** —")
+    A("> 결정된 유예가 아니라 잊힌 유예였다는 뜻이다. 날짜를 박으면 그날부터")
+    A("> `test_repo_levers_have_not_blown_their_unconditional_deadline`이 강제한다.")
     A("")
 
     # ---- 8. 오늘 판정해야 할 가설 ----
@@ -653,6 +1227,69 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         A("> 고치는 것*이라 규약의 뿌리를 무너뜨린다 — `inconclusive`로 닫고 이유를 적는다.")
     A("")
 
+    # ---- 8-1. 전일 지시 이행 대조 (2026-08-14 장전 §6 / 고도화 1) ----
+    A("## 8-1. 전일 보고서의 지시가 이행됐는가 — 기계 대조")
+    A("")
+    prev_report = latest_report_before(root, day)
+    if prev_report is None:
+        A("(직전 운영점검보고서를 못 찾았다 — 첫날이거나 파일명 규약이 다르다)")
+        A("")
+    else:
+        prev_label = prev_report.name[:10]
+        text = read_text(prev_report)
+        ids = report_hypothesis_ids(text)
+        boxes = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- [ ]")]
+        yaml_path = root / "docs" / "동작점검" / "hypotheses.yaml"
+        yaml_ids, _due = due_hypotheses(root, day)
+        known = registered_hypothesis_ids(root)
+        yaml_mtime = (
+            datetime.fromtimestamp(yaml_path.stat().st_mtime, KST).date()
+            if yaml_path.exists() else None
+        )
+
+        A(f"직전 보고서: `{prev_report.name}` · 미완료 체크박스 **{len(boxes)}개** · "
+          f"거기 언급된 가설 id **{len(ids)}개**")
+        A("")
+        A(f"- `hypotheses.yaml` 최종 수정: **{yaml_mtime or '—'}**")
+        if yaml_mtime is not None and yaml_mtime <= _date.fromisoformat(prev_label):
+            flags.append(
+                f"`hypotheses.yaml`이 {prev_label} 보고서 이후 **한 줄도 안 바뀌었다**(mtime {yaml_mtime}) — "
+                "그 보고서의 등재·이동·확정 지시가 전부 무행동으로 성립하는 중이다"
+            )
+        # **접두사로 맞춘다.** 보고서는 `2026-08-12-g1`처럼 짧게 부르고 yaml의 실제 id는
+        # `2026-08-12-g1-reconnect-as-cost`다. 완전 일치로 보면 멀쩡히 등재된 항목이
+        # 「미등재」로 찍히고, 그런 오보가 몇 번 나면 이 절 전체가 무시된다.
+        unregistered = sorted(
+            i for i in ids if not any(k == i or k.startswith(i + "-") for k in known)
+        )
+        if unregistered:
+            A(f"- ⚠ 직전 보고서가 언급했는데 **yaml에 없는 id {len(unregistered)}개**: "
+              + ", ".join(f"`{i}`" for i in unregistered))
+            flags.append(
+                f"전일 보고서의 등재 제안 {len(unregistered)}건이 **미등재**"
+                f"({', '.join(unregistered[:3])}{'…' if len(unregistered) > 3 else ''}) — "
+                "**등재 창은 개장(09:00)에 닫힌다**(소급 금지)"
+            )
+        else:
+            A("- 직전 보고서가 언급한 id는 전부 yaml에 있다")
+        A("")
+        if boxes:
+            A("직전 보고서의 미완료 항목(원문 그대로):")
+            A("")
+            A("```")
+            for ln in boxes[:14]:
+                A(truncate(ln, 150))
+            if len(boxes) > 14:
+                A(f"… 외 {len(boxes) - 14}개")
+            A("```")
+            A("")
+        A("> **이 절이 있는 이유**: 08-14에 「어제 지시 3종이 하나도 이행되지 않았다」를 찾은 것은")
+        A("> 사람이 전일 보고서와 `hypotheses.yaml`을 손으로 겹쳐 읽었기 때문이고, 그날 자동")
+        A("> 적신호는 「예정일 지난 12건」만 냈다. **체크박스 자체는 사람이 지우는 것이라 여기서")
+        A("> 완료 판정을 하지 않는다** — 기계가 답할 수 있는 것(yaml이 움직였는가, 그 id가")
+        A("> 실재하는가)만 답하고 나머지는 원문으로 보여 준다.")
+        A("")
+
     # ---- 9. 산출물 ----
     A("## 9. 산출물 존재 점검")
     A("")
@@ -662,7 +1299,19 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         (f"docs/동작점검/auto/{D}_지표.json", "post"),
         (f"docs/동작점검/{D}_마흐디_운영점검보고서.md", "post"),
         (f"docs/동작점검/auto/{prev_hint}_지표.json", "pre"),
+        # 장후 회차가 **흡수해야 할 원본들**. 없으면 그날 보고서는 오전/오후 중 한쪽을
+        # 못 보고 쓰인다 — 08-14 장후가 장전·장중을 흡수하면서 그 둘을 「보존한다」고
+        # 명시한 것이 이 규약이고, 여기서 그 존재를 기계로 확인한다.
+        (f"docs/동작점검/{D}_점검_pre.md", "post"),
+        (f"docs/동작점검/{D}_점검_intra.md", "post"),
     ]
+    # 2026-08-17부터 장중이 두 회차다(`mahdi-intraday-check-1430`). 그 이전 날짜를 재집계할 때
+    # 이 파일을 기대하면 **매번 거짓 누락**이 뜬다 — 규약이 생기기 전의 날은 없는 게 정상이다.
+    if day >= INTRA_1430_SINCE:
+        targets += [
+            (f"docs/동작점검/{D}_점검_intra_1430.md", "post"),
+            (f"docs/동작점검/auto/{D}_증거_intra_1430.md", "post"),
+        ]
     A("| 파일 | 기대 국면 | 상태 | 크기 | 최종기록 |")
     A("|---|---|---|---|---|")
     for rel, ph in targets:
@@ -791,7 +1440,19 @@ def main(argv=None):
 
     out_arg = args.out
     if not out_arg and args.out_dir:
-        out_arg = str(Path(args.out_dir) / f"{day.isoformat()}_증거_{args.phase}.md")
+        # 2026-08-14 — **회차가 여럿인 국면은 파일명을 갈라야 한다.**
+        #
+        # 장중이 12:30 / 14:30 두 회차가 되면서, 슬롯을 안 붙이면 14:30 실행이 12:30 증거를
+        # 조용히 **덮어쓴다.** 그러면 12:30 보고서의 근거가 사라지고, 장후 회차가 두 보고서를
+        # 흡수할 때 오전 시점의 증거를 못 본다 — 보고서 자체 검증의 「흡수한 원본을 지우지
+        # 않았다」가 증거 쪽에서 깨지는 것이다.
+        #
+        # 첫 슬롯은 접미사 없이 둔다(기존 파일명 유지 — 지난 날짜 산출물과 규약이 갈리지 않는다).
+        # 두 번째 이후만 `_HHMM`을 붙여 `{날짜}_증거_intra_1430.md`가 된다 — 점검 보고서의
+        # `{날짜}_점검_intra_1430.md`와 같은 규약이다.
+        planned, _late, first = matched_phase_slot(args.phase, day, datetime.now(KST))
+        suffix = "" if (first or planned is None) else "_" + planned.replace(":", "")
+        out_arg = str(Path(args.out_dir) / f"{day.isoformat()}_증거_{args.phase}{suffix}.md")
     if out_arg:
         outp = Path(out_arg)
         if not outp.is_absolute():

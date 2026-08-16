@@ -1,0 +1,9 @@
+
+
+커밋(a7f5726) 7/31 fit() 실행
+scripts/fit_regime_engine.py (신규) — feature_store 축적 데이터로 
+RegimeEngine.fit()을 오프라인 실행해 data/models/regime_engine.pkl에 저장하는 배치. 
+데이터가 20영업일 이상 쌓인 뒤 수동 실행하면 됨 — main.py는 그 파일 존재 여부만 보고 
+자동으로 predict() 모드로 전환.
+오늘 당장 체감되는 효과: gap_zscore(실제 갭)·macro_score(외국인 순매수 방향)·전일 마감 레짐이 실데이터로 들어가면서, 큰 갭이 있는 날은 더 이상 "평균회귀"에 갇히지 않고 TREND/VOL_EXPANSION/CRISIS_DEFENSE로 정상 전환됩니다. 다만 gap이 작은 평상시엔 여전히 전일 레짐을 그대로 물려받는 게 스펙상 정상 동작이며, 완전한 장중 세분화는 fit() 배치를 돌린 뒤부터 이뤄집니다.
+
