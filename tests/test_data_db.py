@@ -1374,3 +1374,61 @@ def test_positions_as_of_is_empty_when_nothing_was_ever_snapshotted():
 def test_account_balance_snapshot_columns_include_the_unknown_side_count():
     """마이그레이션 030이 015에 더한 컬럼 — 이 값이 0이 아닌 날은 방향 카운트를 신뢰할 수 없다."""
     assert "unknown_side_count" in db._ACCOUNT_BALANCE_SNAPSHOT_COLUMNS
+
+
+# ===== 2026-08-16 (Block C) — execution_logs 적재 =====
+
+
+def test_insert_execution_log_upserts_on_order_id_so_state_changes_update_one_row():
+    """PK가 `order_id`다 — 같은 주문의 상태 변화는 **같은 행을 갱신**한다.
+
+    테이블은 001_init부터 있었지만 **적재 함수가 없어서** 주문을 내도 남길 곳이 없었다.
+    """
+    from datetime import datetime as _dt
+
+    from mahdi.broker.order_state_machine import Order, OrderState, order_to_execution_log_row
+
+    conn = FakeConnection()
+    order = Order(
+        order_id="0000001666", symbol="201S03C325", side="BUY", order_type="LIMIT",
+        intended_px=3.55, qty=1, timestamp=_dt(2026, 8, 18, 10, 4),
+        state=OrderState.CANCELLED,
+    )
+
+    db.insert_execution_log(conn, order_to_execution_log_row(order))
+
+    assert conn.committed is True
+    assert "INSERT INTO execution_logs" in conn.store["query"]
+    assert "ON CONFLICT (order_id) DO UPDATE" in conn.store["query"]
+    assert len(conn.store["params"]) == len(db._EXECUTION_LOG_COLUMNS)
+    # state는 enum이 아니라 **문자열 값**으로 내려가야 한다(컬럼이 VARCHAR).
+    assert conn.store["params"][db._EXECUTION_LOG_COLUMNS.index("state")] == "CANCELLED"
+
+
+def test_order_to_execution_log_row_matches_the_table_columns_exactly():
+    """행 변환의 키와 DB 컬럼이 갈리면 조용히 None이 들어간다."""
+    from datetime import datetime as _dt
+
+    from mahdi.broker.order_state_machine import Order, order_to_execution_log_row
+
+    row = order_to_execution_log_row(
+        Order(order_id="1", symbol="s", side="BUY", order_type="LIMIT",
+              intended_px=1.0, qty=1, timestamp=_dt(2026, 8, 18, 10, 4))
+    )
+    assert set(row) == set(db._EXECUTION_LOG_COLUMNS)
+
+
+def test_execution_logs_on_converts_decimals_to_float():
+    """Decimal/float 혼합 TypeError를 2026-07-28에 겪었다 — 읽는 쪽에서 float으로 내린다."""
+    from datetime import datetime as _dt
+
+    ts = _dt(2026, 8, 18, 10, 4)
+    conn = FakeReadConnection([
+        ("0000001666", ts, "201S03C325", "BUY", "LIMIT", 3.55, None, 1, "PENDING", None, None),
+    ])
+    (row,) = db.execution_logs_on(conn, date(2026, 8, 18))
+
+    assert row["order_id"] == "0000001666"
+    assert isinstance(row["intended_px"], float)
+    assert row["filled_px"] is None
+    assert row["state"] == "PENDING"

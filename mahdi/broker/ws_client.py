@@ -51,10 +51,25 @@ class SubscriptionAck:
     rt_cd: str      # "0"=성공
     msg_code: str
     message: str
+    # 2026-08-16 (Block C) — **체결통보 복호화 키는 이 응답에만 실려 온다.**
+    #
+    # 공식 문서("선물옵션 실시간체결통보" 시트) 응답 예시:
+    #     "body": {..., "output": {"iv": "0123456789abcdef",
+    #                              "key": "abcdefghijklmnopabcdefghijklmnop"}}
+    # 이후 데이터 프레임은 `1|H0IFCNI0|001|<암호문>` 형태로 오고 위 키로만 읽을 수 있다.
+    # 종전 `parse_subscription_ack()`은 `rt_cd`/`msg_cd`/`msg1`만 뽑아 **이 둘을 버렸다** —
+    # 즉 키를 받는 유일한 창을 놓치고 있었다. 시세 구독에는 `output`이 없으므로 None이다.
+    aes_iv: str | None = None
+    aes_key: str | None = None
 
     @property
     def succeeded(self) -> bool:
         return self.rt_cd == "0"
+
+    @property
+    def carries_cipher_material(self) -> bool:
+        """이 ACK이 복호화 키를 실어 왔는가 — 체결통보 구독에서만 True다."""
+        return bool(self.aes_iv and self.aes_key)
 
     @property
     def is_unsubscribe(self) -> bool:
@@ -177,12 +192,18 @@ class KISWebSocketClient:
         if not isinstance(body, dict) or "rt_cd" not in body:
             return None
         header = message.get("header") or {}
+        # 2026-08-16 (Block C) — 체결통보 구독 ACK에만 실려 오는 복호화 키를 함께 담는다.
+        # 시세 구독에는 `output`이 없으므로 그 경우 둘 다 None이 된다(종전과 같은 값).
+        output = body.get("output")
+        output = output if isinstance(output, dict) else {}
         return SubscriptionAck(
             tr_id=str(header.get("tr_id", "")),
             tr_key=str(header.get("tr_key", "")),
             rt_cd=str(body.get("rt_cd", "")),
             msg_code=str(body.get("msg_cd", "")),
             message=str(body.get("msg1", "")),
+            aes_iv=str(output["iv"]) if output.get("iv") else None,
+            aes_key=str(output["key"]) if output.get("key") else None,
         )
 
     async def listen(self, handler: MessageHandler) -> None:

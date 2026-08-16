@@ -981,3 +981,190 @@ def test_pacer_completion_is_recorded_even_when_the_call_raises():
         with pytest.raises(httpx.ReadTimeout):
             rest._send_get(f"{tr_codes.VPS_REST_DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-price")
     recorded.assert_called_once()
+
+
+# ===== 2026-08-16 (Block C) — 취소·정정·조회 =====
+#
+# 이 셋은 오늘까지 **한 번도 호출된 적이 없다**(주문이 나간 적이 없다). 그래서 이 절이 검사하는
+# 것은 "동작하는가"가 아니라 **"공식 문서가 Required로 적은 필드를 전부 보내는가"** 다 —
+# 잔고 조회가 필수 파라미터 4개 누락으로 **항상 실패**하고 있던 것을 2026-07-28에야 발견했고,
+# 그 실패는 이런 테스트가 없어서 넉 달을 살아남았다.
+
+
+def _capturing_client(response: dict | None = None):
+    captured: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        entry = {"url": str(request.url), "headers": request.headers}
+        if request.content:
+            entry["body"] = _json.loads(request.content)
+        captured.append(entry)
+        return httpx.Response(200, json=response if response is not None else {"rt_cd": "0"})
+
+    client = KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_request_interval=0.0,
+    )
+    return client, captured
+
+
+def test_cancel_order_sends_every_required_field_with_the_documented_cancel_values():
+    """"선물옵션 정정취소주문" 시트가 취소에 대해 못박은 값 셋:
+
+        UNIT_PRICE = 0        ("취소 시에도 0 입력")
+        KRX_NMPR_CNDT_CD = 0  ("취소시 0으로 입력")
+        ORD_QTY = 0           ("전량일경우 0으로 입력")
+
+    그리고 `NMPR_TYPE_CD`/`ORD_DVSN_CD`는 취소에서도 Required다 — 비우면 KIS가 거부한다.
+    """
+    client, captured = _capturing_client()
+    client.cancel_order("0000001666")
+
+    body = captured[0]["body"]
+    assert body["RVSE_CNCL_DVSN_CD"] == tr_codes.RVSE_CNCL_CANCEL == "02"
+    assert body["ORGN_ODNO"] == "0000001666"
+    assert body["ORD_QTY"] == "0"
+    assert body["UNIT_PRICE"] == "0"
+    assert body["KRX_NMPR_CNDT_CD"] == "0"
+    assert body["RMN_QTY_YN"] == "Y"  # 전량
+    assert body["ORD_PRCS_DVSN_CD"] == "02"
+    # Required인데 빠지기 쉬운 둘 — 없으면 거부당한다.
+    assert body["NMPR_TYPE_CD"] and body["ORD_DVSN_CD"]
+    assert "order-rvsecncl" in captured[0]["url"]
+    assert captured[0]["headers"]["tr_id"] == tr_codes.TR_ORDER_MODIFY_CANCEL["vps"] == "VTTO1103U"
+
+
+def test_partial_cancel_flips_the_remaining_quantity_flag():
+    """전량(0)과 일부(N개)는 `RMN_QTY_YN`으로 갈린다 — 문서: Y=전량 / N=일부."""
+    client, captured = _capturing_client()
+    client.cancel_order("0000001666", qty=1)
+
+    assert captured[0]["body"]["ORD_QTY"] == "1"
+    assert captured[0]["body"]["RMN_QTY_YN"] == "N"
+
+
+def test_modify_order_differs_from_cancel_by_exactly_one_field():
+    """정정과 취소는 같은 TR·같은 경로이고 `RVSE_CNCL_DVSN_CD` 한 글자만 다르다.
+    본문을 두 곳에서 만들면 Required 목록이 갈리므로 한 함수가 만든다."""
+    client, captured = _capturing_client()
+    client.cancel_order("0000001666")
+    client.modify_order("0000001666", qty=0, price=3.55)
+
+    cancel_body, modify_body = captured[0]["body"], captured[1]["body"]
+    assert cancel_body["RVSE_CNCL_DVSN_CD"] == "02"
+    assert modify_body["RVSE_CNCL_DVSN_CD"] == "01"
+    differing = {k for k in cancel_body if cancel_body[k] != modify_body.get(k)}
+    assert differing == {"RVSE_CNCL_DVSN_CD", "UNIT_PRICE"}  # 정정은 가격이 바뀐다
+
+
+def test_inquire_ccnl_sends_the_required_blank_fields_rather_than_omitting_them():
+    """`PDNO`/`MKET_ID_CD`/`CTX_AREA_*200`은 **Required인데 공란이 정상값**이다.
+    Required니까 값을 채워야 한다고 오해하거나, 공란이니까 빼도 된다고 오해하면 둘 다 거부당한다.
+    """
+    client, captured = _capturing_client({"rt_cd": "0", "output1": []})
+    client.inquire_ccnl("20260818", "20260818")
+
+    url = captured[0]["url"]
+    assert "inquire-ccnl" in url
+    for required in ("CANO", "ACNT_PRDT_CD", "STRT_ORD_DT", "END_ORD_DT", "SLL_BUY_DVSN_CD",
+                     "CCLD_NCCS_DVSN", "SORT_SQN", "STRT_ODNO", "PDNO", "MKET_ID_CD",
+                     "CTX_AREA_FK200", "CTX_AREA_NK200"):
+        assert f"{required}=" in url, f"{required}가 쿼리에 없다 — KIS가 거부한다"
+    assert "STRT_ORD_DT=20260818" in url
+    assert captured[0]["headers"]["tr_id"] == tr_codes.TR_ORDER_CCNL_INQUIRY["vps"] == "VTTO5201R"
+
+
+def test_get_order_fill_status_finds_the_order_by_the_lowercase_field():
+    """조회 응답은 **소문자** `odno`다(제출 응답은 대문자 `ODNO`) — 대소문자를 섞으면 조용히 못 찾는다."""
+    from datetime import date
+
+    client, _ = _capturing_client({
+        "rt_cd": "0",
+        "output1": [
+            {"odno": "0000000001", "ord_qty": "1", "qty": "1", "tot_ccld_qty": "0", "rjct_qty": "0"},
+            {"odno": "0000001666", "ord_qty": "2", "qty": "0", "tot_ccld_qty": "2",
+             "rjct_qty": "0", "avg_idx": "3.55"},
+        ],
+    })
+    status = client.get_order_fill_status("0000001666", as_of=date(2026, 8, 18))
+
+    assert status == {"state": "FILLED", "filled_px": 3.55, "filled_qty": 2}
+
+
+def test_get_order_fill_status_returns_pending_and_warns_when_the_order_is_absent(caplog):
+    """접수 직후 조회에는 안 보일 수 있다 — PENDING(전이 없음)이 안전한 쪽이다.
+    **다만 조용히 넘기지 않는다**: 영구히 안 보이면 그것은 접수 실패이고 사람이 알아야 한다."""
+    from datetime import date
+
+    client, _ = _capturing_client({"rt_cd": "0", "output1": []})
+    with caplog.at_level("WARNING"):
+        status = client.get_order_fill_status("0000009999", as_of=date(2026, 8, 18))
+
+    assert status["state"] == "PENDING"
+    assert "0000009999" in caplog.text
+
+
+def test_parse_fill_status_reads_qty_as_remaining_not_as_order_quantity():
+    """**`qty`는 「잔량」이다.** 주문수량으로 착각하면 CANCELLED와 PENDING이 뒤집힌다.
+
+    같은 주문수량 2계약인데 잔량만 다른 두 행이 서로 다른 상태로 갈려야 한다.
+    """
+    from mahdi.broker.rest_client import parse_fill_status
+
+    untouched = {"ord_qty": "2", "qty": "2", "tot_ccld_qty": "0", "rjct_qty": "0"}
+    cancelled = {"ord_qty": "2", "qty": "0", "tot_ccld_qty": "0", "rjct_qty": "0"}
+
+    assert parse_fill_status(untouched)["state"] == "PENDING"
+    assert parse_fill_status(cancelled)["state"] == "CANCELLED"
+
+
+def test_parse_fill_status_treats_any_rejection_as_rejected_first():
+    """거부가 최우선이다 — 일부 체결 + 일부 거부도 거부로 읽는다(모르면 안전한 쪽)."""
+    from mahdi.broker.rest_client import parse_fill_status
+
+    row = {"ord_qty": "2", "qty": "0", "tot_ccld_qty": "1", "rjct_qty": "1", "avg_idx": "3.5"}
+    assert parse_fill_status(row)["state"] == "REJECTED"
+
+
+def test_parse_fill_status_handles_zero_padded_strings_and_blanks():
+    """KIS 수치는 전부 문자열이고 `0000000002`처럼 패딩되며 공란이 올 수 있다."""
+    from mahdi.broker.rest_client import parse_fill_status
+
+    row = {"ord_qty": "0000000002", "qty": "0000000000", "tot_ccld_qty": "0000000002",
+           "rjct_qty": "", "avg_idx": "007840000"}
+    assert parse_fill_status(row) == {"state": "FILLED", "filled_px": 7840000.0, "filled_qty": 2}
+
+
+def test_parse_fill_status_reports_no_price_when_nothing_filled():
+    """체결이 0이면 평균지수가 와도 체결가로 쓰지 않는다 — 「못 쟀다」와 「0에 체결」은 다르다."""
+    from mahdi.broker.rest_client import parse_fill_status
+
+    row = {"ord_qty": "2", "qty": "2", "tot_ccld_qty": "0", "rjct_qty": "0", "avg_idx": "3.55"}
+    assert parse_fill_status(row)["filled_px"] is None
+
+
+def test_format_order_price_emits_plain_zero_not_zero_point_zero():
+    """`str(0.0)`은 `"0.0"`이다. 문서는 취소 시 `UNIT_PRICE`에 **"0"** 을 요구한다 —
+    이 한 글자가 8/18 실측을 실패시킬 수 있었다(테스트가 실제로 잡아냈다)."""
+    from mahdi.broker.rest_client import format_order_price
+
+    assert format_order_price(0.0) == "0"
+    assert format_order_price(350.0) == "350"      # 정수는 소수점 없이
+    assert format_order_price(3.55) == "3.55"      # 소수는 그대로
+    assert format_order_price(350.25) == "350.25"  # 선물 0.05틱
+    assert format_order_price(0.01) == "0.01"      # 옵션 최소 호가
+    assert "e" not in format_order_price(0.0001)   # 지수 표기가 새지 않는다
+
+
+def test_submit_and_cancel_use_the_same_price_format():
+    """두 경로가 다른 형식을 보내면 한쪽만 거부당하고 원인 규명이 길어진다."""
+    client, captured = _capturing_client()
+    client.submit_order(symbol="201W09", side="BUY", qty=1, price=350.0)
+    client.cancel_order("0000001666")
+
+    assert captured[0]["body"]["UNIT_PRICE"] == "350"
+    assert captured[1]["body"]["UNIT_PRICE"] == "0"

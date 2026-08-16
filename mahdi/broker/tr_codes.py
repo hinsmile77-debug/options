@@ -30,6 +30,11 @@ PATH_WS_APPROVAL = "/oauth2/Approval"
 PATH_FUTUREOPTION_ORDER = "/uapi/domestic-futureoption/v1/trading/order"
 PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL = "/uapi/domestic-futureoption/v1/trading/order-rvsecncl"
 PATH_FUTUREOPTION_BALANCE = "/uapi/domestic-futureoption/v1/trading/inquire-balance"
+# 2026-08-16 (Block C) — 주문체결내역조회. "선물옵션 주문체결내역조회" 시트에서 확인.
+#
+# **이 경로가 없어서 v6 §13.2의 「체결통보-REST 이중 확인」이 절반만 성립하고 있었다** —
+# `order_manager.confirm_fill()`이 요구하는 `get_order_fill_status()`를 구현할 API가 없었다.
+PATH_FUTUREOPTION_CCNL_INQUIRY = "/uapi/domestic-futureoption/v1/trading/inquire-ccnl"
 
 # 단일 종목 시세/시세호가 — 실전·모의 겸용. "국내옵션전광판_*"(display-board-*) 계열은 모의투자
 # 미지원이라 Phase1(모의투자)에서는 쓸 수 없다. 전 종목 체인을 한 번에 받는 REST는 모의투자에
@@ -55,6 +60,26 @@ FID_MRKT_DIV_DERIVATIVES = "K2I"
 TR_ORDER_NEW = {"real": "TTTO1101U", "vps": "VTTO1101U"}
 TR_ORDER_MODIFY_CANCEL = {"real": "TTTO1103U", "vps": "VTTO1103U"}
 TR_BALANCE_INQUIRY = {"real": "CTFO6118R", "vps": "VTFO6118R"}
+# 2026-08-16 (Block C) — 주문체결내역조회("선물옵션 주문체결내역조회" 시트).
+# 야간(JTCE) 계열은 모의투자 미제공이므로 주간만 둔다.
+TR_ORDER_CCNL_INQUIRY = {"real": "TTTO5201R", "vps": "VTTO5201R"}
+
+# ===== 주문 API의 응답 필드 대소문자가 갈린다 (2026-08-16 실측 전 문서 확인) =====
+#
+# **제출**("선물옵션 주문")의 응답 `output`은 **array**이고 필드가 **대문자**다: `ODNO`(주문번호)
+# `ORD_TMD`(주문시각) `ORD_GNO_BRNO` `ACNT_NAME` `TRAD_DVSN_NAME` `ITEM_NAME`.
+# **조회**("주문체결내역조회")의 `output1`은 **소문자**다: `odno` `ord_tmd` `tot_ccld_qty` ...
+#
+# 같은 도메인의 두 API가 서로 다른 규약을 쓴다 — 한쪽을 보고 다른 쪽을 추측하면 조용히 None이
+# 된다(2026-07-06 `output1.gama` 사건과 같은 형태). 그래서 상수로 못박는다.
+ORDER_SUBMIT_ORDER_NO_FIELD = "ODNO"  # 제출 응답(대문자)
+ORDER_INQUIRY_ORDER_NO_FIELD = "odno"  # 조회 응답(소문자)
+
+# 정정취소구분코드 — "선물옵션 정정취소주문" 시트
+RVSE_CNCL_MODIFY = "01"
+RVSE_CNCL_CANCEL = "02"
+# 주문처리구분코드: 02=주문전송 (문서상 이 값 하나만 정의돼 있다)
+ORD_PRCS_DVSN_SEND = "02"
 TR_OPTION_QUOTE = {"real": "FHMIF10000000", "vps": "FHMIF10000000"}
 TR_OPTION_ASKING_PRICE = {"real": "FHMIF10010000", "vps": "FHMIF10010000"}
 

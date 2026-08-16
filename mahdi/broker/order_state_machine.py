@@ -86,3 +86,38 @@ class OrderStateMachine:
     @property
     def is_terminal(self) -> bool:
         return self.order.state in _TERMINAL_STATES
+
+
+# 2026-08-16 (Block C) — `execution_logs` 적재용 행 변환.
+#
+# `Order` docstring이 *"execution_logs 테이블 1행에 대응"* 이라고 적어 두었는데 **그 행을 만드는
+# 함수가 없어서** 주문을 내도 남길 곳이 없었다. 변환을 `Order` 옆에 두는 이유는 이 dataclass가
+# 컬럼 집합의 소유자이기 때문이다(사실을 아는 쪽이 상수를 소유한다 — 08-06 §7 원칙).
+_EXECUTION_LOG_KEYS = (
+    "order_id", "timestamp", "symbol", "side", "order_type",
+    "intended_px", "filled_px", "qty", "state", "slippage_ticks", "latency_ms",
+)
+
+
+def order_to_execution_log_row(order: Order) -> dict:
+    """
+    입력: Order.
+    계산: `db.insert_execution_log()`에 바로 넘길 dict. `state`는 enum이 아니라 **문자열 값**으로
+         내린다(DB 컬럼이 VARCHAR(15)이고, enum을 그대로 넘기면 psycopg가 어댑터를 못 찾는다).
+    해석: PK가 `order_id`라 같은 주문의 상태 변화는 **같은 행을 갱신**한다 — 주문의 생애가
+         한 행에 누적되고, 이력이 필요하면 `filled_qty` 누적과 `state`로 읽는다.
+    실패 조건: 없음.
+    """
+    return {
+        "order_id": order.order_id,
+        "timestamp": order.timestamp,
+        "symbol": order.symbol,
+        "side": order.side,
+        "order_type": order.order_type,
+        "intended_px": order.intended_px,
+        "filled_px": order.filled_px,
+        "qty": order.qty,
+        "state": order.state.value,
+        "slippage_ticks": order.slippage_ticks,
+        "latency_ms": order.latency_ms,
+    }

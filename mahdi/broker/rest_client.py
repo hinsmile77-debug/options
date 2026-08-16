@@ -10,9 +10,12 @@ import math
 import threading
 import time
 
+from datetime import date
+
 import httpx
 
 from mahdi.broker import tr_codes
+from mahdi.broker.order_state_machine import OrderState
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.config.settings import KISSettings
 
@@ -492,6 +495,92 @@ def _percentile(ordered: list[float], q: float) -> float:
     return ordered[max(index, 0)]
 
 
+def format_order_price(price: float) -> str:
+    """
+    입력: 주문가격(float).
+    반환: KIS가 받는 문자열. **정수는 소수점을 붙이지 않는다.**
+    해석: 2026-08-16 (Block C) — `str(0.0)`은 `"0.0"`이다. 그런데 "선물옵션 정정취소주문" 문서는
+         취소 시 `UNIT_PRICE`에 **"0"** 을 넣으라고 적었고, `"0.0"`을 받아줄지는 알 수 없다.
+         이 한 글자짜리 차이가 8/18 실측을 통째로 실패시킬 수 있는 자리다 —
+         잔고 조회가 필수 파라미터 누락으로 넉 달간 항상 실패했던 것과 같은 급의 함정이다.
+
+         정수는 `"350"`, 소수는 `"3.55"`로 낸다. 지수 표기(`1e-05`)가 새는 것을 막으려고
+         `repr`이 아니라 포맷 문자열을 쓰고, 옵션 최소 호가(0.01)보다 작은 자리는 버린다.
+    실패 조건: 없음.
+    """
+    if price == int(price):
+        return str(int(price))
+    return f"{price:.4f}".rstrip("0")
+
+
+def _ccnl_int(row: dict, key: str) -> int:
+    """조회 응답의 수치는 전부 문자열이고 공란이 올 수 있다 — 공란/None은 0으로 읽는다.
+    앞자리 0으로 패딩된 값(`"0000000002"`)도 int()가 그대로 처리한다."""
+    raw = str(row.get(key, "") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(float(raw))
+    except ValueError:
+        logger.warning("주문체결내역 수치 필드 파싱 실패: %s=%r — 0으로 읽는다", key, raw)
+        return 0
+
+
+def _ccnl_float(row: dict, key: str) -> float | None:
+    raw = str(row.get(key, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("주문체결내역 수치 필드 파싱 실패: %s=%r — None으로 둔다", key, raw)
+        return None
+
+
+def parse_fill_status(row: dict) -> dict:
+    """
+    입력: "선물옵션 주문체결내역조회" `output1` 한 행(필드는 **소문자**).
+    계산: `OrderState`로 매핑하고 평균 체결가·체결수량을 붙인다. 판정 순서가 규칙이다:
+
+        rjct_qty > 0                        -> REJECTED   (거부가 최우선 — 부분거부도 거부다)
+        tot_ccld_qty >= ord_qty (>0)        -> FILLED
+        tot_ccld_qty > 0                    -> PARTIAL    (잔량이 남아 있다)
+        tot_ccld_qty == 0 and qty == 0      -> CANCELLED  (체결도 잔량도 없다 = 사라졌다)
+        그 외                                -> PENDING
+
+    해석: **`qty`는 「잔량」이다**(주문수량이 아니다 — 문서: "주문 체결되지 않고 남은 수량").
+         이름이 짧아서 주문수량으로 착각하기 쉽고, 그러면 CANCELLED와 PENDING이 뒤집힌다.
+         주문수량은 `ord_qty`, 총체결수량은 `tot_ccld_qty`, 평균 체결가는 `avg_idx`(=평균지수)다.
+
+         `CANCELLED` 판정에 주의: KIS는 취소된 주문을 별도 상태 필드로 주지 않고 **잔량 0 +
+         체결 0**으로 나타낸다. 접수 직후 아직 아무 일도 안 일어난 주문은 잔량이 주문수량과
+         같으므로 PENDING으로 갈린다.
+    실패 조건: 없음 — 못 읽은 수치는 0/None으로 흡수하고 로그를 남긴다(계명 12: 조용히 넘기지 않는다).
+    """
+    ord_qty = _ccnl_int(row, "ord_qty")
+    filled_qty = _ccnl_int(row, "tot_ccld_qty")
+    remaining = _ccnl_int(row, "qty")
+    rejected = _ccnl_int(row, "rjct_qty")
+    avg_px = _ccnl_float(row, "avg_idx")
+
+    if rejected > 0:
+        state = OrderState.REJECTED
+    elif filled_qty > 0 and ord_qty > 0 and filled_qty >= ord_qty:
+        state = OrderState.FILLED
+    elif filled_qty > 0:
+        state = OrderState.PARTIAL
+    elif remaining == 0:
+        state = OrderState.CANCELLED
+    else:
+        state = OrderState.PENDING
+
+    return {
+        "state": state.value,
+        "filled_px": avg_px if filled_qty > 0 else None,
+        "filled_qty": filled_qty,
+    }
+
+
 def _is_kis_rate_limit_error(exc: httpx.HTTPStatusError) -> bool:
     """
     계산: KIS가 초당 거래건수 초과 시 돌려주는 특정 에러코드(EGW00201)인지 확인한다(2026-07-20
@@ -835,7 +924,151 @@ class KISRestClient:
                 "SLL_BUY_DVSN_CD": "01" if side.upper() == "SELL" else "02",
                 "SHTN_PDNO": symbol,
                 "ORD_QTY": str(qty),
-                "UNIT_PRICE": str(price),
+                # 2026-08-16 — 취소 경로와 **같은 포맷터**를 쓴다. 제출은 `str(price)`였는데
+                # 두 경로가 다른 형식을 보내면 8/18에 한쪽만 거부당하고 원인 규명이 길어진다.
+                "UNIT_PRICE": format_order_price(price),
                 "ORD_DVSN_CD": order_dvsn_cd,
             },
         )
+
+    # ===== 2026-08-16 (Block C) — 취소·정정·조회 =====
+    #
+    # 이 셋이 없어서 `execution/` 전체가 배선될 수 없었다:
+    #   - 취소가 없으면 CONFIRM 모드의 「60초 미확인 → 자동 취소」가 성립하지 않는다.
+    #   - 조회가 없으면 `order_manager.confirm_fill()`이 요구하는 `get_order_fill_status()`를
+    #     만들 수 없고, v6 §13.2의 「체결통보-REST 이중 확인」이 절반만 남는다.
+
+    def cancel_order(self, orgn_odno: str, qty: int = 0) -> dict:
+        """
+        입력: 원주문번호(제출 응답의 `ODNO`), 취소 수량 — **0이면 전량**이다(문서: "전량일경우
+             0으로 입력").
+        계산: PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL POST. "선물옵션 정정취소주문" 시트 기준
+             Required 전부를 채운다. 취소에 고정되는 값이 셋 있다:
+               `UNIT_PRICE`="0"           — 문서: "취소 시에도 0 입력"
+               `KRX_NMPR_CNDT_CD`="0"     — 문서: "취소시 0으로 입력"
+               `RMN_QTY_YN`="Y"/"N"       — 전량(qty=0)이면 Y, 일부면 N
+             `NMPR_TYPE_CD`/`ORD_DVSN_CD`는 취소에서도 Required라 지정가("01")를 넣는다 —
+             가격이 0이므로 유형은 의미를 갖지 않지만 **필드를 비우면 KIS가 거부한다**
+             (잔고 조회에서 MGNA_DVSN 누락으로 항상 실패했던 것과 같은 종류의 함정).
+        해석: 반환값의 `output.ODNO`는 **취소 주문 자체의 새 주문번호**이고 원주문번호가 아니다.
+        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 전파. 이미 체결된 주문의 취소는 KIS가
+                  `rt_cd != "0"`으로 돌려주므로 **호출측이 rt_cd를 반드시 확인해야 한다**
+                  (HTTP 200 + 업무 실패가 가능하다).
+        """
+        return self._modify_or_cancel(
+            tr_codes.RVSE_CNCL_CANCEL, orgn_odno=orgn_odno, qty=qty, price=0.0,
+        )
+
+    def modify_order(self, orgn_odno: str, qty: int, price: float, order_dvsn_cd: str = "01") -> dict:
+        """
+        입력: 원주문번호, 정정 수량(전량이면 0), 새 주문가격, 주문구분코드.
+        계산: `cancel_order()`와 같은 엔드포인트에 `RVSE_CNCL_DVSN_CD="01"`(정정)로 보낸다.
+        해석: 8/18 실측 대상은 **취소**다. 정정은 같은 엔드포인트라 함께 열어 두지만
+             실측되기 전까지 운영 경로에서 쓰지 않는다(Capability Matrix 규율).
+        실패 조건: `cancel_order()`와 같다.
+        """
+        return self._modify_or_cancel(
+            tr_codes.RVSE_CNCL_MODIFY, orgn_odno=orgn_odno, qty=qty, price=price,
+            order_dvsn_cd=order_dvsn_cd,
+        )
+
+    def _modify_or_cancel(
+        self, rvse_cncl_dvsn_cd: str, *, orgn_odno: str, qty: int, price: float,
+        order_dvsn_cd: str = "01",
+    ) -> dict:
+        """정정·취소의 공통 본문 — 둘은 `RVSE_CNCL_DVSN_CD` 한 글자만 다르다(같은 TR·같은 경로).
+
+        분리하지 않는 이유: 두 함수가 각자 본문을 만들면 Required 필드 목록이 두 곳에서
+        갈릴 수 있다. 그 갈림은 「한쪽만 KIS에 거부당한다」로 나타나 원인 규명이 오래 걸린다.
+        """
+        tr_id = tr_codes.TR_ORDER_MODIFY_CANCEL[self._env_key]
+        return self._post(
+            f"{self._domain}{tr_codes.PATH_FUTUREOPTION_ORDER_MODIFY_CANCEL}",
+            headers=self._headers(tr_id),
+            json={
+                "ORD_PRCS_DVSN_CD": tr_codes.ORD_PRCS_DVSN_SEND,
+                "CANO": self._settings.kis_account_no,
+                "ACNT_PRDT_CD": self._settings.kis_account_product_code,
+                "RVSE_CNCL_DVSN_CD": rvse_cncl_dvsn_cd,
+                "ORGN_ODNO": orgn_odno,
+                "ORD_QTY": str(qty),
+                # **`"0.0"`이 아니라 `"0"`이어야 한다** — `format_order_price()` 주석 참고.
+                "UNIT_PRICE": format_order_price(price),
+                "NMPR_TYPE_CD": order_dvsn_cd,
+                "KRX_NMPR_CNDT_CD": "0",  # 취소=0 고정, 정정=0(없음)
+                "RMN_QTY_YN": "Y" if qty == 0 else "N",
+                "FUOP_ITEM_DVSN_CD": "",  # 주간은 공란(Default)
+                "ORD_DVSN_CD": order_dvsn_cd,
+            },
+        )
+
+    def inquire_ccnl(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        symbol: str = "",
+        sll_buy_dvsn_cd: str = "00",
+        ccld_nccs_dvsn: str = "00",
+        start_order_no: str = "",
+        sort_order: str = "DS",
+    ) -> dict:
+        """
+        입력: 조회 시작/종료 주문일자(YYYYMMDD), (선택) 종목코드·매도매수구분("00"=전체)·
+             체결미체결구분("00"=전체/"01"=체결/"02"=미체결)·시작주문번호·정렬순서("DS"=역순).
+        계산: PATH_FUTUREOPTION_CCNL_INQUIRY GET. "선물옵션 주문체결내역조회" 시트 기준
+             Required 11개를 전부 채운다 — `PDNO`/`MKET_ID_CD`/`CTX_AREA_*200`은 Required이면서
+             **공란이 정상값**이다(문서: "공란 시 전체 조회" / "공란(Default)" / "공란: 최초 조회시").
+             Required인데 공란이 정상이라는 조합은 KIS 문서에 흔하고, 이 필드를 **아예 빼면**
+             거부당한다.
+        해석: `output1`(array)이 주문별 상세, `output2`가 합계다. 필드는 **소문자**다
+             (제출 응답은 대문자 — `tr_codes.ORDER_*_ORDER_NO_FIELD` 주석 참고).
+        실패 조건: 4xx/5xx면 httpx.HTTPStatusError 전파. 연속조회(`tr_cont`=F/M)는 이 함수가
+                  처리하지 않는다 — 하루치 주문이 200건을 넘는 규모가 아니고(고정 1계약 개시),
+                  넘어가면 `ctx_area_*`를 넘겨 다시 부르는 쪽을 그때 만든다.
+        """
+        tr_id = tr_codes.TR_ORDER_CCNL_INQUIRY[self._env_key]
+        return self._get(
+            f"{self._domain}{tr_codes.PATH_FUTUREOPTION_CCNL_INQUIRY}",
+            headers=self._headers(tr_id),
+            params={
+                "CANO": self._settings.kis_account_no,
+                "ACNT_PRDT_CD": self._settings.kis_account_product_code,
+                "STRT_ORD_DT": start_date,
+                "END_ORD_DT": end_date,
+                "SLL_BUY_DVSN_CD": sll_buy_dvsn_cd,
+                "CCLD_NCCS_DVSN": ccld_nccs_dvsn,
+                "SORT_SQN": sort_order,
+                "STRT_ODNO": start_order_no,
+                "PDNO": symbol,
+                "MKET_ID_CD": "",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            },
+        )
+
+    def get_order_fill_status(self, order_id: str, *, as_of: date | None = None) -> dict:
+        """
+        입력: 주문번호(제출 응답 `output[0].ODNO`), (선택) 조회 기준일 — 없으면 오늘.
+        계산: `inquire_ccnl()`로 그날 주문을 받아 `order_id`와 같은 `odno` 행을 찾고
+             `parse_fill_status()`로 `{"state","filled_px","filled_qty"}`를 만든다.
+        해석: `order_manager.BrokerClient` 프로토콜을 만족시키는 어댑터다 —
+             `order_manager.confirm_fill()`이 이 형태를 요구한다.
+        실패 조건: 그 주문번호가 조회 결과에 없으면 **PENDING을 돌려준다**(예외가 아니다).
+                  KIS 접수 직후 조회에는 아직 안 보일 수 있고, `confirm_fill()`은 PENDING을
+                  「전이 없음」으로 처리하므로 이것이 안전한 쪽이다. **다만 조용히 넘기지 않고
+                  로그를 남긴다** — 영구히 안 보이면 그것은 접수 실패이고 사람이 알아야 한다.
+        """
+        target = as_of or date.today()
+        stamp = target.strftime("%Y%m%d")
+        response = self.inquire_ccnl(stamp, stamp)
+        rows = response.get("output1") or []
+        for row in rows:
+            if str(row.get(tr_codes.ORDER_INQUIRY_ORDER_NO_FIELD, "")).strip() == str(order_id).strip():
+                return parse_fill_status(row)
+        logger.warning(
+            "주문번호 %s가 %s 주문체결내역조회에 없다 — PENDING으로 둔다(조회 %d건). "
+            "다음 사이클에도 안 보이면 접수 실패로 보고 사람이 확인해야 한다",
+            order_id, stamp, len(rows),
+        )
+        return {"state": OrderState.PENDING.value, "filled_px": None, "filled_qty": 0}

@@ -1663,6 +1663,48 @@ def insert_account_balance_snapshot(conn: ConnectionLike, row: dict) -> None:
     _upsert(conn, "account_balance_snapshots", _ACCOUNT_BALANCE_SNAPSHOT_COLUMNS, ("timestamp",), row)
 
 
+_EXECUTION_LOG_COLUMNS = (
+    "order_id", "timestamp", "symbol", "side", "order_type",
+    "intended_px", "filled_px", "qty", "state", "slippage_ticks", "latency_ms",
+)
+
+
+def insert_execution_log(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: `execution_logs` 컬럼과 같은 키를 가진 dict
+         (`mahdi.broker.order_state_machine.order_to_execution_log_row()`가 만든다).
+    계산: INSERT ... ON CONFLICT (order_id) DO UPDATE — **같은 주문은 같은 행을 갱신한다.**
+    해석: 2026-08-16 (Block C). 테이블은 001_init부터 있었지만 **적재 함수가 없어서** 주문을
+         내도 남길 곳이 없었다(조회용 `get_trade_history()`만 있었다). 주문 상태가 바뀔 때마다
+         이 함수를 다시 부르면 되고, PK가 `order_id`라 멱등하다.
+
+         `trade_history`(왕복 완결된 트레이드)와 다른 표다 — 이쪽은 **주문 단위**이고, 취소된
+         주문·거부된 주문도 남는다. 8/18 왕복 실측의 증거가 여기 쌓인다.
+    실패 조건: 없음(예외는 호출측 격리 블록으로 전파).
+    """
+    _upsert(conn, "execution_logs", _EXECUTION_LOG_COLUMNS, ("order_id",), row)
+
+
+def execution_logs_on(conn: ConnectionLike, target: date) -> list[dict]:
+    """입력: 날짜. 반환: 그날 `timestamp`를 가진 주문 행 전체(주문번호 순).
+    사후 재구성과 자동 리포트가 쓴다 — 「그날 주문이 몇 건 나갔고 어떻게 끝났나」."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(_EXECUTION_LOG_COLUMNS)} FROM execution_logs "
+            "WHERE timestamp::date=%s ORDER BY order_id",
+            (target,),
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for values in rows:
+        record = dict(zip(_EXECUTION_LOG_COLUMNS, values))
+        for col in ("intended_px", "filled_px", "slippage_ticks"):
+            if record[col] is not None:
+                record[col] = float(record[col])
+        out.append(record)
+    return out
+
+
 _POSITION_SNAPSHOT_COLUMNS = (
     "timestamp", "symbol", "side", "qty", "avg_price",
     "current_price", "eval_pnl", "liquidatable_qty", "raw",

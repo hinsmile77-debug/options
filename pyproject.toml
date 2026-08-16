@@ -20,6 +20,7 @@ dependencies = [
     "redis>=5.0",
     "python-dotenv>=1.0",
     "yfinance>=0.2.40",
+    "cryptography>=50.0.0",
 ]
 
 [dependency-groups]

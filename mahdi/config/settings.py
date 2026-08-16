@@ -22,6 +22,17 @@ class KISSettings(BaseSettings):
     kis_account_no: str = Field(default="", alias="KIS_ACCOUNT_NO")
     kis_account_product_code: str = Field(default="01", alias="KIS_ACCOUNT_PRODUCT_CODE")
     kis_env: str = Field(default="vps", alias="KIS_ENV")  # vps=모의투자, prod=실전
+    # 2026-08-16 (Block C) — **체결통보 WS 구독의 `tr_key`가 이 값이다.**
+    #
+    # 공식 문서("선물옵션 실시간체결통보" 시트)의 Request Body 표는 tr_key를 *"예:101S12"*
+    # (종목코드)로 적었지만, 같은 시트의 Response Example은 `"tr_key": "HTS ID"`를 돌려준다 —
+    # 계좌별 통보라 종목이 아니라 **사용자를 특정**하는 것이 맞다. 문서 두 곳이 어긋나 있으므로
+    # 8/18 실측에서 어느 쪽인지 확정한다(구독 ACK의 `rt_cd`가 답을 준다).
+    #
+    # 비어 있으면 체결통보를 **구독하지 않는다**(예외를 던지지 않는다) — 이 값이 없다고 관측
+    # 루프가 안 뜨면 안 되고, 조용히 안 걸리는 것도 안 된다. `order_notice.subscription()`이
+    # None을 돌려주고 호출측이 경고를 남긴다.
+    kis_hts_id: str = Field(default="", alias="KIS_HTS_ID")
 
     @property
     def is_mock(self) -> bool:
