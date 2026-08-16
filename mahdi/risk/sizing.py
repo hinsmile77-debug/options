@@ -17,6 +17,7 @@ Risk Engine의 책임은 팩터를 곱해 최종 사이즈를 정하고, Full Ke
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from mahdi.config.settings import get_risk_limits
@@ -124,3 +125,34 @@ def compute_position_size(
             "drawdown_adjustment": dd_adjustment,
         },
     )
+
+
+def contracts_from_size(size: float, risk_limits: dict | None = None) -> int:
+    """
+    입력: `compute_position_size()`가 낸 `size`(float), (선택) 리스크 한도 설정.
+    반환: 실제로 주문할 **정수 계약수**.
+    계산: `sizing.fixed_contracts`가 설정돼 있으면 그 값을, 없으면 `size`를 **내림**한다.
+    해석: 2026-08-16 (Block D). `compute_position_size()` docstring이 *"실제 계약 수 변환은
+         호출측 책임"* 이라고 적어 두었는데 **그 호출측이 없었다** — `approved_size`는 float으로만
+         존재하고 `EntryContext.qty`는 int다. Quarter Kelly(0.25)에 중립 팩터들을 곱하면
+         0.25 같은 값이 나오고, 그것은 **주문할 수 없는 수량**이다.
+
+         **왜 올림이 아니라 내림인가**: 올림은 사이징이 계산한 위험을 초과하는 쪽이다.
+         0.9계약을 1로 올리면 그 11%는 아무 근거 없이 늘린 노출이다. 내림은 "계산보다 덜"이라
+         안전한 쪽이고, 그 결과 0이 되면 그것이 곧 "이 신호에는 규모를 줄 수 없다"는 답이다.
+
+         **`fixed_contracts`가 0을 덮어쓰지 않는 것이 이 함수의 핵심이다.** `size == 0`은
+         우연이 아니라 판정이다 — Drawdown Adjustment가 한도 도달 시 0을 내고(v6 §12.2),
+         팩터 하나가 0이면 곱이 0이 된다. 고정 계약수가 그것을 1로 만들면 **리스크 한도를
+         설정 한 줄로 우회**하게 된다. 그래서 `size > 0`일 때만 고정값을 적용한다.
+    실패 조건: 없음 — 음수 size는 0으로 흡수한다(`compute_position_size()`가 음수 입력에
+              ValueError를 내므로 여기 도달하는 음수는 없어야 하지만, 방어적으로 0으로 둔다).
+    """
+    if size <= 0:
+        return 0
+    if risk_limits is None:
+        risk_limits = get_risk_limits()
+    fixed = (risk_limits.get("sizing") or {}).get("fixed_contracts")
+    if fixed is not None:
+        return max(0, int(fixed))
+    return max(0, math.floor(size))

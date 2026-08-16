@@ -240,6 +240,8 @@ _DB_METRIC_ROOTS = {
     "regime_vs_futures_bars",
     # 2026-08-16 (Block B) — 보유 포지션(마이그레이션 030). 방향 판정 실패분을 여기서 본다.
     "positions",
+    # 2026-08-16 (Block D) — 경보 토글(DB 상태). 「조건 없음」과 「토글 꺼짐」을 가른다.
+    "slack_alerts",
 }
 
 

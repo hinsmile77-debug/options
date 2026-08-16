@@ -1737,6 +1737,21 @@ def _render_db_misc(db: dict) -> list[str]:
         f"- `shutdown_check_log` 잔존 프로세스 **{db.get('remaining_processes', '—')}**",
         "",
     ]
+    slack = db.get("slack_alerts") or {}
+    if slack.get("available"):
+        enabled = slack.get("enabled")
+        label = {True: "**켜짐**", False: "**꺼짐**", None: "미설정(env 기본값)"}[enabled]
+        out += [
+            f"- **Slack 경보 토글**: {label} ({slack.get('source')})",
+            "",
+        ]
+        if enabled is False:
+            out += [
+                "> ⚠ **경보가 꺼져 있었다.** 그날 로그에 `slack`·`경보` 문구가 0건인 것은 "
+                "「울릴 조건이 없었다」가 아니라 「울릴 수 없었다」다 — 둘을 가르는 것이 이 줄이다"
+                "(08-14 §3-3이 그 구분 없이 전자로 진단했다).",
+                "",
+            ]
     rl = db.get("rate_limiter") or {}
     out += [
         f"- `rate_limiter_status_history` {rl.get('rows', 0):,}행 / 밀림 **{rl.get('overrun_rows', 0)}건** / "

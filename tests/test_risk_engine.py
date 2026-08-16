@@ -241,3 +241,72 @@ def test_cutoff_uses_the_session_module_constant():
     assert engine.evaluate_entry(
         _sizing_input(), _account(), "vrp_harvest", _market(), now=session.NEW_ENTRY_CUTOFF
     ).reject_reasons == ["entry_cutoff"]
+
+
+# ===== 2026-08-16 (Block D) — approved_contracts =====
+
+
+def test_risk_decision_carries_an_integer_contract_count_beside_the_float_size():
+    """`approved_size`는 사이징 공식의 출력이고 `EntryContext.qty`는 int다 —
+    그 사이를 잇는 변환이 **없어서** 주문 경로가 쓸 수 있는 수량이 존재하지 않았다.
+
+    `approved_size`를 고치지 않고 옆에 세운다(08-06 고도화#2의 member_count 패턴).
+    """
+    from mahdi.risk.engine import RiskEngine
+    from mahdi.risk.limits import AccountState
+    from mahdi.risk.sizing import PositionSizingInput
+
+    limits = {
+        "sizing": {"kelly_fraction": 0.25, "max_kelly_fraction": 0.25, "fixed_contracts": 1},
+        "limits": {"max_drawdown_pct": -0.10},
+        "circuit_breaker": {},
+    }
+    decision = RiskEngine(risk_limits=limits).evaluate_entry(
+        PositionSizingInput(
+            base_size=1.0, regime_confidence=0.9, signal_quality=0.8,
+            target_vol=0.01, realized_vol=0.01, liquidity_score=1.0,
+            drawdown_pct=0.0, portfolio_capacity_remaining_pct=1.0,
+        ),
+        AccountState(
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0, drawdown_pct=0.0,
+            same_direction_positions=0, daily_trades_by_strategy={},
+        ),
+        strategy_id="atm_long",
+        market_conditions=MarketConditions(),
+    )
+
+    assert decision.approved is True
+    # Quarter Kelly가 곱해져 size는 1보다 작다 — 그것이 정수 변환이 필요했던 이유다.
+    assert 0 < decision.approved_size < 1
+    assert decision.approved_contracts == 1
+
+
+def test_rejected_entry_has_zero_contracts_not_the_fixed_count():
+    """거부는 전량 거부다 — 고정 계약수가 거부를 뚫고 나오면 안 된다."""
+    from mahdi.risk.engine import RiskEngine
+    from mahdi.risk.limits import AccountState
+    from mahdi.risk.sizing import PositionSizingInput
+
+    limits = {
+        "sizing": {"fixed_contracts": 1},
+        "limits": {"max_same_direction_positions": 3, "max_drawdown_pct": -0.10},
+        "circuit_breaker": {},
+    }
+    decision = RiskEngine(risk_limits=limits).evaluate_entry(
+        PositionSizingInput(
+            base_size=1.0, regime_confidence=0.9, signal_quality=0.8,
+            target_vol=0.01, realized_vol=0.01, liquidity_score=1.0,
+            drawdown_pct=0.0, portfolio_capacity_remaining_pct=1.0,
+        ),
+        AccountState(
+            daily_pnl_pct=0.0, weekly_pnl_pct=0.0, drawdown_pct=0.0,
+            same_direction_positions=3,  # 한도 위반
+            daily_trades_by_strategy={},
+        ),
+        strategy_id="atm_long",
+        market_conditions=MarketConditions(),
+    )
+
+    assert decision.approved is False
+    assert decision.approved_size == 0.0
+    assert decision.approved_contracts == 0

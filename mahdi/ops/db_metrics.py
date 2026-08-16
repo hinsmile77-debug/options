@@ -138,6 +138,8 @@ def collect(
         ("rate_limiter", _rate_limiter),
         # 2026-08-16 (Block B) — 보유 포지션. 마이그레이션 030. 개시일(08-18)에 가장 먼저 볼 절이다.
         ("positions", positions),
+        # 2026-08-16 (Block D) — 경보 토글. DB에 있어 레버 표(§0)가 모르는 값이다.
+        ("slack_alerts", slack_alerts),
     ):
         try:
             out[key] = fn(conn, target)
@@ -166,6 +168,34 @@ def _fetchone(conn: ConnectionLike, sql: str, params: tuple = ()) -> tuple | Non
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
+
+
+def slack_alerts(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜(쓰지 않는다 — 토글은 시점 상태다).
+    계산: `slack_alert_settings.enabled`의 현재 값.
+    해석: 2026-08-16 (Block D) — **이 토글은 코드가 아니라 DB에 있어서 어디에도 안 보였다.**
+
+         08-14 §3-3은 당일 로그에 `slack`·`경보` 문구가 0건인 것을 보고 *"울릴 조건이 정의돼
+         있지 않다"* 고 진단했다. **절반만 맞았다** — 조건은 있었다(`main.py`가 WS 끊김·체인
+         결손·CB 전이에 CRITICAL로 `notify()`를 부른다). 꺼져 있던 것은 **토글**이다
+         (07-28부터 false, 08-01에 「개발 단계라 보류」로 확정).
+
+         레버 표(§0)는 파일에서 읽으므로 이 값을 모른다. 그래서 여기에 둔다 — **경보가 안 울린
+         날에 「조건이 없었나」와 「토글이 꺼져 있었나」를 가르는 유일한 숫자**다(규약 C).
+    실패 조건: 테이블이 없거나 못 읽으면 `available: False` + 사유.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT enabled FROM slack_alert_settings LIMIT 1")
+            row = cur.fetchone()
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        return {"available": False, "reason": f"조회 실패: {exc!r}"}
+    if row is None:
+        # 아무도 토글한 적 없으면 env 기본값으로 폴백한다(`db.is_slack_alerts_enabled()`와 같은 규칙).
+        return {"available": True, "enabled": None, "source": "미설정(env 기본값 폴백)"}
+    return {"available": True, "enabled": bool(row[0]), "source": "slack_alert_settings"}
 
 
 def positions(conn: ConnectionLike, target: date) -> dict:

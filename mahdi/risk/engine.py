@@ -16,7 +16,7 @@ from mahdi import session
 from mahdi.config.settings import get_risk_limits
 from mahdi.risk.circuit_breaker import CircuitBreaker, CircuitBreakerDecision, CircuitBreakerState, MarketConditions
 from mahdi.risk.limits import AccountState, check_limits
-from mahdi.risk.sizing import PositionSizingInput, compute_position_size
+from mahdi.risk.sizing import PositionSizingInput, compute_position_size, contracts_from_size
 
 
 @dataclass
@@ -25,6 +25,15 @@ class RiskDecision:
     approved_size: float
     reject_reasons: list[str] = field(default_factory=list)
     unconfigured_checks: list[str] = field(default_factory=list)
+    # 2026-08-16 (Block D) — **실제로 주문할 정수 계약수.**
+    #
+    # `approved_size`를 고치지 않고 옆에 세우는 이유는 08-06 고도화#2가
+    # `available/effective_member_count`를 그렇게 둔 것과 같다: 그 값은 사이징 공식의 출력이고,
+    # 정의를 바꾸면 그날부터 시계열이 과거와 비교 불가가 된다. **둘의 차이가 곧 버림분**이고
+    # 그것이 「사이징이 계산한 규모와 실제로 낸 규모」의 간격이다.
+    #
+    # `approved=False`면 항상 0이다(거부는 전량 거부 — 애매한 상태를 만들지 않는다).
+    approved_contracts: int = 0
 
 
 class RiskEngine:
@@ -111,9 +120,13 @@ class RiskEngine:
             )
 
         sizing_result = compute_position_size(sizing_input, risk_limits=self._risk_limits)
+        # 2026-08-16 (Block D) — 정수 계약수를 여기서 확정한다. `contracts_from_size()`가
+        # `size == 0`을 고정 계약수로 덮어쓰지 않는다(DD 한도가 낸 0을 설정으로 우회하면
+        # 리스크 한도가 무의미해진다 — 그 함수 주석 참고).
         return RiskDecision(
             approved=True,
             approved_size=sizing_result.size,
+            approved_contracts=contracts_from_size(sizing_result.size, self._risk_limits),
             unconfigured_checks=limit_result.unconfigured_checks,
         )
 

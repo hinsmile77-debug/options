@@ -5,6 +5,21 @@ version: "1"
 sizing:
   kelly_fraction: 0.25          # Quarter Kelly 기본, Full Kelly 절대 금지
   max_kelly_fraction: 0.25
+  # 2026-08-16 (Block D) — 모의투자 개시 주간의 고정 계약수.
+  #
+  # `null`로 두면 `contracts_from_size()`가 사이징 결과를 **내림**한다(종전 의도).
+  # 숫자를 넣으면 그 수로 고정된다 — **단, 사이징이 0을 냈을 때는 적용되지 않는다**
+  # (DD 한도가 낸 0을 설정 한 줄로 우회하는 것을 막는다. 그 함수 주석 참고).
+  #
+  # 왜 1인가: Kelly 사이징의 입력 4종(`target_vol`/`realized_vol`/`liquidity_score`/
+  # `portfolio_capacity_remaining_pct`)이 **라이브 계산처가 없어 전부 중립값**이다
+  # (docs/동작흐름과상태 §1-⑧에 알려진 한계로 기록돼 있다). 근거 없는 팩터를 곱해 나온
+  # 소수를 계약수로 바꾸는 것보다, 규모를 1로 묶고 **판단의 방향성만 먼저 검증**하는 것이
+  # 개시 주간의 목적에 맞다.
+  #
+  # 되돌리는 조건: 위 4종 중 최소 `realized_vol`과 `liquidity_score`가 라이브 값을 갖고,
+  # `trade_history`가 사후 평가를 낼 만큼 쌓인 뒤. 그때 `null`로 바꾸면 종전 동작이 된다.
+  fixed_contracts: 1
 
 limits:
   per_trade_loss_pct: -0.005    # 계좌의 -0.5% — 진입 거부

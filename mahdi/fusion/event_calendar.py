@@ -74,6 +74,33 @@ def _parse_covered_through(value) -> date | None:
     return None
 
 
+def coverage_gap_days(calendar: dict | None, today: date) -> int | None:
+    """
+    입력: `event_calendar.yaml` 원본 dict, 기준 날짜.
+    반환: `covered_through`가 `today`보다 **며칠 지났는지**. 아직 유효하면 0,
+          `covered_through` 자체가 없거나 못 읽으면 **None("모른다")**.
+    해석: 2026-08-16 (Block D / 08-14 Fix#7) — 만료 판정을 **기동 전에** 물을 수 있게 공개한다.
+
+         런타임은 이미 만료를 안다(`minutes_to_next_event()`가 `STATUS_NOT_COVERED`를 낸다).
+         없던 것은 **기동 시퀀스가 그것을 말해 주는 경로**다. 08-14에 이 파일은 만료된 채
+         하루를 돌며 억제 로깅 뒤에서 **484회** 경고했지만 사람에게 도달한 것은 0건이었고,
+         표시된 줄 수는 9였다. 매분 한 줄은 아무도 안 읽는다 — **아침에 한 번 크게** 말해야 한다.
+
+         **0과 None을 가른다**(규약 C): 0은 "확인했고 아직 유효하다", None은 "확인 자체가
+         불가능하다"(필드 없음·형식 오류)이고 후자가 더 나쁘다. 둘을 섞으면 필드를 지운 날이
+         정상으로 보인다.
+    실패 조건: 없음.
+    """
+    if not calendar:
+        return None
+    covered_through = _parse_covered_through(calendar.get("covered_through"))
+    if covered_through is None:
+        return None
+    # 경계일은 포함한다 — `covered_through`가 오늘이면 오늘까지는 확인된 것이다
+    # (`minutes_to_next_event()`가 같은 규칙을 쓴다: `now.date() > covered_through`일 때만 만료).
+    return max(0, (today - covered_through).days)
+
+
 def minutes_to_next_event(now: datetime, calendar: dict | None) -> EventProximity:
     """
     입력: 현재 시각(`db.local_now()`와 같은 naive 로컬 기준), `event_calendar.yaml` 원본 dict.

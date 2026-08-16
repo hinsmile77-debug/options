@@ -105,3 +105,46 @@ def test_default_risk_limits_loaded_from_yaml_when_not_provided():
         real_limits["sizing"]["kelly_fraction"],
         real_limits["sizing"]["max_kelly_fraction"],
     )
+
+
+# ===== 2026-08-16 (Block D) — 정수 계약수 변환 =====
+
+
+def test_contracts_from_size_floors_rather_than_rounds_up():
+    """올림은 사이징이 계산한 위험을 **초과하는** 쪽이다 — 0.9를 1로 만들면 그 11%는 근거가 없다."""
+    from mahdi.risk.sizing import contracts_from_size
+
+    limits = {"sizing": {}}
+    assert contracts_from_size(0.9, limits) == 0
+    assert contracts_from_size(1.0, limits) == 1
+    assert contracts_from_size(2.7, limits) == 2
+
+
+def test_contracts_from_size_applies_the_fixed_lever():
+    """개시 주간은 `fixed_contracts: 1`로 규모를 묶는다 — Kelly 입력 4종이 전부 중립값이라
+    근거 없는 팩터의 곱을 계약수로 바꾸는 것보다 방향성만 먼저 검증하는 것이 맞다."""
+    from mahdi.risk.sizing import contracts_from_size
+
+    assert contracts_from_size(0.25, {"sizing": {"fixed_contracts": 1}}) == 1
+    assert contracts_from_size(7.9, {"sizing": {"fixed_contracts": 1}}) == 1
+    assert contracts_from_size(0.25, {"sizing": {"fixed_contracts": 3}}) == 3
+
+
+def test_fixed_contracts_never_overrides_a_zero_size():
+    """**이 테스트가 D-1의 핵심이다.**
+
+    `size == 0`은 우연이 아니라 판정이다 — Drawdown Adjustment는 한도 도달 시 0을 내고
+    (v6 §12.2), 팩터 하나가 0이면 곱이 0이 된다. 고정 계약수가 그것을 1로 만들면
+    **리스크 한도를 설정 한 줄로 우회**하게 된다.
+    """
+    from mahdi.risk.sizing import contracts_from_size
+
+    assert contracts_from_size(0.0, {"sizing": {"fixed_contracts": 1}}) == 0
+    assert contracts_from_size(-1.0, {"sizing": {"fixed_contracts": 5}}) == 0
+
+
+def test_the_shipped_config_fixes_one_contract_for_the_opening_week():
+    """설정 파일이 실제로 1로 묶여 있는지 — 주석만 있고 값이 없으면 아무 일도 안 한다."""
+    from mahdi.config.settings import get_risk_limits
+
+    assert (get_risk_limits().get("sizing") or {}).get("fixed_contracts") == 1

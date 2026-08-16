@@ -61,6 +61,40 @@ def _shout(lines: list[str]) -> None:
     print("")
 
 
+def _event_calendar_warning(today) -> list[str]:
+    """반환: 이벤트 캘린더가 만료됐거나 확인 불가면 외칠 줄 목록. 유효하면 빈 목록.
+
+    판정은 `fusion.event_calendar.coverage_gap_days()`가 한다 — 스크립트는 얇게 유지한다
+    (`docs/동작점검/README.md` 규약: 로직은 모듈에, `scripts/`는 인용만).
+    """
+    try:
+        from mahdi.config.settings import get_event_calendar
+        from mahdi.fusion.event_calendar import coverage_gap_days
+
+        gap = coverage_gap_days(get_event_calendar(), today)
+    except Exception as exc:  # noqa: BLE001 — 이 점검이 기동을 막지 않는다
+        return [f"??? 이벤트 캘린더 확인 실패: {exc!r}"]
+
+    if gap is None:
+        return [
+            "*** 이벤트 캘린더에 `covered_through`가 없거나 형식이 잘못됐다",
+            "",
+            "   mahdi/config/event_calendar.yaml",
+            "   → 이 필드가 없으면 「이벤트 없음」과 「안 채웠음」이 구분되지 않는다.",
+        ]
+    if gap > 0:
+        return [
+            f"*** 이벤트 메모 캘린더가 {gap}일 전에 만료됐다 - 오늘 판정에 이벤트 페널티가 안 걸린다",
+            "",
+            "   mahdi/config/event_calendar.yaml 의 `covered_through`를 갱신할 것",
+            "   → 만료 상태면 `event_proximity_minutes`가 항상 None이고,",
+            "     메타 라벨의 이벤트 근접 x0.5 페널티가 하루 종일 한 번도 걸리지 않는다.",
+            "",
+            "   ※ 일정 확인은 사람이 한다 - 이 스크립트는 날짜를 옮기지 않는다.",
+        ]
+    return []
+
+
 def main() -> int:
     try:
         from mahdi.ops import hypotheses, levers
@@ -101,8 +135,22 @@ def main() -> int:
                   "     08-12·08-13·08-14 세 번 다 그것을 안 적어서 유예가 무행동으로 성립했다."]
         _shout(lines)
 
-    if not breaches and not due:
-        print("[check_lever_due] 오늘 발동일인 레버 없음 · 기한 초과 없음")
+    # 2026-08-16 (Block D / 08-14 Fix#7) — 이벤트 캘린더 만료를 **기동 전에** 한 번 크게 말한다.
+    #
+    # 런타임은 이미 만료를 알고 매분 WARNING을 남긴다. 그런데 08-14에 그 경고는 억제 로깅
+    # 뒤에서 **484회** 발생하고 표시는 9줄이었으며 사람에게 도달한 것은 0건이었다.
+    # 매분 한 줄은 아무도 안 읽는다 — 아침에 한 번이 낫다.
+    #
+    # 피해는 로그가 아니라 **판정**이다: 만료된 캘린더는 `event_proximity_minutes`를 None으로
+    # 만들어 메타 라벨의 x0.5 이벤트 페널티를 **한 번도 걸리지 않게** 한다. 08-14 `signal_decisions`
+    # 493행 전부가 그 상태로 산출됐다. 레버 F를 켜는 날 이 파일이 만료돼 있으면 그날 확신도
+    # 판정이 통째로 오염된다(08-14 §1-2).
+    calendar_lines = _event_calendar_warning(today)
+    if calendar_lines:
+        _shout(calendar_lines)
+
+    if not breaches and not due and not calendar_lines:
+        print("[check_lever_due] 오늘 발동일인 레버 없음 · 기한 초과 없음 · 이벤트 캘린더 유효")
     # **항상 0.** 기동을 막는 것은 이 점검의 일이 아니다(파일 docstring 참고).
     return 0
 
