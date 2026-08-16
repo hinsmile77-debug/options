@@ -3968,6 +3968,87 @@ def test_poll_account_balance_cycle_records_snapshot_each_cycle(monkeypatch):
     assert rest_client.calls == 2
 
 
+def test_poll_account_balance_cycle_also_persists_the_position_detail(monkeypatch):
+    """2026-08-16 (Block B) — 잔고 합계와 **종목별 보유 상세**를 같은 사이클에 함께 남긴다.
+
+    배선이 빠지면 `position_snapshots`가 영원히 비고, 자동 리포트 §16-1은 매일 「행 0」을
+    인쇄한다 — 그 0은 「체결이 없었다」와 구별되지 않으므로 아무도 이상을 못 느낀다.
+    같은 종류의 실패가 08-04에 있었다(`ofi=None` 하드코딩: 데이터는 있는데 안 읽었다).
+    """
+    response = {
+        "rt_cd": "0",
+        "output1": [
+            {"shtn_pdno": "101S03", "sll_buy_dvsn_name": "BUY", "cblc_qty": "1",
+             "ccld_avg_unpr1": "352.10", "lqd_psbl_qty": "1"},
+        ],
+        "output2": dict(_SAMPLE_BALANCE_RESPONSE["output2"]),
+    }
+    rest_client = _FakeBalanceRestClient(response)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    balances: list[dict] = []
+    positions: list[list[dict]] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_account_balance_snapshot", lambda conn, row: balances.append(row)
+    )
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_position_snapshots", lambda conn, rows: positions.append(rows) or len(rows)
+    )
+
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_account_balance_cycle(rest_client, interval_seconds=60))
+
+    assert len(positions) == 1
+    (row,) = positions[0]
+    assert row["symbol"] == "101S03" and row["side"] == "BUY"
+    assert row["raw"]["ccld_avg_unpr1"] == "352.10"  # 원본 보존(R8)
+    # **두 표가 같은 시각을 갖는다** — 갈리면 §16-1이 「두 축이 갈렸다」를 오탐한다.
+    assert row["timestamp"] == balances[0]["timestamp"]
+
+
+def test_poll_account_balance_cycle_writes_no_position_rows_for_a_flat_account(monkeypatch):
+    """포지션이 없으면 빈 행을 지어내지 않는다 — 개시 전에는 이것이 정상 경로다."""
+    rest_client = _FakeBalanceRestClient(_SAMPLE_BALANCE_RESPONSE)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.main.db.insert_account_balance_snapshot", lambda conn, row: None)
+
+    calls: list[list[dict]] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_position_snapshots", lambda conn, rows: calls.append(rows) or 0
+    )
+
+    fake_loop = _FakeLoop([1000.0, 1200.0])
+    monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: fake_loop)
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_account_balance_cycle(rest_client, interval_seconds=60))
+
+    assert calls == [[]]
+
+
 def test_poll_account_balance_cycle_continues_after_failure(monkeypatch):
     class _FailingRestClient:
         def get_balance(self):

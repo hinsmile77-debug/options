@@ -1255,3 +1255,122 @@ def test_underlying_spot_bound_matches_the_chain_snapshot_window():
     """스팟과 체인은 같은 GEX 계산에 함께 들어간다 — 두 창이 어긋나면 서로 다른 시각의
     시장을 본 값으로 하나의 감마 지형을 그리게 된다."""
     assert db.UNDERLYING_SPOT_MAX_AGE_MINUTES == db.CHAIN_SNAPSHOT_MAX_AGE_MINUTES
+
+
+# ===== 2026-08-16 (Block B) — position_snapshots (마이그레이션 030) =====
+
+
+class _SequencedCursor:
+    """execute 순서대로 미리 준 결과를 돌려준다 — `positions_as_of()`가 쿼리를 두 번 쏘기 때문에
+    (① 최신 스냅샷 시각 ② 그 시각의 행들) 매번 같은 값을 주는 FakeReadCursor로는 못 쓴다."""
+
+    def __init__(self, results: list, log: list):
+        self._results = results
+        self._log = log
+        self._current = None
+
+    def execute(self, query: str, params=None) -> None:
+        self._log.append((query, params))
+        self._current = self._results.pop(0) if self._results else []
+
+    def fetchone(self):
+        return self._current[0] if self._current else None
+
+    def fetchall(self):
+        return self._current
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _SequencedConnection:
+    def __init__(self, results: list):
+        self.results = results
+        self.log: list = []
+        self.committed = False
+
+    def cursor(self):
+        return _SequencedCursor(self.results, self.log)
+
+    def commit(self) -> None:
+        self.committed = True
+
+
+def _position_row(ts: datetime, symbol: str = "101S03") -> dict:
+    return {
+        "timestamp": ts, "symbol": symbol, "side": "BUY", "qty": 1.0,
+        "avg_price": 352.1, "current_price": 352.4, "eval_pnl": 15000.0,
+        "liquidatable_qty": 1.0, "raw": {"shtn_pdno": symbol, "ccld_avg_unpr1": "352.10"},
+    }
+
+
+def test_insert_position_snapshots_upserts_on_timestamp_and_symbol():
+    """한 잔고 조회는 종목당 한 행이다 — 재조회·재처리에도 멱등해야 한다."""
+    conn = FakeConnection()
+    ts = datetime(2026, 8, 18, 10, 4)
+
+    written = db.insert_position_snapshots(conn, [_position_row(ts)])
+
+    assert written == 1
+    assert conn.committed is True
+    assert "INSERT INTO position_snapshots" in conn.store["query"]
+    assert "ON CONFLICT (timestamp, symbol) DO UPDATE" in conn.store["query"]
+    assert len(conn.store["params"]) == len(db._POSITION_SNAPSHOT_COLUMNS)
+
+
+def test_insert_position_snapshots_serializes_raw_to_json():
+    """`raw`는 JSONB다 — 이 모듈의 다른 JSONB 컬럼과 같은 방식(json.dumps)으로 넣는다.
+    이 원본이 R8의 실측 범위표 원재료라 **문자열로 굳어 들어가야** 한다."""
+    conn = FakeConnection()
+    db.insert_position_snapshots(conn, [_position_row(datetime(2026, 8, 18, 10, 4))])
+
+    raw_index = db._POSITION_SNAPSHOT_COLUMNS.index("raw")
+    assert json.loads(conn.store["params"][raw_index])["ccld_avg_unpr1"] == "352.10"
+
+
+def test_insert_position_snapshots_writes_nothing_for_a_flat_account():
+    """포지션이 없으면 빈 행을 지어내지 않는다 — 심볼이 없는 포지션 행은 만들 수 없고,
+    "조회는 했고 0이었다"는 사실은 같은 사이클의 account_balance_snapshots가 이미 증명한다."""
+    conn = FakeConnection()
+
+    assert db.insert_position_snapshots(conn, []) == 0
+    assert conn.store == {}
+
+
+def test_positions_as_of_returns_only_the_latest_snapshot_generation():
+    """여러 시각의 행을 **섞지 않는다** — 08-07에 체인 스냅샷이 창 안의 여러 사이클을 섞어
+    유령 GEX를 만든 실패를 포지션 축에서 반복하지 않는다."""
+    latest = datetime(2026, 8, 18, 10, 4)
+    conn = _SequencedConnection([
+        [(latest,)],  # ① max(timestamp)
+        [  # ② 그 시각의 행들
+            (latest, "101S03", "BUY", 1, 352.1, 352.4, 15000, 1, {"a": 1}),
+            (latest, "201S03C325", "SELL", 2, 3.55, 352.4, -125000, 1, {"b": 2}),
+        ],
+    ])
+
+    rows = db.positions_as_of(conn, datetime(2026, 8, 18, 10, 5))
+
+    assert [r["symbol"] for r in rows] == ["101S03", "201S03C325"]
+    assert rows[0]["side"] == "BUY"
+    # DECIMAL은 float으로 내려와야 한다 — Decimal/float 혼합 TypeError를 2026-07-28에 겪었다.
+    assert isinstance(rows[1]["qty"], float) and rows[1]["qty"] == 2.0
+    assert isinstance(rows[1]["eval_pnl"], float)
+    # 두 번째 쿼리는 최신 시각으로 **등호** 비교여야 한다(범위가 아니다).
+    assert "WHERE timestamp = %s" in conn.log[1][0]
+    assert conn.log[1][1] == (latest,)
+
+
+def test_positions_as_of_is_empty_when_nothing_was_ever_snapshotted():
+    """개시 전에는 이 표가 비어 있다 — 그때 None을 터뜨리지 않고 빈 목록을 준다."""
+    conn = _SequencedConnection([[(None,)]])
+
+    assert db.positions_as_of(conn, datetime(2026, 8, 18, 10, 5)) == []
+
+
+def test_account_balance_snapshot_columns_include_the_unknown_side_count():
+    """마이그레이션 030이 015에 더한 컬럼 — 이 값이 0이 아닌 날은 방향 카운트를 신뢰할 수 없다."""
+    assert "unknown_side_count" in db._ACCOUNT_BALANCE_SNAPSHOT_COLUMNS

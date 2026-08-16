@@ -45,7 +45,13 @@ from mahdi.data.symbol_master import IndexDerivativesMaster, load_index_derivati
 from mahdi.data import yfinance_fallback
 from mahdi.engines.regime import RegimeState
 from mahdi.engines.regime_pipeline import RegimeStateMachine
-from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state, parse_balance_response, snapshot_to_row
+from mahdi.execution.account_tracker import (
+    BalanceSnapshot,
+    build_account_state,
+    parse_balance_response,
+    position_rows,
+    snapshot_to_row,
+)
 from mahdi.features.options_intel import (
     OptionLeg,
     atm_straddle_vrp,
@@ -3929,6 +3935,14 @@ async def poll_account_balance_cycle(
             snapshot = parse_balance_response(response, poll_time)
             with db.get_connection() as conn:
                 db.insert_account_balance_snapshot(conn, snapshot_to_row(snapshot))
+                # 2026-08-16 (Block B) — 종목별 보유 상세도 남긴다(마이그레이션 030).
+                # 종전에는 `output1`이 방향별 개수 두 개로 요약돼 버려졌고, 그래서 「그 분에
+                # 무엇을 들고 있었나」에 답할 수 없었다. 포지션이 없으면 아무 행도 안 쓴다.
+                #
+                # **같은 커넥션·같은 poll_time을 쓴다** — 두 표가 다른 시각을 갖게 되면
+                # `unknown_side_count`(잔고 표)와 `side_distribution`(포지션 표)이 서로 다른
+                # 사이클을 가리켜 §16-1이 「두 축이 갈렸다」를 오탐한다.
+                db.insert_position_snapshots(conn, position_rows(snapshot))
         except Exception:
             logger.warning("계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
 

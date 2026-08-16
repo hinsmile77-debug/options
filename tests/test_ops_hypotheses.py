@@ -238,6 +238,8 @@ _DB_METRIC_ROOTS = {
     "feature_store", "macro", "market_halt", "ws_status", "remaining_processes", "rate_limiter",
     # 2026-08-12 고도화 1 — 선물봉 vs 레짐 분 수(Fix#3의 직접 지표).
     "regime_vs_futures_bars",
+    # 2026-08-16 (Block B) — 보유 포지션(마이그레이션 030). 방향 판정 실패분을 여기서 본다.
+    "positions",
 }
 
 

@@ -865,3 +865,82 @@ def test_phase_column_is_a_dash_not_a_zero_on_legacy_metrics():
     row = next(line for line in report._render_by_hour(metrics, None) if line.startswith("| 09시"))
 
     assert row.split("|")[7].strip() == "—"
+
+
+# ===== 2026-08-16 (Block B) — §16-1 보유 포지션 =====
+
+
+def _positions_db(**overrides) -> dict:
+    base = {
+        "available": True, "rows": 4, "snapshot_minutes": 2, "symbols": 2,
+        "max_concurrent_symbols": 2, "side_distribution": {"BUY": 1, "SELL": 1},
+        "unknown_side_count_max": 0,
+    }
+    base.update(overrides)
+    return {"positions": base}
+
+
+def test_empty_position_table_is_reported_as_two_possibilities_not_one():
+    """규약 C — 「행 0」은 「체결이 없었다」와 「적재가 죽었다」 둘이다.
+
+    개시 전에는 전자가 정상이므로, 절이 그 둘을 가르는 방법(`execution_logs`)까지 적어야 한다.
+    """
+    rendered = "\n".join(report._render_positions(_positions_db(rows=0)))
+
+    assert "두 가지다" in rendered
+    assert "execution_logs" in rendered
+
+
+def test_position_section_prints_concurrency_next_to_the_same_direction_limit():
+    """동시 보유 종목 수는 **동일방향 한도(3)와 나란히** 읽어야 의미가 있다."""
+    rendered = "\n".join(report._render_positions(_positions_db()))
+
+    assert "동시 보유 최대 **2개**" in rendered
+    assert "동일방향 한도 3" in rendered
+    assert "`BUY` 1" in rendered and "`SELL` 1" in rendered
+
+
+def test_unknown_side_raises_a_warning_that_points_at_the_raw_log_line():
+    """**이 경고가 §16-1의 존재 이유다.**
+
+    방향 판정에 실패한 날은 동일방향 한도 판정이 부풀려져 있고, 실측값은 로그에만 있다 —
+    절이 그 로그 줄을 가리켜야 다음 사람이 R8 범위표를 쓸 수 있다.
+    """
+    rendered = "\n".join(
+        report._render_positions(
+            _positions_db(side_distribution={"UNKNOWN": 1}, unknown_side_count_max=1)
+        )
+    )
+
+    assert "방향 판정 실패 최대 1건" in rendered
+    assert "밑돈다" in rendered
+    assert "잔고 방향 판정 실패" in rendered  # 로그에서 grep할 문구 그대로
+    assert "KIS_RAW_FIELD_RANGES.md" in rendered
+
+
+def test_position_section_flags_when_the_two_axes_disagree():
+    """포지션 스냅샷에는 UNKNOWN이 있는데 잔고 스냅샷의 카운트는 0이면 두 축이 갈린 것이다 —
+    같은 사이클을 보고 있지 않다는 뜻이라 조용히 넘기면 안 된다."""
+    rendered = "\n".join(
+        report._render_positions(
+            _positions_db(side_distribution={"UNKNOWN": 1}, unknown_side_count_max=0)
+        )
+    )
+
+    assert "두 축이 갈렸다" in rendered
+
+
+def test_position_section_says_so_when_every_side_was_understood():
+    """0건일 때도 **무엇이 확인됐는지** 적는다 — 침묵은 「안 쟀다」와 구별되지 않는다."""
+    rendered = "\n".join(report._render_positions(_positions_db()))
+
+    assert "방향 판정 실패 0건" in rendered
+    assert "position_snapshots.raw" in rendered
+
+
+def test_position_section_sets_no_threshold_because_the_normal_range_is_unknown():
+    """첫 포지션이 08-18에 생긴다 — 정상 분포를 모르는 채 임계를 정하면 그 임계가 곧 결론이 된다."""
+    import inspect
+
+    source = inspect.getsource(report._render_positions)
+    assert "임계를 걸지 않는다" in source

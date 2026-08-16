@@ -136,6 +136,8 @@ def collect(
         ("ws_status", _ws_status),
         ("remaining_processes", _remaining_processes),
         ("rate_limiter", _rate_limiter),
+        # 2026-08-16 (Block B) — 보유 포지션. 마이그레이션 030. 개시일(08-18)에 가장 먼저 볼 절이다.
+        ("positions", positions),
     ):
         try:
             out[key] = fn(conn, target)
@@ -164,6 +166,62 @@ def _fetchone(conn: ConnectionLike, sql: str, params: tuple = ()) -> tuple | Non
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
+
+
+def positions(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 그날 `position_snapshots`에 담긴 보유 종목의 방향 분포와 최대 동시 보유 종목 수,
+         그리고 `account_balance_snapshots.unknown_side_count`의 그날 최댓값.
+    해석: 2026-08-16 (Block B) — **개시일에 가장 먼저 볼 절이다.** 답해야 하는 질문 셋:
+           (a) 포지션이 실제로 잡혔는가 — `snapshot_minutes`/`symbols`가 0이면 체결이 없었거나
+               적재 경로가 죽은 것이다(둘은 `execution_logs`로 갈린다).
+           (b) **KIS가 방향값을 무엇으로 보내는가** — `side_distribution`에 `UNKNOWN`이 있으면
+               `observation_loop.log`의 `잔고 방향 판정 실패` 줄이 원본 값을 갖고 있다.
+               그 값이 곧 `account_tracker._BUY_SIDE_TOKENS`를 좁힐 실측 근거다(R8).
+           (c) 동일방향 한도가 볼 수 있는 숫자였는가 — `unknown_side_count_max > 0`이면
+               그날 한도 판정은 보수적으로 부풀려져 있었다.
+         **임계를 걸지 않는다** — 정상 분포를 모른다(첫 포지션이 8/18에 생긴다).
+    실패 조건: 테이블이 비어 있으면 0/빈 dict를 낸다 — 「없다」와 「못 쟀다」를 가르기 위해
+              `available`을 함께 낸다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*), count(DISTINCT timestamp), count(DISTINCT symbol) "
+            "FROM position_snapshots WHERE timestamp::date=%s",
+            (target,),
+        )
+        rows, snapshot_minutes, symbols = cur.fetchone() or (0, 0, 0)
+        cur.execute(
+            "SELECT coalesce(side, '(미기록)'), count(DISTINCT symbol) "
+            "FROM position_snapshots WHERE timestamp::date=%s GROUP BY 1 ORDER BY 1",
+            (target,),
+        )
+        distribution = {str(side): int(count) for side, count in cur.fetchall()}
+        # 한 스냅샷 시각에 들고 있던 종목 수의 최댓값 — 동일방향 한도(3)와 나란히 읽는다.
+        cur.execute(
+            "SELECT coalesce(max(per_ts), 0) FROM ("
+            "  SELECT count(*) AS per_ts FROM position_snapshots "
+            "  WHERE timestamp::date=%s GROUP BY timestamp) s",
+            (target,),
+        )
+        max_concurrent = int((cur.fetchone() or (0,))[0])
+        cur.execute(
+            "SELECT coalesce(max(unknown_side_count), 0) FROM account_balance_snapshots "
+            "WHERE timestamp::date=%s",
+            (target,),
+        )
+        unknown_max = int((cur.fetchone() or (0,))[0])
+
+    return {
+        "available": True,
+        "rows": int(rows or 0),
+        "snapshot_minutes": int(snapshot_minutes or 0),
+        "symbols": int(symbols or 0),
+        "max_concurrent_symbols": max_concurrent,
+        "side_distribution": distribution,
+        "unknown_side_count_max": unknown_max,
+    }
 
 
 def _tables(conn: ConnectionLike, target: date) -> list[dict]:

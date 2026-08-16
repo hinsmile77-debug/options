@@ -220,6 +220,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
         lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
                           lambda: _render_book_gamma_map(db_metrics, previous))
         lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
+        lines += _section("16-1. 보유 포지션 — 브로커가 무엇을 들고 있다고 말했는가",
+                          lambda: _render_positions(db_metrics))
     lines += _section("17. 교차 점검 — 지표끼리 모순되는가",
                       lambda: _render_crosschecks(metrics, db_metrics))
     return "\n".join(lines).rstrip() + "\n"
@@ -1742,6 +1744,61 @@ def _render_db_misc(db: dict) -> list[str]:
         "",
     ]
     out += _render_spot_divergence(db)
+    return out
+
+
+def _render_positions(db: dict) -> list[str]:
+    """2026-08-16 (Block B) — 보유 포지션(마이그레이션 030 `position_snapshots`).
+
+    **개시일(08-18)에 가장 먼저 읽을 절이다.** 임계를 걸지 않는다 — 첫 포지션이 그날 생기므로
+    정상 분포를 아직 모른다(§16 괴리율에서 배운 것: 정상 범위를 모르는 채 임계를 먼저 정하면
+    그 임계가 곧 결론이 된다).
+    """
+    pos = db.get("positions") or {}
+    if not pos.get("available"):
+        return [f"> 포지션 집계 불가 — {pos.get('reason', '사유 미상')}.", ""]
+
+    if pos.get("rows", 0) == 0:
+        return [
+            "- **그날 보유 포지션 기록이 없다**(행 0).",
+            "",
+            "> **이것은 두 가지다**(규약 C): 체결이 없어서 포지션이 없었던 것과, 적재 경로가 "
+            "죽어서 못 남긴 것. 가르는 방법은 `execution_logs`를 함께 보는 것이다 — 주문이 "
+            "0건이면 전자다. ADVISORY/CONFIRM 미통과 상태에서는 전자가 정상이다.",
+            "",
+        ]
+
+    dist = pos.get("side_distribution") or {}
+    out = [
+        f"- 스냅샷 **{pos['snapshot_minutes']}분** / 종목 **{pos['symbols']}개** / "
+        f"동시 보유 최대 **{pos['max_concurrent_symbols']}개**(동일방향 한도 3과 나란히 읽는다)",
+        f"- 방향 분포: {', '.join(f'`{k}` {v}' for k, v in sorted(dist.items())) or '—'}",
+        "",
+    ]
+
+    unknown = pos.get("unknown_side_count_max", 0)
+    if unknown:
+        out += [
+            f"> ⚠ **방향 판정 실패 최대 {unknown}건.** 그날 `same_direction_buy_count`/"
+            "`sell_count`는 실제 포지션 수를 **밑돈다**(동일방향 한도 판정은 보수적으로 "
+            "부풀려져 있었다 — 미인식분을 후보 방향에 더하므로).",
+            "> **`observation_loop.log`의 `잔고 방향 판정 실패` 줄에 KIS 원본 값이 있다** — "
+            "그 값이 `account_tracker._BUY_SIDE_TOKENS`를 실측 기준으로 좁힐 근거이고, "
+            "R8 범위표(`docs/dev_memory/KIS_RAW_FIELD_RANGES.md`)에 적을 대상이다.",
+            "",
+        ]
+    elif "UNKNOWN" in dist:
+        out += [
+            "> ⚠ `side_distribution`에 `UNKNOWN`이 있는데 `unknown_side_count_max`는 0이다 — "
+            "두 축이 갈렸다(잔고 스냅샷과 포지션 스냅샷이 다른 사이클을 보고 있을 수 있다).",
+            "",
+        ]
+    else:
+        out += [
+            "> 방향 판정 실패 0건 — **KIS가 보낸 방향값을 전부 알아봤다.** 그 값이 무엇이었는지는 "
+            "`position_snapshots.raw`에 남아 있다(R8 실측 확정의 원재료).",
+            "",
+        ]
     return out
 
 

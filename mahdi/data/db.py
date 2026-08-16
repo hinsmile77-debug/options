@@ -1635,6 +1635,8 @@ _ACCOUNT_BALANCE_SNAPSHOT_COLUMNS = (
     "timestamp", "prsm_dpast", "evlu_pfls_amt_smtl", "trad_pfls_amt_smtl",
     "dnca_cash", "ord_psbl_cash", "mgna_tota",
     "same_direction_buy_count", "same_direction_sell_count",
+    # 마이그레이션 030 (2026-08-16) — 방향 판정 실패분. 위 두 카운트의 신뢰도 표시다.
+    "unknown_side_count",
 )
 _ACCOUNT_BALANCE_SNAPSHOT_DECIMAL_COLUMNS = (
     "prsm_dpast", "evlu_pfls_amt_smtl", "trad_pfls_amt_smtl", "dnca_cash", "ord_psbl_cash", "mgna_tota",
@@ -1659,6 +1661,68 @@ def insert_account_balance_snapshot(conn: ConnectionLike, row: dict) -> None:
     계산: INSERT ... ON CONFLICT (timestamp) DO UPDATE — 재처리에도 멱등.
     """
     _upsert(conn, "account_balance_snapshots", _ACCOUNT_BALANCE_SNAPSHOT_COLUMNS, ("timestamp",), row)
+
+
+_POSITION_SNAPSHOT_COLUMNS = (
+    "timestamp", "symbol", "side", "qty", "avg_price",
+    "current_price", "eval_pnl", "liquidatable_qty", "raw",
+)
+
+
+def insert_position_snapshots(conn: ConnectionLike, rows: list[dict]) -> int:
+    """
+    입력: `mahdi.execution.account_tracker.position_rows()`가 만든 dict 목록.
+    계산: 행별로 INSERT ... ON CONFLICT (timestamp, symbol) DO UPDATE — 재처리에도 멱등.
+         `raw`는 JSONB라 `json.dumps`를 통과시킨다(이 모듈의 다른 JSONB 컬럼과 같은 방식).
+    반환: 적재한 행 수.
+    해석: 포지션이 없으면 **아무 행도 안 쓴다**(빈 스냅샷을 남기지 않는다) — "그 시각에 조회는
+         했고 포지션이 0이었다"는 사실은 같은 사이클의 `account_balance_snapshots` 행이 이미
+         증명한다. 여기에 빈 행을 넣으려면 심볼이 필요하고, 그러려면 가짜 심볼을 지어내야 한다.
+    실패 조건: 항목별로 격리하지 **않는다** — 한 사이클의 포지션 집합은 원자적으로 들어가거나
+              말아야 한다(절반만 들어간 포지션 스냅샷은 「그때 무엇을 들고 있었나」에 틀린
+              답을 준다). 예외는 호출측으로 전파돼 폴러의 격리 블록이 받는다(R7).
+    """
+    written = 0
+    for row in rows:
+        payload = dict(row)
+        payload["raw"] = json.dumps(payload.get("raw") or {}, ensure_ascii=False)
+        _upsert(conn, "position_snapshots", _POSITION_SNAPSHOT_COLUMNS, ("timestamp", "symbol"), payload)
+        written += 1
+    return written
+
+
+def positions_as_of(conn: ConnectionLike, as_of: datetime) -> list[dict]:
+    """
+    입력: DB 커넥션, 기준 시각.
+    계산: `as_of` 이하의 **가장 최근 스냅샷 시각** 한 벌을 그대로 돌려준다.
+    해석: 사후 재구성 전용이다 — **라이브 판단은 이 함수를 쓰지 않는다.** 포지션의 권위는
+         브로커이고(L12/R12) 이 테이블은 미러다(마이그레이션 030 주석). 여러 시각의 행을
+         섞지 않기 위해 최신 시각 하나로 자른다(체인 스냅샷이 창 안에서 여러 사이클을 섞어
+         유령 GEX를 만든 08-07의 실패를 반복하지 않는다).
+    실패 조건: 스냅샷이 없으면 빈 목록.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT max(timestamp) FROM position_snapshots WHERE timestamp <= %s", (as_of,)
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return []
+        latest_ts = row[0]
+        cur.execute(
+            f"SELECT {', '.join(_POSITION_SNAPSHOT_COLUMNS)} FROM position_snapshots "
+            "WHERE timestamp = %s ORDER BY symbol",
+            (latest_ts,),
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for values in rows:
+        record = dict(zip(_POSITION_SNAPSHOT_COLUMNS, values))
+        for col in ("qty", "avg_price", "current_price", "eval_pnl", "liquidatable_qty"):
+            if record[col] is not None:
+                record[col] = float(record[col])
+        out.append(record)
+    return out
 
 
 def latest_account_balance_snapshot(conn: ConnectionLike) -> dict | None:
