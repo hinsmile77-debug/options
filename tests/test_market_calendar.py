@@ -137,15 +137,31 @@ def test_the_shipped_calendar_lists_the_day_we_actually_lost():
     assert market_calendar.holiday_name(_HOLIDAY, calendar) is not None
 
 
-def test_the_shipped_calendar_does_not_claim_more_than_it_verified():
-    """`covered_through`를 넘어선 휴장일을 등재하면 「확인했다」는 선언이 거짓이 된다.
+def test_the_shipped_calendar_declares_its_coverage():
+    """`covered_through`가 없거나 안 읽히면 **만료 경고가 영영 안 뜬다.**
 
-    이 파일의 다른 항목들과 달리 여기서는 **적게 적는 것이 옳다** — 미등재는 거래일로 접히지만
-    잘못 등재된 날짜는 그날 관측을 통째로 없앤다.
+    그 침묵이 이 방식의 유일한 실패 모드다 — `event_calendar.yaml` 헤더가 같은 말을 한다
+    ("안 채운 걸 아무도 모르는 것").
     """
     calendar = market_calendar.load_holiday_calendar()
-    covered = calendar.get("covered_through")
-    assert covered, "covered_through가 없으면 만료 경고가 영영 안 뜬다"
-    limit = datetime.strptime(str(covered), "%Y-%m-%d").date()
-    for day in market_calendar.parse_holidays(calendar):
-        assert day <= limit, f"{day}는 covered_through({limit}) 밖인데 등재돼 있다"
+    assert calendar.get("covered_through")
+    assert market_calendar.coverage_gap_days(calendar, _HOLIDAY) is not None
+
+
+def test_entries_beyond_covered_through_are_allowed():
+    """**목록의 끝과 신뢰의 끝은 다르다** — `event_calendar.yaml`이 이미 명시한 규약이다.
+
+    처음에는 `날짜 <= covered_through`를 강제했다가 뺐다. 그 검사는 **비대칭을 거꾸로 적용한
+    것**이었다: 12-25가 휴장일임을 아는데 연간 전수 확인은 아직 못 한 사람에게 "아는 것조차
+    적지 말라"고 막는다. 그러면 그날 시스템이 휴장일에 뜬다 — 즉 **막는 쪽이 더 나쁘다.**
+
+    `covered_through`가 답하는 질문은 「이 목록이 완전한가」이고, 개별 항목이 답하는 질문은
+    「이 날은 안 여는가」다. 후자가 전자를 기다릴 이유가 없다.
+    """
+    partial = {
+        "covered_through": "2026-08-17",
+        "holidays": [{"date": "2026-12-25", "name": "성탄절"}],
+    }
+    assert market_calendar.is_trading_day(date(2026, 12, 25), partial) is False
+    # 그러면서도 목록은 여전히 「불완전하다」고 신고한다 — 두 축은 독립이다.
+    assert market_calendar.coverage_gap_days(partial, date(2026, 12, 25)) > 0
