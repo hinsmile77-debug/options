@@ -116,3 +116,22 @@ def get_event_calendar() -> dict[str, Any]:
         return _load_yaml("event_calendar.yaml") or {}
     except FileNotFoundError:
         return {}
+
+
+@lru_cache
+def get_market_holidays() -> dict[str, Any]:
+    """
+    계산: `market_holidays.yaml`(수기 휴장일 달력)을 읽는다 — 2026-08-17 2차 신규.
+    해석: `get_event_calendar()`와 같은 규약이다 — `@lru_cache`라 **프로세스당 1회만** 읽고,
+         파일이 없으면 빈 dict를 돌려준다. 빈 dict는 "등재된 휴장일이 없다"이고, 그러면
+         `market_calendar.is_trading_day()`가 주말만 걸러낸다(= 08-17 이전의 동작).
+         **여기서 예외를 던지면 달력 하나 때문에 관측 루프도 워치독도 못 뜬다.**
+
+         워치독은 1분마다 새 프로세스로 뜨므로 캐시가 매번 비어 **파일 수정이 즉시 반영된다**.
+         반대로 관측 루프는 장전 기동까지 옛 값을 쓴다 — 그 비대칭이 여기서는 옳다: 오늘이
+         휴장일이라는 것을 뒤늦게 알았을 때 **먼저 멈춰야 하는 쪽이 워치독**이다.
+    """
+    try:
+        return _load_yaml("market_holidays.yaml") or {}
+    except FileNotFoundError:
+        return {}

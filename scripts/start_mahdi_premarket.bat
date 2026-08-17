@@ -19,11 +19,53 @@ echo [%date% %time%] ===== Mahdi 장전 기동 시작 ===== >> "%LOG_FILE%"
 
 cd /d "%PROJECT_DIR%"
 
+REM 2026-08-17 2차: **오늘 시장이 안 열리면 아무것도 하지 않는다.**
+REM
+REM 08-15(토)·08-16(일)에 워치독이 주말에 시스템 전체를 부팅했고, 08-17(광복절 대체공휴일)에는
+REM 이 스크립트가 월~금 트리거를 타고 정상적으로 떠서 종일 돌았다. 그 하루가 option_analysis_1m에
+REM 9,640행을 남겼는데 IV 고유값은 30(=레그 수)이었다 — 값이 얼어붙은 하루가 영업일(9,194행)보다
+REM 많이 적재된 것이고, 행 수로는 구분이 안 된다.
+REM
+REM **표식 생성보다 앞에 둔다** — 건너뛸 날에는 .startup_in_progress도 만들지 않는다(만들면
+REM 300초 동안 워치독 판정이 보류되는데, 그 사이 아무 일도 안 일어날 것이 확실하다).
+REM
+REM 판정은 mahdi\market_calendar.py에 있고 이 스크립트는 종료 코드만 본다. 문자열 출력을
+REM 파싱하지 않는 이유는 cmd.exe의 문자열 처리가 로케일·인코딩을 타기 때문이다(이 저장소가
+REM 2026-08-03에 실제로 다친 지점).
+REM
+REM 우회: `start_mahdi_premarket.bat force` — 달력이 틀렸거나 휴장일에 일부러 띄울 때 쓴다.
+REM 워치독의 재기동 경로(_restart)는 인자 없이 부르므로 **자동 재기동은 이 게이트를 못 넘는다** —
+REM 그것이 옳다(휴장일에 워치독이 되살릴 이유가 없고, 애초에 워치독도 그날은 IDLE이다).
+if /i "%~1"=="force" goto :trading_day_ok
+echo [%date% %time%] 거래일 점검 >> "%LOG_FILE%"
+call uv run python scripts\check_trading_day.py
+if errorlevel 1 goto :not_a_trading_day
+goto :trading_day_ok
+
+:not_a_trading_day
+echo [%date% %time%] ===== 비거래일 - 기동하지 않는다 (uv run python scripts\check_trading_day.py 참고) ===== >> "%LOG_FILE%"
+echo.
+echo   비거래일이라 마흐디를 띄우지 않았다. 그래도 띄우려면: scripts\start_mahdi_premarket.bat force
+echo.
+endlocal
+exit /b 0
+
+:trading_day_ok
+
 REM 2026-08-06(§2-1 / Fix#2): 워치독에게 "지금 기동 중"이라고 알린다.
 REM 이 표식이 없으면 1분 주기 워치독이 **기동 중인 루프를 다시 기동한다** — 아래 Docker 대기가
 REM 최대 180초라 그 사이 생존 신호는 늙은 채로(또는 없는 채로) 남아 있기 때문이다.
 REM 표식의 내용은 아무도 읽지 않는다(mtime만 본다) — cmd.exe의 날짜 문자열은 로케일을 탄다.
 echo startup > "%PROJECT_DIR%\logs\.startup_in_progress"
+
+REM 2026-08-17: 기동을 시작한 순간 「의도적 정지」는 철회된 것이다 — 정지 표식을 여기서 지운다.
+REM **끝이 아니라 시작에서 지우는 것이 중요하다.** 끝에서 지우면 이 스크립트가 중간에(예: Docker
+REM 데몬을 180초 기다리다가) 죽었을 때 표식이 살아남아 워치독이 그날 내내 침묵한다 — 되살릴 것이
+REM 없는 상태로 조용해지는 것이 08-06에 19분을 만든 바로 그 모양이다. 시작에서 지우면 그 경우
+REM .startup_in_progress가 300초 뒤 만료되고 워치독이 정상적으로 되살린다.
+REM 워치독의 재기동도 이 스크립트를 그대로 쓰므로(watchdog_observation_loop._restart) 표식 정리
+REM 경로가 하나뿐이다 — 하루 한 번도 안 쓰이는 두 번째 경로를 만들지 않는다.
+del /q "%PROJECT_DIR%\logs\.intentional_stop" 2>nul
 
 REM 2026-07-22 이상점 대응(운영점검보고서 2026-07-22 §1-1): 어제(07-21) 08:15에 수동으로 뜬
 REM COCKPIT/관측 루프가 그날 15:45 자동 종료 실패 이후에도 밤새 좀비로 남아, 오늘 아침까지

@@ -10,6 +10,15 @@ if not exist "%PROJECT_DIR%\logs" mkdir "%PROJECT_DIR%\logs"
 
 echo [%date% %time%] ===== Mahdi 장마감 자동 종료 시작 ===== >> "%LOG_FILE%"
 
+REM 2026-08-17: 「사람이(또는 예약이) 일부러 껐다」를 워치독에게 알린다 — **taskkill보다 먼저 쓴다.**
+REM 이 표식이 없으면 워치독은 정지와 죽음을 구분할 방법이 없어 3~4분 뒤 되살린다(08-17 15:00 /
+REM 15:06 / 15:28 재기동 3회가 정확히 그 경우였다). 지금까지 이 스크립트가 무사했던 것은 설계가
+REM 아니라 시각 우연이다 — 실행 시각(15:45)이 감시 창 끝(liveness.WATCH_WINDOW_END)과 정확히
+REM 겹쳐서 재기동이 안 걸렸을 뿐이고, 이 배치가 조금이라도 일찍 돌면 그대로 되살아난다.
+REM 판정은 mtime만 보므로 내용은 사람이 읽기 위한 것이다(cmd.exe 날짜 문자열은 로케일을 탄다).
+REM 표식은 다음 기동 스크립트가 **시작하면서** 지운다 — 만료를 여기서 관리하지 않는다.
+echo intentional stop %date% %time% > "%PROJECT_DIR%\logs\.intentional_stop"
+
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi COCKPIT*" >> "%LOG_FILE%" 2>&1
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi Observation Loop*" >> "%LOG_FILE%" 2>&1
 

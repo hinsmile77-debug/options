@@ -4430,8 +4430,38 @@ async def main() -> None:
         await asyncio.gather(*tasks)
 
 
+def _mark_intentional_stop() -> None:
+    """사람이 일부러 껐다는 것을 워치독에게 남긴다 (2026-08-17).
+
+    종전에는 Ctrl+C 경로가 로그 한 줄만 남기고 끝났고, 그래서 워치독에게는 죽음과 구분되지
+    않았다 — 08-17 15:00 / 15:06 / 15:28에 세 번 되살아났다.
+
+    **순서가 규약이다: 표식 먼저, 하트비트 나중.** 그 사이에 워치독이 판정을 돌려도 표식이
+    이미 보인다. 뒤집으면 그 한 번의 판정에는 「죽음」만 보인다.
+
+    하트비트를 지우는 것은 결과를 바꾸지 않지만(`decide()`는 missing이든 stale이든 되살린다)
+    **사유가 사실과 맞게 찍힌다**: 지우면 `missing`("아예 안 떴다"), 남기면 `stale`("떴다가
+    죽었다")이고 다음날 원인을 찾는 사람에게 그 구분이 출발점이다.
+    `liveness.clear_heartbeat()`는 08-06에 만들어졌지만 호출부가 없어 그동안 죽은 코드였다.
+
+    **이 함수는 콘솔 종료 핸들러의 다른 스레드에서도 불린다**(창 닫기 경로) — 파일 두 개를
+    쓰는 동기 I/O 말고는 아무것도 넣지 말 것. 상세 근거는 `liveness.install_console_stop_handler`.
+    """
+    liveness.write_intentional_stop(liveness.intentional_stop_path(LOG_DIR), db.local_now())
+    liveness.clear_heartbeat(liveness.heartbeat_path(LOG_DIR))
+
+
 if __name__ == "__main__":
+    # 2026-08-17 2차 — **창 닫기(X 버튼)는 KeyboardInterrupt를 만들지 않는다.** 08-17의 세 번의
+    # 정지가 전부 그 경로였고(그날 로그에 `Ctrl+C로 종료합니다`가 0건이다), 아래 except가
+    # 덮지 못하는 유일한 사람 손이다. Windows에만 걸리고 실패해도 조용히 지나간다 — 못 걸면
+    # 표식이 없어 워치독이 종전처럼 되살릴 뿐이므로 **안전한 쪽의 실패**다.
+    liveness.install_console_stop_handler(_mark_intentional_stop)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Ctrl+C로 종료합니다.")
+        _mark_intentional_stop()
+        logger.info(
+            "Ctrl+C로 종료합니다 — 정지 표식을 남겼으므로 워치독이 되살리지 않는다. "
+            "다시 띄우려면 scripts\\start_mahdi_premarket.bat"
+        )

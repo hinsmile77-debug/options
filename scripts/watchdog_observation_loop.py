@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mahdi import liveness, notify
+from mahdi import liveness, market_calendar, notify
 from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 
@@ -182,14 +182,29 @@ def main() -> None:
     now = db.local_now()
     beat = liveness.read_heartbeat(liveness.heartbeat_path(LOG_DIR))
     state = _read_state()
+    # 2026-08-17 — 사람이 일부러 껐는가. **적재 조회보다 먼저 본다**: 정지 중이라면 DB를 열
+    # 이유가 없다(규약 D — 감시자가 매분 감시 대상의 DB에 붙는 결합을 하나라도 덜 만든다).
+    stopped_at = liveness.intentional_stop_at(
+        liveness.intentional_stop_path(LOG_DIR), now, beat
+    )
+    # 2026-08-17 2차 — 오늘이 등재된 휴장일인가. 워치독은 1분마다 **새 프로세스**로 뜨므로
+    # `@lru_cache`가 매번 비어 달력 수정이 즉시 반영된다(관측 루프는 다음 기동까지 옛 값을
+    # 쓴다 — 오늘이 휴장일임을 뒤늦게 알았을 때 먼저 멈춰야 하는 쪽이 워치독이다).
+    holiday = market_calendar.holiday_name(now, market_calendar.load_holiday_calendar())
     # 적재 감시 창 밖에서는 **DB를 아예 안 연다** — 밤새 매분 커넥션을 만들 이유가 없고,
     # 창 밖의 「적재 0분」은 이상이 아니라 정상이다(`liveness.INGEST_WATCH_*` 주석).
-    ingest = _recent_ingest_minutes(now) if liveness.in_ingest_window(now) else None
+    ingest = (
+        _recent_ingest_minutes(now)
+        if stopped_at is None and holiday is None and liveness.in_ingest_window(now)
+        else None
+    )
     decision = liveness.decide(
         beat, now, state,
         # 기동 스크립트가 도는 중이면 판정을 보류한다 — 안 그러면 기동이 서로를 덮어쓴다.
         starting=liveness.startup_in_progress(liveness.startup_marker_path(LOG_DIR), now),
         ingest_minutes_recent=ingest,
+        stopped_at=stopped_at,
+        holiday=holiday,
     )
 
     # 2026-08-12 Fix#8 — **판정했다는 사실 자체를 남긴다.** 로그보다 먼저, 그리고 IDLE에도 쓴다:
@@ -202,10 +217,24 @@ def main() -> None:
         action=decision.action, detail=decision.detail,
     )
 
-    if decision.action == liveness.ACTION_IDLE:
-        return  # 감시 창 밖 — 로그도 남기지 않는다(매분 한 줄이면 하루 1,000줄이다)
-
     stamp = f"[{now:%Y-%m-%d %H:%M:%S}]"
+    if decision.action == liveness.ACTION_IDLE:
+        # 감시 창 밖의 IDLE은 안 남긴다 — 매분 한 줄이면 하루 1,000줄이다.
+        #
+        # **의도적 정지는 예외로 남긴다**(2026-08-17). 이 구간은 「감시 창 밖이라 조용한 것」이
+        # 아니라 **감시 창 안인데 우리가 감시를 껐다**는 뜻이고, 다음날 로그를 읽는 사람에게
+        # 그 둘은 완전히 다른 사실이다. 08-12 Fix#8이 `.watchdog_last_check.json`을 만든 것과
+        # 같은 이유이고, 주기도 `OK`와 같이 10분에 한 줄로 맞춘다.
+        #
+        # **휴장일도 같이 남긴다**(2026-08-17 2차). 달력이 틀려 거래일을 휴장일로 적은 날,
+        # 이 줄이 그 오답을 드러내는 유일한 자리다 — 그날은 관측도 알림도 없으므로 다른
+        # 신호가 하나도 안 나온다. 감시 창 안에서만 찍히므로 하루 최대 49줄이다.
+        if now.minute % 10 == 0 and decision.reason in (
+            liveness.REASON_INTENTIONAL_STOP, liveness.REASON_HOLIDAY,
+        ):
+            _log(f"{stamp} IDLE — {decision.detail}")
+        return
+
     if decision.action == liveness.ACTION_OK:
         # 정상도 기록은 남긴다 — 다음날 "워치독이 돌기는 했는가"를 물을 수 있어야 한다.
         # 다만 10분에 한 번만(1분 주기 x 매번이면 로그가 이 줄로 채워진다).

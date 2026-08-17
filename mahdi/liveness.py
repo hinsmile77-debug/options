@@ -44,11 +44,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
-from mahdi import session
+from mahdi import market_calendar, session
 
 logger = logging.getLogger("mahdi.liveness")
 
@@ -198,7 +199,7 @@ INGEST_WATCH_START = dtime(9, 0)
 INGEST_WATCH_END = dtime(15, 15)
 
 ACTION_OK = "ok"
-ACTION_IDLE = "idle"  # 감시 창 밖 — 아무것도 하지 않는다
+ACTION_IDLE = "idle"  # 감시 창 밖이거나 판정을 보류할 이유가 있다 — 아무것도 하지 않는다
 ACTION_RESTART = "restart"
 ACTION_ALERT_ONLY = "alert_only"  # 이상은 맞는데 재기동 상한을 썼다
 ACTION_DEGRADED = "degraded"  # 살아 있는데 적재가 없다 — 알림만, 재기동은 하지 않는다
@@ -206,6 +207,8 @@ ACTION_DEGRADED = "degraded"  # 살아 있는데 적재가 없다 — 알림만,
 REASON_MISSING = "missing"
 REASON_STALE = "stale"
 REASON_NO_INGEST = "no_ingest"
+REASON_INTENTIONAL_STOP = "intentional_stop"  # 사람이 일부러 껐다 — 되살리지 않는다
+REASON_HOLIDAY = "holiday"  # 등재된 휴장일 — 오늘은 감시할 것이 없다
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +220,19 @@ class WatchdogDecision:
 
 
 def in_watch_window(now: datetime) -> bool:
+    """반환: 지금이 관측 루프가 **떠 있어야 하는** 시각인가.
+
+    2026-08-17 2차 — **주말을 여기서 뺀다.** 종전에는 `now.time()`만 봐서 요일을 몰랐고,
+    그 결과 08-15(토) 07:40:02와 08-16(일) 10:14:39에 **워치독이 주말에 시스템 전체를
+    부팅했다**(장전 기동 작업은 월~금 트리거라 안 떴는데 워치독이 대신 띄웠다). 두 날 모두
+    재기동 상한을 채우고 `ALERT_ONLY`를 94줄·113줄 쏟았다.
+
+    주말 판정은 `market_calendar.is_weekend()`가 한다 — **계산이라 파일이 필요 없으므로**
+    이 순수 함수 안에 둘 수 있다. 휴장일은 사람이 확인한 파일이 있어야 알 수 있어서 여기가
+    아니라 `decide(holiday=...)`로 주입한다(`starting`/`stopped_at`과 같은 패턴).
+    """
+    if market_calendar.is_weekend(now):
+        return False
     return WATCH_WINDOW_START <= now.time() <= WATCH_WINDOW_END
 
 
@@ -348,6 +364,195 @@ def startup_in_progress(
     return (now.timestamp() - mtime) < grace_seconds
 
 
+# ===== 2026-08-17 — **의도적 정지와 죽음은 다른 사건이다** =====
+#
+# 08-17 15:00:01 / 15:06:01 / 15:28:02, 워치독이 관측 루프를 세 번 되살렸다. 셋 다 정상이었다 —
+# 판정도 조치도 설계대로였다. **틀린 것은 입력이었다.** 그날 세 번의 정지는 전부 사람이 코드를
+# 고치려고 창을 닫은 것이었는데, `decide()`가 보는 입력에는 「사람이 껐다」를 표현할 자리가
+# 아예 없었다. 감시 창 · 기동 표식 · 하트비트 나이 · 적재 분 수 — 이 넷 어디에도 의도가 없으므로
+# **의도적 정지와 죽음은 이 함수 안에서 정의상 같은 사건**이었다.
+#
+# 대가는 재기동 3회로 끝나지 않았다:
+#   - 하루 재기동 상한(`MAX_RESTARTS_PER_DAY`)이 15:28에 전부 소진됐다. 그때부터 15:45까지
+#     **진짜 사고가 났다면 워치독은 알림만 내고 손을 뗐을 것이다.**
+#   - CRITICAL 알림 2건이 오발됐다(15:00:01, 15:06은 쿨다운에 눌림, 15:28:02).
+#   - 정규장 시간대 옵션체인 결손 약 12분(14:56~15:01, 15:03~15:07, 15:25~15:29).
+#
+# ## `.last_marketclose_stop.txt`로는 왜 안 되는가
+#
+# 그 파일은 이미 있었다. 그런데 쓰는 곳은 `scripts/log_marketclose_stop.py` 하나이고 읽는 곳은
+# `docs/동작점검/tools/collect_evidence.py`(사후 증거 다이제스트)뿐이다 — **판정 경로가 그 파일을
+# 한 번도 안 본다.** 게다가 그것은 「마지막으로 정상 종료한 시각」이라 *지금 정지 중인가*에 답하지
+# 못한다. 답해야 하는 질문이 다르므로 파일도 다르다.
+#
+# ## 정식 15:45 종료가 지금까지 무사했던 것은 설계가 아니라 시각 우연이다
+#
+# `WATCH_WINDOW_END`(15:45)와 종료 배치(15:45)가 정확히 겹쳐서 재기동이 안 걸렸을 뿐이다.
+# 07:40~15:45 사이라면 **정식 종료 스크립트로 꺼도** 3~4분 뒤 되살아난다(정지 임계 180초 +
+# 워치독 1분 주기 = 08-17 실측 3분10초~3분37초).
+_INTENTIONAL_STOP_FILENAME = ".intentional_stop"
+
+
+def intentional_stop_path(log_dir: Path) -> Path:
+    return log_dir / _INTENTIONAL_STOP_FILENAME
+
+
+def write_intentional_stop(path: Path, now: datetime) -> None:
+    """정지 의도를 남긴다(`mahdi/main.py`의 Ctrl+C 경로용 — 배치 스크립트는 `echo`로 쓴다).
+
+    내용은 **사람이 로그를 읽을 때를 위한 것**이고 판정은 mtime만 본다(`startup_in_progress`와
+    같은 이유 — cmd.exe가 쓴 날짜 문자열은 로케일을 탄다).
+
+    실패 조건: 어떤 예외도 밖으로 내지 않는다. 표식을 못 썼다고 종료가 막히면 안 된다 — 못 쓰면
+              워치독이 종전처럼 되살릴 뿐이고, 그것은 **안전한 쪽의 실패**다.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"intentional stop at {now.isoformat()}\n", encoding="utf-8")
+    except Exception:
+        logger.warning("정지 표식 기록 실패: %s", path, exc_info=True)
+
+
+def intentional_stop_at(path: Path, now: datetime, beat: dict | None = None) -> datetime | None:
+    """반환: **아직 유효한** 정지 표식의 시각. 표식이 없거나 이미 소비됐으면 None.
+
+    세 조건을 **모두** 만족해야 유효하다:
+
+    1. 파일이 있다.
+    2. 표식의 **날짜가 오늘**이다 — 밤사이 PC가 꺼져 아침 기동 스크립트가 못 돈 날, 어제
+       15:45의 표식이 오늘 07:40 감시 창을 침묵시키는 것을 막는다. 기동 스크립트의 `del`이
+       주 만료 경로이고 이것은 그 경로가 실패했을 때의 두 번째 그물이다.
+    3. 표식보다 **나중의 박동이 없다.** 표식이 남은 채로 사람이 별도 터미널에서 루프를 띄우면
+       (2026-07-21에 실제로 있었던 일 — 창 제목 규약을 안 타는 경로라 기동 스크립트의 `del`을
+       거치지 않는다) 박동이 표식보다 새로워지고, 그 순간 표식은 **자동으로 무효**가 된다.
+       시간 상수를 하나도 안 늘리고 "이미 소비된 의도"를 걸러내는 자리다.
+
+    해석: 이 판정이 True인 동안 워치독은 그날 남은 시간의 감시를 **실제로 하지 않는다.** 그것이
+         「사람이 껐다」의 문자 그대로의 의미이고, 그래서 워치독이 그 구간을 10분에 한 줄
+         기록하고 COCKPIT이 초록 대신 경고를 낸다(`ACTION_IDLE`을 감시 창 안에서 받은 배지).
+
+    실패 조건: 못 읽으면 **None(= 감시를 계속한다)** 이다. `_no_ingest_detail`이 「모른다」를
+              정상으로 접는 것과 방향이 반대인데, 이유가 다르다 — 거기서 접지 않으면 DB가 죽은 날
+              `degraded` 폭주가 나고, 여기서는 **감시자가 의심스러울 때 감시하는 쪽으로 넘어져야**
+              한다. 잘못 감시하면 재기동 1회지만, 잘못 침묵하면 08-06의 19분이 돌아온다.
+    """
+    try:
+        stamped = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return None
+    if stamped.date() != now.date():
+        return None
+    if beat is not None and beat["at"] > stamped:
+        return None
+    return stamped
+
+
+# ===== 2026-08-17 2차 — **창 닫기 버튼은 Ctrl+C가 아니다** =====
+#
+# 08-17의 세 번의 정지는 전부 창 닫기였다. 근거: 그날 로그에 `Ctrl+C로 종료합니다`가 0건인데
+# 프로세스는 정상 사이클 로그 한복판에서 끊겼다 — KeyboardInterrupt 경로를 못 탔다는 뜻이다.
+#
+# Windows는 콘솔 창이 닫힐 때 `CTRL_CLOSE_EVENT`를 보내는데 **파이썬은 이것을 기본으로 잡지
+# 않는다.** `signal` 모듈이 다루는 것은 Ctrl+C(`CTRL_C_EVENT`)와 Ctrl+Break뿐이고, 닫기는
+# 예외도 `atexit`도 `finally`도 태우지 않은 채 프로세스를 끝낸다. 그래서 표식을 쓸 자리가
+# 파이썬 코드 안에 존재하지 않았다 — `SetConsoleCtrlHandler`로 직접 만드는 수밖에 없다.
+#
+# ## 핸들러는 **다른 스레드**에서 불린다
+#
+# OS가 전용 스레드를 만들어 호출한다. asyncio 루프도 우리 코드의 어떤 락도 그 스레드에서는
+# 기댈 수 없다 — 그래서 이 경로가 하는 일은 **파일 두 개를 쓰는 동기 I/O뿐**이다. 로깅은
+# 락을 잡으므로 파일을 다 쓴 **뒤에** 최선 노력으로만 한다(막혀도 표식은 이미 남아 있다).
+#
+# ## 예산은 약 5초다
+#
+# `CTRL_CLOSE_EVENT`에서 핸들러가 돌아오면(또는 시간이 다하면) 시스템이 프로세스를 끝낸다.
+# 파일 두 개 쓰기는 마이크로초 단위라 여유가 크지만, **여기에 다른 일을 더하지 말 것** —
+# 이 예산은 우리 것이 아니라 OS가 빌려준 것이다.
+CTRL_C_EVENT = 0
+CTRL_BREAK_EVENT = 1
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
+
+# OS가 콜백을 부를 때까지 살아 있어야 하는 참조.
+#
+# **모듈 전역으로 붙들지 않으면 GC가 가져간다.** ctypes 콜백 객체는 파이썬 쪽 참조가 사라지는
+# 순간 해제되는데 OS의 핸들러 테이블에는 그 주소가 그대로 남는다 — 창을 닫는 순간 OS가
+# **해제된 메모리를 호출한다.** 재현이 어렵고 로그도 안 남는 종류의 사고다.
+_console_handler_ref = None
+
+
+def is_intentional_console_stop(event: int) -> bool:
+    """반환: 이 콘솔 제어 이벤트를 「사람이 일부러 껐다」로 볼 것인가.
+
+    **`CTRL_CLOSE_EVENT` 하나뿐이다.** 나머지를 왜 빼는지가 이 함수의 내용이다:
+
+    - `CTRL_C_EVENT` / `CTRL_BREAK_EVENT` — 파이썬 기본 핸들러가 `KeyboardInterrupt`를 내야
+      하고, 그 경로는 `mahdi/main.py`가 이미 덮는다. 여기서 True를 내고 핸들러가 TRUE를
+      반환하면 **핸들러 체인이 끊겨 KeyboardInterrupt 자체가 사라진다** — 표식 하나 얻자고
+      정상 종료 경로를 부수는 셈이다.
+    - `CTRL_LOGOFF_EVENT` / `CTRL_SHUTDOWN_EVENT` — **PC 재부팅은 정지 의도가 아니다.**
+      장전 기동은 07:30 주간 트리거라 낮에 재부팅해도 다시 돌지 않는다. 그날 시스템을 되살릴
+      수 있는 유일한 주체가 워치독인데, 여기에 표식을 남기면 **재부팅 한 번이 그날 감시를
+      통째로 끈다.** 창 하나를 닫는 것과 PC를 내리는 것은 의도의 범위가 다르다.
+
+    `taskkill /F`(워치독의 재기동 경로)는 애초에 어떤 이벤트도 보내지 않는다 —
+    `TerminateProcess`라 핸들러가 불리지 않는다. 자동 재기동이 표식을 남길 길은 없다.
+    """
+    return event == CTRL_CLOSE_EVENT
+
+
+def install_console_stop_handler(on_stop: Callable[[], None]) -> bool:
+    """창 닫기를 잡아 `on_stop()`을 부르도록 OS에 핸들러를 건다. 반환: 실제로 걸었는가.
+
+    입력: 인자 없는 콜백. **다른 스레드에서, 약 5초 예산 안에서** 불린다는 전제로 쓸 것 —
+         파일 쓰기 같은 짧은 동기 작업만 넣는다.
+    계산: Windows에서만 `kernel32.SetConsoleCtrlHandler`를 건다. 다른 OS에서는 아무것도 하지
+         않고 False를 낸다(이 프로젝트는 Windows에서 돌지만, 테스트가 다른 곳에서 돌 수 있다).
+    해석: False는 「못 걸었다」이고 그것은 **치명적이지 않다** — 표식이 없으면 워치독이 종전처럼
+         되살릴 뿐이다. 안전한 쪽의 실패다.
+    실패 조건: 어떤 예외도 밖으로 내지 않는다. 이 배선을 못 했다고 관측 루프가 안 뜨면 본말이
+              뒤집힌다 — 08-06 이후 이 파일이 일관되게 지켜온 규칙이다.
+    """
+    global _console_handler_ref
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        def _handler(event: int) -> bool:
+            if not is_intentional_console_stop(event):
+                # **FALSE를 반환해 다음 핸들러에게 넘긴다** — Ctrl+C가 여기서 멈추면 안 된다.
+                return False
+            try:
+                on_stop()
+            except Exception:  # noqa: BLE001 — 이 스레드에서 예외를 내면 아무도 못 본다
+                pass
+            try:
+                logger.info("콘솔 창이 닫혔다 — 정지 표식을 남기고 종료한다(워치독 보류).")
+            except Exception:  # noqa: BLE001 — 로깅 락은 남의 스레드가 쥐고 있을 수 있다
+                pass
+            # TRUE = 우리가 처리했다. 어느 쪽을 반환하든 시스템은 곧 프로세스를 끝내지만,
+            # TRUE로 체인을 끊어 **다른 핸들러가 이 종료에 끼어들 여지를 없앤다.**
+            return True
+
+        prototype = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        handler = prototype(_handler)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel32.SetConsoleCtrlHandler(handler, True):
+            logger.warning(
+                "콘솔 종료 핸들러 등록 실패(errno=%s) — 창을 닫으면 워치독이 되살린다",
+                ctypes.get_last_error(),
+            )
+            return False
+        _console_handler_ref = handler  # GC가 가져가면 OS가 죽은 콜백을 부른다
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("콘솔 종료 핸들러 등록 중 예외 — 표식 없이 진행한다", exc_info=True)
+        return False
+
+
 def decide(
     beat: dict | None,
     now: datetime,
@@ -356,11 +561,14 @@ def decide(
     stale_seconds: float = HEARTBEAT_STALE_SECONDS,
     starting: bool = False,
     ingest_minutes_recent: int | None = None,
+    stopped_at: datetime | None = None,
+    holiday: str | None = None,
 ) -> WatchdogDecision:
     """
     입력: 마지막 박동(`read_heartbeat()` 결과), 현재 시각, 워치독 상태
          (`{"date": "YYYY-MM-DD", "restarts": int, "last_alert_at": iso}`),
-         (선택) 직전 `INGEST_STALE_MINUTES`분 동안 옵션체인이 **적재된 분 수**.
+         (선택) 직전 `INGEST_STALE_MINUTES`분 동안 옵션체인이 **적재된 분 수**,
+         (선택) 유효한 정지 표식의 시각(`intentional_stop_at()` 결과).
     계산: 감시 창 안에서 박동이 **없거나 늙었으면** 재기동을 지시한다. 하루 상한을 넘겼으면
          알림만 낸다. 박동이 정상이어도 정규장 안에서 **적재가 0분이면** `ACTION_DEGRADED`를
          낸다(2026-08-14 Fix#2). 알림은 `ALERT_COOLDOWN_SECONDS`로 눌러 같은 말을 반복하지 않는다.
@@ -373,11 +581,35 @@ def decide(
          상한도 하루 단위다.
     실패 조건: 없다(순수 함수). 시각 판단만 하고 파일도 프로세스도 건드리지 않는다.
               `ingest_minutes_recent=None`은 **「모른다」**이고 종전과 완전히 같은 판정을 낸다.
+              `stopped_at=None`(기본값)도 마찬가지다 — 이 인자를 안 주면 08-17 이전과 판정이
+              한 글자도 달라지지 않는다.
     """
     if not in_watch_window(now):
-        return WatchdogDecision(ACTION_IDLE, detail="감시 창 밖")
+        # 주말은 시각과 무관하게 창 밖이다(2026-08-17 2차) — 사유를 갈라 두지 않으면 다음날
+        # 로그를 읽는 사람이 "토요일 09시인데 왜 창 밖이지"에서 멈춘다.
+        detail = "주말 — 감시 창 밖" if market_calendar.is_weekend(now) else "감시 창 밖"
+        return WatchdogDecision(ACTION_IDLE, detail=detail)
+    # 2026-08-17 2차 — 등재된 휴장일. **`starting`보다 앞이다**: 휴장일에 기동 스크립트가
+    # 도는 것 자체가 이상 신호이고, 그때 「기동 진행 중」으로 덮어버리면 그 사실이 로그에서
+    # 사라진다. 주말과 달리 이것은 **사람이 확인해 적은 사실**이므로 이름을 그대로 인쇄한다 —
+    # 달력이 틀렸을 때 그 줄이 오답을 드러내는 유일한 자리다.
+    if holiday:
+        return WatchdogDecision(
+            ACTION_IDLE, REASON_HOLIDAY,
+            detail=f"휴장일로 등재됨({holiday}) — 오늘은 관측하지 않는다",
+        )
     if starting:
         return WatchdogDecision(ACTION_IDLE, detail="기동 진행 중 — 판정 보류")
+    # 2026-08-17 — 사람이 일부러 껐다. **`starting` 바로 다음, 하트비트보다 앞**이 자리다:
+    # 정지 표식이 유효하다는 것은 이미 "박동이 없거나 늙은 것이 정상"이라는 뜻이므로, 그 아래
+    # 판정을 돌리면 무엇이 나오든 오답이다. 두 표식이 겹칠 때 `starting`이 이기는 이유는 그쪽이
+    # **더 짧게 살고 더 구체적**이기 때문이다(기동 스크립트는 시작하면서 정지 표식을 지운다 —
+    # 그 사이 몇 밀리초 동안만 둘이 공존한다).
+    if stopped_at is not None:
+        return WatchdogDecision(
+            ACTION_IDLE, REASON_INTENTIONAL_STOP,
+            detail=f"의도적 정지 표식({stopped_at:%H:%M:%S}) — 판정 보류",
+        )
 
     age = heartbeat_age_seconds(beat, now)
     if beat is None:

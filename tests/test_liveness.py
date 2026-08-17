@@ -7,9 +7,8 @@
 
 from __future__ import annotations
 
-import json
 import os
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -136,6 +135,54 @@ def test_outside_the_watch_window_nothing_happens():
     """장마감 후 하트비트가 없는 것은 정상이다 — 여기서 알리면 매일 밤 오경보다."""
     assert liveness.decide(None, datetime(2026, 8, 6, 22, 0)).action == liveness.ACTION_IDLE
     assert liveness.decide(None, datetime(2026, 8, 6, 6, 0)).action == liveness.ACTION_IDLE
+
+
+def test_the_2026_08_15_weekend_boot_would_not_happen():
+    """**08-15(토) 07:40:02에 워치독이 토요일에 시스템 전체를 부팅했다.**
+
+    장전 기동 작업은 월~금 트리거라 안 떴는데, 감시 창이 `now.time()`만 봐서 요일을 몰랐다.
+    08-16(일) 10:14:39에도 같은 일이 반복됐고, 두 날 모두 재기동 상한 3회를 채운 뒤
+    `ALERT_ONLY`를 94줄·113줄 쏟았다.
+    """
+    saturday = datetime(2026, 8, 15, 7, 40, 2)
+    sunday = datetime(2026, 8, 16, 10, 14, 39)
+    for weekend in (saturday, sunday):
+        decision = liveness.decide(None, weekend)
+        assert decision.action == liveness.ACTION_IDLE
+        assert "주말" in decision.detail
+    # 같은 시각의 평일은 종전대로 되살린다 — 주말 검사가 감시를 통째로 끄면 안 된다.
+    assert liveness.decide(None, datetime(2026, 8, 17, 7, 40, 2)).action == liveness.ACTION_RESTART
+
+
+def test_a_listed_holiday_suspends_everything():
+    """08-17(대체공휴일)은 기동 작업이 월~금이라 **정상적으로** 떠서 종일 돌았다."""
+    decision = liveness.decide(
+        _beat(datetime(2026, 8, 17, 10, 0)), datetime(2026, 8, 17, 10, 30),
+        holiday="광복절 대체공휴일",
+    )
+    assert decision.action == liveness.ACTION_IDLE
+    assert decision.reason == liveness.REASON_HOLIDAY
+    assert "광복절 대체공휴일" in decision.detail  # 달력이 틀렸을 때 오답을 드러내는 자리다
+
+
+def test_a_holiday_outranks_a_startup_in_progress():
+    """휴장일에 기동 스크립트가 도는 것 자체가 이상 신호다 — 「기동 중」으로 덮으면 사라진다.
+
+    시각은 감시 창(07:40~) **안**이어야 한다. 07:30 기동 자체는 창 밖이라 이 분기까지 오지도
+    않는다 — 휴장일 사유가 의미를 갖는 것은 재기동이 일어날 수 있는 구간뿐이다.
+    """
+    decision = liveness.decide(
+        None, datetime(2026, 8, 17, 7, 45), starting=True, holiday="광복절 대체공휴일",
+    )
+    assert decision.reason == liveness.REASON_HOLIDAY
+
+
+def test_no_holiday_keeps_the_old_judgement_exactly():
+    """`holiday`를 안 주면 08-17 이전과 판정이 한 글자도 달라지지 않아야 한다."""
+    died_at = datetime(2026, 8, 6, 10, 4)  # 목요일
+    assert liveness.decide(_beat(died_at), died_at + timedelta(seconds=181)) == liveness.decide(
+        _beat(died_at), died_at + timedelta(seconds=181), holiday=None
+    )
 
 
 def test_a_start_in_progress_suspends_judgement():
@@ -305,6 +352,186 @@ def test_stale_startup_marker_is_ignored(tmp_path):
     path.write_text("startup", encoding="utf-8")
     much_later = datetime.now() + timedelta(seconds=liveness.STARTUP_MARKER_GRACE_SECONDS + 60)
     assert liveness.startup_in_progress(path, much_later) is False
+
+
+# ===== 2026-08-17 — 의도적 정지 표식 =====
+#
+# 08-17에 워치독이 관측 루프를 세 번(15:00 / 15:06 / 15:28) 되살렸다. 세 번 다 사람이 코드를
+# 고치려고 창을 닫은 직후였고, 세 번 다 판정 자체는 설계대로였다 — **입력에 「사람이 껐다」를
+# 표현할 자리가 없었을 뿐이다.** 아래 테스트의 절반은 그 표식이 **너무 오래 살지 않게** 막는
+# 쪽이다: 잘못 감시하면 재기동 1회지만, 잘못 침묵하면 08-06의 19분이 돌아온다.
+
+
+def _stamp_marker(path, at: datetime) -> None:
+    """표식 파일의 mtime을 지정 시각으로 맞춘다 — 판정이 내용이 아니라 mtime을 보므로."""
+    path.write_text("intentional stop", encoding="utf-8")
+    os.utime(path, (at.timestamp(), at.timestamp()))
+
+
+def test_intentional_stop_marker_is_read_by_mtime_not_content(tmp_path):
+    """cmd.exe가 쓴 날짜 문자열은 로케일을 탄다 — 파싱하면 조용히 오판한다(기동 표식과 같다)."""
+    path = liveness.intentional_stop_path(tmp_path)
+    _stamp_marker(path, _MORNING)
+    assert liveness.intentional_stop_at(path, _MORNING + timedelta(minutes=5)) == _MORNING
+
+
+def test_no_marker_means_the_watchdog_keeps_watching(tmp_path):
+    assert liveness.intentional_stop_at(liveness.intentional_stop_path(tmp_path), _MORNING) is None
+
+
+def test_yesterdays_marker_cannot_silence_todays_window(tmp_path):
+    """밤사이 PC가 꺼져 아침 기동 스크립트가 못 돈 날 — 어제 15:45의 표식이 남아 있다.
+
+    기동 스크립트의 `del`이 주 만료 경로이고 이 날짜 검사가 그 경로가 실패했을 때의 두 번째
+    그물이다. 이게 없으면 **되살릴 것이 없는 아침에 워치독이 조용해진다.**
+    """
+    path = liveness.intentional_stop_path(tmp_path)
+    _stamp_marker(path, datetime(2026, 8, 16, 15, 45))
+    assert liveness.intentional_stop_at(path, datetime(2026, 8, 17, 7, 45)) is None
+
+
+def test_a_newer_heartbeat_consumes_the_marker(tmp_path):
+    """표식이 남은 채로 사람이 별도 터미널에서 루프를 띄운 경우(2026-07-21에 실제로 있었다).
+
+    그 경로는 창 제목 규약을 안 타므로 기동 스크립트의 `del`을 거치지 않는다. 박동이 표식보다
+    새로우면 **의도는 이미 소비된 것**이고, 그 뒤에 죽으면 되살려야 한다.
+    """
+    path = liveness.intentional_stop_path(tmp_path)
+    stopped = datetime(2026, 8, 17, 15, 0)
+    _stamp_marker(path, stopped)
+    revived = _beat(stopped + timedelta(minutes=5))
+    assert liveness.intentional_stop_at(path, stopped + timedelta(minutes=30), revived) is None
+    # 표식보다 **앞선** 박동은 소비가 아니다 — 정지 직전의 마지막 박동이 그것이다.
+    last = _beat(stopped - timedelta(seconds=30))
+    assert liveness.intentional_stop_at(path, stopped + timedelta(minutes=30), last) == stopped
+
+
+def test_an_unreadable_marker_falls_back_to_watching(tmp_path):
+    """감시자는 의심스러울 때 **감시하는 쪽으로** 넘어져야 한다."""
+    assert liveness.intentional_stop_at(tmp_path / "없는디렉터리" / "표식", _MORNING) is None
+
+
+def test_write_intentional_stop_never_raises(tmp_path):
+    """표식을 못 썼다고 종료가 막히면 안 된다 — 못 쓰면 종전처럼 되살아날 뿐이다."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("파일이라 하위 디렉터리를 만들 수 없다", encoding="utf-8")
+    liveness.write_intentional_stop(blocker / "sub" / ".intentional_stop", _MORNING)  # 예외 없음
+
+
+def test_write_then_read_marker_roundtrip(tmp_path):
+    """방금 쓴 표식은 곧바로 유효해야 한다 — `main.py`의 Ctrl+C 경로가 이 왕복에 기댄다.
+
+    `now`는 실제 시계를 쓴다. 판정이 보는 것은 **mtime**이고 그것은 OS가 찍으므로, 인자로
+    과거 시각을 넘겨도 파일은 오늘 것이 된다(그래서 날짜 검사에 걸린다). 인자의 `now`는
+    파일 **내용**에만 들어가고, 그 내용은 사람이 로그를 읽을 때를 위한 것이다.
+    """
+    path = liveness.intentional_stop_path(tmp_path)
+    now = datetime.now()
+    liveness.write_intentional_stop(path, now)
+    assert path.exists()
+    assert liveness.intentional_stop_at(path, now + timedelta(minutes=1)) is not None
+
+
+# ----- 판정에 미치는 영향 -----
+
+
+def test_the_2026_08_17_restarts_would_not_have_happened():
+    """**이 절의 존재 이유.** 15:24:52에 사람이 껐고 15:28:02에 워치독이 되살렸다."""
+    stopped = datetime(2026, 8, 17, 15, 24, 52)
+    judged = datetime(2026, 8, 17, 15, 28, 2)
+    # 표식이 없던 그날의 판정
+    assert liveness.decide(_beat(stopped), judged).action == liveness.ACTION_RESTART
+    # 표식이 있는 지금의 판정
+    decision = liveness.decide(_beat(stopped), judged, stopped_at=stopped)
+    assert decision.action == liveness.ACTION_IDLE
+    assert decision.reason == liveness.REASON_INTENTIONAL_STOP
+    assert "15:24:52" in decision.detail
+
+
+def test_a_missing_heartbeat_is_also_held_when_stopped():
+    """정식 종료 경로는 하트비트를 지운다 — 그래서 `missing`으로 오는 쪽도 막아야 한다."""
+    stopped = datetime(2026, 8, 17, 15, 45)
+    decision = liveness.decide(None, stopped + timedelta(minutes=1), stopped_at=stopped)
+    assert decision.action == liveness.ACTION_IDLE
+
+
+def test_the_default_keeps_the_old_judgement_exactly():
+    """`stopped_at`을 안 주면 08-17 이전과 판정이 한 글자도 달라지지 않아야 한다."""
+    died_at = datetime(2026, 8, 6, 10, 4)
+    assert liveness.decide(_beat(died_at), died_at + timedelta(seconds=181)) == liveness.decide(
+        _beat(died_at), died_at + timedelta(seconds=181), stopped_at=None
+    )
+
+
+def test_starting_wins_over_a_stop_marker():
+    """기동 스크립트가 시작하며 정지 표식을 지우므로 둘이 겹치는 것은 그 사이 몇 밀리초뿐이다.
+
+    그때는 **더 짧게 살고 더 구체적인** 쪽이 이겨야 로그가 사실과 맞는다.
+    """
+    now = datetime(2026, 8, 17, 15, 30)
+    decision = liveness.decide(None, now, starting=True, stopped_at=now - timedelta(minutes=5))
+    assert decision.action == liveness.ACTION_IDLE
+    assert "기동" in decision.detail
+
+
+def test_a_stop_never_costs_a_restart_or_an_alert():
+    """08-17의 진짜 대가는 재기동 3회가 아니라 **그날 남은 감시 예산**이었다."""
+    stopped = datetime(2026, 8, 17, 15, 0)
+    state = {"date": "2026-08-17", "restarts": 0, "last_alert_at": None}
+    decision = liveness.decide(_beat(stopped), stopped + timedelta(minutes=10), state,
+                               stopped_at=stopped)
+    assert decision.should_alert is False
+    assert liveness.next_state(state, stopped + timedelta(minutes=10), decision)["restarts"] == 0
+
+
+def test_a_stop_outside_the_window_is_still_plain_idle():
+    """감시 창 밖이라는 사실이 먼저다 — 표식이 그 판정을 가로채면 사유가 흐려진다."""
+    night = datetime(2026, 8, 17, 22, 0)
+    decision = liveness.decide(None, night, stopped_at=night - timedelta(hours=6))
+    assert decision.action == liveness.ACTION_IDLE
+    assert decision.reason is None
+
+
+# ----- 콘솔 제어 이벤트 (2026-08-17 2차) -----
+#
+# 08-17의 세 번의 정지는 전부 **창 닫기**였다 — 그날 로그에 `Ctrl+C로 종료합니다`가 0건인데
+# 프로세스는 정상 사이클 로그 한복판에서 끊겼다. 표식을 쓸 자리가 파이썬 코드 안에 없었다.
+# 아래 테스트는 그 자리를 만들되 **너무 넓게 잡지 않았는지**를 본다.
+
+
+def test_the_close_button_is_an_intentional_stop():
+    assert liveness.is_intentional_console_stop(liveness.CTRL_CLOSE_EVENT) is True
+
+
+def test_ctrl_c_is_left_to_python():
+    """여기서 잡아채면 `KeyboardInterrupt` 자체가 사라진다 — 표식 하나 얻자고 종료를 부순다."""
+    assert liveness.is_intentional_console_stop(liveness.CTRL_C_EVENT) is False
+    assert liveness.is_intentional_console_stop(liveness.CTRL_BREAK_EVENT) is False
+
+
+def test_a_reboot_is_not_an_intentional_stop():
+    """**재부팅 한 번이 그날 감시를 통째로 끄면 안 된다.**
+
+    장전 기동은 07:30 주간 트리거라 낮에 재부팅해도 다시 안 돈다. 그날 시스템을 되살릴 수
+    있는 유일한 주체가 워치독인데, 로그오프/셧다운에 표식을 남기면 그 주체가 침묵한다.
+    창 하나를 닫는 것과 PC를 내리는 것은 **의도의 범위가 다르다.**
+    """
+    assert liveness.is_intentional_console_stop(liveness.CTRL_LOGOFF_EVENT) is False
+    assert liveness.is_intentional_console_stop(liveness.CTRL_SHUTDOWN_EVENT) is False
+
+
+def test_unknown_console_events_are_not_intentional():
+    """모르는 이벤트는 의도가 아니다 — 의심스러우면 감시하는 쪽으로 넘어진다."""
+    assert liveness.is_intentional_console_stop(99) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="SetConsoleCtrlHandler는 Windows 전용")
+def test_the_handler_actually_installs_on_windows():
+    """등록 자체가 되는지 본다. **이벤트를 흉내 낼 수는 없다** — 창 닫기는 OS만 보낼 수 있고,
+    `GenerateConsoleCtrlEvent`는 Ctrl+C/Break만 보낼 수 있다. 실제 창 닫기 검증은 손으로 했다
+    (DECISION_LOG 2026-08-17 2차)."""
+    assert liveness.install_console_stop_handler(lambda: None) is True
+    assert liveness._console_handler_ref is not None  # GC가 가져가면 OS가 죽은 콜백을 부른다
 
 
 # ===== 2026-08-12 §2-3 / Fix#8 — 감시자를 감시한다 =====
