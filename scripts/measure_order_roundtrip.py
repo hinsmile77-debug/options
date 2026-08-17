@@ -20,6 +20,9 @@ Capability Matrix 규율(L9·L19·L26)은 실측 검증 안 된 기능의 사용
   * **1계약 지정가.** 수량은 상수로 1에 고정돼 있고 인자로 바꿀 수 없다.
   * **원거리 지정가.** 매수는 현재가보다 크게 **낮은** 가격, 매도는 크게 **높은** 가격에 낸다
     (`_PRICE_AWAY_RATIO`). 체결되면 실측의 목적(취소 확인)이 사라지고 포지션이 생긴다.
+  * **호가단위 격자에 스냅한다 — 항상 «더 멀어지는» 쪽으로만**(매수 내림/매도 올림).
+    가장 가까운 격자로 반올림하면 가격이 현재가 쪽으로 움직일 수 있고, 그것은 이 스크립트가
+    유일하게 피해야 하는 것에 한 걸음 다가가는 일이다. 근거와 실측은 `_away_price()` 참고.
   * **`--confirm` 없이는 아무것도 보내지 않는다.** 기본 실행은 계획만 인쇄하는 예행연습이다.
   * **취소는 finally에서 반드시 시도한다.** 중간에 무엇이 실패하든 접수된 주문을 남기지 않는다.
   * 장 시간 확인. 정규장이 아니면 경고하고 `--confirm`이라도 멈춘다(`--force-outside-hours`로만 통과).
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -45,16 +49,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mahdi import session
 from mahdi.broker import tr_codes
-from mahdi.broker.rest_client import KISRestClient, parse_fill_status
+from mahdi.broker.rest_client import KISRestClient, format_order_price, parse_fill_status
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.config.settings import PROJECT_ROOT, get_kis_settings
 from mahdi.data import db
+from mahdi.execution.entry import DEFAULT_TICK_SIZE
 
 # 바꿀 수 없다 — 인자로 노출하지 않는 것이 이 스크립트의 안전 설계다.
 _QTY = 1
 # 현재가에서 이 비율만큼 불리한 쪽으로 지정가를 낸다(체결 방지).
 # 옵션 프리미엄은 변동이 크므로 30%로 넉넉히 잡는다 — 목적은 「접수되고 체결되지 않는 것」이다.
 _PRICE_AWAY_RATIO = 0.30
+# 격자 판정에서 부동소수 먼지를 흡수하는 여유. 호가단위(0.01)보다 일곱 자리 작아 실제 가격을
+# 한 틱도 옮기지 못한다.
+_TICK_EPSILON = 1e-9
 
 
 def _log_path() -> Path:
@@ -96,11 +104,45 @@ def _acquire_token(daemon: TokenDaemon, attempts: int = 3, wait_seconds: int = 6
     return False
 
 
-def _away_price(reference: float, side: str) -> float:
-    """체결되지 않을 지정가 — 매수는 아래로, 매도는 위로. 옵션 최소 호가단위(0.01)로 내림/올림."""
-    if side.upper() == "BUY":
-        return max(0.01, round(reference * (1 - _PRICE_AWAY_RATIO), 2))
-    return round(reference * (1 + _PRICE_AWAY_RATIO), 2)
+def _away_price(reference: float, side: str, tick: float = DEFAULT_TICK_SIZE) -> float:
+    """
+    입력: 현재가, BUY/SELL, 호가단위(기본 `DEFAULT_TICK_SIZE` — 선물·옵션 양쪽에서 유효한 격자).
+    계산: 현재가에서 `_PRICE_AWAY_RATIO`만큼 불리한 쪽으로 옮긴 뒤, **더 불리한 쪽으로만**
+         격자에 스냅한다 — 매수는 내림, 매도는 올림.
+    해석: **스냅 방향이 안전장치다.** 가장 가까운 격자로 반올림하면 가격이 현재가 쪽으로
+         움직일 수 있고, 그것은 이 스크립트가 유일하게 피해야 하는 것(체결)에 한 걸음
+         다가가는 일이다. 항상 멀어지는 쪽으로만 스냅하면 체결 위험은 결코 늘지 않는다.
+
+         2026-08-17까지 이 함수는 `round(x, 2)`였다 — 주석은 "옵션 최소 호가단위(0.01)"라고
+         적었지만 첫 실측 대상은 **선물(A01609)** 이었고, 선물 격자는 0.05다. 현재가 2,000개
+         실측에서 **1,600개(80%)** 가 격자를 위반하는 지정가를 만들었다. 거래소가 거부하면
+         포지션은 안 생기지만, 한 번뿐인 실측이 날아가고 «주문 API가 안 된다»로 오귀속되기 쉽다.
+    실패 조건: 스냅 결과가 0 이하이거나 현재가보다 불리하지 않으면 `ValueError`.
+         저가 옵션(프리미엄 0.05 미만)에서 0.05 격자로는 「현재가보다 낮은 양수」를 만들 수 없다 —
+         그 경우 조용히 0이나 현재가 위쪽 값을 내보내지 않고 **멈춰서 사람에게 `--tick`을
+         묻는다**(체결될 수 있는 가격을 지어내는 것보다 실측을 미루는 편이 낫다).
+    """
+    if tick <= 0:
+        raise ValueError(f"호가단위는 양수여야 한다: {tick}")
+
+    is_buy = side.upper() == "BUY"
+    raw = reference * (1 - _PRICE_AWAY_RATIO) if is_buy else reference * (1 + _PRICE_AWAY_RATIO)
+    # 부동소수 먼지가 격자 판정을 뒤집지 않도록 여유를 준다(예: 13651.999999997 -> 13652).
+    units = raw / tick
+    steps = math.floor(units + _TICK_EPSILON) if is_buy else math.ceil(units - _TICK_EPSILON)
+    price = round(steps * tick, 4)
+
+    if price <= 0:
+        raise ValueError(
+            f"호가단위 {tick}로는 현재가 {reference}에서 체결 방지 지정가를 만들 수 없다"
+            f"(계산값 {price}). 더 작은 --tick을 지정할 것."
+        )
+    if (is_buy and price >= reference) or (not is_buy and price <= reference):
+        raise ValueError(
+            f"스냅 결과 {price}가 현재가 {reference}보다 불리하지 않다 — 체결될 수 있다. "
+            "--tick을 확인할 것."
+        )
+    return price
 
 
 def main() -> int:
@@ -109,6 +151,11 @@ def main() -> int:
     parser.add_argument("--side", default="BUY", choices=["BUY", "SELL"])
     parser.add_argument("--confirm", action="store_true", help="실제로 주문을 보낸다(없으면 예행연습)")
     parser.add_argument("--force-outside-hours", action="store_true", help="정규장 밖에서도 진행")
+    parser.add_argument(
+        "--tick", type=float, default=DEFAULT_TICK_SIZE,
+        help=f"호가단위(기본 {DEFAULT_TICK_SIZE} — 선물·옵션 양쪽에서 유효한 격자). "
+             "프리미엄이 아주 낮은 옵션에서만 0.01로 내릴 것.",
+    )
     args = parser.parse_args()
 
     settings = get_kis_settings()
@@ -151,9 +198,19 @@ def main() -> int:
         print(json.dumps(quote, ensure_ascii=False)[:600], file=sys.stderr)
         return 3
 
-    price = _away_price(reference, args.side)
+    try:
+        price = _away_price(reference, args.side, args.tick)
+    except ValueError as exc:
+        print(f"거부: {exc}", file=sys.stderr)
+        return 6
+    record["tick"] = args.tick
+    record["reference_price"] = reference
+    record["order_price"] = price
     print(f"종목 {args.symbol} / {args.side} {_QTY}계약 / 현재가 {reference} → 지정가 {price} "
           f"({_PRICE_AWAY_RATIO:.0%} 불리한 쪽 = 체결 방지)")
+    # 격자를 **눈으로 확인할 수 있게** 함께 인쇄한다 — 이 줄이 없어서 08-17까지 아무도
+    # 지정가가 호가단위를 벗어난다는 것을 몰랐다(거리만 보고 격자는 안 봤다).
+    print(f"  호가단위 {args.tick} 격자 스냅 완료 · 전송 문자열 {format_order_price(price)!r}")
 
     if not args.confirm:
         print("\n예행연습이다 — 주문을 보내지 않았다. 실제 실행은 --confirm.")

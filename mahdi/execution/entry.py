@@ -14,6 +14,22 @@ from datetime import time
 
 _OPENING_DAMPENING_UNTIL = time(9, 5)
 
+# ===== 2026-08-18 — 호가단위의 단일 출처 =====
+#
+# **0.05를 쓰는 이유는 그것이 두 격자 모두에서 유효하기 때문이다.** 지수선물의 호가단위는
+# 0.05이고 옵션은 프리미엄 구간에 따라 0.01까지 내려가는데, 0.05의 배수는 언제나 0.01의
+# 배수이기도 하다(0.05 격자는 0.01 격자의 부분집합이다). 즉 이 값으로 스냅한 가격은 선물에서도
+# 옵션에서도 거부되지 않는다 — 대신 저가 옵션에서는 해상도가 거칠어지므로, 그 구간을 다루는
+# 호출측은 더 작은 tick을 명시해야 한다.
+#
+# **상수를 여기 두는 이유**: 2026-08-17까지 이 값이 두 곳에 따로 있었다 — 여기 `EntryContext`의
+# 기본값 0.05와 `scripts/measure_order_roundtrip._away_price()`의 `round(x, 2)`(= 0.01)다.
+# 후자는 주석에 "옵션 최소 호가단위"라고 적고 있었지만 그 스크립트가 실제로 겨눈 첫 대상은
+# **선물(A01609)** 이었고, 실측 결과 현재가 2,000개 중 **1,600개(80%)가 0.05 격자를 위반**하는
+# 지정가를 만들어냈다. 거래소가 거부하면 포지션은 안 생기지만 «주문 API가 안 된다»로 오귀속되기
+# 쉽다 — 잔고 조회가 필수 파라미터 누락으로 넉 달간 실패했던 것과 같은 급의 함정이다.
+DEFAULT_TICK_SIZE = 0.05
+
 
 @dataclass(frozen=True, slots=True)
 class EntryContext:
@@ -25,7 +41,7 @@ class EntryContext:
     negative_gex_expansion: bool = False  # -GEX 팽창 국면 -> Urgency Mode 후보
     event_proximity_minutes: float | None = None
     event_dampening_minutes: float = 15.0
-    tick_size: float = 0.05
+    tick_size: float = DEFAULT_TICK_SIZE
     passive_offset_ticks: int = 1  # 지정가를 기준가에서 몇 틱 안쪽에 두는지
 
 
