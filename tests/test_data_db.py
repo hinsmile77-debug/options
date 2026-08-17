@@ -553,6 +553,38 @@ def test_expiry_liquidity_fossil_series_returns_values_outside_whitelist():
     assert "series != ALL(%s)" in conn.store["query"]
 
 
+def test_signal_decision_columns_match_the_actual_insert():
+    """`signal_decision_columns()`가 **실제로 INSERT되는 컬럼**과 같은가.
+
+    2026-08-18 — 마이그레이션 031이 `selected_instruments`를 추가하고 `insert_signal_decision()`이
+    거기에 쓰기 시작했는데 `_SIGNAL_DECISION_COLUMNS`에는 안 들어왔다. 그 목록이 존재하는 유일한
+    이유는 COCKPIT 배지가 «마이그레이션 미적용»을 잡게 하는 것인데, 정작 **새로 추가된 컬럼에
+    대해서만 배지가 눈을 감은** 상태였다 — 그리고 그 컬럼이 없으면 매분 INSERT가 통째로 실패한다.
+
+    주석으로 "잊지 말 것"이라고 적는 대신 **실행된 SQL에서 컬럼을 뽑아 대조한다.** 다음에 컬럼을
+    늘리고 목록을 잊으면 여기서 막힌다.
+    """
+    conn = FakeConnection()
+    db.insert_signal_decision(
+        conn, datetime(2026, 8, 18, 10, 0), conviction="STANDARD", decision="ENTER",
+        reject_reason=None, risk_gate_state={}, exec_mode="ADVISORY",
+    )
+
+    query = conn.store["query"]
+    columns_sql = query[query.index("(") + 1 : query.index(")")]
+    inserted = tuple(c.strip() for c in columns_sql.split(","))
+
+    assert inserted == db.signal_decision_columns()
+    # 자리표시자 수도 함께 맞아야 한다 — 컬럼만 늘리고 %s를 빠뜨리면 런타임에야 터진다.
+    values_sql = query[query.rindex("(") + 1 : query.rindex(")")]
+    assert len(values_sql.split(",")) == len(inserted)
+
+
+def test_the_schema_badge_would_catch_a_missing_migration_031():
+    """031 미적용을 배지가 실제로 잡는가 — 위 목록이 배지의 단일 입력이다."""
+    assert "selected_instruments" in db.signal_decision_columns()
+
+
 def test_insert_signal_decision_is_plain_insert_not_upsert():
     # signal_decisions는 decision_id가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이 새 행.
     conn = FakeConnection()

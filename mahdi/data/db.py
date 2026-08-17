@@ -218,10 +218,25 @@ def regime_state_columns() -> tuple[str, ...]:
 # 위 둘과 **같은 이유**로 노출한다. 이 표는 매분 INSERT되므로 마이그레이션 029가 라이브 DB에
 # 안 붙어 있으면 **판단이 한 줄도 안 남는다** — regime_state보다 파급이 크다.
 # 025를 넣을 때 적은 원칙("컬럼을 늘린 이번에 대상 테이블도 함께 늘린다")을 그대로 적용한다.
+#
+# 2026-08-18 — **이 목록이 INSERT와 어긋난 채로 하루를 보냈다.** 마이그레이션 031이
+# `selected_instruments`를 추가하고 `insert_signal_decision()`이 그 컬럼에 쓰기 시작했는데
+# 여기에는 안 들어와 있었다. 즉 이 목록이 존재하는 유일한 이유(«마이그레이션 미적용을
+# 배지가 잡는다»)가 **바로 그 새 컬럼에 대해서만 작동하지 않는** 상태였다.
+#
+# 자동 재적용(`start_mahdi_premarket.bat`, 2026-07-21)이 1차 방어선이지만 그것은 실패해도
+# `경고: 마이그레이션 적용 실패 (계속 진행)`을 남기고 넘어간다 — 배지가 2차 방어선이고,
+# 2차가 새 컬럼에 대해 비어 있으면 1차 실패가 조용해진다.
+#
+# 재발 방지는 주석이 아니라 테스트다: `test_signal_decision_columns_match_the_actual_insert`가
+# **실제로 실행된 INSERT문에서 컬럼 목록을 뽑아** 이 튜플과 대조한다. 다음에 컬럼을 늘리고
+# 이 줄을 잊으면 그 테스트가 막는다.
 _SIGNAL_DECISION_COLUMNS = (
     "timestamp", "conviction", "decision", "reject_reason", "risk_gate_state", "exec_mode",
     "gamma_flip", "gex", "chain_leg_count", "chain_oldest_leg_age_seconds",
     "gex_expiry", "vrp", "chain_input_source",
+    # 마이그레이션 031(§11.5). 미적용이면 매분 INSERT가 통째로 실패한다.
+    "selected_instruments",
 )
 
 

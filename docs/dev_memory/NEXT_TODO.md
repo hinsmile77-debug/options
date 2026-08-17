@@ -23,7 +23,16 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 | 7 | **ExecutionEngine 그림자 배선** — 주문 없이 판정만 기록 | `test_main.py` 3건 |
 | 8 | COCKPIT "선택 종목" 카드 | `test_dashboard_decision_panel.py` 5건 |
 
-**⚠ 마이그레이션 031을 08-18 기동 전에 적용할 것.** 안 하면 매 사이클 INSERT가 실패한다.
+**마이그레이션 031은 수동 적용이 필요 없다** — `start_mahdi_premarket.bat`(2026-07-21)이 매일
+07:30 기동마다 `db/migrations/*.sql` **전체를 파일명 순으로 재적용**한다. 010/011이 파일로만
+커밋되고 라이브엔 반영 안 된 사고가 두 번 난 뒤 만든 구조이고, 전 파일이 `IF NOT EXISTS` /
+`COMMENT ON`이라 매일 재실행해도 안전하다. (08-17 확인: 라이브 DB에 컬럼·코멘트 반영 완료.)
+
+⚠ **다만 그 자동 적용은 실패해도 조용하다** — `경고: 마이그레이션 적용 실패 (계속 진행)`을
+로그에 남기고 넘어간다. 2차 방어선은 COCKPIT "스키마 정합성" 배지이고, 그 배지의 입력인
+`db._SIGNAL_DECISION_COLUMNS`에 `selected_instruments`가 **빠져 있었다**(08-18 수정).
+이제 `test_signal_decision_columns_match_the_actual_insert`가 실행된 INSERT문에서 컬럼을 뽑아
+대조하므로 다음에 컬럼을 늘리고 목록을 잊으면 테스트가 막는다.
 
 ### 08-18 실주문 왕복 실측 — 지정가가 호가단위를 벗어나던 것을 고쳤다
 
