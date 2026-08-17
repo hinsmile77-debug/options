@@ -1,4 +1,4 @@
-from datetime import time
+from datetime import datetime, time
 
 from mahdi.execution.engine import EntryRequest, ExecutionEngine
 from mahdi.execution.entry import EntryContext
@@ -93,6 +93,36 @@ def test_risk_engine_rejection_blocks_entry_regardless_of_mode():
     assert not outcome.approved
     assert any(r.startswith("circuit_breaker:daily_loss_pct") for r in outcome.reject_reasons)
     assert outcome.entry_plan is None
+
+
+# --- 2026-08-17 — 실행 경로에서 조용히 빠져 있던 게이트 둘 -------------------------------------
+#
+# `main.py`의 그림자 게이트가 이 결함을 미리 적어 뒀다: *"이 인자가 비어 있으면 Phase 2에서
+# 실행 엔진이 같은 호출을 복사해 갈 때 시각 게이트가 조용히 빠진다."* 복사해 간 쪽이 실제로
+# 그 상태였다. 아래 셋이 그 회귀를 막는다.
+
+
+def test_entry_after_the_1450_cutoff_is_rejected_by_the_execution_path_too():
+    """v6 §4.2 신규 진입 컷오프 — 판단 층에만 있으면 실행 층이 그것을 우회한다."""
+    outcome = _engine().evaluate_entry(
+        _entry_request(now=datetime(2026, 8, 17, 14, 51)), HybridMode.FULL_AUTO
+    )
+    assert not outcome.approved
+    assert outcome.reject_reasons == ["entry_cutoff"]
+    assert outcome.entry_plan is None
+
+
+def test_entry_just_before_the_cutoff_still_passes():
+    outcome = _engine().evaluate_entry(
+        _entry_request(now=datetime(2026, 8, 17, 14, 49)), HybridMode.FULL_AUTO
+    )
+    assert outcome.approved
+
+
+def test_a_halted_market_blocks_the_execution_path():
+    outcome = _engine().evaluate_entry(_entry_request(market_halted=True), HybridMode.FULL_AUTO)
+    assert not outcome.approved
+    assert outcome.reject_reasons == ["market_halt"]
 
 
 def test_averaging_down_blocked_before_risk_engine_is_even_consulted():

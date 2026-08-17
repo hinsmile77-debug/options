@@ -1039,9 +1039,20 @@ _CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", 
 # `DISTINCT ON`에 **expiry를 포함한다**(2026-08-03 §2-2). 종전에는 (strike, option_type)으로만 묶어
 # 만기가 다른 3개 북(regular/weekly_mon/weekly_thu)이 같은 행사가에서 서로를 덮어썼다 — 마지막으로
 # 폴링된 북 하나만 남아, 반환된 감마가 어느 만기의 것인지 알 수 없었고 북별 GEX도 볼 수 없었다.
+#
+# 2026-08-17(§11.5 Instrument Selection) — `delta`/`volume`/`spread_state` 세 컬럼을 **여기에
+# 덧붙인다.** 종목 선택기용 조회를 따로 만들지 않는 이유는 이 함수가 이미 지고 있는 성질 때문이다:
+# *"라이브(`latest_option_chain`)와 백테스트(`option_chain_as_of`)가 같은 체인을 본다."* 선택기가
+# 다른 SQL로 체인을 읽으면 **GEX를 낸 체인과 종목을 고른 체인이 갈린다** — 같은 분에 다른 행사가
+# 집합을 보고 "감마가 이렇다"와 "이 행사가를 고른다"가 나오면 사후에 둘을 대조할 수 없다.
+# `_restrict_to_latest_cycle_window()`의 ATM 창 절단도 그대로 물려받는다(창 밖으로 빠진 유령
+# 행사가를 후보로 고르지 않는다).
+#
+# **끝에 붙이는 것이 중요하다** — 그 함수는 위치 인덱스(0=strike, 6=expiry, 7=timestamp)로 읽는다.
 _CHAIN_SNAPSHOT_SQL = """
     SELECT DISTINCT ON (expiry, strike, option_type)
-        strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d
+        strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d,
+        delta, volume, spread_state
     FROM option_analysis_1m
     WHERE underlying=%s
       AND timestamp <= %s
@@ -1121,8 +1132,18 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
             # None을 0.0으로 바꾸지 않는다 — `atm_straddle_vrp()`가 "rv 없음"을 산출 불가로
             # 판정해야 하는데, 0.0으로 채우면 "실현변동성이 0"과 구분되지 않는다.
             "rv_5d": float(rv_5d) if rv_5d is not None else None,
+            # 2026-08-17 §11.5 — 종목 선택기 입력. **셋 다 None을 보존한다**: `delta`가 없으면
+            # 「델타 밴드로 못 고른다」이고 0.0이면 「심외가라 델타가 0에 가깝다」인데, 후자로
+            # 오인하면 선택기가 엉뚱한 행사가를 «규칙대로» 고른다. `volume`의 None과 0도 마찬가지로
+            # 「모른다」와 「오늘 한 건도 안 붙었다」이고, 유동성 필터는 뒤쪽만 걸러야 한다.
+            "delta": float(delta) if delta is not None else None,
+            "volume": int(volume) if volume is not None else None,
+            "spread_state": int(spread_state) if spread_state is not None else None,
         }
-        for strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d in rows
+        for (
+            strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d,
+            delta, volume, spread_state,
+        ) in rows
     ]
 
 
@@ -1442,6 +1463,7 @@ def insert_signal_decision(
     risk_gate_state: dict,
     exec_mode: str,
     chain_inputs: dict | None = None,
+    selected_instruments: dict | None = None,
 ) -> None:
     """
     입력: 시각, conviction(v6 §11.1 4단계 문자열), decision("ENTER"/"HOLD"/"REJECT"),
@@ -1464,8 +1486,9 @@ def insert_signal_decision(
         cur.execute(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
             "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
-            "chain_oldest_leg_age_seconds, gex_expiry, vrp, chain_input_source) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "chain_oldest_leg_age_seconds, gex_expiry, vrp, chain_input_source, "
+            "selected_instruments) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
                 chain.get("gamma_flip"), chain.get("gex"),
@@ -1474,6 +1497,10 @@ def insert_signal_decision(
                 # 2026-08-11 고도화 B — 마이그레이션 029. 상세 근거는 그 파일과
                 # `_SIGNAL_DECISION_COLUMNS` 주석.
                 chain.get("chain_input_source"),
+                # 2026-08-17 §11.5 — 마이그레이션 031. **None과 `{"candidates": []}`는 다르다**:
+                # NULL은 «선택기가 안 돌았다», 빈 목록+사유는 «돌았으나 고를 것이 없었다».
+                # 그 둘이 구분되지 않으면 이 컬럼은 쓸모가 없다(규약 C).
+                None if selected_instruments is None else json.dumps(selected_instruments),
             ),
         )
     conn.commit()
@@ -1594,7 +1621,10 @@ def recent_signal_decisions(conn: ConnectionLike, limit: int = 20) -> list[dict]
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT timestamp, conviction, decision, reject_reason, risk_gate_state, exec_mode "
+            "SELECT timestamp, conviction, decision, reject_reason, risk_gate_state, exec_mode, "
+            # 2026-08-17 §11.5 — COCKPIT "판단 현황"이 지금까지 `허용 전략`까지만 보여주고
+            # **어느 종목인지가 없었다.** 사람이 수동 주문할 때 비교 대상이 되는 값이다.
+            "selected_instruments "
             "FROM signal_decisions ORDER BY timestamp DESC LIMIT %s",
             (limit,),
         )
@@ -1603,8 +1633,12 @@ def recent_signal_decisions(conn: ConnectionLike, limit: int = 20) -> list[dict]
         {
             "timestamp": timestamp, "conviction": conviction, "decision": decision,
             "reject_reason": reject_reason, "risk_gate_state": risk_gate_state, "exec_mode": exec_mode,
+            "selected_instruments": selected_instruments,
         }
-        for timestamp, conviction, decision, reject_reason, risk_gate_state, exec_mode in rows
+        for (
+            timestamp, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+            selected_instruments,
+        ) in rows
     ]
 
 

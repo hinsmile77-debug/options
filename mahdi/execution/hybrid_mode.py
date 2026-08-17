@@ -32,6 +32,40 @@ class GateDecision:
     confirmation_timeout_seconds: int | None = None
 
 
+def mode_from_params(params: dict | None) -> HybridMode:
+    """
+    입력: `strategy_params.yaml` 전체 dict(`hybrid_mode.default`를 읽는다).
+    계산: 설정 문자열을 `HybridMode`로 옮긴다.
+    해석: 2026-08-17 — **이 함수가 없어서 설정값이 아무 데도 안 닿고 있었다.**
+         `strategy_params.yaml`에 `hybrid_mode.default: "ADVISORY"`가 v6 §13.1을 따라 처음부터
+         있었는데, 그것을 읽어 `HybridMode`로 바꾸는 코드가 저장소 어디에도 없었다. 라이브는
+         `main.py`가 문자열 `"ADVISORY"`를 DB에 직접 하드코딩했고, 백테스트는 생성자 기본값
+         `FULL_AUTO`를 썼다 — 즉 설정 파일은 **읽히지 않는 선언**이었다.
+    실패 조건: 값이 없거나 모르는 문자열이면 ADVISORY로 떨어진다. **가장 보수적인 쪽으로
+              떨어지는 것이 요점이다** — 오타 하나가 자동매매를 켜면 안 된다.
+    """
+    configured = ((params or {}).get("hybrid_mode") or {}).get("default")
+    try:
+        return HybridMode(str(configured).upper())
+    except ValueError:
+        return HybridMode.ADVISORY
+
+
+def effective_mode(configured: HybridMode, *, order_path_wired: bool) -> tuple[HybridMode, str | None]:
+    """
+    입력: 설정된 모드, 주문 제출 경로가 실제로 배선돼 있는지.
+    계산: 배선 전이면 무조건 ADVISORY로 낮추고 그 사유를 함께 돌려준다.
+    해석: **설정이 곧 사실이 되지 않게 하는 지점이다.** 주문 경로가 없는데 `exec_mode`에
+         "FULL_AUTO"를 기록하면 `signal_decisions`가 «자동매매 중»이라고 말하면서 체결은 0건인
+         상태가 된다 — 사후에 그 기록을 읽는 사람은 자동매매가 돌았는데 신호가 없었다고 읽는다.
+         설정과 실제를 **둘 다** 남기고, 값이 갈리면 호출측이 경고한다.
+    실패 조건: 없음 — 배선 후에는 설정 그대로 통과한다(두 번째 반환값 None).
+    """
+    if order_path_wired or configured == HybridMode.ADVISORY:
+        return configured, None
+    return HybridMode.ADVISORY, "order_path_not_wired"
+
+
 def gate_entry(mode: HybridMode, confirmation_timeout_seconds: int = 60) -> GateDecision:
     """
     입력: 현재 하이브리드 모드, CONFIRM 모드 대시보드 승인 타임아웃(초).

@@ -107,6 +107,73 @@ def _allowed_strategy_card(allowed_strategies: list[str]) -> dict:
     return {"label": "허용 전략", "value": top, "status": "neutral", "help": None}
 
 
+# 2026-08-17 §11.5 — 선택기가 후보를 못 만든 사유의 한글 라벨. 매핑에 없는 값은 **원문 그대로**
+# 보여준다(정보를 줄이는 방향으로 실패하지 않는다 — `reject_reason_ko`와 같은 규칙).
+SELECTION_REASON_LABEL_KO: dict[str, str] = {
+    "no_entry_strategy": "진입 전략 없음(팔레트 관망/방어 레짐)",
+    "no_chain_snapshot": "체인 스냅샷 없음",
+    "no_eligible_book": "쓸 만기 없음(만기 당일 북뿐)",
+    "no_liquid_instrument": "유동성 하한 미달",
+    "no_selection_rule": "선택 규칙 미정의 전략",
+    "spot_unavailable": "기준가(선물 체결가) 없음",
+    "no_strike_match": "규칙에 맞는 행사가 없음",
+}
+
+
+def _instrument_label(leg: dict) -> str:
+    """계산: 단축코드가 있으면 그것을, 없으면 «행사가 콜/풋»으로 사람이 읽을 라벨을 만든다."""
+    kind = "콜" if str(leg.get("option_type", "")).upper() == "C" else "풋"
+    strike = leg.get("strike")
+    base = f"{strike:g} {kind}" if strike is not None else kind
+    symbol = leg.get("symbol")
+    return f"{symbol} ({base})" if symbol else base
+
+
+def _selected_instrument_card(selected: dict | None) -> dict:
+    """
+    입력: 판단 행의 `selected_instruments`(마이그레이션 031). 배선 이전 행은 None이다.
+    계산: 고른 종목을 한 칸으로 요약하고, 못 골랐으면 **그 사유**를 보여준다.
+    해석: 2026-08-17 — 이 카드가 없을 때 화면은 `허용 전략`까지만 말하고 «그래서 무엇을 살
+         것인가»에 답하지 않았다. 사람이 수동 주문하는 단계(§11.5 승격 경로 ②)에서 갈림을
+         재려면 화면에 이 값이 있어야 한다.
+         **None과 빈 후보를 다르게 표시한다** — 전자는 선택기가 안 돈 행(배선 이전)이고
+         후자는 돌았는데 고를 것이 없던 분이다.
+    실패 조건: 없음.
+    """
+    if selected is None:
+        return {
+            "label": "선택 종목",
+            "value": "미기록",
+            "status": "neutral",
+            "help": "이 판단 행은 종목 선택기 배선(2026-08-17) 이전에 기록됐습니다.",
+        }
+    candidates = selected.get("candidates") or []
+    if not candidates:
+        reason = selected.get("reason")
+        return {
+            "label": "선택 종목",
+            "value": "없음",
+            "status": "info",
+            "help": SELECTION_REASON_LABEL_KO.get(reason, reason) if reason else None,
+        }
+    first = candidates[0]
+    legs = first.get("legs") or []
+    label = " / ".join(_instrument_label(leg) for leg in legs) if legs else "-"
+    unresolved = sum(1 for leg in legs if not leg.get("symbol"))
+    return {
+        "label": "선택 종목",
+        "value": f"{first.get('strategy', '-')}: {label}",
+        "status": "warning" if unresolved else "ok",
+        "help": (
+            f"{unresolved}개 다리의 단축코드를 종목 마스터에서 찾지 못했습니다 — 선택 자체는 "
+            "유효하고, 코드 조회만 실패한 상태입니다."
+            if unresolved
+            else f"만기 {selected.get('book_expiry') or '-'} · 규칙 "
+            + ", ".join(str(leg.get("rule")) for leg in legs)
+        ),
+    }
+
+
 def _risk_engine_card(risk_gate_state: dict) -> dict:
     risk_engine = risk_gate_state.get("risk_engine")
     if risk_engine is None:
@@ -180,6 +247,8 @@ def build_decision_summary_cards(latest: dict | None) -> list[dict]:
         },
         conviction_card,
         _allowed_strategy_card(allowed_strategies),
+        # 2026-08-17 §11.5 — 「전략 이름」 바로 옆에 「그래서 어느 종목인가」를 둔다.
+        _selected_instrument_card(latest.get("selected_instruments")),
         _risk_engine_card(risk_gate_state),
         _EXIT_STAGE_NOT_WIRED_CARD,
     ]

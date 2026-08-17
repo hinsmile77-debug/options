@@ -1371,6 +1371,92 @@ def decisions(conn: ConnectionLike, target: date) -> dict:
             "enter_after_cutoff": after_cutoff,
             "enter_after_forced_flat": after_flat,
         },
+        # 2026-08-17 §11.5 — 종목 선택기. 상세 근거는 `_selected_instruments()`.
+        "selected_instruments": _selected_instruments(conn, target),
+    }
+
+
+def _selected_instruments(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 그날 `signal_decisions.selected_instruments`(마이그레이션 031)를 접어 낸다 —
+         ENTER 분에서 후보가 나온 비율, 사유 분포, 단축코드 해결률, 그리고 **불변식 둘**
+         (당일 만기 다리 수 · 주문 제출 건수).
+    해석: **`enter_minutes_with_candidate_pct`가 주장 지표다** — 선택기가 «돌았고 결과를
+         남겼는가»를 잰다. "더 좋은 행사가를 골랐는가"는 여기서 재지 않는다(체결 0건인 동안
+         정의상 관측 불가이고, 재려 들면 선택기가 아니라 우리의 상상을 재게 된다).
+
+         `expiry_day_leg_count`와 `order_submitted_true_count`는 **불변식이라 건수로 낸다**
+         — 규약 F는 *비례하는* 값에 대한 규칙이고, 0이어야 하는 값은 비율로 만들면 1건이
+         0.2%로 묻힌다(`gex_input_missing_minutes`가 같은 이유로 건수다).
+
+         `symbol_resolved_pct`에는 **임계를 두지 않는다.** 정상 분포를 모른다(규약 G) —
+         마스터의 만기 표기가 `YYYYMM`/`YYMMW#`이라 달력상 만기일과 대조할 수 없어, 북이
+         롤오버되는 날 얼마나 빗나가는지가 아직 실측되지 않았다.
+    실패 조건: 컬럼이 없는 과거 날짜에서도 죽지 않는다 — `available: False`로 내려간다
+              (키가 사라지면 이 절을 지목한 가설이 다시 「경로 없음」이 된다).
+    """
+    try:
+        row = _fetchone(
+            conn,
+            "SELECT"
+            "  count(*) FILTER (WHERE selected_instruments IS NOT NULL),"
+            "  count(*) FILTER (WHERE decision='ENTER'),"
+            "  count(*) FILTER (WHERE decision='ENTER'"
+            "      AND jsonb_array_length(coalesce(selected_instruments->'candidates','[]'::jsonb)) > 0)"
+            " FROM signal_decisions WHERE timestamp::date=%s",
+            (target,),
+        )
+    except Exception:
+        return {"available": False, "reason": "selected_instruments 컬럼 없음(마이그레이션 031 이전)"}
+    if row is None:
+        return {"available": False, "reason": "판단 행 없음"}
+
+    recorded, enter_total, enter_with_candidate = int(row[0]), int(row[1]), int(row[2])
+
+    reason_rows = _fetchall(
+        conn,
+        "SELECT selected_instruments->>'reason', count(*) FROM signal_decisions"
+        " WHERE timestamp::date=%s AND selected_instruments->>'reason' IS NOT NULL GROUP BY 1"
+        " ORDER BY 2 DESC",
+        (target,),
+    )
+    # 다리 단위 집계 — 후보의 다리를 전부 펼쳐 만기/단축코드를 센다.
+    leg_row = _fetchone(
+        conn,
+        "SELECT count(*), count(*) FILTER (WHERE leg->>'symbol' IS NOT NULL),"
+        "       count(*) FILTER (WHERE (leg->>'expiry')::date = timestamp::date)"
+        " FROM signal_decisions,"
+        "   LATERAL jsonb_array_elements(coalesce(selected_instruments->'candidates','[]'::jsonb)) c,"
+        "   LATERAL jsonb_array_elements(c->'legs') leg"
+        " WHERE timestamp::date=%s",
+        (target,),
+    )
+    legs, resolved, expiry_day_legs = (
+        (int(leg_row[0]), int(leg_row[1]), int(leg_row[2])) if leg_row else (0, 0, 0)
+    )
+    submitted_row = _fetchone(
+        conn,
+        "SELECT count(*) FROM signal_decisions WHERE timestamp::date=%s"
+        "   AND (risk_gate_state->'execution_engine'->>'order_submitted')::boolean IS TRUE",
+        (target,),
+    )
+    return {
+        "available": True,
+        "recorded_minutes": recorded,
+        "enter_minutes": enter_total,
+        "enter_minutes_with_candidate": enter_with_candidate,
+        # **주장 지표.**
+        "enter_minutes_with_candidate_pct": (
+            round(enter_with_candidate / enter_total * 100, 1) if enter_total else None
+        ),
+        "reason": {str(k): int(n) for k, n in reason_rows},
+        "leg_count": legs,
+        "symbol_resolved_pct": round(resolved / legs * 100, 1) if legs else None,
+        # **불변식 — 0이 아니면 코드가 깨진 것이다**(0DTE 제외가 뚫렸다).
+        "expiry_day_leg_count": expiry_day_legs,
+        # **불변식 — main.py에 order_manager.submit() 호출부가 없으므로 나올 수 없어야 한다.**
+        "order_submitted_true_count": int(submitted_row[0]) if submitted_row else 0,
     }
 
 

@@ -35,6 +35,7 @@ from mahdi.config.settings import (
     get_kis_settings,
     get_risk_limits,
     get_slack_settings,
+    get_strategy_params,
 )
 from mahdi import notify
 from mahdi.data import db
@@ -52,6 +53,9 @@ from mahdi.execution.account_tracker import (
     position_rows,
     snapshot_to_row,
 )
+from mahdi.execution.engine import EntryRequest, ExecutionEngine
+from mahdi.execution.entry import EntryContext
+from mahdi.execution.hybrid_mode import HybridMode, effective_mode, mode_from_params
 from mahdi.features.options_intel import (
     OptionLeg,
     atm_straddle_vrp,
@@ -69,6 +73,11 @@ from mahdi.fusion.engine import MetaLabelContext, SignalFusionEngine
 from mahdi.fusion.event_calendar import (
     NEEDS_ATTENTION as EVENT_CALENDAR_NEEDS_ATTENTION,
     minutes_to_next_event,
+)
+from mahdi.fusion.instrument_selection import (
+    LiquidityThresholds,
+    legs_from_chain_snapshot,
+    select_instruments,
 )
 from mahdi.fusion.meta_label import TradePermission
 from mahdi.fusion.signal_layer import (
@@ -1706,6 +1715,36 @@ def _parse_market_operation(raw: str) -> MarketOperationStatus | None:
     )
 
 
+# ===== 2026-08-17 — 옵션 «가격»이 어디에 있는지 우리는 모른다 =====
+#
+# `option_analysis_1m`에는 가격 컬럼이 아예 없다(그릭스·IV·OI·거래량만 있다). Passive-first
+# 지정가는 기준가에서 틱을 빼서 만드는 것이므로, 가격 없이는 진입 계획을 만들 수 없다 —
+# CONFIRM 승격의 하드 전제다.
+#
+# **여기서 필드명을 추측하지 않는 이유**: `KIS_RAW_FIELD_RANGES.md`의 체크리스트가 정확히
+# 그것을 금한다. theta가 원화 절대값이라 `DECIMAL(8,6)`에서 상시 오버플로우하던 버그를 5일간
+# 못 잡은 것이 그 문서가 생긴 이유이고, 원인은 "KIS 응답의 실제 값을 안 보고 컬럼을 추측으로
+# 정함"이었다. 같은 실수를 이름 짓기에서 반복하지 않는다.
+#
+# 대신 **프로세스당 1회** 응답의 키 목록을 그대로 남긴다. 다음 기동 하루치 로그면 필드명이
+# 확정되고, 그때 `KIS_RAW_FIELD_RANGES.md`에 범위를 적고 컬럼을 만든다. 매 레그 찍으면
+# 하루 수만 줄이 되므로 1회로 묶는다(`WarningThrottle`과 같은 취지, 다만 이건 영구 1회다).
+_option_quote_fields_logged = False
+
+
+def _log_option_quote_fields_once(output1: dict) -> None:
+    """계산: 옵션 시세 응답의 키 목록을 프로세스당 한 번만 INFO로 남긴다. 실패 조건: 없음."""
+    global _option_quote_fields_logged
+    if _option_quote_fields_logged or not output1:
+        return
+    _option_quote_fields_logged = True
+    logger.info(
+        "KIS 옵션시세 output1 필드 목록(프로세스 1회) — 가격 컬럼 신설 전 실측용, "
+        "근거는 docs/dev_memory/KIS_RAW_FIELD_RANGES.md: %s",
+        sorted(output1.keys()),
+    )
+
+
 def _parse_option_quote(
     resp: dict, strike: float, option_type: str, poll_time: datetime
 ) -> tuple[dict, float] | None:
@@ -1724,6 +1763,7 @@ def _parse_option_quote(
     """
     output1 = resp.get("output1") or {}
     output3 = resp.get("output3") or {}
+    _log_option_quote_fields_once(output1)
     try:
         spot = float(output3["bstp_nmix_prpr"])
         expiry = datetime.strptime(output1["futs_last_tr_date"], "%Y%m%d").date()
@@ -3492,6 +3532,18 @@ def _build_signal_inputs(
         "gex_expiry": gex_expiry,
         # 마이그레이션 024. None(산출 불가)과 0.0(IV=RV)은 다르다 — 전자만 fair로 폴백한 분이다.
         "vrp": vrp,
+        # 2026-08-17 §11.5 — **종목 선택기가 볼 체인.** 밑줄 접두어는 "DB 컬럼이 아닌 전달용
+        # 필드"라는 뜻이다(`_parse_option_quote()`의 `_raw_kis_output1`과 같은 관례 —
+        # `insert_signal_decision()`은 아는 키만 `.get()`으로 골라 읽으므로 INSERT에 안 섞인다).
+        #
+        # **왜 선택기가 체인을 따로 조회하지 않는가**: `latest_option_chain()`은 내부에서
+        # `local_now()`를 부른다. 같은 사이클에 두 번 부르면 두 스냅샷이 갈릴 수 있고, 그러면
+        # **GEX를 낸 체인과 종목을 고른 체인이 다른 분의 것**이 된다. 한 번 읽어 나눠 쓴다.
+        #
+        # `legs`(먼슬리 전용)가 아니라 `chain_rows`(전 북)를 싣는 이유: §11.5의 만기 규칙은
+        # "최근접 **비만기일** 북"이고 그것은 위클리일 수 있다. 판단 입력(GEX)이 먼슬리 전용인
+        # 것과는 별개의 규칙이다.
+        "_chain_rows": chain_rows,
     }
     signal_inputs = SignalInputs(
         regime_state=regime_state,
@@ -3668,12 +3720,162 @@ def _record_risk_snapshot(
         logger.warning("risk_snapshots 기록 실패 — 판단 자체에는 영향 없음", exc_info=True)
 
 
+# §11.5 선택기가 후보를 만들 수 없었던 사유 중 **선택기 바깥에서 정해지는 것** — 팔레트가
+# 관망만 지시했거나 방어 레짐이라 진입 전략 자체가 없었던 경우다. 선택기 내부 사유(`REASON_*`)와
+# 섞이지 않게 여기서 이름을 따로 준다: NULL은 「선택기가 안 돌았다」, 이 값은 「돌릴 것이
+# 없었다」, `REASON_*`는 「돌렸는데 못 골랐다」 — 셋은 서로 다른 사건이다.
+_SELECTION_NO_ENTRY_STRATEGY = "no_entry_strategy"
+
+# ===== 2026-08-17 — 주문 제출 경로는 아직 배선돼 있지 않다 =====
+#
+# 이 상수 하나가 «설정»과 «사실»을 가른다. `strategy_params.yaml`을 CONFIRM/FULL_AUTO로 바꿔도
+# 이 값이 False인 동안 실행 모드는 ADVISORY로 낮춰지고(`effective_mode()`), `signal_decisions.
+# exec_mode`에는 **실제로 일어난 것**이 기록된다. 설정값은 `risk_gate_state.execution_engine.
+# configured_mode`에 따로 남으므로 둘이 갈렸다는 사실 자체가 관측 가능하다.
+#
+# **이 값을 True로 바꾸는 것만으로는 주문이 나가지 않는다** — `order_manager.submit()` 호출부를
+# 이 파일에 실제로 넣는 것이 그 작업이고, 그때 이 상수도 함께 바꾼다. 지금 이것을 True로 두면
+# 기록만 거짓이 되고 체결은 여전히 0건이다.
+_ORDER_PATH_WIRED = False
+
+# `EntryContext.reference_price`를 채울 옵션 가격이 **수집되지 않는다.**
+# `option_analysis_1m`에는 가격 컬럼 자체가 없다(그릭스·IV·OI·거래량만 있다). Passive-first
+# 지정가는 기준가에서 틱을 빼서 만드는 것이므로, 가격 없이는 진입 계획을 만들 수 없다.
+#
+# ADVISORY에서는 `gate_entry()`가 ADVISORY_ONLY를 돌려줘 `build_entry_plan()`이 아예 안 불리므로
+# 지금은 무해하다. **CONFIRM 승격의 하드 전제**이고, 그 사실을 매 판단에 사유로 남긴다 —
+# 승격일에 "왜 지정가가 안 나오지"를 처음 발견하지 않기 위해서다.
+_ENTRY_PLAN_BLOCKED_NO_PRICE = "option_price_not_collected"
+
+
+def _shadow_execution_outcome(
+    execution_engine: ExecutionEngine,
+    selection_record: dict,
+    *,
+    sizing_input: PositionSizingInput,
+    account_state: AccountState,
+    strategy_id: str,
+    side: str,
+    approved_contracts: int,
+    now: datetime,
+    market_halted: bool,
+    mode: HybridMode,
+    configured_mode: HybridMode,
+) -> dict:
+    """
+    입력: 실행 파사드, 이번 사이클 종목 선택 결과, Risk 입력 일습, 유효 하이브리드 모드.
+    계산: 선택된 첫 후보의 첫 다리를 `EntryContext`로 옮겨 `ExecutionEngine.evaluate_entry()`를
+         **실주문 없이** 호출하고 그 결과를 dict로 남긴다.
+    해석: `order_submitted`는 항상 False다 — 이 함수는 `order_manager`를 부르지 않는다. 그
+         사실을 값으로 남기는 이유는, 나중에 이 기록을 읽는 사람이 «승인됐다»를 «주문했다»로
+         읽지 않게 하기 위해서다(`risk_gate_state.risk_engine`이 07-28부터 같은 성질을 가진다).
+         `entry_plan`은 ADVISORY에서 항상 None이고, 그 위에 **가격 미수집**이라는 별도 제약이
+         있다(`_ENTRY_PLAN_BLOCKED_NO_PRICE`) — 모드를 올려도 그것이 풀리지 않는다는 뜻이라
+         사유를 따로 싣는다.
+    실패 조건: 고른 종목이 없으면 엔진을 부르지 않고 `evaluated=False` + 선택기 사유를 남긴다
+              (없는 종목으로 EntryContext를 지어내면 그 순간부터 이 기록은 허구다).
+    """
+    candidates = selection_record.get("candidates") or []
+    if not candidates:
+        return {
+            "evaluated": False,
+            "reason": selection_record.get("reason"),
+            "order_submitted": False,
+            "mode": mode.value,
+            "configured_mode": configured_mode.value,
+        }
+
+    leg = candidates[0]["legs"][0]
+    request = EntryRequest(
+        entry_context=EntryContext(
+            # 단축코드를 못 찾았으면 행사가 라벨을 대신 싣는다 — **주문에 쓰이는 값이 아니고**
+            # (ADVISORY라 계획 자체를 안 만든다) 기록의 가독성을 위한 것이다. 그 사실은
+            # `symbol_resolved`가 구분해 준다.
+            symbol=leg.get("symbol") or f"{leg['option_type']}{leg['strike']:g}",
+            side=side,
+            qty=max(approved_contracts, 0),
+            # 옵션 가격이 없다(`_ENTRY_PLAN_BLOCKED_NO_PRICE`). 0.0은 «가격이 0»이 아니라
+            # «안 쓴다»는 뜻이고, ADVISORY에서 이 값을 읽는 경로가 실제로 없다.
+            reference_price=0.0,
+            now=now.time(),
+        ),
+        sizing_input=sizing_input,
+        account_state=account_state,
+        strategy_id=strategy_id,
+        market_conditions=MarketConditions(),
+        now=now,
+        market_halted=market_halted,
+    )
+    outcome = execution_engine.evaluate_entry(request, mode)
+    return {
+        "evaluated": True,
+        "approved": outcome.approved,
+        "approved_size": outcome.approved_size,
+        "reject_reasons": list(outcome.reject_reasons),
+        "gate_action": outcome.gate_decision.action.value if outcome.gate_decision else None,
+        "symbol": leg.get("symbol"),
+        "symbol_resolved": leg.get("symbol") is not None,
+        "qty": max(approved_contracts, 0),
+        "entry_plan": None if outcome.entry_plan is None else {
+            "order_type": outcome.entry_plan.order_type,
+            "limit_price": outcome.entry_plan.limit_price,
+            "urgency": outcome.entry_plan.urgency,
+        },
+        "entry_plan_blocked_by": _ENTRY_PLAN_BLOCKED_NO_PRICE,
+        # **주문은 나가지 않았다.** 이 파일에 `order_manager.submit()` 호출부가 없다.
+        "order_submitted": False,
+        "mode": mode.value,
+        # 설정과 실제가 갈렸는지 여기서 보인다 — 둘이 다르면 주문 경로가 아직 없다는 뜻이다.
+        "configured_mode": configured_mode.value,
+    }
+
+
+def _build_symbol_resolver(conn, master: IndexDerivativesMaster | None, underlying: str):
+    """
+    입력: DB 커넥션, 종목코드 마스터(없으면 None), 기초자산 라벨.
+    계산: `(option_type, strike, expiry) -> 단축상품번호 | None` 콜백을 만든다. 만기(date)를
+         series(regular/weekly_mon/weekly_thu)로 옮기는 다리는 `expiry_liquidity_1m`이다 —
+         **그 테이블만이 series와 expiry를 동시에 가진다**(`option_analysis_1m`에는 series가
+         없고, 마스터에는 실제 만기일이 없다. 마스터의 만기 표기는 `YYYYMM`/`YYMMW#`이라
+         달력상 며칠인지 알 수 없다 — `symbol_master` 모듈 docstring 참고).
+    해석: **못 찾으면 None을 돌려주고 그것으로 끝낸다.** 그 사실은 후보의 `symbol=None`으로
+         기록에 남고, 후보 자체는 살아남는다(선택의 실패와 코드 조회의 실패는 다른 사건이다).
+         모의투자 단계에서 이 None의 빈도를 실측한 뒤에 보강한다 — 지금 추측으로 메우면
+         무엇이 틀렸는지 알 수 없게 된다.
+    실패 조건: 마스터가 없거나 조회가 실패하면 항상 None을 돌려주는 콜백(진입 판단 자체를
+              막지 않는다 — 종목코드는 ADVISORY 기록의 부가 정보다).
+    """
+    if master is None:
+        return lambda option_type, strike, expiry: None
+    try:
+        series_by_expiry = {
+            row["expiry"]: row["series"]
+            for row in db.latest_expiry_liquidity(conn, underlying)
+            if row.get("expiry") and row.get("series")
+        }
+    except Exception:
+        logger.warning("만기->series 매핑 조회 실패 — 이번 사이클 종목코드는 비운다", exc_info=True)
+        return lambda option_type, strike, expiry: None
+
+    def resolve(option_type: str, strike: float, expiry) -> str | None:
+        series = series_by_expiry.get(expiry)
+        if series is None:
+            return None
+        try:
+            return master.option_symbol(option_type, strike, underlying=underlying, series=series)
+        except Exception:
+            return None
+
+    return resolve
+
+
 async def poll_signal_fusion_cycle(
     regime_state_machine: RegimeStateMachine,
     underlying: str = UNDERLYING,
     interval_seconds: float = SIGNAL_FUSION_POLL_INTERVAL_SECONDS,
     phase_offset_seconds: float = 0.0,
     futures_symbol: str | None = None,
+    master: IndexDerivativesMaster | None = None,
 ) -> None:
     """
     입력: 다른 폴러가 매 선물봉마다 갱신하는 RegimeStateMachine(최신 레짐은 last_state로 읽음 —
@@ -3700,6 +3902,21 @@ async def poll_signal_fusion_cycle(
 
     fusion_engine = SignalFusionEngine()
     risk_engine = RiskEngine()
+    # 2026-08-17 — 실행 파사드를 **그림자로** 세운다(주문 제출 경로는 여전히 없다).
+    #
+    # `configured_mode`는 `strategy_params.yaml`이 v6 §13.1을 따라 처음부터 갖고 있던 값이고,
+    # 08-17까지 **아무도 읽지 않았다**(라이브는 문자열을 하드코딩, 백테스트는 생성자 기본값
+    # FULL_AUTO). 이제 읽되, 주문 경로가 없으므로 `effective_mode()`가 ADVISORY로 낮춘다 —
+    # 설정이 곧 사실이 되지 않게 하는 지점이다.
+    execution_engine = ExecutionEngine(risk_engine=risk_engine)
+    configured_mode = mode_from_params(get_strategy_params())
+    live_mode, mode_clamp_reason = effective_mode(configured_mode, order_path_wired=_ORDER_PATH_WIRED)
+    if mode_clamp_reason is not None:
+        logger.warning(
+            "하이브리드 모드가 설정(%s)보다 낮게 동작한다: %s — 주문 제출 경로가 이 파일에 "
+            "아직 없다. 기록되는 exec_mode는 실제 동작(%s)이다.",
+            configured_mode.value, mode_clamp_reason, live_mode.value,
+        )
     # 2026-08-01(§5-4): RiskEngine의 진입 게이트는 **진입 후보가 있을 때만** 불린다(07-31 하루
     # 0회). 그 자체는 정상이지만, 0회라는 사실이 어디에도 안 남으면 "게이트가 죽었는지"와
     # "진입 후보가 없었는지"를 구분할 수 없다. 호출 횟수/마지막 호출 시각을 남긴다 —
@@ -3843,6 +4060,37 @@ async def poll_signal_fusion_cycle(
                 candidate_side = "BUY" if decision.direction > 0 else "SELL"
                 account_state = _build_account_state_for_candidate(conn, candidate_side, poll_time)
 
+                # 2026-08-17 §11.5 — **전략 이름과 주문 사이의 빈칸을 여기서 메운다.**
+                #
+                # 진입 후보 전략이 있으면 항상 돌린다 — 컷오프로 `is_entry`가 꺼진 분에도
+                # 돌린다(§11.5 원칙 1: "후보 생성은 모드와 무관하게 항상 자동이다". 모드가
+                # 가르는 것은 «실행할 것인가»이지 «누가 고를 것인가»가 아니다). ADVISORY라
+                # 주문이 나가지 않으므로 계좌에 무해하고, 배선일에 비교할 며칠치가 쌓인다.
+                selection_record: dict | None
+                if entry_candidates:
+                    selection = select_instruments(
+                        entry_candidates,
+                        legs_from_chain_snapshot(chain_inputs.get("_chain_rows") or []),
+                        signal_inputs.spot,
+                        poll_time.date(),
+                        direction=decision.direction,
+                        thresholds=LiquidityThresholds.from_params(
+                            (get_strategy_params().get("instrument_selection") or {}).get("liquidity")
+                        ),
+                        symbol_resolver=_build_symbol_resolver(conn, master, underlying),
+                    )
+                    selection_record = selection.to_record()
+                else:
+                    # 팔레트가 관망만 지시했거나 방어 레짐 — 돌릴 것이 없었다는 사실을 남긴다.
+                    # NULL로 두면 「선택기가 안 돌았다」와 구분되지 않는다(규약 C).
+                    selection_record = {
+                        "candidates": [],
+                        "book_expiry": None,
+                        "reason": _SELECTION_NO_ENTRY_STRATEGY,
+                        "rejected": [],
+                    }
+                risk_gate_state["selected_instrument_count"] = len(selection_record["candidates"])
+
                 if is_entry:
                     if account_state is None:
                         risk_gate_state["risk_engine"] = "account_tracker_not_ready"
@@ -3873,6 +4121,30 @@ async def poll_signal_fusion_cycle(
                             "approved_size": risk_decision.approved_size,
                             "reject_reasons": risk_decision.reject_reasons,
                         }
+                        # 2026-08-17 — **ExecutionEngine 그림자 배선.**
+                        #
+                        # `RiskEngine`을 07-28에 그림자로 먼저 붙인 것과 같은 방식이다: 실제
+                        # 주문은 내지 않고 *"지금 실행 게이트를 거쳤다면 어떻게 됐을지"* 를
+                        # 남긴다. Risk 그림자가 08-06 컷오프 결함을 사후가 아니라 **기록으로**
+                        # 잡게 해 준 전례가 있다.
+                        #
+                        # 그림자가 Risk 게이트를 한 번 더 부르는 것은 낭비가 아니다 —
+                        # `ExecutionEngine`은 물타기 금지 -> Risk -> 모드 게이트 순서로 도는
+                        # **파사드**이고, 그 순서 자체가 배선일에 검증돼야 할 대상이다. 위
+                        # `risk_decision`과 여기 결과가 갈리면 그것이 곧 회귀 신호다.
+                        risk_gate_state["execution_engine"] = _shadow_execution_outcome(
+                            execution_engine,
+                            selection_record,
+                            sizing_input=sizing_input,
+                            account_state=account_state,
+                            strategy_id=entry_candidates[0],
+                            side=candidate_side,
+                            approved_contracts=risk_decision.approved_contracts,
+                            now=poll_time,
+                            market_halted=market_halted,
+                            mode=live_mode,
+                            configured_mode=configured_mode,
+                        )
 
                 db.insert_signal_decision(
                     conn,
@@ -3881,10 +4153,15 @@ async def poll_signal_fusion_cycle(
                     decision="ENTER" if is_entry else "REJECT",
                     reject_reason=reject_reason,
                     risk_gate_state=risk_gate_state,
-                    exec_mode="ADVISORY",
+                    # 2026-08-17 — **설정값이 아니라 실제 동작 모드**를 남긴다. 주문 경로가
+                    # 배선되기 전에는 `effective_mode()`가 이것을 ADVISORY로 고정한다. 설정과
+                    # 갈렸다는 사실은 `risk_gate_state.execution_engine.configured_mode`가 담는다.
+                    exec_mode=live_mode.value,
                     # 2026-08-03 §5-1: 판단 시점의 체인 입력을 함께 남겨야 "신호 도달률"을 사후에
                     # 셀 수 있다(마이그레이션 022).
                     chain_inputs=chain_inputs,
+                    # 2026-08-17 §11.5 — 마이그레이션 031. 후보가 없어도 사유와 함께 채운다.
+                    selected_instruments=selection_record,
                 )
                 _record_risk_snapshot(
                     conn, poll_time, signal_inputs, account_state, risk_engine,
@@ -4121,6 +4398,9 @@ async def main() -> None:
                 phase_offset_seconds=SIGNAL_FUSION_PHASE_OFFSET_SECONDS,
                 # 2026-08-04 Fix#2 — 주문흐름(OFI)은 선물 1분봉에서 온다(`market_raw_1m`).
                 futures_symbol=futures_symbol,
+                # 2026-08-17 §11.5 — 고른 (만기, 행사가, 콜풋)을 단축상품번호로 옮기려면
+                # 종목 마스터가 필요하다. 없으면 후보의 `symbol`만 비고 선택 자체는 돈다.
+                master=master,
             ),
             poll_account_balance_cycle(
                 rest_client, phase_offset_seconds=ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS

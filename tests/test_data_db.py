@@ -493,7 +493,10 @@ def test_latest_expiry_liquidity_maps_rows_to_dicts():
 
 
 def test_latest_option_chain_maps_rows_to_dicts():
-    rows = [(1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72)]
+    rows = [
+        (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72,
+         0.51, 120, 1)
+    ]
     conn = FakeReadConnection(rows)
 
     chain = db.latest_option_chain(conn, "KOSPI200")
@@ -509,6 +512,10 @@ def test_latest_option_chain_maps_rows_to_dicts():
             "expiry": date(2026, 7, 9),
             "timestamp": datetime(2026, 7, 6, 9, 31),
             "rv_5d": 0.72,
+            # 2026-08-17 §11.5 — 종목 선택기 입력. GEX 경로와 **같은 스냅샷**에서 온다.
+            "delta": 0.51,
+            "volume": 120,
+            "spread_state": 1,
         }
     ]
 
@@ -517,7 +524,10 @@ def test_latest_option_chain_keeps_missing_rv_as_none_not_zero():
     # 2026-08-05(Fix#1): rv 없음(NULL)과 실현변동성 0은 다르다 — 0.0으로 채우면
     # `atm_straddle_vrp()`가 "못 쟀다"를 "쟀는데 0"으로 오인해 VRP = IV가 되고,
     # 그 분은 항상 극단적 고평가로 판정된다(08-05 위클리 두 북이 실제로 rv_5d=0이었다).
-    rows = [(1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), None)]
+    rows = [
+        (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), None,
+         0.51, 120, 1)
+    ]
 
     chain = db.latest_option_chain(FakeReadConnection(rows), "KOSPI200")
 
@@ -583,7 +593,10 @@ def test_market_bars_between_empty_range_is_empty():
 
 
 def test_option_chain_as_of_matches_latest_option_chain_shape():
-    rows = [(1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72)]
+    rows = [
+        (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72,
+         0.51, 120, 1)
+    ]
     conn = FakeReadConnection(rows)
 
     chain = db.option_chain_as_of(conn, "KOSPI200", datetime(2026, 7, 6, 9, 31))
@@ -592,7 +605,7 @@ def test_option_chain_as_of_matches_latest_option_chain_shape():
         {
             "strike": 1340.0, "option_type": "C", "oi": 363.0, "iv": 0.9, "gamma": 0.0047,
             "gex": 123.4, "expiry": date(2026, 7, 9), "timestamp": datetime(2026, 7, 6, 9, 31),
-            "rv_5d": 0.72,
+            "rv_5d": 0.72, "delta": 0.51, "volume": 120, "spread_state": 1,
         }
     ]
     assert "timestamp <= %s" in conn.store["query"]
@@ -625,7 +638,7 @@ def test_chain_snapshot_bounds_freshness_and_expiry():
 
 def _chain_row(strike, option_type, expiry, ts):
     """`_CHAIN_SNAPSHOT_SQL` 컬럼 순서 그대로의 한 행 — 창 자르기 테스트에서 값은 무관하다."""
-    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15)
+    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15, 0.5, 10, 1)
 
 
 def test_chain_snapshot_drops_strikes_outside_the_latest_cycle_window():
@@ -814,6 +827,8 @@ def test_recent_signal_decisions_maps_rows_and_respects_limit():
             datetime(2026, 7, 29, 9, 5), "STANDARD", "ENTER", None,
             {"direction": 1.0, "risk_engine": {"approved": True, "approved_size": 1.0, "reject_reasons": []}},
             "ADVISORY",
+            # 2026-08-17 §11.5 — 마이그레이션 031. COCKPIT이 「어느 종목인가」를 읽는 자리.
+            {"candidates": [], "reason": "no_entry_strategy"},
         ),
     ]
     conn = FakeReadConnection(rows)
@@ -828,6 +843,7 @@ def test_recent_signal_decisions_maps_rows_and_respects_limit():
                 "direction": 1.0, "risk_engine": {"approved": True, "approved_size": 1.0, "reject_reasons": []},
             },
             "exec_mode": "ADVISORY",
+            "selected_instruments": {"candidates": [], "reason": "no_entry_strategy"},
         }
     ]
     assert conn.store["params"] == (5,)

@@ -3501,7 +3501,8 @@ def test_poll_signal_fusion_cycle_logs_decision_and_respects_fixed_tick_schedule
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (ts, conviction, decision, reject_reason, risk_gate_state, exec_mode)
         ),
     )
@@ -3549,7 +3550,8 @@ def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeyp
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (ts, conviction, decision, reject_reason, risk_gate_state, exec_mode)
         ),
     )
@@ -3572,6 +3574,195 @@ def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeyp
     assert decision == "ENTER"
     assert reject_reason is None
     assert risk_gate_state["direction"] > 0
+
+
+# --- §11.5 종목 선택기 라이브 배선(2026-08-17) ------------------------------------------------
+#
+# 스펙에 절이 생긴 것과 코드가 도는 것은 다르다 — 워치독이 08-06에 만들어져 08-11까지 한 번도
+# 안 돈 것과 같은 형태를 여기서 반복하지 않기 위한 테스트다. 「선택기가 돌았는가」와
+# 「무엇을 골랐는가」를 각각 고정한다.
+
+
+def _run_fusion_cycle_capturing_selection(monkeypatch, *, chain_rows, spot, regime_state):
+    """진입 판단 1사이클을 돌리고 `selected_instruments` 인자로 넘어간 값을 돌려준다."""
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: chain_rows)
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: spot)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: None)
+    monkeypatch.setattr(
+        "mahdi.main.db.latest_expiry_liquidity",
+        lambda conn, underlying: [{"series": "regular", "expiry": date(2026, 8, 18)}],
+    )
+    monkeypatch.setattr("mahdi.main.db.entry_strategies_used_today", lambda conn, day: frozenset())
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    captured: list[dict | None] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: captured.append(selected_instruments),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(
+            _FakeRegimeStateMachineWithLastState(regime_state), interval_seconds=60
+        ))
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _trend_up_regime():
+    prob_vector = [0.0] * 8
+    prob_vector[RegimeLabel.TREND_UP_STRONG] = 1.0
+    return RegimeState(regime=RegimeLabel.TREND_UP_STRONG, prob_vector=tuple(prob_vector))
+
+
+def _selection_chain_rows(expiry=date(2026, 8, 18)):
+    """ATM 100 부근의 최소 체인 — 만기는 2026-08-18(화요일, 대체공휴일 이월분).
+
+    `rv_5d`가 iv보다 높아 VRP가 저평가로 떨어지고, 그래야 TREND_STRONG 행의 §11.4 매트릭스가
+    `atm_long` 셀을 연다(적정이면 `itm_debit`라 델타 밴드 규칙이 대신 걸린다).
+    """
+    rows = []
+    for strike in (95.0, 100.0, 105.0):
+        for option_type in ("C", "P"):
+            rows.append({
+                "strike": strike, "option_type": option_type, "oi": 100.0, "iv": 0.18,
+                "rv_5d": 0.30, "gamma": 0.02, "gex": 0.0, "expiry": expiry, "delta": 0.5,
+                "volume": 10, "spread_state": 1,
+            })
+    return rows
+
+
+def test_the_selector_records_a_concrete_instrument_on_an_entry_minute(monkeypatch):
+    """§11.4까지는 전략 «이름»만 나왔다 — 이 테스트가 그 뒤에 종목이 붙는 것을 고정한다."""
+    record = _run_fusion_cycle_capturing_selection(
+        monkeypatch, chain_rows=_selection_chain_rows(), spot=100.0, regime_state=_trend_up_regime()
+    )
+    assert record is not None
+    assert record["book_expiry"] == "2026-08-18"
+    (candidate,) = record["candidates"]
+    (leg,) = candidate["legs"]
+    assert leg["strike"] == 100.0  # ATM
+    assert leg["rule"] == "atm@100"
+    # 근거가 함께 남아야 한다 — 계산해 놓고 버리면 "무엇이 이 행사가를 골랐나"에 못 답한다.
+    assert leg["oi"] == 100 and leg["delta"] is not None
+
+
+def test_a_minute_with_no_entry_strategy_still_says_why(monkeypatch):
+    """NULL은 「선택기가 안 돌았다」다. 「돌릴 것이 없었다」와 뭉개지면 이 기록은 쓸모없다."""
+    record = _run_fusion_cycle_capturing_selection(
+        monkeypatch, chain_rows=[], spot=None, regime_state=None
+    )
+    assert record == {
+        "candidates": [], "book_expiry": None, "reason": "no_entry_strategy", "rejected": [],
+    }
+
+
+def test_the_expiry_day_book_never_becomes_a_general_entry_candidate(monkeypatch):
+    """만기 당일 북은 0DTE 플레이북 전용 — 이 불변식이 깨지면 잔존 0일짜리를 사게 된다."""
+    today = date(2026, 8, 6)  # `_patch_signal_fusion_cycle_db_defaults`가 고정하는 날짜
+    record = _run_fusion_cycle_capturing_selection(
+        monkeypatch, chain_rows=_selection_chain_rows(expiry=today), spot=100.0,
+        regime_state=_trend_up_regime(),
+    )
+    assert record["candidates"] == []
+    assert record["reason"] == "no_eligible_book"
+
+
+# --- ExecutionEngine 그림자 배선(2026-08-17) --------------------------------------------------
+#
+# RiskEngine을 07-28에 그림자로 먼저 붙인 것과 같은 방식이다 — 주문은 내지 않고 "지금 실행
+# 게이트를 거쳤다면 어떻게 됐을지"를 남긴다. 그 전례가 08-06 컷오프 결함을 사후 추적이 아니라
+# **기록으로** 잡게 해 줬다.
+
+
+def _run_fusion_cycle_capturing_risk_gate(monkeypatch, **kwargs):
+    _patch_signal_fusion_cycle_db_defaults(monkeypatch)
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain",
+                        lambda conn, underlying: _selection_chain_rows())
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kw: 100.0)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
+    monkeypatch.setattr("mahdi.main.db.entry_strategies_used_today", lambda conn, day: frozenset())
+    monkeypatch.setattr(
+        "mahdi.main.db.latest_expiry_liquidity",
+        lambda conn, underlying: [{"series": "regular", "expiry": date(2026, 8, 18)}],
+    )
+    monkeypatch.setattr("mahdi.main.db.latest_account_balance_snapshot", lambda conn: _ACCOUNT_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.account_balance_snapshot_before",
+                        lambda conn, before: _BASELINE_SNAPSHOT_ROW)
+    monkeypatch.setattr("mahdi.main.db.max_account_balance_ever", lambda conn: 110.0)
+    monkeypatch.setattr("mahdi.main.db.daily_trade_counts_by_strategy", lambda conn, day: {})
+    for name, value in kwargs.items():
+        monkeypatch.setattr(f"mahdi.main.{name}", value)
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield object()
+
+    monkeypatch.setattr("mahdi.main.db.get_connection", fake_get_connection)
+
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        "mahdi.main.db.insert_signal_decision",
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: captured.append((risk_gate_state, exec_mode)),
+    )
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+    with pytest.raises(RuntimeError, match="stop-loop"):
+        _run(poll_signal_fusion_cycle(
+            _FakeRegimeStateMachineWithLastState(_trend_up_regime()), interval_seconds=60
+        ))
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_the_execution_facade_is_evaluated_in_the_shadow_and_submits_nothing(monkeypatch):
+    risk_gate_state, exec_mode = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
+    shadow = risk_gate_state["execution_engine"]
+    assert shadow["evaluated"] is True
+    # 이 파일에 order_manager.submit() 호출부가 없다는 사실을 값으로 남긴다 —
+    # 「승인됐다」를 「주문했다」로 읽지 않게.
+    assert shadow["order_submitted"] is False
+    assert shadow["mode"] == "ADVISORY"
+    assert exec_mode == "ADVISORY"
+
+
+def test_the_shadow_carries_the_selected_symbol_so_the_two_layers_can_be_compared(monkeypatch):
+    risk_gate_state, _ = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
+    shadow = risk_gate_state["execution_engine"]
+    # 마스터가 없으므로 단축코드는 못 찾는다 — 그 사실이 값으로 드러나야 한다.
+    assert shadow["symbol_resolved"] is False
+    assert shadow["entry_plan"] is None
+    assert shadow["entry_plan_blocked_by"] == "option_price_not_collected"
+
+
+def test_a_configured_auto_mode_is_still_recorded_as_advisory_while_unwired(monkeypatch):
+    """설정을 FULL_AUTO로 올려도 주문 경로가 없으면 기록은 실제(ADVISORY)를 말해야 한다."""
+    from mahdi.config.settings import get_strategy_params
+
+    monkeypatch.setattr(
+        "mahdi.main.get_strategy_params",
+        lambda: {**get_strategy_params(), "hybrid_mode": {"default": "FULL_AUTO"}},
+    )
+    risk_gate_state, exec_mode = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
+    assert exec_mode == "ADVISORY"
+    assert risk_gate_state["execution_engine"]["configured_mode"] == "FULL_AUTO"
+    assert risk_gate_state["execution_engine"]["mode"] == "ADVISORY"
 
 
 def test_poll_signal_fusion_cycle_continues_after_cycle_failure(monkeypatch):
@@ -3662,7 +3853,8 @@ def test_poll_signal_fusion_cycle_calls_risk_engine_when_account_tracker_ready(m
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (decision, risk_gate_state)
         ),
     )
@@ -3718,7 +3910,8 @@ def _run_signal_fusion_at(monkeypatch, now: datetime) -> list[tuple]:
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (decision, reject_reason, risk_gate_state)
         ),
     )
@@ -3782,7 +3975,8 @@ def test_entry_cutoff_does_not_overwrite_an_existing_reject_reason(monkeypatch):
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (decision, reject_reason)
         ),
     )
@@ -3853,7 +4047,8 @@ def test_poll_signal_fusion_cycle_rejects_entry_when_market_halted(monkeypatch):
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (decision, risk_gate_state)
         ),
     )
@@ -3898,7 +4093,8 @@ def test_poll_signal_fusion_cycle_marks_account_tracker_not_ready(monkeypatch):
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (decision, risk_gate_state)
         ),
     )
@@ -4281,7 +4477,8 @@ def test_poll_signal_fusion_cycle_rejects_when_palette_only_says_wait(monkeypatc
     recorded: list[tuple] = []
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
-        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode, chain_inputs=None: recorded.append(
+        lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
+        chain_inputs=None, selected_instruments=None: recorded.append(
             (decision, reject_reason, risk_gate_state)
         ),
     )
@@ -5398,7 +5595,7 @@ def test_poll_signal_fusion_cycle_passes_vrp_to_the_strategy_palette(monkeypatch
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
         lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
-        chain_inputs=None: recorded.append(chain_inputs or {}),
+        chain_inputs=None, selected_instruments=None: recorded.append(chain_inputs or {}),
     )
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
 
@@ -5444,7 +5641,7 @@ def test_poll_signal_fusion_cycle_falls_back_to_fair_when_vrp_is_unavailable(mon
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
         lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
-        chain_inputs=None: recorded.append(chain_inputs or {}),
+        chain_inputs=None, selected_instruments=None: recorded.append(chain_inputs or {}),
     )
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
 
@@ -5561,7 +5758,7 @@ def test_poll_signal_fusion_cycle_passes_real_meta_label_context(monkeypatch):
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
         lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
-        chain_inputs=None: recorded.append(risk_gate_state),
+        chain_inputs=None, selected_instruments=None: recorded.append(risk_gate_state),
     )
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
 
@@ -5605,7 +5802,7 @@ def _run_one_fusion_cycle(monkeypatch, recorded: list):
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
         lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
-        chain_inputs=None: recorded.append(risk_gate_state),
+        chain_inputs=None, selected_instruments=None: recorded.append(risk_gate_state),
     )
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
 
@@ -5763,7 +5960,7 @@ def _run_fusion_cycle_with_calendar(monkeypatch, calendar, recorded, now):
     monkeypatch.setattr(
         "mahdi.main.db.insert_signal_decision",
         lambda conn, ts, conviction, decision, reject_reason, risk_gate_state, exec_mode,
-        chain_inputs=None: recorded.append(risk_gate_state),
+        chain_inputs=None, selected_instruments=None: recorded.append(risk_gate_state),
     )
     monkeypatch.setattr("mahdi.main.asyncio.get_running_loop", lambda: _FakeLoop([1000.0, 1200.0]))
 

@@ -37,6 +37,20 @@ strategy_gates:
     - "positive_gex"
     - "stable_regime"
 
+# v6 §11.5 Instrument Selection — 전략명이 실제 종목이 되는 지점(2026-08-17 신설).
+#
+# **임계값이 비어 있는 것이 현재의 설계다.** 전부 null/false면 유동성 필터가 하나도 안 걸린다
+# (레버 OFF와 같은 상태). 모의투자 실측 분포를 본 뒤에 채운다 — 모르는 채 임계를 정하면
+# 그 임계가 곧 결론이 된다(2026-08-05 스팟 괴리율에서 한 실수).
+#
+# 채울 때 볼 것: `signal_decisions.selected_instruments`의 후보들에 실린 `oi`/`volume`/
+# `spread_state` 분포. 며칠치가 쌓이기 전에 값을 넣지 말 것.
+instrument_selection:
+  liquidity:
+    min_oi: null                 # 미결제약정 하한(계약). null = 안 거름
+    max_spread_state: null       # 호가 스프레드 상태 상한. null = 안 거름
+    require_traded_today: false  # true면 당일 거래량 0인 행사가를 후보에서 제외
+
 weekly_0dte:
   size_cap_pct_of_normal: 0.50
   time_stop_pct_of_normal: 0.50

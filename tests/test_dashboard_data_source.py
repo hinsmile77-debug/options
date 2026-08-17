@@ -154,8 +154,9 @@ def test_load_snapshot_builds_live_snapshot_with_real_spot_and_chain(monkeypatch
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "chain": [
-            (1340.0, "C", 363, 0.9, 0.0047, 1000.0, date(2026, 7, 9), ts, 0.72),
-            (1340.0, "P", 200, 0.85, 0.0040, -800.0, date(2026, 7, 9), ts, 0.72),
+            # 뒤 세 값(delta/volume/spread_state)은 2026-08-17 §11.5로 붙은 컬럼이다.
+            (1340.0, "C", 363, 0.9, 0.0047, 1000.0, date(2026, 7, 9), ts, 0.72, 0.51, 120, 1),
+            (1340.0, "P", 200, 0.85, 0.0040, -800.0, date(2026, 7, 9), ts, 0.72, -0.49, 90, 1),
         ],
         "investor_flow": [(-150.0, 250.0, -40.0)],
     }
@@ -238,11 +239,11 @@ def test_load_snapshot_gamma_map_uses_only_the_monthly_book_like_the_engine(monk
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "chain": [
-            (1045.0, "C", 100.0, 0.60, 0.02, 1_000.0, monthly, ts, 0.5),
-            (1047.5, "P", 120.0, 0.62, 0.03, -400.0, monthly, ts, 0.5),
+            (1045.0, "C", 100.0, 0.60, 0.02, 1_000.0, monthly, ts, 0.5, 0.5, 10, 1),
+            (1047.5, "P", 120.0, 0.62, 0.03, -400.0, monthly, ts, 0.5, -0.5, 10, 1),
             # 위클리 두 북 — 화면에 섞이면 안 된다(만기 Pinning은 별도 신호).
-            (1045.0, "C", 900.0, 0.90, 0.09, 90_000.0, weekly_thu, ts, 0.5),
-            (1050.0, "C", 800.0, 0.85, 0.08, 80_000.0, weekly_mon, ts, 0.5),
+            (1045.0, "C", 900.0, 0.90, 0.09, 90_000.0, weekly_thu, ts, 0.5, 0.5, 10, 1),
+            (1050.0, "C", 800.0, 0.85, 0.08, 80_000.0, weekly_mon, ts, 0.5, 0.5, 10, 1),
         ],
     }
 
@@ -273,8 +274,8 @@ def test_load_snapshot_omits_gamma_wall_when_top_exposure_is_zero(monkeypatch):
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "chain": [
-            (1045.0, "C", 0.0, 0.60, 0.02, 0.0, expiry, ts, 0.5),  # oi=0 -> 노출 0
-            (1047.5, "P", 0.0, 0.62, 0.03, 0.0, expiry, ts, 0.5),
+            (1045.0, "C", 0.0, 0.60, 0.02, 0.0, expiry, ts, 0.5, 0.5, 0, 1),  # oi=0 -> 노출 0
+            (1047.5, "P", 0.0, 0.62, 0.03, 0.0, expiry, ts, 0.5, -0.5, 0, 1),
         ],
     }
 
@@ -300,9 +301,9 @@ def test_load_snapshot_reports_a_single_gamma_wall_matching_the_engine(monkeypat
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "spot": [(1045.0, ts)],
         "chain": [
-            (1040.0, "C", 10.0, 0.60, 0.01, 100.0, expiry, ts, 0.5),
-            (1045.0, "C", 900.0, 0.60, 0.09, 900.0, expiry, ts, 0.5),  # 압도적 1등
-            (1050.0, "P", 20.0, 0.62, 0.02, -200.0, expiry, ts, 0.5),
+            (1040.0, "C", 10.0, 0.60, 0.01, 100.0, expiry, ts, 0.5, 0.6, 10, 1),
+            (1045.0, "C", 900.0, 0.60, 0.09, 900.0, expiry, ts, 0.5, 0.5, 10, 1),  # 압도적 1등
+            (1050.0, "P", 20.0, 0.62, 0.02, -200.0, expiry, ts, 0.5, -0.4, 10, 1),
         ],
     }
 

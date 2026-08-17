@@ -23,9 +23,10 @@ from mahdi.backtest.engine import BacktestStep
 from mahdi.backtest.simulated_broker import Bar
 from mahdi.data import db
 from mahdi.engines.regime import RegimeLabel, RegimeState
-from mahdi.execution.exit_stack import MarketStructureState
+from mahdi.execution.exit_stack import MarketStructureState, exit_rules_key
 from mahdi.features.options_intel import calculate_gex, find_gamma_flip, legs_from_chain_rows
 from mahdi.fusion.engine import MetaLabelContext
+from mahdi.fusion.instrument_selection import is_expiry_day, legs_from_chain_snapshot
 from mahdi.fusion.signal_layer import SignalInputs
 from mahdi.risk.circuit_breaker import MarketConditions
 from mahdi.risk.limits import AccountState
@@ -116,6 +117,32 @@ def load_backtest_steps_from_db(
                 market_conditions=_NEUTRAL_MARKET_CONDITIONS,
                 meta_context=MetaLabelContext(),
                 market_structure=MarketStructureState(),
+                # 2026-08-17 — **그 봉 시점에 실제로 관측된 레짐**을 청산 규칙 키로 넘긴다.
+                #
+                # 이 인자를 비우면 `BacktestStep`이 `_DEFAULT_REGIME_FOR_EXIT_RULES`
+                # ("TREND_STRONG")로 떨어지고, 실측 레짐 이력에서 그 계열은 **0분**이다.
+                # 즉 백테스트가 한 번도 일어난 적 없는 레짐의 청산 파라미터(time_stop 120분,
+                # 레짐 손절 없음)로 손익 분포를 재고 있었다 — 실제로 71.7%를 차지하는
+                # VOL_COMPRESSION은 `exit_rules`에 행이 아예 없어 타임스톱이 안 걸린다.
+                #
+                # **그 사실을 여기서 숨기지 않는 것이 요점이다**: 이제 백테스트도 미정의 레짐을
+                # 만나면 `resolve_exit_params()`의 경고를 그대로 맞는다. 값을 정하는 것은
+                # 사람의 일이고, 그 전까지 백테스트 결과는 그 구간에 시간 방어선이 없었음을
+                # 반영해야 한다(낙관적으로 보이던 종전 결과가 그 반대였다).
+                #
+                # 만기 당일 여부는 §11.5 선택기와 **같은 함수**로 판정한다 — 두 곳이 따로
+                # 판정하면 한쪽은 0DTE 파라미터로 청산하면서 다른 쪽은 일반 후보를 만드는
+                # 상태가 되고, 어느 쪽이 옳은지 알 방법이 없어진다.
+                exit_rules_regime=(
+                    None
+                    if regime_label is None
+                    else exit_rules_key(
+                        RegimeLabel(regime_label),
+                        is_expiry_day=is_expiry_day(
+                            legs_from_chain_snapshot(chain_rows), as_of.date()
+                        ),
+                    )
+                ),
             )
         )
     return steps

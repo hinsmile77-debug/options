@@ -3633,3 +3633,90 @@
     ⚠ 체결통보는 **별도 도메인**(모의 :31000)이라 두 번째 WS 연결이 필요하다 —
       `main.py` 배선은 이 커밋에 없다(복호·파싱 계층까지만이다).
   상태: pending
+
+- id: "2026-08-17-p1-instrument-selection"
+  구현일: 2026-08-17
+  검증예정일: 2026-08-18
+  가설: "§11.5 선택기가 라이브에서 돌면, ENTER 계열 분의 90% 이상에서 제안 종목이 비어있지 않다"
+  근거: |
+    선택기는 REST를 부르지 않고 GEX와 **같은 체인 스냅샷**을 나눠 쓴다. 그 스냅샷이 비지 않은
+    분이라면 ATM 최근접 행사가는 항상 존재한다. 유동성 임계는 전부 null(OFF)이라 후보를 거르지
+    않는다. 90% 미만이면 (a) 체인 스냅샷이 비었거나 (b) 팔레트가 규칙 미정의 전략(long_gamma /
+    프리미엄 매도 계열)만 열었다는 뜻이고, **그 둘은 `reason` 코드로 갈린다**.
+  예측:
+    - metric: db.decisions.selected_instruments.enter_minutes_with_candidate_pct
+      expect: ">= 90"
+      역할: 주장
+    - metric: db.decisions.selected_instruments.symbol_resolved_pct
+      expect: "수기 판정"
+      역할: 참고
+  주의: |
+    이 가설은 «좋은 행사가를 골랐는가»를 재지 않는다 — 체결 0건인 동안 그것은 정의상 관측
+    불가이고, 재려 들면 선택기가 아니라 우리의 상상을 재게 된다. 재는 것은 «선택기가 돌았고
+    결과를 남겼는가» 하나뿐이다.
+    `symbol_resolved_pct`에 **임계를 두지 않는다**(규약 G) — 정상 분포를 모른다. 종목 마스터의
+    만기 표기가 YYYYMM/YYMMW#이라 달력상 만기일과 대조할 수 없어, 북이 롤오버되는 날 얼마나
+    빗나가는지가 아직 실측되지 않았다.
+  상태: pending
+
+- id: "2026-08-17-p2-expiry-day-excluded"
+  구현일: 2026-08-17
+  검증예정일: 2026-08-18
+  가설: "제안 종목의 만기가 당일 만기인 다리 수는 0이다"
+  근거: |
+    `select_book()`이 today보다 **큰** 만기만 후보로 둔다 — 만기 당일 북은 0DTE 플레이북
+    전용이다(§11.4/§11.5). 잔존만기 0일에는 감마플립이 정의되지 않고 핀 리스크만 의미를 갖는다.
+  예측:
+    - metric: db.decisions.selected_instruments.expiry_day_leg_count
+      expect: "0"
+      역할: 주장
+  주의: |
+    **불변식이다.** 0이 아니면 시장이 특이한 것이 아니라 코드가 깨진 것이다.
+    건수로 세는 것이 규약 F 위반이 아닌 이유: F는 **비례하는** 값에 대한 규칙이고, 0이어야 하는
+    값을 비율로 만들면 1건이 0.2%로 묻힌다(`gex_input_missing_minutes`가 같은 이유로 건수다).
+  상태: pending
+
+- id: "2026-08-17-p3-no-order-submitted"
+  구현일: 2026-08-17
+  검증예정일: 2026-08-18
+  가설: "ExecutionEngine 그림자 배선은 주문을 한 건도 내지 않는다"
+  근거: |
+    `main.py`에 `order_manager.submit()` 호출부가 **없다**. 그리고 `_ORDER_PATH_WIRED=False`인
+    동안 `effective_mode()`가 설정 모드를 ADVISORY로 낮추고, `gate_entry(ADVISORY)`는
+    ADVISORY_ONLY를 돌려주므로 `EntryPlan` 자체가 만들어지지 않는다.
+  예측:
+    - metric: db.decisions.selected_instruments.order_submitted_true_count
+      expect: "0"
+      역할: 주장
+    - metric: db.decisions.selected_instruments.recorded_minutes
+      expect: ">= 1"
+      역할: 참고
+  주의: |
+    첫 지표는 **불변식**이다 — 0이 아니면 즉시 관측 루프를 세운다. 계좌에 실제로 닿는 경로가
+    의도치 않게 열렸다는 뜻이기 때문이다.
+    둘째 지표는 **배선 생존 신호**다. 0이면 선택기가 하루 종일 한 번도 안 돌았다는 뜻이고,
+    그 경우 첫 지표의 0은 «주문을 안 냈다»가 아니라 «아무것도 안 했다»여서 증명이 아니다
+    (규약 C — 라벨 0이면 count 0은 증명이 아니다).
+  상태: pending
+
+- id: "2026-08-17-p4-selection-cycle-cost"
+  구현일: 2026-08-17
+  검증예정일: 2026-08-18
+  가설: "선택기는 사이클 시간을 늘리지 않는다"
+  근거: |
+    선택기는 REST를 부르지 않는다 — 체인은 `_build_signal_inputs()`가 이미 읽은 것을
+    `chain_inputs`로 넘겨받아 나눠 쓴다(같은 사이클에 두 번 조회하면 GEX를 낸 체인과 종목을
+    고른 체인이 갈리므로 의도적으로 한 번만 읽는다). 남는 비용은 수십 레그에 대한 순수 파이썬
+    순회뿐이다.
+  예측:
+    - metric: overrun.count
+      expect: "0"
+      역할: 주장
+    - metric: rest.total_calls
+      expect: "수기 판정"
+      역할: 참고
+  주의: |
+    `rest.total_calls`는 선택기와 무관한 힘(옵션체인 폴링 레버들)이 이미 움직이는 값이라
+    **수기 판정**으로 둔다. 이 가설이 말하는 것은 «선택기가 REST를 늘리지 않았다»뿐이고,
+    총계가 움직여도 선택기를 반증하지 않는다 — 귀속은 레버 표(§0)로 한다.
+  상태: pending

@@ -1,7 +1,115 @@
 # CURRENT_STATE — 마흐디(options) 현재 개발 상태
 
-_최종 갱신: **2026-08-12 밤** (운영점검 + Fix 8종 + 고도화 5건). 아래 절은 **날짜가 최신인 것이
-우선한다** — 맨 위 "2026-08-12 저녁 갱신"이 그 아래 모든 절보다 우선한다._
+_최종 갱신: **2026-08-17** (Phase 진단 + Phase 2 착수). 아래 절은 **날짜가 최신인 것이
+우선한다** — 맨 위 절이 그 아래 모든 절보다 우선한다._
+
+---
+
+## [MW0601] 2026-08-17 갱신 — **우리는 Phase 1에 있지 않다. 이미 Phase 2 안에 있다**
+
+> v6 PART 21 로드맵 기준으로 "현재 Phase 1"이라 읽어 왔으나, 코드 전수 확인 결과 **판단 층은
+> 이미 Phase 2이고 실행 층만 미배선**이었다. 로드맵이 선형이라 진행도 선형일 것이라 읽은 것이
+> 착오의 형태다. 테스트 1,500개 전부 통과(15.5초) 상태에서 조사했다.
+
+### Phase 1 — 완료로 본다. 남은 셋은 Phase 1의 잔여가 아니다
+
+| 항목 | 상태 |
+|---|---|
+| KIS 연동(토큰·WS·구독 롤링) | 완성, 실가동 |
+| TimescaleDB 스키마 | 완성(마이그레이션 30개) |
+| Regime Engine v1 (GaussianHMM 8-state) | 완성 + 오프라인 fit 배치 |
+| COCKPIT v1 | 완성(요구 4패널 + 추가 5패널) |
+| 피처 6종 | 6/6 구현, **VWAP·VAP만 라이브 미배선** |
+| 피처 사전 문서(4요소) | 별도 md 없음 — **docstring 규약으로 내재화**(실질 충족) |
+| 장전 매크로 나침반 | 원시 데이터·`cross_asset_stress`는 배선, §8 스코어는 프록시 |
+| 주문 상태머신 모의계좌 검증 | 로직·테스트 완성, **실주문 0건** |
+
+**VWAP/VAP 배선과 매크로 나침반 정식화를 Phase 1 잔여로 두지 않기로 했다.** 그 피처를 판단
+입력으로 쓰는 시점에 배선해야 소비자가 있는 배선이 된다. 지금 하면 «만들어 두는 것과 도는
+것은 다르다»의 역방향 — 도는데 아무도 안 보는 것 — 을 새로 만든다. 워치독(08-06 생성, 08-11
+까지 미가동)과 같은 형태다.
+
+### Phase 2 — 판단 층은 이미 라이브, 실행 층은 코드만 있다
+
+| 항목 | 판정 |
+|---|---|
+| Signal Fusion | **라이브 배선**(60초 주기, `signal_decisions` 기록) |
+| Risk Engine | **라이브 배선 — 단 «그림자 게이트»**(승인/거부를 기록만, 주문 없음) |
+| Meta-Labeling | 결정론적 프록시. **Triple Barrier·Purged CV는 심볼 0건**(학습 데이터 대기 — 정상) |
+| Execution Engine | 실구현, **`main.py`에 단 한 줄도 없음.** 유일 호출부는 백테스트 |
+| 하이브리드 3모드 | 실구현, **미배선.** `main.py:3884`가 `exec_mode="ADVISORY"` 문자열 하드코딩 |
+| 백테스트 + WFO·MC·DSR | 실구현, 오프라인 전용(정상) |
+
+**`main.py`의 execution 임포트는 `account_tracker` 하나뿐이다.** `order_manager.submit()` ·
+`forced_flat.build_forced_flat_orders()` · `evaluate_exit_stack()` 전부 프로덕션 호출부 0건.
+
+### ⚠ 배선하는 순간 터지는 결함 2건 — 지금은 미배선이라 무해하다
+
+1. **실행 경로에서 14:50 컷오프가 조용히 빠진다.** `execution/engine.py:78-80`이
+   `risk_engine.evaluate_entry()`에 `now=`·`market_halted=`를 **안 넘긴다.** 기본값이
+   `now=None`이고 그 뜻은 "시각 게이트를 건너뛴다"이다. `main.py:3863-3866`이 정확히 이
+   위험을 예언해 뒀다 — *"이 인자가 비어 있으면 Phase 2에서 실행 엔진이 같은 호출을 복사해
+   갈 때 시각 게이트가 조용히 빠진다."* **복사해 간 쪽이 이미 그 상태다.**
+2. **청산 타임스톱이 실측 레짐 71.7%에서 무효.** `VOL_COMPRESSION` 행이 `exit_rules`에
+   미정의다. 08-17에 조용한 False를 시끄러운 경고로 바꾸는 데까지는 했으나(`resolve_exit_params`),
+   **값을 정하는 것은 사람의 일이라 아직 열려 있다.**
+
+### 빠져 있던 계층 — §11.5
+
+§11.4의 출력은 전략 **이름**이고 Execution의 입력은 **단축상품번호**인데 그 사이가 코드에도
+스펙에도 없었다. 08-17에 스펙(§11.5)을 신설했고, 이번에 코드를 만들었다. 라이브가 미배선이라
+아무도 이 빈칸을 밟지 않았을 뿐이다 — 백테스트는 `symbol="BACKTEST"` 자리표시자로 메우고 있었다.
+
+---
+
+## [MW0601] 2026-08-17 — 같은 날 구현분. **08-18 07:30 기동부터 실린다**
+
+> 상세 결정 근거는 `DECISION_LOG.md` 2026-08-17. 예측치는 `hypotheses.yaml` `2026-08-17-p1~p4`.
+> 테스트 **1,563개 전부 통과**(1,500 → +63).
+
+**⚠ 마이그레이션 031을 08-18 기동 전에 적용할 것.** 안 하면 매 사이클 INSERT가 실패한다.
+
+| # | 무엇 | 되돌리면 깨지는 테스트 |
+|---|---|---|
+| 1 | `mahdi/fusion/instrument_selection.py` 신설 — §11.5 선택기(순수 함수) | `test_fusion_instrument_selection.py` 26건 |
+| 2 | 마이그레이션 **031** `signal_decisions.selected_instruments` | `test_data_db.py` 2건 |
+| 3 | 체인 스냅샷에 `delta`/`volume`/`spread_state` 합류 | `test_data_db.py::test_latest_option_chain_maps_rows_to_dicts` |
+| 4 | **ExecutionEngine 시각·거래정지 게이트 복구**(P0급) | `test_execution_engine.py` 3건 |
+| 5 | 백테스트 레짐을 실측으로(`exit_rules_regime`) | `test_backtest_data_adapter.py` 4건 |
+| 6 | `hybrid_mode` 설정 읽기 + 배선 전 ADVISORY 클램프 | `test_execution_hybrid_mode.py` 5건 |
+| 7 | ExecutionEngine 그림자 배선 | `test_main.py` 3건 |
+| 8 | COCKPIT "선택 종목" 카드 | `test_dashboard_decision_panel.py` 5건 |
+| 9 | 일일 리포트 `db.decisions.selected_instruments` 절 | `test_ops_selected_instruments_metric.py` 11건 |
+
+### 새로 생긴 규약 — 기록에서 세 상태를 가른다
+
+`signal_decisions.selected_instruments`가
+
+- **NULL** → 선택기가 그 사이클에 안 돌았다(배선 이전 행).
+- `{"candidates": [], "reason": "no_entry_strategy"}` → 돌릴 것이 없었다(팔레트 관망/방어 레짐).
+- `{"candidates": [], "reason": "no_liquid_instrument" 등}` → 돌렸는데 못 골랐다.
+
+**셋이 뭉개지면 이 컬럼은 쓸모가 없다**(규약 C). COCKPIT 카드도 같은 세 상태를 구분해 표시한다.
+
+### 켜지 않은 것 — 유동성 임계는 **전부 비어 있다**
+
+`strategy_params.yaml`의 `instrument_selection.liquidity`는 `min_oi: null` ·
+`max_spread_state: null` · `require_traded_today: false` 다. **그 상태가 현재의 설계다** —
+모의투자 실측 분포(`selected_instruments`의 후보에 실린 `oi`/`volume`/`spread_state`)를 본
+뒤에 채운다. 며칠치가 쌓이기 전에 값을 넣지 말 것.
+
+### ⚠ CONFIRM 승격의 하드 전제 — 옵션 가격이 수집되지 않는다
+
+`option_analysis_1m`에 가격 컬럼이 **없다.** 지정가 진입 계획을 만들 수 없다는 뜻이고, 지금은
+ADVISORY라 `build_entry_plan()`이 아예 안 불려 무해하다. 08-18 로그의
+`KIS 옵션시세 output1 필드 목록` INFO 한 줄로 필드명을 확정한 뒤 컬럼을 만든다 —
+**추측 금지**(`KIS_RAW_FIELD_RANGES.md` 체크리스트).
+
+### 아직 중립 상수인 것 — 사이징 입력
+
+`main.py`의 `target_vol=0.01, realized_vol=0.01, liquidity_score=1.0,
+portfolio_capacity_remaining_pct=1.0`은 전부 하드코딩이다. Kelly 사이징의 **변동성 타게팅·유동성
+축이 라이브에서 사실상 무력**이라는 뜻이다. 다음 작업이고, 한 번에 하나씩 켠다.
 
 ---
 

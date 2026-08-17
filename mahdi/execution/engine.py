@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, time as dtime
 
 from mahdi.config.settings import get_strategy_params
 from mahdi.execution.entry import EntryContext, EntryPlan, build_entry_plan, forbid_averaging_down
@@ -42,6 +43,22 @@ class EntryRequest:
     market_conditions: MarketConditions
     has_open_position_same_direction: bool = False
     is_new_signal: bool = True
+    # ===== 2026-08-17 — 이 두 필드가 없어서 실행 경로에서 게이트 둘이 조용히 빠져 있었다 =====
+    #
+    # `RiskEngine.evaluate_entry()`의 `now`/`market_halted`는 기본값이 있고, 그 기본값의 뜻은
+    # **"그 게이트를 건너뛴다"** 이다(`now=None` → 14:50 신규 진입 컷오프 미평가,
+    # `market_halted=False` → 거래소 정지 미평가). 이 파사드는 둘 다 안 넘기고 있었다.
+    #
+    # `main.py`의 그림자 게이트 호출부가 정확히 이것을 예언해 뒀다(2026-08-06 Fix#1 주석):
+    #     *"이 인자가 비어 있으면 Phase 2에서 실행 엔진이 같은 호출을 복사해 갈 때
+    #       시각 게이트가 조용히 빠진다. **두 층 모두 채워져 있어야 한다.**"*
+    # 복사해 간 쪽이 이미 그 상태였고, 라이브 미배선이라 아무도 안 밟았을 뿐이다.
+    #
+    # **기본값을 None/False로 두는 이유**: 시각과 무관한 한도만 보고 싶은 기존 테스트/백테스트를
+    # 깨지 않기 위함이다 — RiskEngine이 같은 이유로 같은 기본값을 쓴다. 대신 **라이브 경로는
+    # 반드시 채운다**(`test_execution_engine.py`가 그것을 강제한다).
+    now: datetime | dtime | None = None
+    market_halted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,11 +77,12 @@ class ExecutionEngine:
 
     def evaluate_entry(self, request: EntryRequest, mode: HybridMode) -> EntryOutcome:
         """
-        입력: EntryRequest(진입 컨텍스트 + Risk Engine 입력 + 물타기 판단용 플래그), 현재
-             하이브리드 모드.
+        입력: EntryRequest(진입 컨텍스트 + Risk Engine 입력 + 물타기 판단용 플래그 + 판단 시각
+             `now`과 거래정지 여부 `market_halted`), 현재 하이브리드 모드.
         계산: (1) 물타기 금지 규칙(entry.forbid_averaging_down) 선체크 — 위반이면 즉시 거부.
-             (2) RiskEngine.evaluate_entry()로 사이징/한도/Circuit Breaker 통과 여부 확인 —
-             거부되면 그대로 전파(§12 "독립 거부권", 이 파사드가 절대 우회하지 않음).
+             (2) RiskEngine.evaluate_entry()로 **시각 컷오프(14:50)·거래정지**·사이징·한도·
+             Circuit Breaker 통과 여부 확인 — 거부되면 그대로 전파(§12 "독립 거부권", 이
+             파사드가 절대 우회하지 않음).
              (3) 하이브리드 모드 게이트(hybrid_mode.gate_entry) — ADVISORY면 주문 계획을
              만들지 않고 신호만 승인(entry_plan=None).
              (4) 그 외(CONFIRM/FULL_AUTO)엔 Passive-first EntryPlan을 만든다.
@@ -76,7 +94,11 @@ class ExecutionEngine:
             return EntryOutcome(approved=False, reject_reasons=["averaging_down_forbidden"])
 
         risk_decision = self._risk_engine.evaluate_entry(
-            request.sizing_input, request.account_state, request.strategy_id, request.market_conditions
+            request.sizing_input, request.account_state, request.strategy_id, request.market_conditions,
+            # 2026-08-17 — 이 두 인자를 넘기지 않으면 §12의 거부권 중 **시각·거래정지 두 개가
+            # 조용히 사라진다.** 자세한 근거는 `EntryRequest`의 두 필드 위 주석.
+            market_halted=request.market_halted,
+            now=request.now,
         )
         if not risk_decision.approved:
             return EntryOutcome(approved=False, reject_reasons=list(risk_decision.reject_reasons))
