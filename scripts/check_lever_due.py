@@ -121,7 +121,10 @@ def _event_calendar_warning(today) -> list[str]:
             "   → 만료 상태면 `event_proximity_minutes`가 항상 None이고,",
             "     메타 라벨의 이벤트 근접 x0.5 페널티가 하루 종일 한 번도 걸리지 않는다.",
             "",
-            "   ※ 일정 확인은 사람이 한다 - 이 스크립트는 날짜를 옮기지 않는다.",
+            "   만기 항목은 아래가 만들어 준다(붙여넣기만 하면 된다):",
+            "       uv run python scripts/suggest_event_calendar.py",
+            "",
+            "   ※ 일정 확인은 사람이 한다 - 이 스크립트도, 위 생성기도 날짜를 옮기지 않는다.",
         ]
     return []
 

@@ -142,3 +142,46 @@ def test_shipped_calendar_parses_and_declares_its_coverage():
     assert result.status != STATUS_EMPTY, "배포된 event_calendar.yaml이 파싱되지 않는다"
     assert result.invalid_entries == 0, "배포된 캘린더에 형식 오류 항목이 있다"
     assert raw.get("covered_through") is not None
+
+
+# ===== 2026-08-17 — 만기 항목 생성기(옮겨 적기 자동화) =====
+
+from datetime import date  # noqa: E402
+
+from mahdi.fusion.event_calendar import EXPIRY_EVENT_TIME, render_expiry_events  # noqa: E402
+
+
+def _observed(expiry: date, **overrides) -> dict:
+    base = dict(expiry=expiry, rows=10_613, first_seen=date(2026, 8, 11),
+                last_seen=date(2026, 8, 17), lead_days=7)
+    base.update(overrides)
+    return base
+
+
+def test_renders_pasteable_event_block_with_expiry_time():
+    lines = render_expiry_events([_observed(date(2026, 8, 18))])
+    assert f'- when: "2026-08-18 {EXPIRY_EVENT_TIME}"' in "\n".join(lines)
+    assert 'kind: "expiry"' in "\n".join(lines)
+
+
+def test_weekday_is_taken_from_the_observed_date_not_a_rule():
+    """08-18은 대체공휴일로 밀린 **화요일** 만기다 — 주기 규칙이면 못 맞힌다."""
+    lines = render_expiry_events([_observed(date(2026, 8, 18))])
+    assert "옵션 만기(화)" in "\n".join(lines)
+
+
+def test_already_registered_expiry_is_not_suggested_again():
+    calendar = {"events": [{"when": f"2026-08-18 {EXPIRY_EVENT_TIME}", "name": "x", "kind": "expiry"}]}
+    assert render_expiry_events([_observed(date(2026, 8, 18))], calendar) == []
+
+
+def test_observation_evidence_is_printed_so_the_human_can_name_it():
+    """먼슬리 여부는 실측으로 알 수 없다 — 판단 재료만 준다."""
+    joined = "\n".join(render_expiry_events([_observed(date(2026, 9, 10), rows=9663, lead_days=27)]))
+    assert "9,663행" in joined and "리드 27일" in joined
+
+
+def test_covered_through_is_never_generated():
+    """`covered_through`는 사람의 선언이다 — 생성기가 만들면 안 된다."""
+    joined = "\n".join(render_expiry_events([_observed(date(2026, 8, 18))]))
+    assert "covered_through" not in joined

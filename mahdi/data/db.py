@@ -1126,6 +1126,55 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
     ]
 
 
+def observed_future_expiries(conn: ConnectionLike, on_date: date) -> list[dict]:
+    """
+    입력: DB 커넥션, 기준 날짜(보통 `local_now().date()`).
+    계산: `option_analysis_1m`에 **실제로 적재된** 만기 중 `on_date` 이후(당일 포함)인 것을
+         만기일 순으로 돌려준다. 각 건에 관측 근거를 함께 싣는다 —
+         `rows`(적재 행수), `first_seen`/`last_seen`(관측 구간), `lead_days`(만기까지 남은 일수).
+    해석: 2026-08-17 — `event_calendar.yaml`의 만기 항목을 사람이 **DB를 열어보고 옮겨 적고**
+         있었다. 그 노동이 08-14~08-17 나흘 만료의 실제 원인이다(매크로를 못 찾아서가 아니라
+         만기를 안 옮겨 적어서다).
+
+         **주기 규칙으로 만들지 않고 실측을 쓰는 이유**: 2026-08-18 만기는 **화요일**이다.
+         08-15 광복절이 토요일이라 08-17(월)이 대체공휴일이 되면서 위클리(월)가 하루 밀렸다.
+         "매주 월·목"이라는 규칙으로는 나오지 않는 날짜이고, 이 저장소는 같은 형태로 이미
+         다쳤다(`features/options_intel.py` — "위클리는 늘 먼슬리보다 가깝다"는 전제가
+         2026-08-11에 깨져 ATM IV가 분 단위로 교대했다). 공휴일 캘린더는 이 코드베이스에 없고,
+         만들지 않기로 한 결정이 여러 곳에 적혀 있다.
+
+         `rows`/`lead_days`를 함께 주는 것은 **위클리와 먼슬리를 이름 붙이는 판단을 사람에게
+         남기기 위해서다** — 실측으로 알 수 있는 것은 "언제 만기인가"이지 "그것이 먼슬리인가"가
+         아니다. 리드타임이 길고 행수가 많으면 먼슬리일 가능성이 높지만, 그것은 추정이다.
+    실패 조건: 미래 만기가 하나도 관측되지 않았으면 빈 리스트(체인 수집이 죽은 날일 수 있다 —
+              호출측이 "없다"와 "못 봤다"를 구분해 표시해야 한다).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT expiry,
+                   COUNT(*),
+                   MIN(timestamp)::date,
+                   MAX(timestamp)::date
+            FROM option_analysis_1m
+            WHERE expiry >= %s
+            GROUP BY expiry
+            ORDER BY expiry
+            """,
+            (on_date,),
+        )
+        return [
+            {
+                "expiry": expiry,
+                "rows": int(rows),
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+                "lead_days": (expiry - first_seen).days,
+            }
+            for expiry, rows, first_seen, last_seen in cur.fetchall()
+        ]
+
+
 def latest_option_chain(conn: ConnectionLike, underlying: str) -> list[dict]:
     """
     계산: 지금(`local_now()`) 기준 체인 스냅샷 — 상세 규칙은 `_chain_snapshot()` 참고.

@@ -101,6 +101,54 @@ def coverage_gap_days(calendar: dict | None, today: date) -> int | None:
     return max(0, (today - covered_through).days)
 
 
+# 만기 항목의 시각 — 종가 단일가 시작(`dashboard/data_source.py:_CLOSING_AUCTION_START`)이자
+# 만기 Pinning(v6 §A3)이 가장 강해지는 구간의 시작점. 기존 3건이 쓰던 값과 같다.
+EXPIRY_EVENT_TIME = "15:35"
+
+_WEEKDAY_KO = ("월", "화", "수", "목", "금", "토", "일")
+
+
+def render_expiry_events(observed: list[dict], existing_calendar: dict | None = None) -> list[str]:
+    """
+    입력: `db.observed_future_expiries()`가 돌려준 목록, (선택) 현재 캘린더 dict.
+    계산: `event_calendar.yaml`에 그대로 붙여넣을 YAML 블록을 줄 목록으로 만든다.
+         이미 같은 `when`이 등록된 만기는 **건너뛴다**(중복 제안 금지).
+    해석: 2026-08-17 — 이 함수가 자동화하는 것은 **선언이 아니라 옮겨 적기**다.
+         `covered_through`는 여기서 만들지 않는다. 그 값은 만기만이 아니라 **매크로를 포함한
+         이벤트 전체의 완전성**을 사람이 선언하는 자리이고, 기계가 대신 말하는 순간 이 파일이
+         존재하는 유일한 이유가 사라진다(2026-08-05 9차 결정: 만기만 자동 배선하면 "이벤트
+         근접도가 배선됐다"는 **커버리지 착시**가 생긴다 — FOMC는 여전히 안 걸리는데 표에는
+         값이 찍힌다).
+
+         이름은 "옵션 만기(<요일>)"로만 붙인다. 실측으로 아는 것은 **언제 만기인가**이지
+         **그것이 먼슬리인가**가 아니다 — 판단 재료(`rows`/`lead_days`)를 주석으로 함께 인쇄해
+         사람이 고쳐 쓰게 한다.
+    실패 조건: 없음 — 새로 제안할 만기가 없으면 빈 목록.
+    """
+    existing_whens = set()
+    for entry in (existing_calendar or {}).get("events") or []:
+        if isinstance(entry, dict):
+            when = _parse_when(entry.get("when"))
+            if when is not None:
+                existing_whens.add(when)
+
+    lines: list[str] = []
+    for item in observed:
+        expiry = item["expiry"]
+        when_str = f"{expiry:%Y-%m-%d} {EXPIRY_EVENT_TIME}"
+        if _parse_when(when_str) in existing_whens:
+            continue
+        weekday = _WEEKDAY_KO[expiry.weekday()]
+        lines.append(
+            f"  # 실측 {item['rows']:,}행 / 관측 {item['first_seen']}~{item['last_seen']}"
+            f" / 리드 {item['lead_days']}일 — 먼슬리 여부는 사람이 판단해 이름을 고칠 것"
+        )
+        lines.append(f'  - when: "{when_str}"')
+        lines.append(f'    name: "옵션 만기({weekday})"')
+        lines.append('    kind: "expiry"')
+    return lines
+
+
 def minutes_to_next_event(now: datetime, calendar: dict | None) -> EventProximity:
     """
     입력: 현재 시각(`db.local_now()`와 같은 naive 로컬 기준), `event_calendar.yaml` 원본 dict.
