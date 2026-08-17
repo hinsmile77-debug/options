@@ -8,8 +8,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
+
+from mahdi.engines.regime import RegimeLabel
+
+logger = logging.getLogger("mahdi.execution.exit_stack")
 
 
 class ExitLayer(str, Enum):
@@ -21,6 +26,94 @@ class ExitLayer(str, Enum):
     FORCED_FLAT = "forced_flat_15_10"
 
 
+# ===== 2026-08-17 — RegimeLabel 8종 -> exit_rules 키 매핑 =====
+#
+# **이 매핑이 없어서 생긴 일**: `PositionState.regime`은 `exit_rules`의 키 문자열인데,
+# 8종 `RegimeLabel`을 그 문자열로 옮기는 함수가 **어디에도 없었다.** 유일한 호출부인
+# 백테스트는 `_DEFAULT_REGIME_FOR_EXIT_RULES = "TREND_STRONG"`을 전 포지션에 박아 넣었고,
+# 라이브는 `ExecutionEngine` 자체가 미배선이라 아무도 이 빈칸을 밟지 않았다.
+#
+# 빈칸의 대가는 `check_time_stop()`이 미정의 키에 **조용히 False**를 돌려주는 것이다 —
+# 예외도 경고도 없이 "타임스톱 없음"이 된다. 실측 레짐 이력(2026-08-17 DB 전수):
+#
+#     RANGE_BREAK_PREP    414분 (28.3%)   -> RANGE_TIGHT     (정의됨)
+#     VOL_COMPRESSION   1,047분 (71.7%)   -> VOL_COMPRESSION (**미정의**)
+#     TREND_UP/DOWN         0분           -> 백테스트가 하드코딩하던 그 키다
+#
+# 즉 학습된 레짐이 나온 분의 **71.7%가 청산 시간 규칙이 없는 레짐**이고, 백테스트가 쓰던
+# 키는 **한 번도 나온 적이 없다**. 배선 후 그 구간에서 열린 포지션은 15:10 강제청산까지
+# 시간 방어선이 없다.
+#
+# **여기서 미정의 레짐에 값을 지어내지 않는 이유**: v6 §13.5가 정의한 청산 파라미터는 4종
+# 뿐이다. 없는 값을 만들면 그 숫자가 곧 결론이 된다(08-05 스팟 괴리율에서 한 실수).
+# 대신 **조용한 False를 시끄러운 경고로 바꾼다** — 값을 정하는 것은 사람의 일이고,
+# 그 전까지 이 경고가 매번 남는 것이 설계 의도다.
+EXIT_RULES_KEY_BY_REGIME: dict[RegimeLabel, str] = {
+    RegimeLabel.TREND_UP_STRONG: "TREND_STRONG",
+    RegimeLabel.TREND_DOWN_STRONG: "TREND_STRONG",
+    RegimeLabel.RANGE_BALANCED: "RANGE_TIGHT",
+    RegimeLabel.RANGE_BREAK_PREP: "RANGE_TIGHT",
+    RegimeLabel.VOL_EXPANSION: "VOL_EXPANSION",
+    RegimeLabel.VOL_COMPRESSION: "VOL_COMPRESSION",
+    RegimeLabel.LIQUIDITY_THIN: "LIQUIDITY_THIN",
+    RegimeLabel.CRISIS_DEFENSE: "CRISIS_DEFENSE",
+}
+
+_EXPIRY_DAY_KEY = "EXPIRY_DAY_0DTE"
+
+
+def exit_rules_key(regime: RegimeLabel | int, *, is_expiry_day: bool = False) -> str:
+    """
+    입력: `RegimeLabel`(또는 그 정수값), 오늘이 만기 당일인지 여부.
+    계산: 만기 당일이면 레짐과 무관하게 `EXPIRY_DAY_0DTE`를 돌려준다 — v6 §11.4가 0DTE를
+         "만기 당일 전용 **별도 파라미터 세트**"로 정의했기 때문이다(감마 폭발 구간에서
+         평시 레짐 파라미터를 쓰는 것이 위험의 본체다). 그 외에는 8종 매핑을 따른다.
+    해석: 반환값이 `exit_rules`에 없을 수 있다 — 그 판정은 `resolve_exit_params()`가 한다.
+    실패 조건: RegimeLabel로 변환되지 않는 값이면 ValueError(모르는 레짐을 조용히
+         TREND_STRONG으로 흘려보내면 이 함수를 만든 이유가 사라진다).
+    """
+    if is_expiry_day:
+        return _EXPIRY_DAY_KEY
+    return EXIT_RULES_KEY_BY_REGIME[RegimeLabel(int(regime))]
+
+
+@dataclass(frozen=True, slots=True)
+class ExitParams:
+    """`exit_rules`의 한 레짐 행 — `defined=False`면 그 레짐 행이 설정에 아예 없다."""
+
+    key: str
+    time_stop: float | None = None
+    stop: float | None = None
+    defined: bool = True
+
+
+# 미정의 키 경고는 키당 1회만 — 매분 호출되는 경로라 로그가 잠긴다(`RegimeEngine.predict`의
+# 길이 1 경고와 같은 이유).
+_warned_missing_keys: set[str] = set()
+
+
+def resolve_exit_params(regime_key: str, exit_rules_cfg: dict) -> ExitParams:
+    """
+    입력: `exit_rules` 키 문자열, 설정 dict.
+    계산: 해당 행을 찾아 `time_stop`/`stop`을 꺼낸다. 행이 없으면 `defined=False`로 표시하고
+         **키당 1회 경고**를 남긴다(종전에는 아무 신호 없이 타임스톱만 사라졌다).
+    해석: `defined=False`는 "그 레짐의 청산 규칙을 우리가 아직 정하지 않았다"는 뜻이지
+         "규칙이 없어도 된다"가 아니다. 호출측은 이 값을 화면/리포트에 노출해야 한다.
+    실패 조건: 없음 — 예외를 던지지 않는다. 라이브 청산 경로에서 예외는 포지션을 방치한다.
+    """
+    row = exit_rules_cfg.get(regime_key)
+    if row is None:
+        if regime_key not in _warned_missing_keys:
+            _warned_missing_keys.add(regime_key)
+            logger.warning(
+                "exit_rules에 '%s' 행이 없다 — 이 레짐의 포지션은 타임스톱·레짐 손절이 "
+                "걸리지 않고 15:10 강제청산까지 간다. 값을 정하거나 이 레짐의 진입을 막을 것.",
+                regime_key,
+            )
+        return ExitParams(key=regime_key, defined=False)
+    return ExitParams(key=regime_key, time_stop=row.get("time_stop"), stop=row.get("stop"))
+
+
 @dataclass(frozen=True, slots=True)
 class PositionState:
     symbol: str
@@ -29,7 +122,7 @@ class PositionState:
     current_price: float
     entry_time_minutes: float  # 세션 시작 기준 경과 분 — 호출측이 계산해 전달
     now_minutes: float
-    regime: str  # exit_rules 키(TREND_STRONG/RANGE_TIGHT/VOL_EXPANSION/EXPIRY_DAY_0DTE)
+    regime: str  # exit_rules 키 — `exit_rules_key()`로 RegimeLabel에서 변환해 넣을 것
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +166,23 @@ def _pnl_pct(side: str, entry_price: float, current_price: float) -> float:
 def check_hard_stop(position: PositionState, hard_stop_pct: float) -> bool:
     """계산: 손익률(_pnl_pct)이 hard_stop_pct(음수, 예: -0.02) 이하면 True."""
     return _pnl_pct(position.side, position.entry_price, position.current_price) <= hard_stop_pct
+
+
+def effective_stop_pct(params: ExitParams, hard_stop_pct: float) -> float:
+    """
+    입력: 해당 레짐의 `ExitParams`, 절대 손실 한도(`hard_stop_pct`, 음수).
+    계산: 레짐 손절이 정의돼 있으면 **둘 중 더 타이트한 쪽**(둘 다 음수이므로 max)을 쓴다.
+    해석: v6 §13.3 레이어 1은 "절대 허용 손실 한도(−1~2%)"이고, §13.5의 레짐별 `stop`은
+         그보다 **먼저 걸리는 전술적 손절**이다(레인지 −0.8% < 절대한도 −2%). 둘을 별개
+         레이어로 늘리지 않고 한 지점에서 합치는 이유: 레이어를 늘리면 §13.3 표가 6-Layer가
+         아니게 되고 `gate_exit()`의 자동/승인 분류에 이름을 하나 더 정해야 한다 — 그것은
+         스펙 변경이라 이 증분의 범위 밖이다. **더 타이트한 쪽을 쓰면 절대 한도는 결코
+         느슨해지지 않는다**(안전 방향으로만 움직인다).
+    실패 조건: 없음 — 레짐 손절이 없으면 `hard_stop_pct`를 그대로 돌려준다(종전 동작).
+    """
+    if params.stop is None:
+        return hard_stop_pct
+    return max(hard_stop_pct, float(params.stop))
 
 
 def check_structure_stop(position: PositionState, market: MarketStructureState) -> bool:
@@ -133,11 +243,16 @@ def reevaluate_position(belief: BeliefState) -> ExitDecision:
 
 
 def check_time_stop(position: PositionState, exit_rules_cfg: dict) -> bool:
-    """계산: 레짐별 exit_rules.time_stop(분)을 경과 보유 시간과 비교. 미설정 레짐은 항상 False."""
-    time_stop = exit_rules_cfg.get(position.regime, {}).get("time_stop")
-    if time_stop is None:
+    """
+    계산: 레짐별 exit_rules.time_stop(분)을 경과 보유 시간과 비교.
+    해석: 미설정 레짐은 여전히 False지만, 이제 `resolve_exit_params()`가 **경고를 남긴다** —
+         종전에는 이 경로가 완전히 조용해서 "타임스톱이 안 걸린다"는 사실이 아무 데도
+         나타나지 않았다.
+    """
+    params = resolve_exit_params(position.regime, exit_rules_cfg)
+    if params.time_stop is None:
         return False
-    return (position.now_minutes - position.entry_time_minutes) >= time_stop
+    return (position.now_minutes - position.entry_time_minutes) >= params.time_stop
 
 
 def evaluate_exit_stack(
@@ -158,8 +273,13 @@ def evaluate_exit_stack(
     """
     if market.is_forced_flat_time:
         return ExitDecision(triggered_layer=ExitLayer.FORCED_FLAT, action="FULL_EXIT", reason="15:10 강제청산")
-    if check_hard_stop(position, hard_stop_pct):
-        return ExitDecision(triggered_layer=ExitLayer.HARD_STOP, action="FULL_EXIT", reason="hard_stop_pct 이탈")
+
+    # 2026-08-17 — 레짐별 손절(§13.5)을 레이어 1에 합류시킨다. 자세한 근거는 `effective_stop_pct()`.
+    params = resolve_exit_params(position.regime, exit_rules_cfg)
+    stop_pct = effective_stop_pct(params, hard_stop_pct)
+    if check_hard_stop(position, stop_pct):
+        reason = f"레짐 손절 {stop_pct:.3%} 이탈({params.key})" if params.stop is not None else "hard_stop_pct 이탈"
+        return ExitDecision(triggered_layer=ExitLayer.HARD_STOP, action="FULL_EXIT", reason=reason)
     if check_structure_stop(position, market):
         return ExitDecision(triggered_layer=ExitLayer.STRUCTURE_STOP, action="FULL_EXIT", reason="구조적 붕괴")
     if check_flow_stop(market):

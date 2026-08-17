@@ -1,10 +1,17 @@
+import pytest
+
+from mahdi.engines.regime import RegimeLabel
 from mahdi.execution.exit_stack import (
     BeliefState,
     ExitLayer,
+    ExitParams,
     MarketStructureState,
     PositionState,
+    effective_stop_pct,
     evaluate_exit_stack,
+    exit_rules_key,
     reevaluate_position,
+    resolve_exit_params,
 )
 
 _EXIT_RULES = {
@@ -97,3 +104,59 @@ def test_reevaluate_position_negative_ev_counts_as_one_degradation():
         BeliefState(win_probability=0.1, avg_win=1.0, avg_loss=5.0, regime_degraded=True)
     )
     assert decision.action == "PARTIAL_EXIT_50"
+
+
+# ===== 2026-08-17 — 레짐 -> exit_rules 키 매핑(A) / 레짐별 손절(B) =====
+
+
+def test_every_regime_label_maps_to_an_exit_rules_key():
+    """8종 전부 매핑돼야 한다 — 빠진 레짐은 조용히 타임스톱 없는 포지션이 된다."""
+    for label in RegimeLabel:
+        assert exit_rules_key(label)
+
+
+def test_expiry_day_overrides_regime_mapping():
+    """만기 당일은 레짐과 무관하게 0DTE 전용 세트(v6 §11.4)."""
+    assert exit_rules_key(RegimeLabel.VOL_COMPRESSION, is_expiry_day=True) == "EXPIRY_DAY_0DTE"
+    assert exit_rules_key(RegimeLabel.TREND_UP_STRONG, is_expiry_day=True) == "EXPIRY_DAY_0DTE"
+
+
+def test_trend_up_and_down_share_one_exit_rules_row():
+    assert exit_rules_key(RegimeLabel.TREND_UP_STRONG) == exit_rules_key(RegimeLabel.TREND_DOWN_STRONG)
+
+
+def test_unknown_regime_value_raises_instead_of_defaulting():
+    with pytest.raises(ValueError):
+        exit_rules_key(99)
+
+
+def test_missing_exit_rules_row_is_reported_not_silent():
+    """설정에 행이 없으면 defined=False — 종전에는 아무 표시 없이 타임스톱만 사라졌다."""
+    params = resolve_exit_params("VOL_COMPRESSION", _EXIT_RULES)
+    assert params.defined is False
+    assert params.time_stop is None
+
+
+def test_regime_stop_binds_before_absolute_hard_stop():
+    """레짐 손절(-0.8%)이 절대한도(-2%)보다 타이트하면 그쪽이 먼저 문다."""
+    assert effective_stop_pct(ExitParams(key="RANGE_TIGHT", stop=-0.008), -0.02) == pytest.approx(-0.008)
+
+
+def test_regime_stop_never_loosens_the_absolute_limit():
+    """레짐 손절이 절대한도보다 느슨해도 한도는 유지된다(안전 방향으로만 움직인다)."""
+    assert effective_stop_pct(ExitParams(key="X", stop=-0.05), -0.02) == pytest.approx(-0.02)
+
+
+def test_regime_stop_triggers_hard_stop_layer_with_regime_reason():
+    cfg = {"RANGE_TIGHT": {"stop": -0.008, "time_stop": 30}}
+    position = _position(regime="RANGE_TIGHT", entry_price=100.0, current_price=99.0)  # -1%
+    decision = evaluate_exit_stack(position, MarketStructureState(), _belief(), cfg)
+    assert decision.triggered_layer == ExitLayer.HARD_STOP
+    assert "RANGE_TIGHT" in (decision.reason or "")
+
+
+def test_regime_without_stop_keeps_previous_absolute_behaviour():
+    """`stop`이 없는 레짐은 종전과 바이트 단위로 같은 동작이어야 한다."""
+    position = _position(regime="TREND_STRONG", entry_price=100.0, current_price=99.0)  # -1%, -2% 미달
+    decision = evaluate_exit_stack(position, MarketStructureState(), _belief(), _EXIT_RULES)
+    assert decision.triggered_layer is None

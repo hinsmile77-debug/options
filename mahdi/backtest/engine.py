@@ -45,6 +45,14 @@ class BacktestStep:
     belief_state_if_open: BeliefState | None = None
     vrp: float = 0.0
     strategy_id: str = "backtest_strategy"
+    # 2026-08-17 — 이 봉 시점의 실제 레짐(`exit_rules` 키). None이면 종전대로
+    # `_DEFAULT_REGIME_FOR_EXIT_RULES`를 쓴다(기존 픽스처 하위호환).
+    #
+    # **이 필드가 없어서 생긴 왜곡**: 종전 백테스트는 전 포지션에 "TREND_STRONG"을 박았고,
+    # 그 키의 청산 파라미터는 `time_stop: 120` + 절대손절 −2%다. 실측 레짐 이력에서
+    # TREND_STRONG 계열은 **0분**이다 — 즉 지금까지의 백테스트는 한 번도 일어난 적 없는
+    # 레짐의 규칙으로 손익 분포를 재고 있었다.
+    exit_rules_regime: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +63,10 @@ class BacktestTrade:
     qty: int
     net_pnl: float
     exit_reason: str
+    # 2026-08-17 — 청산 분석에는 "얼마나 들고 있었나"와 "그때 어느 레짐이었나"가 필요하다.
+    # 종전에는 둘 다 없어서 `time_stop`이 실제로 무는지 사후에 확인할 방법이 없었다.
+    holding_minutes: float = 0.0
+    regime_at_exit: str = ""
 
 
 def _minutes_to_time(minutes: float) -> time:
@@ -125,13 +137,18 @@ class BacktestEngine:
                         current_price=step.bar.close,
                         entry_time_minutes=step.bar.timestamp_minutes,
                         now_minutes=step.bar.timestamp_minutes,
-                        regime=_DEFAULT_REGIME_FOR_EXIT_RULES,
+                        regime=step.exit_rules_regime or _DEFAULT_REGIME_FOR_EXIT_RULES,
                     )
                     open_order = None
 
             if open_position is not None:
+                # 레짐은 보유 중에도 바뀐다 — 매 봉의 값으로 갱신한다(진입 시점에 고정하면
+                # 압축에서 들어가 팽창으로 바뀐 포지션이 끝까지 압축 규칙으로 관리된다).
                 open_position = replace(
-                    open_position, current_price=step.bar.close, now_minutes=step.bar.timestamp_minutes
+                    open_position,
+                    current_price=step.bar.close,
+                    now_minutes=step.bar.timestamp_minutes,
+                    regime=step.exit_rules_regime or open_position.regime,
                 )
                 belief = step.belief_state_if_open or BeliefState(win_probability=0.5, avg_win=1.0, avg_loss=1.0)
                 decision, _gate = self._execution.evaluate_exit(
@@ -154,6 +171,8 @@ class BacktestEngine:
                             qty=1,
                             net_pnl=pnl,
                             exit_reason=decision.reason or "unknown",
+                            holding_minutes=open_position.now_minutes - open_position.entry_time_minutes,
+                            regime_at_exit=open_position.regime,
                         )
                     )
                     open_position = None
