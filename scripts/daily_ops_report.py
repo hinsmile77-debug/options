@@ -145,12 +145,27 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
         payload["db"] = db_metrics_result
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
+    # 2026-08-18 — 검증 캠페인은 **위 json을 쓴 뒤에** 평가한다. 캠페인의 유일한 입력이
+    # `auto/*_지표.json`이므로, 순서를 뒤집으면 **오늘치가 누적에서 빠진다** — 매일 하루씩
+    # 뒤처진 표본으로 판정하게 되고 그 사실은 어디에도 안 드러난다.
+    campaign_results = None
+    try:
+        from mahdi.ops import campaign as campaign_module
+
+        campaign_results = campaign_module.evaluate(
+            campaign_module.load(PROJECT_ROOT / "docs" / "동작점검" / "validation_campaign.yaml"),
+            campaign_module.load_daily_metrics(out_dir, until=target),
+        )
+    except Exception:
+        logger.warning("검증 캠페인 건너뜀", exc_info=True)
+
     md_path = out_dir / f"{target.isoformat()}_지표.md"
     md_path.write_text(
         report.render(
             metrics, previous=previous, db_metrics=db_metrics_result,
             hypotheses=hypothesis_results, history=history,
             levers=lever_state, watchdog=watchdog_result,
+            campaign=campaign_results,
         ),
         encoding="utf-8",
     )

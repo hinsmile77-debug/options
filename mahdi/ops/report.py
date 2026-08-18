@@ -160,7 +160,8 @@ def _section(title: str, builder: Callable[[], list[str]]) -> list[str]:
 
 def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None = None,
            hypotheses: list[dict] | None = None, history: list[dict] | None = None,
-           levers: dict | None = None, watchdog: dict | None = None) -> str:
+           levers: dict | None = None, watchdog: dict | None = None,
+           campaign: list[dict] | None = None) -> str:
     """
     입력: 오늘 로그 지표, (선택) 전일 지표, (선택) DB 지표, (선택) 가설 검정 결과,
          (선택) **직전 영업일들의 지표**(최신순, 2026-08-07 고도화#5).
@@ -184,6 +185,9 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     if hypotheses:
         lines += _section("0-1. 가설 검정 (구현 시점에 적어둔 예측 vs 오늘 실측)",
                           lambda: _render_hypotheses(hypotheses))
+    if campaign:
+        lines += _section("0-2. 검증 캠페인 (표본이 찰 때까지 판정하지 않는다)",
+                          lambda: _render_campaign(campaign))
     lines += _section("1. 한눈에 (전일 대비) — 인프라와 **판단 입력**을 같은 화면에",
                       lambda: _render_headline(metrics, previous, db_metrics))
     lines += _section("2. 시간대별 사이클/밀림 (전일 같은 시간대 대비)",
@@ -1863,6 +1867,52 @@ def _render_crosschecks(metrics: dict, db_metrics: dict | None) -> list[str]:
         "> 이 절은 **모순을 지적할 뿐 판정하지 않는다** — 어느 쪽이 틀렸는지는 사람이 정한다.",
         "",
     ]
+    return out
+
+
+_CAMPAIGN_ICONS = {
+    "표본 미달": "⏳",
+    "합격": "✅",
+    "불합격": "❌",
+    "관측": "👁",
+    "선행 대기": "⏸",
+    "경로 없음": "🚫",
+    "스키마 오류": "🚫",
+}
+
+
+def _render_campaign(rows: list[dict]) -> list[str]:
+    """
+    입력: `campaign.evaluate()` 결과.
+    계산: 채널별 판정·진행률·핵심 수치를 한 표로 낸다.
+    해석: **`표본 미달`은 실패가 아니다.** 그 행의 값은 「아직 모른다」이고, 진행률이 그것을
+         숫자로 말한다 — 이 절이 존재하는 이유가 그 구분이다(`hypotheses`는 「아직 모른다」와
+         「틀렸다」를 둘 다 `inconclusive`로 뭉갠다).
+         📌가 붙은 채널은 **주간회의에서 확정된 결정이 있다** — 판정과 결정은 별개이므로,
+         판정이 매일 바뀌어도 그 결정은 남는다.
+    실패 조건: 없음 — 빈 목록이면 안내 한 줄.
+    """
+    if not rows:
+        return ["열린 채널이 없다."]
+    out = [
+        "> 판정은 **매일 재계산**된다 — 「불합격이 계속 뜬다」가 「미조치」를 뜻하지 않는다.",
+        "> 📌는 확정된 결정이 있다는 뜻이고, 판정(verdict)과 결정(decision)은 별개다.",
+        "",
+        "| 채널 | 판정 | 진행 | 핵심 수치 |",
+        "|---|---|---|---|",
+    ]
+    for row in rows:
+        icon = _CAMPAIGN_ICONS.get(row.get("verdict", ""), "")
+        detail = row.get("detail") or "-"
+        if row.get("decision"):
+            detail += f"  📌 **{row['decision']}** ({row.get('decision_date', '?')})"
+        out.append(
+            f"| {row.get('id', '?')} | {icon} {row.get('verdict', '?')} "
+            f"| {row.get('progress') or '-'} | {detail} |"
+        )
+    unresolved = [r for r in rows if r.get("problems")]
+    if unresolved:
+        out += ["", "⚠ **스키마 오류가 있는 채널은 판정하지 않는다** — 고치기 전까지 표본도 안 쌓인다."]
     return out
 
 
