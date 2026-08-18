@@ -73,6 +73,8 @@ _OPTION_ANALYSIS_1M_COLUMNS = (
     "delta", "gamma", "theta", "vega", "vanna", "charm",
     "iv", "rv_5d", "vrp", "skew_25d", "gex", "oi", "oi_change",
     "volume", "spread_state",
+    # 마이그레이션 032 (2026-08-18) — 옵션 현재가(프리미엄). 필드명 확정 근거는 그 파일.
+    "price",
 )
 
 
@@ -1067,7 +1069,7 @@ _CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", 
 _CHAIN_SNAPSHOT_SQL = """
     SELECT DISTINCT ON (expiry, strike, option_type)
         strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d,
-        delta, volume, spread_state
+        delta, volume, spread_state, price
     FROM option_analysis_1m
     WHERE underlying=%s
       AND timestamp <= %s
@@ -1154,10 +1156,14 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
             "delta": float(delta) if delta is not None else None,
             "volume": int(volume) if volume is not None else None,
             "spread_state": int(spread_state) if spread_state is not None else None,
+            # 2026-08-18 마이그레이션 032 — Passive-first 지정가의 기준가. **None을 보존한다**:
+            # 「그 분에 가격을 못 읽었다」와 「심외가라 0이다」는 다른 사실이고, 후자로 오인하면
+            # 지정가가 0 근처에서 만들어진다.
+            "price": float(price) if price is not None else None,
         }
         for (
             strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d,
-            delta, volume, spread_state,
+            delta, volume, spread_state, price,
         ) in rows
     ]
 
@@ -1739,6 +1745,27 @@ _ACCOUNT_BALANCE_SNAPSHOT_COLUMNS = (
 _ACCOUNT_BALANCE_SNAPSHOT_DECIMAL_COLUMNS = (
     "prsm_dpast", "evlu_pfls_amt_smtl", "trad_pfls_amt_smtl", "dnca_cash", "ord_psbl_cash", "mgna_tota",
 )
+# 2026-08-18 — **NULL 정수 컬럼이 `int` 필드로 새어 들어가 판단 4분을 통째로 날렸다.**
+#
+# `BalanceSnapshot.unknown_side_count`는 `int = 0`으로 선언돼 있지만, DB 행에 NULL이 들어 있으면
+# `BalanceSnapshot(**row)`가 그 기본값을 **덮어쓴다** — 기본값은 키가 없을 때만 쓰인다.
+# 그 뒤 `same_direction_positions()`의 `matched + unknown_side_count`가 TypeError를 내고,
+# 그 예외는 Signal Fusion 사이클 전체를 접는다: **REJECT 행조차 안 남는다.**
+#
+# 08-18 07:31~07:34 실측 4분이 그렇게 사라졌다. 원인은 마이그레이션 030(08-16)이 이 컬럼을
+# nullable로 추가한 뒤 **08-15~08-17 사흘 휴장**이 겹쳐, 오늘 첫 잔고 스냅샷이 쌓이기 전까지
+# `latest_account_balance_snapshot()`이 08-14 행(NULL)을 돌려줬기 때문이다.
+#
+# NULL을 0으로 읽는 것이 옳은 이유: 그 행은 **030 이전에 쓰인 행**이고, 030 이전 코드는 이
+# 값을 아예 더하지 않았다(= 0을 더한 것과 같다). `same_direction_positions()` 주석이 적어 둔
+# *"정상 운영에서 0이므로 평시 동작은 종전과 완전히 같다"* 를 구버전 행에도 그대로 적용한다.
+# `db_metrics`가 이미 같은 판단을 SQL에서 하고 있다(`coalesce(max(unknown_side_count), 0)`).
+#
+# **이 함수에 두는 이유**는 2026-07-28에 이 함수가 생긴 이유와 같다 — DB 표현이 파이썬 타입으로
+# 넘어오는 경계는 여기 하나뿐이고, 소비자마다 방어하면 다음 컬럼에서 또 뚫린다.
+_ACCOUNT_BALANCE_SNAPSHOT_COUNT_COLUMNS = (
+    "same_direction_buy_count", "same_direction_sell_count", "unknown_side_count",
+)
 
 
 def _account_balance_snapshot_row_to_dict(row: tuple) -> dict:
@@ -1749,6 +1776,10 @@ def _account_balance_snapshot_row_to_dict(row: tuple) -> dict:
     for col in _ACCOUNT_BALANCE_SNAPSHOT_DECIMAL_COLUMNS:
         if values[col] is not None:
             values[col] = float(values[col])
+    # 2026-08-18 — 정수 카운트의 NULL은 0으로 읽는다. 근거는 위 상수 주석.
+    for col in _ACCOUNT_BALANCE_SNAPSHOT_COUNT_COLUMNS:
+        if values.get(col) is None:
+            values[col] = 0
     return values
 
 

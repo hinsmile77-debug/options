@@ -495,7 +495,7 @@ def test_latest_expiry_liquidity_maps_rows_to_dicts():
 def test_latest_option_chain_maps_rows_to_dicts():
     rows = [
         (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72,
-         0.51, 120, 1)
+         0.51, 120, 1, 7.25)
     ]
     conn = FakeReadConnection(rows)
 
@@ -516,6 +516,7 @@ def test_latest_option_chain_maps_rows_to_dicts():
             "delta": 0.51,
             "volume": 120,
             "spread_state": 1,
+            "price": 7.25,
         }
     ]
 
@@ -526,7 +527,7 @@ def test_latest_option_chain_keeps_missing_rv_as_none_not_zero():
     # 그 분은 항상 극단적 고평가로 판정된다(08-05 위클리 두 북이 실제로 rv_5d=0이었다).
     rows = [
         (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), None,
-         0.51, 120, 1)
+         0.51, 120, 1, 7.25)
     ]
 
     chain = db.latest_option_chain(FakeReadConnection(rows), "KOSPI200")
@@ -627,7 +628,7 @@ def test_market_bars_between_empty_range_is_empty():
 def test_option_chain_as_of_matches_latest_option_chain_shape():
     rows = [
         (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72,
-         0.51, 120, 1)
+         0.51, 120, 1, 7.25)
     ]
     conn = FakeReadConnection(rows)
 
@@ -637,7 +638,7 @@ def test_option_chain_as_of_matches_latest_option_chain_shape():
         {
             "strike": 1340.0, "option_type": "C", "oi": 363.0, "iv": 0.9, "gamma": 0.0047,
             "gex": 123.4, "expiry": date(2026, 7, 9), "timestamp": datetime(2026, 7, 6, 9, 31),
-            "rv_5d": 0.72, "delta": 0.51, "volume": 120, "spread_state": 1,
+            "rv_5d": 0.72, "delta": 0.51, "volume": 120, "spread_state": 1, "price": 7.25,
         }
     ]
     assert "timestamp <= %s" in conn.store["query"]
@@ -670,7 +671,7 @@ def test_chain_snapshot_bounds_freshness_and_expiry():
 
 def _chain_row(strike, option_type, expiry, ts):
     """`_CHAIN_SNAPSHOT_SQL` 컬럼 순서 그대로의 한 행 — 창 자르기 테스트에서 값은 무관하다."""
-    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15, 0.5, 10, 1)
+    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15, 0.5, 10, 1, 7.25)
 
 
 def test_chain_snapshot_drops_strikes_outside_the_latest_cycle_window():
@@ -1422,6 +1423,48 @@ def test_positions_as_of_is_empty_when_nothing_was_ever_snapshotted():
 def test_account_balance_snapshot_columns_include_the_unknown_side_count():
     """마이그레이션 030이 015에 더한 컬럼 — 이 값이 0이 아닌 날은 방향 카운트를 신뢰할 수 없다."""
     assert "unknown_side_count" in db._ACCOUNT_BALANCE_SNAPSHOT_COLUMNS
+
+
+# --- 2026-08-18 — NULL 정수 컬럼이 판단 4분을 통째로 날렸다 --------------------------------
+#
+# 마이그레이션 030(08-16)이 `unknown_side_count`를 nullable로 추가했고, 08-15~08-17 사흘
+# 휴장이 겹쳐 08-18 07:31~07:34에 `latest_account_balance_snapshot()`이 08-14 행(NULL)을
+# 돌려줬다. `BalanceSnapshot(**row)`가 dataclass 기본값 0을 **덮어쓰고**,
+# `same_direction_positions()`가 `int + None`으로 터지고, 그 예외가 Signal Fusion 사이클
+# 전체를 접었다 — **REJECT 행조차 안 남았다.**
+
+
+def _snapshot_row(unknown=None, buy=1, sell=0):
+    """`_ACCOUNT_BALANCE_SNAPSHOT_COLUMNS` 순서 그대로의 한 행."""
+    return (
+        datetime(2026, 8, 14, 15, 44), 110.0, 10.0, 0.0, 100.0, 90.0, 5.0, buy, sell, unknown,
+    )
+
+
+def test_a_null_count_column_never_reaches_python_as_none():
+    """DB 표현이 파이썬 타입으로 넘어오는 경계는 이 함수 하나뿐이다 — 여기서 막는다."""
+    values = db._account_balance_snapshot_row_to_dict(_snapshot_row(unknown=None))
+
+    assert values["unknown_side_count"] == 0
+    assert all(values[c] is not None for c in db._ACCOUNT_BALANCE_SNAPSHOT_COUNT_COLUMNS)
+
+
+def test_a_measured_zero_and_a_null_are_indistinguishable_here_on_purpose():
+    """030 이전 행은 이 값을 아예 안 더했다 — NULL을 0으로 읽는 것이 그 동작의 복원이다."""
+    assert db._account_balance_snapshot_row_to_dict(_snapshot_row(unknown=None))["unknown_side_count"] == 0
+    assert db._account_balance_snapshot_row_to_dict(_snapshot_row(unknown=0))["unknown_side_count"] == 0
+    assert db._account_balance_snapshot_row_to_dict(_snapshot_row(unknown=3))["unknown_side_count"] == 3
+
+
+def test_the_08_18_crash_no_longer_reproduces_end_to_end():
+    """08-18 07:34 실측 크래시의 재현 경로 — 로드 -> BalanceSnapshot -> 동일방향 카운트."""
+    from mahdi.execution.account_tracker import BalanceSnapshot, same_direction_positions
+
+    row = db._account_balance_snapshot_row_to_dict(_snapshot_row(unknown=None))
+    snapshot = BalanceSnapshot(**row)
+
+    assert same_direction_positions(snapshot, "BUY") == 1  # 종전에는 TypeError였다
+    assert same_direction_positions(snapshot, "SELL") == 0
 
 
 # ===== 2026-08-16 (Block C) — execution_logs 적재 =====

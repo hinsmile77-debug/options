@@ -1745,6 +1745,40 @@ def _log_option_quote_fields_once(output1: dict) -> None:
     )
 
 
+def _optional_price(raw) -> float | None:
+    """계산: 숫자로 읽히면 float, 아니면 None. 실패 조건: 없음(없는 값은 없다고 쓴다)."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# 가격 필드를 잘못 짚었는지 **첫 사이클에 시끄럽게** 드러내는 가드.
+#
+# `futs_prpr`가 (실측과 달리) 기초자산·선물 수준을 담고 있다면 그 값은 스팟과 거의 같아진다
+# (프리미엄이라면 ATM 근처에서 스팟의 몇 %에 불과하다). 우리가 구독하는 것은 ATM±N뿐이라
+# 심외가 착시도 없다. 임계 0.9는 «프리미엄이 지수의 90%»라는 불가능한 영역이다.
+#
+# 이 가드를 두는 이유: 잘못된 필드를 조용히 넣으면 그 값이 나중에 **지정가**가 된다.
+# 08-17까지 우리가 반복해 다친 형태(문서와 실측이 다른데 아무도 안 봤다)를 여기서 끊는다.
+_PRICE_LOOKS_LIKE_UNDERLYING_RATIO = 0.9
+_price_field_warned = False
+
+
+def _warn_if_price_looks_like_underlying(price: float | None, spot: float) -> None:
+    global _price_field_warned
+    if _price_field_warned or price is None or spot <= 0:
+        return
+    if price >= spot * _PRICE_LOOKS_LIKE_UNDERLYING_RATIO:
+        _price_field_warned = True
+        logger.warning(
+            "옵션 가격 필드 의심 — price=%s가 기초자산(%s)의 %.0f%% 이상이다. "
+            "`futs_prpr`가 프리미엄이 아니라 선물/지수 수준일 수 있다(마이그레이션 032 근거 재확인 필요). "
+            "이 값은 Passive-first 지정가의 기준가로 쓰인다.",
+            price, spot, _PRICE_LOOKS_LIKE_UNDERLYING_RATIO * 100,
+        )
+
+
 def _parse_option_quote(
     resp: dict, strike: float, option_type: str, poll_time: datetime
 ) -> tuple[dict, float] | None:
@@ -1794,6 +1828,16 @@ def _parse_option_quote(
             "oi_change": int(float(output1["otst_stpl_qty_icdc"])),
             "volume": int(float(output1["acml_vol"])),
             "spread_state": None,
+            # 2026-08-18 마이그레이션 032 — **그 옵션의 현재가(프리미엄).**
+            #
+            # 필드명은 08-18 07:31 실측으로 확정했다(응답에 `optn_prpr`는 없다 — 공식 문서에는
+            # 있지만 그것은 다른 TR의 스키마다). `futs_` 접두어가 «선물의 값»이 아니라는 증거는
+            # 바로 위 `futs_last_tr_date`다 — 그 값을 이 옵션의 만기로 쓰고 있고, 실측에서
+            # 08-18/08-20/09-10 세 만기로 정확히 갈린다(선물이라면 전 행이 09-10이다).
+            #
+            # **`.get()`으로 읽는다** — 없으면 그 레그의 그릭스까지 통째로 버리는 대신 가격만
+            # 비운다. GEX/감마플립은 가격 없이도 성립하고, 이 값이 필요한 것은 진입 계획뿐이다.
+            "price": _optional_price(output1.get("futs_prpr")),
             # DB 컬럼이 아닌 진단용 필드 — _upsert()는 _OPTION_ANALYSIS_1M_COLUMNS에 있는
             # 키만 읽으므로 여기 얹어도 INSERT 쿼리에 섞이지 않는다. 2026-07-16 점검에서
             # 특정 행사가의 IV 등이 DECIMAL(8,6) 범위를 넘어 삽입이 실패하는데 원인(실제 raw
@@ -1801,6 +1845,7 @@ def _parse_option_quote(
             # 수 있게 파싱 이전 output1을 함께 들고 다닌다.
             "_raw_kis_output1": output1,
         }
+        _warn_if_price_looks_like_underlying(row["price"], spot)
         return row, spot
     except (KeyError, ValueError, TypeError):
         return None
@@ -3738,14 +3783,14 @@ _SELECTION_NO_ENTRY_STRATEGY = "no_entry_strategy"
 # 기록만 거짓이 되고 체결은 여전히 0건이다.
 _ORDER_PATH_WIRED = False
 
-# `EntryContext.reference_price`를 채울 옵션 가격이 **수집되지 않는다.**
-# `option_analysis_1m`에는 가격 컬럼 자체가 없다(그릭스·IV·OI·거래량만 있다). Passive-first
-# 지정가는 기준가에서 틱을 빼서 만드는 것이므로, 가격 없이는 진입 계획을 만들 수 없다.
+# 2026-08-18 — 마이그레이션 032로 `option_analysis_1m.price`가 생겨 이 제약이 **풀렸다.**
+# 종전에는 가격 컬럼 자체가 없어 `EntryContext.reference_price`를 채울 수 없었고, 그것이
+# CONFIRM 승격의 하드 전제였다.
 #
-# ADVISORY에서는 `gate_entry()`가 ADVISORY_ONLY를 돌려줘 `build_entry_plan()`이 아예 안 불리므로
-# 지금은 무해하다. **CONFIRM 승격의 하드 전제**이고, 그 사실을 매 판단에 사유로 남긴다 —
-# 승격일에 "왜 지정가가 안 나오지"를 처음 발견하지 않기 위해서다.
-_ENTRY_PLAN_BLOCKED_NO_PRICE = "option_price_not_collected"
+# 다만 «컬럼이 생겼다»와 «그 분에 값이 있다»는 다르다. 체인 폴링이 그 레그를 놓친 분에는
+# 여전히 가격이 비고, 그때는 지정가를 지어내지 않고 사유를 남긴다 — 0.0을 기준가로 쓰면
+# 그 순간부터 이 기록은 허구가 되고, 모드를 올린 날 그 허구가 주문이 된다.
+_ENTRY_PLAN_BLOCKED_NO_PRICE = "option_price_missing_this_minute"
 
 
 def _shadow_execution_outcome(
@@ -3786,6 +3831,8 @@ def _shadow_execution_outcome(
         }
 
     leg = candidates[0]["legs"][0]
+    # 2026-08-18 — 기준가는 그 레그의 **실제 프리미엄**이다(마이그레이션 032).
+    reference_price = leg.get("price")
     request = EntryRequest(
         entry_context=EntryContext(
             # 단축코드를 못 찾았으면 행사가 라벨을 대신 싣는다 — **주문에 쓰이는 값이 아니고**
@@ -3794,9 +3841,9 @@ def _shadow_execution_outcome(
             symbol=leg.get("symbol") or f"{leg['option_type']}{leg['strike']:g}",
             side=side,
             qty=max(approved_contracts, 0),
-            # 옵션 가격이 없다(`_ENTRY_PLAN_BLOCKED_NO_PRICE`). 0.0은 «가격이 0»이 아니라
-            # «안 쓴다»는 뜻이고, ADVISORY에서 이 값을 읽는 경로가 실제로 없다.
-            reference_price=0.0,
+            # 값이 없는 분에는 0.0을 넣되, 그 사실을 `entry_plan_blocked_by`가 말한다 —
+            # ADVISORY에서는 `build_entry_plan()`이 안 불리므로 읽히지 않는 값이다.
+            reference_price=reference_price if reference_price is not None else 0.0,
             now=now.time(),
         ),
         sizing_input=sizing_input,
@@ -3821,7 +3868,9 @@ def _shadow_execution_outcome(
             "limit_price": outcome.entry_plan.limit_price,
             "urgency": outcome.entry_plan.urgency,
         },
-        "entry_plan_blocked_by": _ENTRY_PLAN_BLOCKED_NO_PRICE,
+        "reference_price": reference_price,
+        # 가격이 있는 분에는 None — 즉 이 키가 채워져 있으면 그 분은 지정가를 못 만든다.
+        "entry_plan_blocked_by": None if reference_price is not None else _ENTRY_PLAN_BLOCKED_NO_PRICE,
         # **주문은 나가지 않았다.** 이 파일에 `order_manager.submit()` 호출부가 없다.
         "order_submitted": False,
         "mode": mode.value,

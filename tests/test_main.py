@@ -3576,6 +3576,74 @@ def test_poll_signal_fusion_cycle_marks_entry_when_strong_aligned_signal(monkeyp
     assert risk_gate_state["direction"] > 0
 
 
+# --- 2026-08-18 마이그레이션 032 — 옵션 가격 필드 -------------------------------------------
+#
+# 필드명(`futs_prpr`)은 08-18 07:31 실측 키 목록으로 확정했다. 공식 문서에는 `optn_prpr`가
+# 있지만 우리 TR 응답에는 없다 — 문서와 실측이 갈리면 실측을 따른다.
+
+
+def test_a_missing_price_field_empties_only_the_price_not_the_whole_leg():
+    """가격이 없다고 그릭스까지 버리면 GEX가 죽는다 — 가격이 필요한 것은 진입 계획뿐이다."""
+    from mahdi.main import _parse_option_quote
+
+    resp = {
+        "output1": {
+            "futs_last_tr_date": "20260820", "gama": "0.02", "hts_ints_vltl": "18.0",
+            "hist_vltl": "16.0", "hts_otst_stpl_qty": "100", "delta_val": "0.5",
+            "theta": "-100.0", "vega": "1.0", "otst_stpl_qty_icdc": "0", "acml_vol": "10",
+        },
+        "output3": {"bstp_nmix_prpr": "1089.6"},
+    }
+    row, spot = _parse_option_quote(resp, 1090.0, "C", datetime(2026, 8, 18, 10, 0))
+
+    assert row["price"] is None          # 가격만 빈다
+    assert row["gamma"] == 0.02 and row["oi"] == 100  # 나머지는 살아 있다
+    assert spot == 1089.6
+
+
+def test_the_price_is_read_from_futs_prpr():
+    from mahdi.main import _parse_option_quote
+
+    resp = {
+        "output1": {
+            "futs_last_tr_date": "20260820", "gama": "0.02", "hts_ints_vltl": "18.0",
+            "hist_vltl": "16.0", "hts_otst_stpl_qty": "100", "delta_val": "0.5",
+            "theta": "-100.0", "vega": "1.0", "otst_stpl_qty_icdc": "0", "acml_vol": "10",
+            "futs_prpr": "7.25",
+        },
+        "output3": {"bstp_nmix_prpr": "1089.6"},
+    }
+    row, _ = _parse_option_quote(resp, 1090.0, "C", datetime(2026, 8, 18, 10, 0))
+
+    assert row["price"] == 7.25
+
+
+def test_a_price_at_the_underlying_level_warns_because_the_field_would_be_wrong(caplog):
+    """잘못된 필드를 조용히 넣으면 그 값이 나중에 **지정가**가 된다."""
+    import mahdi.main as main_module
+
+    monkey_reset = main_module._price_field_warned
+    main_module._price_field_warned = False
+    try:
+        with caplog.at_level("WARNING", logger="mahdi.main"):
+            main_module._warn_if_price_looks_like_underlying(1089.0, 1089.6)
+        assert "옵션 가격 필드 의심" in caplog.text
+    finally:
+        main_module._price_field_warned = monkey_reset
+
+
+def test_a_normal_premium_is_silent():
+    import mahdi.main as main_module
+
+    monkey_reset = main_module._price_field_warned
+    main_module._price_field_warned = False
+    try:
+        main_module._warn_if_price_looks_like_underlying(7.25, 1089.6)
+        assert main_module._price_field_warned is False  # 경고 안 함
+    finally:
+        main_module._price_field_warned = monkey_reset
+
+
 # --- §11.5 종목 선택기 라이브 배선(2026-08-17) ------------------------------------------------
 #
 # 스펙에 절이 생긴 것과 코드가 도는 것은 다르다 — 워치독이 08-06에 만들어져 08-11까지 한 번도
@@ -3639,7 +3707,7 @@ def _selection_chain_rows(expiry=date(2026, 8, 18)):
             rows.append({
                 "strike": strike, "option_type": option_type, "oi": 100.0, "iv": 0.18,
                 "rv_5d": 0.30, "gamma": 0.02, "gex": 0.0, "expiry": expiry, "delta": 0.5,
-                "volume": 10, "spread_state": 1,
+                "volume": 10, "spread_state": 1, "price": 7.25,
             })
     return rows
 
@@ -3687,10 +3755,10 @@ def test_the_expiry_day_book_never_becomes_a_general_entry_candidate(monkeypatch
 # **기록으로** 잡게 해 줬다.
 
 
-def _run_fusion_cycle_capturing_risk_gate(monkeypatch, **kwargs):
+def _run_fusion_cycle_capturing_risk_gate(monkeypatch, chain_rows=None, **kwargs):
+    rows = _selection_chain_rows() if chain_rows is None else chain_rows
     _patch_signal_fusion_cycle_db_defaults(monkeypatch)
-    monkeypatch.setattr("mahdi.main.db.latest_option_chain",
-                        lambda conn, underlying: _selection_chain_rows())
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: rows)
     monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kw: 100.0)
     monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: (500.0, 0.0, 0.0))
     monkeypatch.setattr("mahdi.main.db.entry_strategies_used_today", lambda conn, day: frozenset())
@@ -3747,8 +3815,28 @@ def test_the_shadow_carries_the_selected_symbol_so_the_two_layers_can_be_compare
     shadow = risk_gate_state["execution_engine"]
     # 마스터가 없으므로 단축코드는 못 찾는다 — 그 사실이 값으로 드러나야 한다.
     assert shadow["symbol_resolved"] is False
+    # ADVISORY라 계획 자체를 안 만든다(모드 게이트) — 가격 유무와 무관하다.
     assert shadow["entry_plan"] is None
-    assert shadow["entry_plan_blocked_by"] == "option_price_not_collected"
+
+
+def test_the_shadow_carries_the_real_premium_as_the_reference_price(monkeypatch):
+    """2026-08-18 마이그레이션 032 — 가격이 없어 막혀 있던 자리가 풀렸다."""
+    risk_gate_state, _ = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
+    shadow = risk_gate_state["execution_engine"]
+
+    assert shadow["reference_price"] == 7.25
+    # 가격이 있으면 «막혔다»가 비어야 한다 — 이 키가 채워져 있으면 그 분은 지정가를 못 만든다.
+    assert shadow["entry_plan_blocked_by"] is None
+
+
+def test_a_minute_without_a_premium_says_so_instead_of_pricing_at_zero(monkeypatch):
+    """0.0을 기준가로 쓰면 그 순간부터 기록이 허구가 되고, 모드를 올린 날 그 허구가 주문이 된다."""
+    rows = [{**r, "price": None} for r in _selection_chain_rows()]
+    risk_gate_state, _ = _run_fusion_cycle_capturing_risk_gate(monkeypatch, chain_rows=rows)
+    shadow = risk_gate_state["execution_engine"]
+
+    assert shadow["reference_price"] is None
+    assert shadow["entry_plan_blocked_by"] == "option_price_missing_this_minute"
 
 
 def test_a_configured_auto_mode_is_still_recorded_as_advisory_while_unwired(monkeypatch):

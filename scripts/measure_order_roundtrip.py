@@ -191,6 +191,9 @@ def main() -> int:
     client = KISRestClient(settings, daemon)
 
     quote = client.get_quote(args.symbol)
+    # 2026-08-18 실측: 옵션을 조회해도 응답에는 `optn_prpr`가 **없다**(공식 문서에는 있으나 그것은
+    # 다른 TR의 스키마다). 선물·옵션 모두 `futs_prpr`가 그 종목 자신의 현재가다 —
+    # 근거는 `docs/dev_memory/KIS_RAW_FIELD_RANGES.md`. 폴백은 TR이 바뀔 때를 위해 남겨 둔다.
     reference = float(quote.get("output1", {}).get("futs_prpr") or quote.get("output1", {}).get("optn_prpr") or 0)
     record["steps"].append({"step": "get_quote", "reference_price": reference, "raw": quote})
     if reference <= 0:

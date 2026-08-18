@@ -60,6 +60,10 @@ class ChainLeg:
     oi: int | None = None
     volume: int | None = None
     spread_state: int | None = None
+    # 2026-08-18 — 프리미엄(마이그레이션 032). 선택에는 쓰지 않고 **실행 계획에 실어 보낸다** —
+    # Passive-first 지정가의 기준가다. 여기서 가격으로 후보를 거르지 않는 이유: 유동성 판정은
+    # `LiquidityThresholds`의 일이고, 가격은 «얼마에 살 것인가»이지 «살 수 있는가»가 아니다.
+    price: float | None = None
 
 
 def legs_from_chain_snapshot(rows: Iterable[dict]) -> list[ChainLeg]:
@@ -86,6 +90,7 @@ def legs_from_chain_snapshot(rows: Iterable[dict]) -> list[ChainLeg]:
                 oi=None if row.get("oi") is None else int(row["oi"]),
                 volume=None if row.get("volume") is None else int(row["volume"]),
                 spread_state=None if row.get("spread_state") is None else int(row["spread_state"]),
+                price=None if row.get("price") is None else float(row["price"]),
             )
         )
     return legs
@@ -200,6 +205,7 @@ class SelectedLeg:
     oi: int | None = None
     volume: int | None = None
     spread_state: int | None = None
+    price: float | None = None
 
     def to_record(self) -> dict:
         """JSONB 적재용 — 날짜는 ISO 문자열로 내린다(psycopg가 dict 안의 date를 모른다)."""
@@ -214,6 +220,7 @@ class SelectedLeg:
             "oi": self.oi,
             "volume": self.volume,
             "spread_state": self.spread_state,
+            "price": self.price,
         }
 
 
@@ -466,6 +473,7 @@ def select_instruments(
                     oi=leg.oi,
                     volume=leg.volume,
                     spread_state=leg.spread_state,
+                    price=leg.price,
                 )
             )
 
