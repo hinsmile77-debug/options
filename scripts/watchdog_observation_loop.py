@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -53,6 +53,95 @@ _RESTART_TIMEOUT_SECONDS = 300
 #
 # connect와 statement 양쪽에 건다 — 붙는 데서 막히는 것과 쿼리에서 막히는 것은 다른 경로다.
 _INGEST_QUERY_TIMEOUT_SECONDS = 2
+
+# ===== 2026-08-19 (08-18 보고서 §1-2 / Fix#4) — **예약이 안 뜬 것을 예약으로 감시할 수 없다** =====
+#
+# ## 무엇이 사흘째 안 고쳐졌는가
+#
+# 08-18 장전 회차는 08:30 예정에 **13:28:36**(298분 지연)에 떴다. 같은 날 14:30 회차는 10분
+# 만에 떴다 — **같은 날 같은 스케줄러에서 298분 지연과 정시가 함께 나왔다.** 그 대조 실험이
+# 원인을 확정했다: 결함은 예약 자체가 아니라 **Claude 앱 기동 시각에 예약이 종속된 것**이다.
+#
+# 08-17 보고서가 남긴 `[P1] 그날 안에 알아챌 경로가 없다`가 그날로 사흘째였다. 더 나쁜 것은
+# **산출물만 보면 「예약이 돈 것」과 「사람이 손으로 돌린 것」이 구별되지 않는다**는 점이다
+# (08-18 12:54본이 그랬다 — `lastRunAt`을 봐야 알 수 있었다).
+#
+# ## 왜 여기인가
+#
+# 10분마다(실제로는 1분마다) 도는 **유일한 상시 프로세스**가 이것이다. 예약을 예약으로
+# 감시하면 예약이 안 뜬 날 감시도 안 뜬다.
+#
+# ## 왜 09:00인가
+#
+# 장전 회차의 존재 이유가 「개장 전에 본다」이므로, 09:00을 넘긴 장전 점검은 **떴어도 늦은
+# 것**이다. 그래서 임계를 예정 시각(08:30)이 아니라 개장에 건다 — 30분 지터로 매일 울리는
+# 경보는 곧 안 읽힌다.
+_PREMARKET_CHECK_DEADLINE = dtime(9, 0)
+# 그날 장전 점검이 남겼어야 할 산출물. 이름 규칙은 `docs/동작점검/README.md`의 규약이고,
+# `collect_evidence.py`가 같은 규칙으로 쓴다. **`auto/`가 아니라 루트**다(사람이 쓰는 문서).
+_CHECK_DOC_DIR = PROJECT_ROOT / "docs" / "동작점검"
+_CHECK_DOC_PATTERN = "{date}_점검_pre.md"
+# 하루에 한 번만 울린다. 09:00~15:45 사이 매분 울리면 397건이고, 그 소음은 08-15~16에
+# `ALERT_ONLY` 94·113줄로 이미 한 번 겪었다 — 그때 아무도 안 읽었다.
+_MISSING_CHECK_MARKER = "MISSING_CHECK"
+# 하루 1회 제한의 기록처. `.watchdog_state.json`에 얹지 않는 이유는 `liveness.next_state()`가
+# **매번 새 dict를 만들어** 세 키만 남기기 때문이다 — 거기 얹은 값은 조용히 사라지고, 그러면
+# 경보가 매분 울린다. 08-12 Fix#8이 `.watchdog_last_check.json`을 따로 만든 것과 같은 형태다.
+_MISSING_CHECK_STATE = LOG_DIR / ".watchdog_missing_check.json"
+
+
+def _premarket_check_missing(now: datetime) -> bool:
+    """반환: 지금이 09:00을 넘겼는데 **오늘 날짜의 장전 점검 산출물이 없는가**.
+
+    입력: 현재 시각. 계산: 파일 존재 확인 한 번(디렉터리 순회도 DB 접속도 하지 않는다).
+    해석: 상세 근거는 위 `_PREMARKET_CHECK_DEADLINE` 주석. 이 함수는 **판정만** 하고,
+         휴장일·의도적 정지 게이트는 호출측이 이미 통과시킨 것을 전제한다(그 둘을 여기서 다시
+         보면 같은 사실이 두 곳에 적힌다 — 규약 B).
+    실패 조건: 없다. 경로를 못 읽으면 「없다」로 본다 — 이 경보의 대가는 오경보 한 줄이고,
+         침묵의 대가는 08-18처럼 하루를 통째로 놓치는 것이다. 비대칭이 반대 방향이다.
+    """
+    if now.time() < _PREMARKET_CHECK_DEADLINE:
+        return False
+    try:
+        return not (_CHECK_DOC_DIR / _CHECK_DOC_PATTERN.format(date=now.date().isoformat())).exists()
+    except OSError:
+        return True
+
+
+def _missing_check_already_alerted(today: str) -> bool:
+    try:
+        return json.loads(_MISSING_CHECK_STATE.read_text(encoding="utf-8")).get("date") == today
+    except Exception:  # noqa: BLE001 — 없거나 깨졌으면 「아직 안 울렸다」
+        return False
+
+
+def _alert_missing_premarket_check(now: datetime) -> bool:
+    """장전 점검 산출물이 없으면 `watchdog.log` 한 줄 + Slack 1회. 반환: 울렸는가.
+
+    **`_restart()`도 `decide()`도 건드리지 않는다.** 이 경보는 관측 루프의 생사와 무관한
+    별개의 축이고(관측은 08-18에 완벽히 돌았다 — 안 뜬 것은 사람의 점검이다), 두 축을 한
+    판정에 섞으면 「루프가 죽었다」와 「점검이 안 떴다」의 조치가 뒤섞인다.
+
+    실패 조건: 없다 — 파일 쓰기가 실패하면 다음 분에 한 번 더 울릴 뿐이다. 그 소음이
+         「영영 안 울림」보다 낫다(08-18이 사흘째 후자였다).
+    """
+    today = now.date().isoformat()
+    if _missing_check_already_alerted(today):
+        return False
+    detail = (
+        f"오늘({today}) 장전 점검 산출물이 {_PREMARKET_CHECK_DEADLINE:%H:%M}까지 없다 — "
+        f"`docs/동작점검/{_CHECK_DOC_PATTERN.format(date=today)}`. "
+        "**예약이 안 뜬 것을 예약으로 감시할 수 없으므로** 이 줄이 유일한 신호다 "
+        "(08-18: 08:30 예정 → 13:28 발화, 298분)."
+    )
+    _log(f"[{now:%Y-%m-%d %H:%M:%S}] {_MISSING_CHECK_MARKER} — {detail}")
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _MISSING_CHECK_STATE.write_text(json.dumps({"date": today}, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    notify.notify_sync(f"장전 점검 미발화 — {detail}", level="WARNING")
+    return True
 
 
 def _log(line: str) -> None:
@@ -198,6 +287,16 @@ def main() -> None:
         if stopped_at is None and holiday is None and liveness.in_ingest_window(now)
         else None
     )
+    # 2026-08-19 Fix#4 — **`decide()`보다 먼저, 그리고 조기 return보다 먼저.** 정상일의 판정은
+    # `ACTION_OK`라 아래에서 곧장 return하므로, 이 검사를 뒤에 두면 **평소에는 영영 안 돈다**
+    # (그리고 평소가 바로 이 경보가 필요한 날이다 — 08-18은 인프라가 하루 종일 초록이었다).
+    #
+    # 게이트는 `ingest`와 같은 것을 쓴다: 사람이 껐거나 휴장일이면 점검이 없는 것이 정상이다.
+    # `in_watch_window`(07:40~15:45)로 창을 잡는 이유는 밤새 매분 파일을 뒤지지 않기 위함이고,
+    # 09:00 하한은 `_premarket_check_missing()`이 자체적으로 건다.
+    if stopped_at is None and holiday is None and liveness.in_watch_window(now):
+        if _premarket_check_missing(now):
+            _alert_missing_premarket_check(now)
     decision = liveness.decide(
         beat, now, state,
         # 기동 스크립트가 도는 중이면 판정을 보류한다 — 안 그러면 기동이 서로를 덮어쓴다.

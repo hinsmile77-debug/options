@@ -143,3 +143,62 @@ def test_every_invocation_records_that_it_judged(tmp_path, monkeypatch):
     assert check is not None, "IDLE에도 판정 기록이 남아야 한다"
     assert check["action"] == liveness.ACTION_IDLE
     assert check["at"] == datetime(2026, 8, 12, 3, 0, 0)
+
+
+# ===== 2026-08-19 (08-18 보고서 §1-2 / Fix#4) — 장전 점검 미발화 판정 =====
+#
+# 이 판정 자체는 파일 존재 확인 한 번이라 플랫폼과 무관하지만, **파일 모듈의 `pytestmark`
+# (win32 한정)를 그대로 물려받는다** — 운영 환경이 Windows이고, 여기만 예외로 빼면 이 파일의
+# 스킵 조건이 두 갈래가 되어 다음 사람이 어느 쪽이 진짜인지 물어야 한다.
+def test_before_the_open_it_never_fires(monkeypatch, tmp_path):
+    """08:30 예정에서 30분 지터로 매일 울리면 그 경보는 곧 안 읽힌다 — 임계는 개장(09:00)이다."""
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 18, 8, 59)) is False
+
+
+def test_after_the_open_a_missing_document_fires(monkeypatch, tmp_path):
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 18, 9, 0)) is True
+
+
+def test_a_document_that_exists_silences_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    (tmp_path / "2026-08-18_점검_pre.md").write_text("x", encoding="utf-8")
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 18, 13, 28)) is False
+
+
+def test_yesterdays_document_does_not_count_as_todays(monkeypatch, tmp_path):
+    """**날짜가 요점이다.** 08-18에 08-17본이 있다고 오늘 점검이 뜬 것은 아니다."""
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    (tmp_path / "2026-08-17_점검_pre.md").write_text("x", encoding="utf-8")
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 18, 9, 30)) is True
+
+
+def test_it_alerts_once_a_day_not_once_a_minute(monkeypatch, tmp_path):
+    """09:00~15:45 매분이면 397건이다 — 08-15~16의 `ALERT_ONLY` 94·113줄을 반복하지 않는다."""
+    sent: list[str] = []
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    monkeypatch.setattr(watchdog, "_MISSING_CHECK_STATE", tmp_path / "state.json")
+    monkeypatch.setattr(watchdog, "WATCHDOG_LOG", tmp_path / "watchdog.log")
+    monkeypatch.setattr(watchdog, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(watchdog.notify, "notify_sync", lambda msg, level="INFO": sent.append(msg))
+
+    assert watchdog._alert_missing_premarket_check(datetime(2026, 8, 18, 9, 0)) is True
+    assert watchdog._alert_missing_premarket_check(datetime(2026, 8, 18, 9, 1)) is False
+    assert len(sent) == 1
+    # 로그 줄은 `watchdog_metrics`가 세는 마커로 시작해야 한다(그쪽 계약 테스트의 짝).
+    logged = (tmp_path / "watchdog.log").read_text(encoding="utf-8")
+    assert f"] {watchdog._MISSING_CHECK_MARKER} —" in logged
+
+
+def test_a_new_day_alerts_again(monkeypatch, tmp_path):
+    sent: list[str] = []
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    monkeypatch.setattr(watchdog, "_MISSING_CHECK_STATE", tmp_path / "state.json")
+    monkeypatch.setattr(watchdog, "WATCHDOG_LOG", tmp_path / "watchdog.log")
+    monkeypatch.setattr(watchdog, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(watchdog.notify, "notify_sync", lambda msg, level="INFO": sent.append(msg))
+
+    watchdog._alert_missing_premarket_check(datetime(2026, 8, 18, 9, 0))
+    assert watchdog._alert_missing_premarket_check(datetime(2026, 8, 19, 9, 0)) is True
+    assert len(sent) == 2

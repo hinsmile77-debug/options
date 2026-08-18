@@ -948,3 +948,51 @@ def test_logs_without_the_violation_label_report_none_not_zero():
     budget = _parse(legacy)["budget_exceeded"]
     assert budget["priority_cut_minutes"] == 1  # 구 라벨은 여전히 읽힌다
     assert budget["priority_before_others_minutes"] is None
+
+
+# ===== 2026-08-19 (08-18 보고서 §2-5 / Fix#6) — 검열 임계의 복제가 갈라지지 않는다 =====
+#
+# `log_metrics._ENDPOINT_READ_TIMEOUT_BY_LABEL`은 `rest_client._ENDPOINT_READ_TIMEOUT_SECONDS`의
+# 복제본이다(이 모듈은 브로커 계층을 import하지 않는다 — `GLOBAL_HTTP_READ_TIMEOUT_SECONDS`와
+# 같은 규약). **복제 자체가 위험한 게 아니라 복제가 조용히 갈라지는 것이 위험하다**: 천장이
+# 어긋나면 검열 건수가 통째로 0이 되고, 그 0은 「검열이 없었다」로 읽힌다.
+
+
+def test_the_censoring_ceiling_matches_the_client_for_every_registered_endpoint():
+    for path, seconds in rest_client._ENDPOINT_READ_TIMEOUT_SECONDS.items():
+        label = rest_client.endpoint_label(path)
+        assert log_metrics.read_timeout_for_label(label) == seconds, (
+            f"{label}: 파서는 {log_metrics.read_timeout_for_label(label)}초로 세는데 "
+            f"클라이언트는 {seconds}초에 자른다 — 그 사이의 호출이 통째로 안 세어진다"
+        )
+
+
+def test_an_unregistered_endpoint_falls_back_to_the_global_ceiling():
+    """등록 안 된 경로는 클라이언트도 전역값으로 떨어진다(`timeout_for_url`)."""
+    assert log_metrics.read_timeout_for_label("inquire-price") == rest_client._HTTP_READ_TIMEOUT_SECONDS
+    assert log_metrics.GLOBAL_HTTP_READ_TIMEOUT_SECONDS == rest_client._HTTP_READ_TIMEOUT_SECONDS
+
+
+def test_a_call_cut_at_the_ceiling_is_counted_as_censored():
+    """emit 측 포맷 그대로 조립한 줄이 **검열로** 세어지는가 — 이 파일의 존재 이유 그 자체다."""
+    line = _emit(
+        "mahdi.broker.rest_client", "INFO", rest_client.LOG_SLOW_CALL,
+        5.52, 1.50, 4.02, 1.50, "GET", "inquire-price",
+    )
+    censored = _parse(line)["slow_calls"]["censored"]
+    assert censored["count"] == 1
+    assert censored["by_endpoint"] == {"inquire-price": 1}
+
+
+def test_a_slow_but_uncensored_call_is_not_counted():
+    """`inquire-balance`의 천장은 10초다 — 7.62초는 느린 것이지 잘린 것이 아니다(08-18 §3-5)."""
+    line = _emit(
+        "mahdi.broker.rest_client", "INFO", rest_client.LOG_SLOW_CALL,
+        8.62, 1.00, 7.62, 1.00, "GET", "inquire-balance",
+    )
+    parsed = _parse(line)["slow_calls"]
+    assert parsed["count"] == 1
+    assert parsed["censored"]["count"] == 0
+    # 0건일 때 점유율은 **None이지 0.0이 아니다** — 분모가 없는 비율을 0으로 인쇄하면
+    # 「몰리지 않았다」로 읽히는데 사실은 「잴 것이 없었다」이다(규약 C).
+    assert parsed["censored"]["phase_concentration"] is None

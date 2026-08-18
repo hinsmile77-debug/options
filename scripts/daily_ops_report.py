@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from mahdi import market_calendar
 from mahdi.config.settings import PROJECT_ROOT
 from mahdi.ops import log_metrics, report
 
@@ -41,6 +42,37 @@ DEFAULT_OUT_DIR = PROJECT_ROOT / "docs" / "동작점검" / "auto"
 # 3인 이유: 하루치로는 "갈렸다"와 "부호가 뒤집혀 있다"를 구분할 수 없고, 그 이상 늘리면
 # 표가 옆으로 넘쳐 사람이 안 읽는다. 판정 자체는 사람이 하므로 **보이기만 하면 된다.**
 MEMBER_SIGN_HISTORY_DAYS = 3
+
+
+def _delta_baseline_metric(
+    target: date, baseline: date | None, calendar: dict | None, previous: dict | None
+) -> dict:
+    """§1 델타의 **기준일이 무엇이었는가**를 지표로 남긴다 (2026-08-19 / Fix#3).
+
+    계산: 기준일·그날이 거래일인가·비거래일을 몇 개 건너뛰었는가·오늘 자신이 거래일인가.
+    해석: 08-18에 이 값이 없어서 «전일 08-17»이 휴장일이라는 사실이 **어디에도 안 남았다.**
+         표에 인쇄되는 것과 별개로 이 dict가 사이드카에 들어가야 다음날 기계가 그것을 묻는다.
+    실패 조건: 없다. 기준일을 못 찾으면 전부 `None` — **「모름」을 0으로 접지 않는다.**
+         `baseline_is_trading_day`가 `None`이면 그 가설은 반증이 아니라 「실측 없음」이다.
+    """
+    skipped = None
+    if baseline is not None:
+        skipped = (target - baseline).days - 1
+    return {
+        "date": baseline.isoformat() if baseline else None,
+        # 1/0으로 낸다 — `hypotheses`의 자동 판정은 수치 비교만 하고, bool을 넣으면
+        # "True >= 0"이 참이 되어 **불변식이 아무것도 안 지키게 된다.**
+        "baseline_is_trading_day": (
+            None if baseline is None else int(market_calendar.is_trading_day(baseline, calendar))
+        ),
+        "skipped_non_trading_days": skipped,
+        "target_is_trading_day": int(market_calendar.is_trading_day(target, calendar)),
+        "target_holiday_name": market_calendar.holiday_name(target, calendar),
+        # 달력이 오늘까지 유효한가. `None`은 「확인 자체가 불가능」이고 0과 다르다.
+        "calendar_coverage_gap_days": market_calendar.coverage_gap_days(calendar, target),
+        # 기준일을 정했는데 그날 사이드카가 없으면 델타가 생략된다 — 그 둘은 다른 사실이다.
+        "sidecar_found": int(previous is not None),
+    }
 
 
 def build(target: date, out_dir: Path, use_db: bool) -> Path:
@@ -79,20 +111,37 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
     # 2026-08-07 고도화#5 — 전일 하나가 아니라 **직전 영업일들**을 읽는다.
     # `previous`(전일 대비 델타)와 `history`(추세 판정)는 다른 질문이다: 하루치 변화로는
     # 멤버 부호 일치율이 "갈렸다"인지 "뒤집혀 있다"인지 구분할 수 없다(§14-3).
+    # 2026-08-19 (08-18 보고서 §3-3 / Fix#3) — **기준일은 달력이 정한다.**
+    #
+    # 종전에는 `previous_business_day()`가 주말만 건너뛰고 *"공휴일은 파일 존재 여부로
+    # 걸러진다"* 고 가정했다. **그 가정이 08-18에 깨졌다**: 광복절 대체휴일인 08-17에도 루프가
+    # 돌아 사이드카가 실제로 생겼고, 08-17이 월요일이라 주말 스킵에도 안 걸렸다. 그날의 §1
+    # 델타 넷이 전부 «거래일 vs 휴장일»이었고 붉은 ⚠ 넷이 거짓이었다.
+    #
+    # `continue`(건너뛰되 더 거슬러 올라가지 않는다)는 그대로 둔다 — 그것은 「그날 프로세스가
+    # 안 돌았다」에 대한 규칙이고, 이제 창 자체가 **거래일**로 세어지므로 두 질문이 갈렸다.
+    calendar = market_calendar.load_holiday_calendar()
     history: list[dict] = []
-    day = target
+    day: date | None = target
     for _ in range(MEMBER_SIGN_HISTORY_DAYS):
-        day = log_metrics.previous_business_day(day)
+        day = market_calendar.previous_trading_day(day, calendar) if day else None
+        if day is None:
+            break  # 달력이 답을 못 준다 — **거기서 멈춘다**(그럴듯한 날짜로 접지 않는다).
         path = out_dir / f"{day.isoformat()}_지표.json"
         if not path.exists():
-            continue  # 공휴일/미가동일 — 건너뛰되 더 거슬러 올라가지는 않는다(창은 영업일 고정).
+            continue  # 미가동일 — 건너뛰되 더 거슬러 올라가지는 않는다(창은 거래일 고정).
         try:
             history.append(json.loads(path.read_text(encoding="utf-8")))
         except Exception:
             logger.warning("%s 지표 사이드카 읽기 실패 — 그날은 비운다", day, exc_info=True)
-    previous = history[0] if history and str(history[0].get("date")) == str(
-        log_metrics.previous_business_day(target)
+
+    baseline = market_calendar.previous_trading_day(target, calendar)
+    previous = history[0] if (
+        baseline is not None and history and str(history[0].get("date")) == baseline.isoformat()
     ) else None
+    # **가설이 참조할 수 있으려면 `metrics` 본체에 실려야 한다**(아래 `levers`/`watchdog`과 같은
+    # 이유). `2026-08-19-fix3-delta-baseline-is-a-trading-day`의 주장 지표가 이것이다.
+    metrics["delta_baseline"] = _delta_baseline_metric(target, baseline, calendar, previous)
 
     # 2026-08-12 Fix#6(규약 H) — **가설 검정보다 먼저 읽는다.** 검정이 이 값을 받아야
     # "레버가 꺼진 채 판정하는" 08-12의 오독을 막을 수 있다.

@@ -16,7 +16,7 @@ import logging
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -77,6 +77,7 @@ from mahdi.fusion.event_calendar import (
 from mahdi.fusion.instrument_selection import (
     LiquidityThresholds,
     legs_from_chain_snapshot,
+    rotation_snapshot,
     select_instruments,
 )
 from mahdi.fusion.meta_label import TradePermission
@@ -304,7 +305,7 @@ OPTION_CHAIN_CYCLE_FAILURE_BUDGET_LEGS = 6
 
 LOG_CHAIN_FAILURE_BUDGET = (
     "옵션체인 실패 예산(%d건) 소진 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
-    "(시간 예산은 %.1f초 남아 있었다, 2026-08-11 고도화 A). 적재 %d행 · 컷당한북=%s · 우선순위위반=%s"
+    "(시간 예산은 %.1f초 남아 있었다, 2026-08-11 고도화 A). 적재 %d행 · 컷당한북=%s · 데드라인이먼슬리에서끝남=%s"
 )
 
 # 2026-08-05(운영점검보고서 2026-08-05 §2 이상점 8 / Fix#8) — 장전에는 지수 스팟을 적재하지 않는다.
@@ -360,7 +361,36 @@ LOG_CHAIN_OVERRUN = (
     "(REST수집 %.2f초, DB적재 %.2f초, rows=%d%s, 타폴러동시호출추정=%s)"
 )
 LOG_CHAIN_CATCHUP = "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로 채움(밀린 사이클 %s)"
-# 2026-08-12 Fix#5 — 꼬리에 `· 우선순위위반=예|아니오`가 붙는다(세 컷 로그 공통).
+# 2026-08-12 Fix#5 — 꼬리에 `· 데드라인이먼슬리에서끝남=예|아니오`가 붙는다(세 컷 로그 공통).
+#
+# ===== 2026-08-19 (08-18 보고서 §2-4) — **이름을 고친다. 코드는 안 고친다.** =====
+#
+# 이 라벨의 원래 이름은 `우선순위위반`이었고, 08-18 보고서가 그 이름 때문에 **P1을 잘못
+# 진단했다**: `예` 3건(14:05:52 · 14:06:52 · 15:01:52, 전부 `budget_exceeded`)을 보고
+# 「불변식이 오늘 처음 깨졌다」로 읽은 뒤, 아래 `if cut_by_scope or (deadline ...)`을
+# «구멍의 자리»로 지목하고 «데드라인 분기를 분리해 위클리를 먼저 소거하라»는 fix를 냈다.
+#
+# **그 fix는 이득이 음수다.** 세 가지 때문이다:
+#
+#   1. 레그 순서는 **이미 먼슬리 우선**이다(`books[0]`이 monthly — `main()` 하단 `books = [...]`,
+#      `test_collect_option_chain_cycle_visits_the_monthly_book_first`가 08-05부터 지킨다).
+#   2. 그래서 위클리는 언제나 뒤에 있고, 벽시계 데드라인이 먼슬리 구간에서 끝나면
+#      `non_priority_ahead[index+1]`은 **구조적으로 항상 True**다. 그 세 사이클에서 위클리
+#      레그는 **한 건도 호출되지 않았다** — 먼슬리가 50초 예산 100%를 썼다. 우선순위가
+#      **지켜진** 결과이지 어긴 결과가 아니다.
+#   3. `time.monotonic() >= deadline`이 참이 된 뒤에는 위클리를 «먼저 소거»하든 말든 호출이
+#      0건이다. 즉 그 fix는 **동작을 한 줄도 안 바꾸고** 라벨만 영구히 `아니오`로 만든다 —
+#      08-12 Fix#5가 만든 계측을 무력화하는 것이 그 fix의 유일한 효과다.
+#
+# 실제 손상은 **순서가 아니라 두께**였다(15:01:52 먼슬리 6/10레그). 그것은 §2-5의 지연·위상
+# 축이고, 그 축을 재는 것은 `slow_calls.censored`(Fix#6)다.
+#
+# 그래서 고치는 것은 **이름**이다. 이 라벨이 답하는 질문은 처음부터
+# «아직 안 부른 위클리를 두고 먼슬리가 잘렸는가»였는데, 데드라인 경로에서 그 질문의 답은
+# 언제나 「예」이고 그것이 위반을 뜻하지 않는다. `timeout_abort` 경로에서는 여전히 **진짜
+# 순서 축**이다(스코프 컷은 1단계 접기를 거치므로 `아니오`가 정보를 담는다).
+# 파서는 옛 이름도 계속 읽는다(`log_metrics._PRIORITY_LABEL`) — 이름을 바꾸느라 과거 지표를
+# 잃으면 그것이 새 결함이다.
 #
 # **`컷당한북`만으로는 판정할 수 없다는 것이 08-12의 발견이다.** 그날 `priority_cut_minutes`가
 # 2로 나와 불변식 위반처럼 보였는데, 실측하니 둘 다 **홀수분(먼슬리 단독 사이클)의 꼬리 컷**
@@ -375,7 +405,7 @@ LOG_CHAIN_CATCHUP = "옵션체인 결손 회수: %s 분을 먼슬리 %d레그로
 # 셋(`_BUDGET_RE`/`_TIMEOUT_ABORT_RE`/`_FAILURE_BUDGET_RE`)이 그대로 통과한다.
 LOG_CHAIN_BUDGET_EXCEEDED = (
     "옵션체인 수집 예산(%.0f초) 초과 — 남은 %d레그를 포기하고 %d레그로 이번 분을 마감합니다 "
-    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8) 컷당한북=%s · 우선순위위반=%s"
+    "(다음 분 사이클을 정시에 시작하기 위함, §2-6/Fix#8) 컷당한북=%s · 데드라인이먼슬리에서끝남=%s"
 )
 
 # ===== 2026-08-11 Fix#1 — 연속 타임아웃이면 이번 사이클을 조기에 접는다 =====
@@ -416,7 +446,7 @@ OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT = 3
 LOG_CHAIN_TIMEOUT_ABORT = (
     "옵션체인 연속 타임아웃 %d회 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
     "(확정 실패 호출을 안 쏘고 다음 분을 정시에 시작한다, 2026-08-11 Fix#1). "
-    "적재 %d행 · 컷당한북=%s · 우선순위위반=%s"
+    "적재 %d행 · 컷당한북=%s · 데드라인이먼슬리에서끝남=%s"
 )
 # 2026-08-05(운영점검보고서 §2-6) — 사이클은 정상 실행됐는데 **행이 한 줄도 안 남은** 분.
 #
@@ -486,6 +516,11 @@ LOG_KIS_FAILURE_TRACEBACK_OMITTED = "%s — %s (트레이스백 생략 — %s, �
 _TRACEBACK_BUDGET = TracebackBudget()
 
 LOG_ATM_ROLL = "ATM 롤링: 스팟 %.2f — 행사가 %s → %s"
+# 2026-08-18(SERIES_ROTATION_RULE_v1 §6-3) — 창 고착 의심. 롤 직후에도 히스테리시스 임계를
+# 넘긴 거리가 남아 있고, 그 거리가 다음 사이클에도 줄지 않은 상태(롤링이 걸렸어야 한다).
+# 08-04 이전 사고(하루치 체인이 5.5% OTM 방치)의 재발을 실시간으로 잡는 상시 진단 —
+# 사이클당 최대 1줄(고착 북들을 한 줄에 합친다).
+LOG_WINDOW_STUCK = "창 고착 의심: %s — 임계 초과 거리가 다음 사이클에도 줄지 않음(롤링 미동작)"
 LOG_REST_LATENCY = "REST 응답시간(%.0f초 창): %s"
 
 # 2026-08-05 — 이벤트 캘린더 미기입 경고.
@@ -579,6 +614,16 @@ class WsLiveness:
     # 롤 횟수는 시장 변동성의 함수라 통제 대상이 아니다 — 우리가 통제하는 것은 그 롤이 구독을
     # 실제로 끊었는가이고(고도화#1의 유지 풀), 그것이 이 값이다. 0이 목표 상태다.
     atm_roll_dropped_subs: int = 0
+
+    # 2026-08-18(SERIES_ROTATION_RULE_v1 §6-3) — 창 고착 진단 상태.
+    #
+    # `window_stuck_prev`: 직전 사이클에 롤 직후에도 히스테리시스 임계를 넘겨 있던 북의
+    # {라벨: 거리}. 다음 사이클에 같은 북의 거리가 줄지 않았으면 WARNING — 판정 근거는
+    # `RollingSubscriptionManager.window_stuck_distance()` 주석.
+    # `window_stuck_warnings`: 오늘 WARNING 횟수 누적. §6-6 롤백 조건("3회 이상이면 파일럿
+    # 중단")을 사람이 로그를 세지 않고 이 값으로 읽게 한다. 0이 목표 상태다.
+    window_stuck_prev: dict = field(default_factory=dict)
+    window_stuck_warnings: int = 0
 
 # 2026-07-28 2차 — Signal Fusion 라이브 배선(ADVISORY 전용, [[DECISION_LOG]] 참고). 다른 폴러와
 # 달리 이 폴러는 KIS REST를 전혀 호출하지 않는다(DB 조회 + 계산만) — 레이트리밋 스태거링 대상이
@@ -1124,6 +1169,30 @@ async def _reroll_books_to_spot(
                 f"{min(before):.1f}~{max(before):.1f}" if before else "(없음)",
                 f"{min(after):.1f}~{max(after):.1f}" if after else "(없음)",
             )
+    # 2026-08-18(SERIES_ROTATION_RULE_v1 §6-3) — 창 고착 진단. 롤 시도 **직후**에 재므로
+    # 정상이면 전 북이 None이다. 임계 초과 거리가 직전 사이클에도 있었고 줄지 않은 북만
+    # WARNING에 올린다(1사이클짜리 초과는 다음 롤이 잡는 과도 상태일 수 있어 기다린다).
+    # 사이클당 최대 1줄 — 로그 폭증 방지 관례(08-04 §2-2).
+    if ws_liveness is not None:
+        stuck_lines: list[str] = []
+        for subscription_manager in subscription_managers:
+            key = subscription_manager.label or f"manager@{id(subscription_manager):x}"
+            distance = subscription_manager.window_stuck_distance(spot)
+            previous = ws_liveness.window_stuck_prev.get(key)
+            if distance is None:
+                ws_liveness.window_stuck_prev.pop(key, None)
+                continue
+            if previous is not None and distance >= previous:
+                center = subscription_manager.current_atm
+                stuck_lines.append(
+                    f"{key} 중심 {center:.1f} 스팟 {spot:.2f} 거리 {distance:.2f}"
+                    if center is not None else f"{key} 거리 {distance:.2f}"
+                )
+            ws_liveness.window_stuck_prev[key] = distance
+        if stuck_lines:
+            ws_liveness.window_stuck_warnings += 1
+            logger.warning(LOG_WINDOW_STUCK, " / ".join(stuck_lines))
+
     if rolled and ws_liveness is not None:
         ws_liveness.atm_roll_count += 1
         # 2026-08-07 고도화#2 — 대가는 매니저가 아니라 **공용 유지 풀**이 안다(세 북이 슬롯을
@@ -2033,6 +2102,10 @@ async def _collect_option_chain_cycle(
                 missing_priority.append((strike, option_type))
             continue
         row, spot = parsed
+        # 2026-08-18 마이그레이션 033 — 어느 북의 레그인지를 적재에 싣는다. 종전엔 이 루프가
+        # 알던 series를 여기서 버려서, 체인 스냅샷이 "이 만기가 어느 북인가"에 답할 수 없었다
+        # (종목 로테이션 규칙 SERIES_ROTATION_RULE_v1의 입력 결손).
+        row["series"] = series
         rows.append(row)
         latest_spot = spot
     if skipped:
@@ -2102,6 +2175,9 @@ async def _retry_priority_legs(
         if parsed is None:
             continue
         row, spot = parsed
+        # 이 재시도는 먼슬리 전용이다(위 `option_symbol(series=OPTION_CHAIN_PRIORITY_SERIES)`)
+        # — 정규 수집 경로와 같은 이유로 series를 싣는다(마이그레이션 033).
+        row["series"] = OPTION_CHAIN_PRIORITY_SERIES
         recovered.append(row)
         latest_spot = spot
     return recovered, latest_spot, attempted
@@ -4116,10 +4192,11 @@ async def poll_signal_fusion_cycle(
                 # 가르는 것은 «실행할 것인가»이지 «누가 고를 것인가»가 아니다). ADVISORY라
                 # 주문이 나가지 않으므로 계좌에 무해하고, 배선일에 비교할 며칠치가 쌓인다.
                 selection_record: dict | None
+                chain_legs = legs_from_chain_snapshot(chain_inputs.get("_chain_rows") or [])
                 if entry_candidates:
                     selection = select_instruments(
                         entry_candidates,
-                        legs_from_chain_snapshot(chain_inputs.get("_chain_rows") or []),
+                        chain_legs,
                         signal_inputs.spot,
                         poll_time.date(),
                         direction=decision.direction,
@@ -4132,11 +4209,14 @@ async def poll_signal_fusion_cycle(
                 else:
                     # 팔레트가 관망만 지시했거나 방어 레짐 — 돌릴 것이 없었다는 사실을 남긴다.
                     # NULL로 두면 「선택기가 안 돌았다」와 구분되지 않는다(규약 C).
+                    # 로테이션 판정(SERIES_ROTATION_RULE_v1 §3)은 관망 분에도 싣는다 —
+                    # 규칙 재검증 표본은 진입 후보 유무와 무관하게 매분이어야 한다.
                     selection_record = {
                         "candidates": [],
                         "book_expiry": None,
                         "reason": _SELECTION_NO_ENTRY_STRATEGY,
                         "rejected": [],
+                        **rotation_snapshot(chain_legs, poll_time.date()),
                     }
                 risk_gate_state["selected_instrument_count"] = len(selection_record["candidates"])
 
@@ -4400,6 +4480,7 @@ async def main() -> None:
             strikes_each_side=STRIKES_EACH_SIDE,
             symbol_formatter=lambda strike, opt: master.option_symbol(opt, strike, underlying="KOSPI200"),
             retention_pool=retention_pool,
+            label="regular",
         )
         weekly_mon_manager = RollingSubscriptionManager(
             ws_client,
@@ -4410,6 +4491,7 @@ async def main() -> None:
                 opt, strike, underlying="KOSPI200", series="weekly_mon"
             ),
             retention_pool=retention_pool,
+            label="weekly_mon",
         )
         weekly_thu_manager = RollingSubscriptionManager(
             ws_client,
@@ -4420,6 +4502,7 @@ async def main() -> None:
                 opt, strike, underlying="KOSPI200", series="weekly_thu"
             ),
             retention_pool=retention_pool,
+            label="weekly_thu",
         )
         books = [
             (monthly_manager, "regular"),

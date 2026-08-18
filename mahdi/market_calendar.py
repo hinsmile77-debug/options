@@ -47,7 +47,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from mahdi.fusion.event_calendar import coverage_gap_days as _coverage_gap_days
 
@@ -121,6 +121,45 @@ def is_trading_day(value: date | datetime, calendar: dict | None) -> bool:
     if is_weekend(value):
         return False
     return holiday_name(value, calendar) is None
+
+
+# 직전 거래일을 찾을 때 거슬러 올라갈 최대 일수. 한국 시장의 최장 연휴(추석·설 + 주말 +
+# 임시공휴일)가 6일을 넘은 적이 없으므로 10일이면 충분하고, **상한이 있는 것 자체가 중요하다**:
+# 달력이 잘못 채워져 한 달이 전부 휴장으로 적힌 날 이 함수가 조용히 몇십 번 도는 대신
+# `None`(= 모른다)을 내야 한다. 「모름」을 0으로도 「그럴듯한 날짜」로도 접지 않는다.
+PREVIOUS_TRADING_DAY_MAX_LOOKBACK = 10
+
+
+def previous_trading_day(
+    value: date | datetime, calendar: dict | None, max_lookback: int = PREVIOUS_TRADING_DAY_MAX_LOOKBACK
+) -> date | None:
+    """반환: `value` **직전의 거래일**(주말도 등재된 휴장일도 아닌 첫 날). 못 찾으면 `None`.
+
+    입력: 날짜(또는 datetime)와 달력 원본 dict. `is_trading_day()`와 같이 **파일을 안 읽는다**.
+
+    해석: 2026-08-19 (08-18 보고서 §3-3 / Fix#3). `log_metrics.previous_business_day()`가
+         주말만 건너뛰면서 docstring에 *"공휴일은 **파일 존재 여부로 걸러진다**"* 고 적어
+         두었는데, **그 가정이 08-18에 깨졌다.** 광복절 대체휴일인 08-17에도 관측 루프가
+         돌아 `auto/2026-08-17_지표.json`이 실제로 생성됐고, 08-17이 **월요일**이라 주말
+         스킵에도 안 걸렸다. 그 결과 08-18 리포트 §1의 붉은 ⚠ 4개가 전부 «거래일 vs 휴장일»
+         비교였다 — 사건이 아닌 것 넷이 사건으로 인쇄됐다.
+
+         **가정을 지우고 달력을 직접 본다.** 파일 존재는 「그날 프로세스가 돌았는가」이지
+         「그날 시장이 열렸는가」가 아니고, 둘을 같은 것으로 읽은 것이 이 결함의 전부다.
+
+    실패 조건: `max_lookback`일을 거슬러도 거래일이 없으면 `None`. 그때 호출측은 델타를
+              **생략해야 한다** — 「모름」을 그럴듯한 날짜로 접으면 08-18이 반복된다.
+    """
+    day = _as_date(value)
+    for _ in range(max(0, max_lookback)):
+        day -= timedelta(days=1)
+        if is_trading_day(day, calendar):
+            return day
+    logger.warning(
+        "%s 직전 %d일 안에 거래일이 없다 — 달력이 잘못됐거나 연휴가 비정상적으로 길다",
+        _as_date(value), max_lookback,
+    )
+    return None
 
 
 def coverage_gap_days(calendar: dict | None, today: date) -> int | None:

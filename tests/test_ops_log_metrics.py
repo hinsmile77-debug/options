@@ -210,11 +210,19 @@ def test_parse_day_on_empty_input_returns_zeros_not_fabrications():
     assert m["bursts"] == {}
 
 
-def test_resolve_target_date_and_previous_business_day():
+def test_resolve_target_date():
     assert log_metrics.resolve_target_date("2026-07-31", datetime(2026, 8, 1, 15, 0)) == TARGET
     assert log_metrics.resolve_target_date(None, datetime(2026, 8, 1, 15, 0)) == date(2026, 8, 1)
-    # 월요일(08-03)의 직전 영업일은 일/토를 건너뛴 금요일(07-31)이다.
-    assert log_metrics.previous_business_day(date(2026, 8, 3)) == TARGET
+
+
+def test_the_weekend_only_baseline_helper_is_gone():
+    """2026-08-19 Fix#3 — `previous_business_day()`는 **지웠다**(주말만 보는 함수였다).
+
+    기준일 계산의 유일한 답은 `market_calendar.previous_trading_day()`다. 이 단언이 있는
+    이유는 «편해서» 다시 만들어지는 것을 막기 위함이다 — 같은 질문에 답이 둘 있으면
+    하나는 반드시 틀린 채로 쓰이고, 08-18에 그 틀린 쪽이 하루를 오독하게 만들었다.
+    """
+    assert not hasattr(log_metrics, "previous_business_day")
 
 
 # ===== 2026-08-06 §3-2·§3-3 / Fix#4 — 억제된 예외와 프로세스 재기동 =====

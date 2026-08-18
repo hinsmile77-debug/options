@@ -165,3 +165,56 @@ def test_entries_beyond_covered_through_are_allowed():
     assert market_calendar.is_trading_day(date(2026, 12, 25), partial) is False
     # 그러면서도 목록은 여전히 「불완전하다」고 신고한다 — 두 축은 독립이다.
     assert market_calendar.coverage_gap_days(partial, date(2026, 12, 25)) > 0
+
+
+# ===== 2026-08-19 (08-18 보고서 §3-3 / Fix#3) — 직전 **거래일** =====
+#
+# 08-18의 §1 델타 기준일이 08-17, 즉 광복절 대체휴일이었다. 붉은 ⚠ 4개가 전부 «거래일 vs
+# 휴장일»이라 사건이 아니었고, 그 오독은 **08-17이 월요일이었기 때문에** 주말 스킵에도 안 걸렸다.
+# 아래가 그 하루를 그대로 재현한다.
+
+
+def test_the_day_that_actually_broke_it():
+    """08-18의 직전 **거래일**은 08-17(휴장)이 아니라 **08-14(금)** 이다."""
+    assert market_calendar.previous_trading_day(date(2026, 8, 18), _CALENDAR) == date(2026, 8, 14)
+    # 달력을 안 주면 종전 동작과 같다 — 08-17이 월요일이라 주말 스킵에 안 걸린다.
+    # **이 줄이 08-18에 실제로 일어난 일이고**, 그래서 달력을 넘기는 것이 fix의 전부다.
+    assert market_calendar.previous_trading_day(date(2026, 8, 18), None) == date(2026, 8, 17)
+
+
+def test_a_plain_weekday_baseline_is_just_yesterday():
+    assert market_calendar.previous_trading_day(date(2026, 8, 19), _CALENDAR) == date(2026, 8, 18)
+
+
+def test_monday_reaches_back_over_the_weekend():
+    assert market_calendar.previous_trading_day(date(2026, 8, 3), _CALENDAR) == date(2026, 7, 31)
+
+
+def test_datetime_is_accepted_like_everywhere_else():
+    """호출측이 `db.local_now()`를 그대로 넘길 수 있어야 한다(모듈 전체의 규약)."""
+    assert market_calendar.previous_trading_day(
+        datetime(2026, 8, 18, 15, 45), _CALENDAR
+    ) == date(2026, 8, 14)
+
+
+def test_an_impossible_calendar_returns_none_not_a_plausible_date():
+    """**「모름」을 그럴듯한 날짜로 접지 않는다.**
+
+    달력이 잘못 채워져 한 달이 전부 휴장으로 적히면, 이 함수는 조용히 몇십 번 도는 대신
+    `None`을 내야 한다. 그때 호출측은 델타를 **생략**한다 — 08-18의 실패는 「모르는 것을
+    아는 것처럼 인쇄한」 것이었고, 여기서 같은 실패를 반대편에서 막는다.
+    """
+    everything_closed = {
+        "covered_through": "2026-12-31",
+        "holidays": [
+            {"date": (date(2026, 8, 18) - __import__("datetime").timedelta(days=n)).isoformat(),
+             "name": "가짜"}
+            for n in range(1, 40)
+        ],
+    }
+    assert market_calendar.previous_trading_day(date(2026, 8, 18), everything_closed) is None
+
+
+def test_the_lookback_bound_is_wide_enough_for_a_real_holiday_run():
+    """한국 시장 최장 연휴(연휴 + 주말)가 상한 안에 들어야 한다 — 안 그러면 그날 델타가 사라진다."""
+    assert market_calendar.PREVIOUS_TRADING_DAY_MAX_LOOKBACK >= 9

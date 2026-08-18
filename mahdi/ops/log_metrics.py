@@ -19,7 +19,7 @@ import bisect
 import collections
 import re
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -108,6 +108,18 @@ _ATM_ROLL_RE = re.compile(
 # 같은 (전창→후창)이 이 시간 안에 다시 나오면 같은 이벤트의 다른 북 줄로 본다.
 # 08-04 실측으로 세 줄은 0.3초 안에 붙어 나왔고, 진짜 재전이는 폴링 주기(60초) 이상 걸린다.
 _ATM_ROLL_DEDUP_SECONDS = 5.0
+
+# 2026-08-19 (08-18 보고서 §2-4) — 컷 로그 꼬리 라벨의 **이름이 바뀌었다.**
+#
+# `우선순위위반` → `데드라인이먼슬리에서끝남`. 옛 이름은 08-18 보고서가 P1을 잘못 진단하게
+# 만들었다(상세 근거는 `mahdi/main.py`의 `LOG_CHAIN_BUDGET_EXCEEDED` 위 주석) — 데드라인
+# 경로에서 그 라벨의 `예`는 **위반이 아니라 「먼슬리가 예산을 다 썼다」**이다.
+#
+# **옛 이름도 계속 읽는다.** 로그는 10MB×10 로테이션이라 이틀치가 남고, 이름을 바꾸느라
+# 그 이틀을 「못 쟀다」로 만들면 이름을 고친 대가가 지표 손실이 된다. 정규식 하나로 둘을
+# 받으면 개명 전후가 같은 축에 쌓인다 — 이 저장소가 08-04에 배운 것(포맷을 바꾸면 파서가
+# 조용히 죽는다)의 반대편 적용이다.
+_PRIORITY_LABEL = r"(?:우선순위위반|데드라인이먼슬리에서끝남)"
 # 2026-08-04(Fix#8) — 수집 예산 초과(`mahdi.main.LOG_CHAIN_BUDGET_EXCEEDED`).
 #
 # 2026-08-11 Fix#2 — 꼬리에 `컷당한북=<series[,series]>`가 붙었다. **선택 그룹으로 둔다**:
@@ -117,7 +129,7 @@ _ATM_ROLL_DEDUP_SECONDS = 5.0
 # (08-11 로그에는 없다). 없는 날은 `None`이고, 그때 「위반 0건」이라고 말하면 안 된다 — 규약 C.
 _BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 수집 예산\([\d.]+초\) 초과 — 남은 (\d+)레그를 포기하고 (\d+)레그로"
-    r"(?:.* 컷당한북=(\S+))?(?:.* 우선순위위반=(\S+))?"
+    r"(?:.* 컷당한북=(\S+))?(?:.* " + _PRIORITY_LABEL + r"=(\S+))?"
 )
 # 2026-08-11 Fix#1 — 연속 타임아웃 조기 포기(`mahdi.main.LOG_CHAIN_TIMEOUT_ABORT`).
 #
@@ -126,7 +138,7 @@ _BUDGET_RE = re.compile(
 # 났는데 종전 로그는 둘을 같은 줄로 냈다.
 _TIMEOUT_ABORT_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 연속 타임아웃 (\d+)회 — 남은 (\d+)레그를 포기하고"
-    r".*적재 (\d+)행 · 컷당한북=(\S+)(?: · 우선순위위반=(\S+))?"
+    r".*적재 (\d+)행 · 컷당한북=(\S+)(?: · " + _PRIORITY_LABEL + r"=(\S+))?"
 )
 # 2026-08-11 고도화 A — 누적 실패 예산 소진(`mahdi.main.LOG_CHAIN_FAILURE_BUDGET`).
 #
@@ -135,7 +147,7 @@ _TIMEOUT_ABORT_RE = re.compile(
 # 셋을 한 지표로 세면 "무엇이 이 분을 얇게 만들었는가"에 답할 수 없다.
 _FAILURE_BUDGET_RE = re.compile(
     _TS + r" WARNING:mahdi\.main:옵션체인 실패 예산\((\d+)건\) 소진 — 남은 (\d+)레그를 포기하고"
-    r".*적재 (\d+)행 · 컷당한북=(\S+)(?: · 우선순위위반=(\S+))?"
+    r".*적재 (\d+)행 · 컷당한북=(\S+)(?: · " + _PRIORITY_LABEL + r"=(\S+))?"
 )
 # 2026-08-06(고도화#1) — 먼슬리 레그 재시도(`mahdi.main.LOG_CHAIN_PRIORITY_RETRY`).
 # **시도와 회복을 둘 다 센다**: 회복 0건은 "KIS가 계속 느렸다"이고, 시도 0건은 "예산이 없었다"라
@@ -922,6 +934,55 @@ REST_LATENCY_P50_TIMEOUT_RATIO_WARN = 0.8
 # 그때는 리포트가 레버 값을 넘겨받아 쓴다(`report._render_rest_latency`).
 GLOBAL_HTTP_READ_TIMEOUT_SECONDS = 4.0
 
+# ===== 2026-08-19 (08-18 보고서 §2-5 / Fix#6) — **우측 검열을 센다** =====
+#
+# ## p50이 구조적으로 못 보는 축이 있다
+#
+# 08-18에 `감마플립 산출 불가`가 **4건뿐이었고 시각이 전부 `:01`** 이었다
+# (13:01:10 · 13:31:10 · 14:01:10 · 15:01:10). 같은 날 정규장 `느린 REST 호출` 2,850건 중
+# HTTP 성분이 4.0초 이상인 것이 **333건**이었고, 그중 103건(31%)이 `:00~:03`·`:30~:33`
+# **여덟 분**에 몰렸다 — 균등이면 13.3%다.
+#
+# 그런데 그 333건의 `4.02`·`4.05`·`4.06`은 **실제 응답시간이 아니다.** read timeout에 잘린
+# 값이다. 통계에서 이것을 **우측 검열**(right censoring)이라 하고, 검열된 표본의 분위수는
+# 천장에 눌려 위쪽 꼬리를 잃는다. 그래서 `p50 ÷ timeout` 게이지는 이 분들을 **원리적으로**
+# 못 본다 — 14:30 회차가 「최대 0.74로 경고선 아래」라고 옳게 닫았는데, 그 게이지가 못 보는
+# 축에서 넉 분의 판단이 죽었다.
+#
+# **검열된 값의 p50은 의미가 없고, 진짜 신호는 검열 «건수»다.** 그래서 여기서 따로 센다.
+#
+# ## 왜 라벨별 임계인가 — 통로마다 천장이 다르다
+#
+# 08-18 §3-5가 실측으로 보여 준 그대로다: `inquire-price`(천장 4.0초)는 12시부터 천장에
+# 눌리기 시작했는데 `inquire-balance`(천장 10.0초)는 최대 7.62초로 **천장에 안 닿았다.**
+# 두 행을 같은 임계로 세면 미검열 통로가 검열로 찍히거나 그 반대가 된다.
+#
+# 이 dict는 `rest_client._ENDPOINT_READ_TIMEOUT_SECONDS`의 **복제본**이다 —
+# `GLOBAL_HTTP_READ_TIMEOUT_SECONDS`와 같은 규약이고(이 모듈은 브로커 계층을 import하지 않는다),
+# 같은 이유로 **계약 테스트가 두 값의 일치를 강제한다**(`tests/test_ops_log_metrics_contract.py`).
+# 복제 자체가 위험한 게 아니라 복제가 조용히 갈라지는 것이 위험하다.
+_ENDPOINT_READ_TIMEOUT_BY_LABEL: dict[str, float] = {
+    "inquire-balance": 10.0,
+    "inquire-asking-price": 10.0,
+    "order": 10.0,
+    "order-rvsecncl": 10.0,
+}
+
+# 검열이 몰리는지 볼 위상 창 — 정각과 30분의 **앞 네 분씩**. 08-18의 103건이 정확히 이 여덟 분에
+# 있었다. 창을 넓히면 어떤 분포도 「몰려 있다」로 보이고, 좁히면 초 단위 지터에 값이 튄다.
+# 여덟 분이면 60분 중 13.3%라 균등선이 사람 머리에 바로 서는 것도 이 폭을 고른 이유다.
+CENSORED_PHASE_MINUTES = frozenset({0, 1, 2, 3, 30, 31, 32, 33})
+
+
+def read_timeout_for_label(endpoint: str) -> float:
+    """반환: 그 엔드포인트의 read 타임아웃(초). 모르는 라벨은 전역값으로 떨어진다.
+
+    **모르는 라벨을 전역값(4.0)으로 접는 것이 안전한 쪽이다** — 실제 천장이 10초인데 4초로
+    보면 검열 건수가 과다 계상되어 눈에 띄고, 반대면 조용히 사라진다. 08-18의 교훈이 정확히
+    「조용히 사라지는 쪽」이었다.
+    """
+    return _ENDPOINT_READ_TIMEOUT_BY_LABEL.get(endpoint, GLOBAL_HTTP_READ_TIMEOUT_SECONDS)
+
 
 def _rest_latency_metrics(windows: list[dict]) -> dict:
     """
@@ -1354,10 +1415,44 @@ def _stall_metrics(calls: list[tuple[float, str, str]]) -> list[dict]:
     return episodes
 
 
+def _censored_metrics(slow: list[dict]) -> dict:
+    """2026-08-19 Fix#6 — **read timeout에 잘린 호출**(우측 검열)만 따로 센다.
+
+    입력: 느린 호출 목록(각 항목에 `http`·`endpoint`·`at`).
+    계산: 라벨별 천장 이상인 호출 수와 그 **분(minute) 분포**, 그리고 정각·30분 창의 점유율.
+    해석: 상세 근거는 `_ENDPOINT_READ_TIMEOUT_BY_LABEL` 위 주석. 여기서 판정은 하지 않는다 —
+         `phase_concentration`을 균등선(`phase_baseline`)과 비교하는 것은 사람과 리포트의 몫이다.
+    실패 조건: 없다. 검열이 0건이면 점유율은 `None`이다 — **0.0이 아니다**: 분모가 0인
+         비율을 0으로 인쇄하면 「몰리지 않았다」로 읽히는데, 사실은 「잴 것이 없었다」이다(규약 C).
+    """
+    censored = [s for s in slow if s["http"] >= read_timeout_for_label(s["endpoint"])]
+    in_phase = sum(1 for s in censored if int(s["at"][3:]) in CENSORED_PHASE_MINUTES)
+    return {
+        "count": len(censored),
+        # 검열은 **엔드포인트마다 천장이 달라** 통로별로 갈라 보는 것이 유일하게 옳다
+        # (08-18 §3-5: `inquire-price`는 천장에 눌렸고 `inquire-balance`는 안 닿았다).
+        "by_endpoint": dict(
+            collections.Counter(s["endpoint"] for s in censored).most_common()
+        ),
+        "by_minute": dict(sorted(collections.Counter(int(s["at"][3:]) for s in censored).items())),
+        "phase_minutes": sorted(CENSORED_PHASE_MINUTES),
+        "phase_count": in_phase,
+        "phase_concentration": round(in_phase / len(censored), 3) if censored else None,
+        # 여덟 분 / 60분. 이 값을 함께 내야 「31%」가 큰지 사람이 판단할 수 있다.
+        "phase_baseline": round(len(CENSORED_PHASE_MINUTES) / 60.0, 3),
+        "samples": sorted(censored, key=lambda s: -s["http"])[:5],
+    }
+
+
 def _slow_call_metrics(slow: list[dict]) -> dict:
     """§4 우선순위 3 판정용 — 지연이 페이서 대기와 HTTP 중 어디로 귀속되는지."""
     if not slow:
-        return {"count": 0, "pacer_dominant": 0, "http_dominant": 0, "samples": []}
+        return {
+            "count": 0, "pacer_dominant": 0, "http_dominant": 0, "samples": [],
+            # 2026-08-19 Fix#6 — **키를 조용히 빼지 않는다.** 없는 키는 「실측 없음」으로 떨어져
+            # 가설이 검정 불가가 되고, 그것이 08-18 §3-2가 겪은 결함의 형태다.
+            "censored": _censored_metrics([]),
+        }
     pacer_dominant = sum(1 for s in slow if s["pacer"] > s["http"])
     return {
         "count": len(slow),
@@ -1369,6 +1464,7 @@ def _slow_call_metrics(slow: list[dict]) -> dict:
         "by_mod10_minute": dict(
             sorted(collections.Counter(int(s["at"][3:]) % 10 for s in slow).items())
         ),
+        "censored": _censored_metrics(slow),
         "samples": sorted(slow, key=lambda s: -s["total"])[:5],
     }
 
@@ -1411,9 +1507,14 @@ def resolve_target_date(explicit: str | None, now: datetime) -> date:
     return now.date()
 
 
-def previous_business_day(target: date) -> date:
-    """델타 비교 기준일 후보 — 주말은 건너뛴다(공휴일은 파일 존재 여부로 걸러진다)."""
-    day = target - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return day
+# 2026-08-19 (08-18 보고서 §3-3 / Fix#3) — `previous_business_day()`를 **여기서 지웠다.**
+#
+# 그 함수는 주말만 건너뛰면서 docstring에 *"공휴일은 파일 존재 여부로 걸러진다"* 고 적어
+# 두었다. **그 가정이 08-18에 깨졌다**: 광복절 대체휴일인 08-17에도 관측 루프가 돌아
+# `auto/2026-08-17_지표.json`이 실제로 생겼고, 08-17이 **월요일**이라 주말 스킵에도 안 걸렸다.
+# 결과는 08-18 §1의 붉은 ⚠ 4개가 전부 «거래일 vs 휴장일» 비교였다는 것이다.
+#
+# 대체는 `mahdi.market_calendar.previous_trading_day(target, calendar)`다. 여기에 남겨 두지
+# 않는 이유는 **같은 질문에 답이 둘 있으면 하나는 반드시 틀린 채로 쓰인다**는 것이고,
+# 그 틀린 쪽이 방금 하루를 오독하게 만들었다. 이 모듈은 순수 텍스트 파서로 남는다 —
+# 달력은 파일을 읽는 일이라 여기 있으면 안 된다(규약 B, `market_calendar` 모듈 docstring).

@@ -944,3 +944,111 @@ def test_position_section_sets_no_threshold_because_the_normal_range_is_unknown(
 
     source = inspect.getsource(report._render_positions)
     assert "임계를 걸지 않는다" in source
+
+
+# ===== 2026-08-19 (08-18 보고서 §3-3 / Fix#3) — §1 델타 기준일 배너 =====
+#
+# 08-18의 §1은 「REST수집 평균 ▲18.7 ⚠」·「느린 REST 호출 ▲2,840 ⚠」·「사람이 읽는 로그
+# ▲5,770 ⚠」·「비200 응답 ▲35 ⚠」 넷을 붉게 인쇄했다. **넷 다 거짓이었다** — 전일 08-17이
+# 광복절 대체휴일이라 거래일과 휴장일을 뺀 값이었다(규약 G). 배너는 그 표를 읽기 **전에** 뜬다.
+
+
+def _banner(**baseline):
+    base = {
+        "date": "2026-08-14", "baseline_is_trading_day": 1, "skipped_non_trading_days": 0,
+        "target_is_trading_day": 1, "target_holiday_name": None,
+        "calendar_coverage_gap_days": 0, "sidecar_found": 1,
+    }
+    base.update(baseline)
+    return "\n".join(report._delta_baseline_banner({"delta_baseline": base}))
+
+
+def test_a_normal_day_prints_no_banner_at_all():
+    """정상일에 배너가 뜨면 매일 뜨고, 매일 뜨는 경고는 곧 안 읽힌다."""
+    assert _banner() == ""
+
+
+def test_the_baseline_that_skipped_a_holiday_says_so():
+    text = _banner(date="2026-08-14", skipped_non_trading_days=3)
+    assert "직전 거래일 2026-08-14 기준" in text
+    assert "비거래일 3일" in text
+
+
+def test_a_non_trading_day_labels_its_own_output():
+    """휴장일 자신의 산출물이 다음날 기준선으로 쓰이는 것을 막는 것이 이 줄의 목적이다."""
+    text = _banner(target_is_trading_day=0, target_holiday_name="광복절 대체공휴일")
+    assert "비거래일" in text and "광복절 대체공휴일" in text
+
+
+def test_an_unknown_baseline_is_printed_as_unknown_not_as_zero():
+    text = _banner(date=None, baseline_is_trading_day=None, skipped_non_trading_days=None)
+    assert "직전 거래일을 못 찾았다" in text
+    assert "0으로 접지 않았다" in text
+
+
+def test_an_expired_calendar_admits_the_verdict_is_weekend_only():
+    assert "달력이 오늘을 못 덮는다" in _banner(calendar_coverage_gap_days=12)
+    assert "달력이 오늘을 못 덮는다" in _banner(calendar_coverage_gap_days=None)
+
+
+def test_an_old_sidecar_without_the_section_is_silent():
+    """구버전 사이드카에는 이 절이 없다 — 그때 지어낸 배너를 그리면 그것이 새 거짓이다."""
+    assert report._delta_baseline_banner({}) == []
+
+
+# ===== 2026-08-19 (08-18 보고서 §2-4 / Fix#5) — 컷을 독립 절로 올린다 =====
+#
+# 08-18에 컷 라벨 3건이 켜졌는데 그 시각의 `p50 ÷ timeout`은 **0.74로 경고선(0.80) 아래**였다.
+# 지연 표만 읽은 회차는 그 세 건을 못 봤다 — 두 축은 같은 날 반대 방향으로 갈 수 있다.
+
+
+def _cuts(**over):
+    base = {
+        "budget_exceeded": {"count": 177, "skipped_legs_total": 845,
+                            "priority_cut_minutes": 3, "priority_before_others_minutes": 3},
+        "timeout_abort": {"count": 24, "skipped_legs_total": 255,
+                          "priority_cut_minutes": 6, "priority_before_others_minutes": 0},
+        "failure_budget_abort": {"count": 2, "skipped_legs_total": 18,
+                                 "priority_cut_minutes": 0, "priority_before_others_minutes": 0},
+    }
+    for k, v in over.items():
+        base[k] = {**base.get(k, {}), **v} if v is not None else None
+    return {k: v for k, v in base.items() if v is not None}
+
+
+def test_the_three_causes_are_never_merged_into_one_number():
+    """원인이 다르면 조치가 다르다 — 합치면 「무엇이 이 분을 얇게 만들었는가」에 못 답한다."""
+    out = "\n".join(report._render_chain_cuts(_cuts()))
+    assert "예산 초과(벽시계)" in out and "연속 타임아웃" in out and "실패 예산 소진" in out
+    assert "우리가 느렸다" in out and "KIS가 read timeout 천장에 닿았다" in out
+
+
+def test_the_budget_path_label_is_explicitly_not_a_violation():
+    """08-18의 오진을 표 옆에서 막는다 — 그 열은 데드라인 경로에서 **구조적으로** 켜진다."""
+    out = "\n".join(report._render_chain_cuts(_cuts()))
+    assert "위반으로 읽지 말 것" in out
+    assert "먼슬리 두께" in out
+
+
+def test_the_scope_path_is_still_a_real_ordering_invariant():
+    """`timeout_abort`는 1단계 접기를 거치므로 0이어야 한다 — 0이 아니면 Fix#4가 깨진 것이다."""
+    ok = "\n".join(report._render_chain_cuts(_cuts()))
+    assert "✅ `timeout_abort` 경로 **0분**" in ok
+
+    broken = "\n".join(report._render_chain_cuts(
+        _cuts(timeout_abort={"priority_before_others_minutes": 4})
+    ))
+    assert "🚨" in broken and "선제 강등" in broken
+
+
+def test_an_unlabelled_log_says_it_did_not_measure():
+    """규약 C — 라벨이 없는 날의 `None`을 「순서를 지켰다」로 인쇄하면 안 된다."""
+    out = "\n".join(report._render_chain_cuts(
+        _cuts(timeout_abort={"priority_before_others_minutes": None})
+    ))
+    assert "못 쟀다" in out
+
+
+def test_a_log_without_the_cut_sections_is_honest_about_it():
+    out = "\n".join(report._render_chain_cuts({}))
+    assert "안 셌다" in out

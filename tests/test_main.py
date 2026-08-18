@@ -3734,11 +3734,19 @@ def test_a_minute_with_no_entry_strategy_still_says_why(monkeypatch):
     )
     assert record == {
         "candidates": [], "book_expiry": None, "reason": "no_entry_strategy", "rejected": [],
+        # 2026-08-18 로테이션(§3) — 관망 분에도 판정을 싣되, 체인이 비면 「판정 못 했다」가
+        # None 그대로 남는다.
+        "target_series": None, "target_series_reason": None, "volume_leader_series": None,
     }
 
 
-def test_the_expiry_day_book_never_becomes_a_general_entry_candidate(monkeypatch):
-    """만기 당일 북은 0DTE 플레이북 전용 — 이 불변식이 깨지면 잔존 0일짜리를 사게 된다."""
+def test_a_seriesless_chain_keeps_the_expiry_day_book_out_of_candidates(monkeypatch):
+    """series 미상 폴백(마이그레이션 033 이전 행)에서는 종전 규칙대로 만기 당일 북을 제외한다.
+
+    2026-08-18 로테이션 규칙 1 이후 만기 당일 북 **채택**은 series를 아는 정상 경로에서
+    허용된다(`ALLOW_EXPIRY_DAY_TARGET`, 근거는 instrument_selection의 그 상수 주석) — 폴백은
+    어느 북인지도 모르는 상태라 0DTE 후보를 만들지 않는 종전 불변식을 유지한다.
+    """
     today = date(2026, 8, 6)  # `_patch_signal_fusion_cycle_db_defaults`가 고정하는 날짜
     record = _run_fusion_cycle_capturing_selection(
         monkeypatch, chain_rows=_selection_chain_rows(expiry=today), spot=100.0,
@@ -5372,6 +5380,63 @@ def test_reroll_books_to_spot_logs_only_when_window_actually_moves(monkeypatch, 
     assert len(third) == 2
 
 
+def test_reroll_warns_when_the_window_stays_stuck_two_cycles(caplog):
+    """2026-08-18(SERIES_ROTATION_RULE_v1 §6-3) — 창 고착 상시 진단.
+
+    08-04 이전 사고(롤링이 안 돌아 하루치 체인이 5.5% OTM 방치)가 재발하면, 롤 직후에도
+    임계를 넘긴 거리가 남고 다음 사이클에도 안 줄어든다 — 그때 WARNING 1줄. 1사이클짜리
+    초과(다음 롤이 잡는 과도 상태)에는 울리지 않는다.
+    """
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([]))
+    manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1, label="regular"
+    )
+    liveness = mahdi_main.WsLiveness()
+
+    with caplog.at_level("WARNING", logger="mahdi.main"):
+        _run(mahdi_main._reroll_books_to_spot([manager], 350.0, ws_liveness=liveness))
+        assert liveness.window_stuck_warnings == 0
+
+        # 롤링 로직이 죽은 상태를 재현 — roll_to_spot이 불려도 창이 안 움직인다.
+        async def frozen_roll(spot):
+            return None
+
+        manager.roll_to_spot = frozen_roll
+        _run(mahdi_main._reroll_books_to_spot([manager], 356.0, ws_liveness=liveness))
+        assert liveness.window_stuck_warnings == 0, "첫 관측은 과도 상태일 수 있어 기다린다"
+        _run(mahdi_main._reroll_books_to_spot([manager], 356.0, ws_liveness=liveness))
+
+    assert liveness.window_stuck_warnings == 1
+    stuck = [r for r in caplog.records if "창 고착 의심" in r.message]
+    assert len(stuck) == 1
+    assert "regular" in stuck[0].getMessage()
+
+
+def test_reroll_stuck_state_clears_once_the_window_moves_again(caplog):
+    """고착이 풀리면(창이 다시 스팟을 따라가면) 직전 거리 상태도 지워져 다시 울리지 않는다."""
+    ws_client = KISWebSocketClient(approval_key="APV", connection=FakeConnection([]))
+    manager = RollingSubscriptionManager(
+        ws_client, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1, label="regular"
+    )
+    liveness = mahdi_main.WsLiveness()
+    real_roll = manager.roll_to_spot
+
+    with caplog.at_level("WARNING", logger="mahdi.main"):
+        _run(mahdi_main._reroll_books_to_spot([manager], 350.0, ws_liveness=liveness))
+
+        async def frozen_roll(spot):
+            return None
+
+        manager.roll_to_spot = frozen_roll
+        _run(mahdi_main._reroll_books_to_spot([manager], 356.0, ws_liveness=liveness))
+        del manager.roll_to_spot  # 인스턴스 가림막 제거 → 원래 롤링 복구
+        assert manager.roll_to_spot == real_roll
+        _run(mahdi_main._reroll_books_to_spot([manager], 356.0, ws_liveness=liveness))
+
+    assert liveness.window_stuck_warnings == 0
+    assert liveness.window_stuck_prev == {}
+
+
 # ===== 2026-08-03 §2-8 / §4 우선순위 3: 로그 위생 =====
 
 
@@ -6774,7 +6839,7 @@ def test_timeout_abort_drops_the_weekly_book_before_the_monthly(monkeypatch, cap
     message = aborts[0].getMessage()
     # 두 북이 다 잘리긴 했다(먼슬리 잔여 + 위클리 전부). **순서가 지켜졌는지**는 컷당한북이
     # 아니라 아래 라벨이 답한다 — 그것이 Fix#5의 존재 이유다.
-    assert "우선순위위반=아니오" in message
+    assert "데드라인이먼슬리에서끝남=아니오" in message
 
 
 def test_a_monthly_only_cycle_still_aborts_immediately(monkeypatch, caplog):
@@ -6793,7 +6858,7 @@ def test_a_monthly_only_cycle_still_aborts_immediately(monkeypatch, caplog):
     assert len(missing) == 10  # 재시도 경로는 그대로 살아 있다
     message = [r for r in caplog.records if "연속 타임아웃" in r.getMessage()][0].getMessage()
     assert "컷당한북=regular" in message
-    assert "우선순위위반=아니오" in message, (
+    assert "데드라인이먼슬리에서끝남=아니오" in message, (
         "먼슬리 단독 사이클의 꼬리 컷을 위반으로 세면 08-12의 오독(priority_cut_minutes=2)이 재현된다."
     )
 
@@ -6817,11 +6882,22 @@ def test_the_escalation_never_extends_the_time_budget(monkeypatch, caplog):
     assert len(rest_client.calls) <= 3, "예산을 넘겨서까지 먼슬리를 부르면 안 된다"
 
 
-def test_priority_violation_label_fires_when_the_monthly_is_cut_with_weeklies_pending(monkeypatch, caplog):
-    """라벨이 **진짜 순서 위반**에서는 켜져야 한다 — 안 켜지면 불변식이 무의미하다.
+def test_the_label_fires_when_the_deadline_ends_inside_the_monthly(monkeypatch, caplog):
+    """라벨이 **데드라인 컷**에서는 켜져야 한다 — 안 켜지면 그 축을 아무도 못 본다.
 
     시간 예산이 먼슬리 도중에 끝나면 아직 안 부른 위클리를 두고 먼슬리가 잘린다. 그것은
-    Fix#4가 못 막는 종류다(예산은 시계이지 스코프가 아니다) — **그래서 라벨이 필요하다.**
+    Fix#4(스코프 접기)가 못 막는 종류다 — **예산은 시계이지 스코프가 아니다.**
+
+    ## 2026-08-19 — 이 테스트의 **이름과 해석을 고쳤다**(단언은 그대로다)
+
+    08-18 보고서가 이 라벨의 옛 이름(`우선순위위반`)을 보고 「불변식이 처음 깨졌다」로 읽어
+    P1을 잘못 진단했다. 실제로는 `books[0]`이 이미 먼슬리라 위클리는 **언제나 뒤에 있고**,
+    데드라인이 먼슬리 구간에서 끝나면 이 조건은 **구조적으로 항상 참**이다. 그 분에 위클리
+    레그는 한 건도 안 불렸다 — 먼슬리가 예산 100%를 썼고, 그것은 순서를 **지킨** 결과다.
+
+    그러므로 이 라벨이 답하는 것은 「위반했는가」가 아니라 **「데드라인이 먼슬리에서 끝났는가」**
+    이고, 그 사실은 여전히 재야 한다(그 분은 먼슬리가 얇게 끝난 분이다 — 08-18 15:01:52는
+    6/10레그였다). 상세 근거는 `mahdi/main.py`의 `LOG_CHAIN_BUDGET_EXCEEDED` 위 주석.
     """
     books = [
         (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular"),
@@ -6832,4 +6908,4 @@ def test_priority_violation_label_fires_when_the_monthly_is_cut_with_weeklies_pe
 
     cut = [r for r in caplog.records if "수집 예산" in r.getMessage()]
     assert len(cut) == 1
-    assert "우선순위위반=예" in cut[0].getMessage()
+    assert "데드라인이먼슬리에서끝남=예" in cut[0].getMessage()

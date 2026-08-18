@@ -38,6 +38,11 @@ logger = logging.getLogger("mahdi.ops.watchdog_metrics")
 
 WATCHDOG_LOG_FILENAME = "watchdog.log"
 
+# `watchdog_observation_loop._MISSING_CHECK_MARKER`의 **복제본**이다 — 이 모듈은 `scripts/`를
+# import하지 않는다(로직은 모듈에, 스크립트는 얇게). 갈라지면 경보가 0건으로 세어지고 그 0은
+# 「점검이 제때 있었다」로 읽히므로, `tests/test_ops_watchdog_metrics.py`가 일치를 강제한다.
+MISSING_CHECK_MARKER = "MISSING_CHECK"
+
 # `[2026-08-12 10:14:01] RESTART — ...` / `[...] OK — ...` / `[...] 재기동 시도: ...`
 _LINE_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})\]\s*(.*)$")
 
@@ -72,6 +77,7 @@ def parse(lines: list[str], target: date) -> dict:
     restart_failures = 0
     alert_only = 0
     degraded = 0
+    missing_check = 0
     for line in lines:
         m = _LINE_RE.match(line.rstrip("\n"))
         if not m:
@@ -83,7 +89,12 @@ def parse(lines: list[str], target: date) -> dict:
         )
         body = m.group(5)
         stamps.append(at)
-        if body.startswith("RESTART"):
+        if body.startswith(MISSING_CHECK_MARKER):
+            # 2026-08-19 (08-18 §1-2 / Fix#4) — **관측 루프 이상이 아니다.** 루프는 멀쩡한데
+            # 사람의 장전 점검이 09:00까지 안 뜬 것이고, 08-18에는 인프라가 하루 종일 초록인
+            # 채로 그 회차가 298분 늦었다. `restarts`/`degraded`와 섞으면 조치가 뒤섞인다.
+            missing_check += 1
+        elif body.startswith("RESTART"):
             restarts += 1
         elif body.startswith("ALERT_ONLY"):
             alert_only += 1
@@ -115,6 +126,9 @@ def parse(lines: list[str], target: date) -> dict:
         # 2026-08-14 Fix#2. **0은 두 가지다**(규약 C): 이 키가 있고 0이면 「적재가 끊긴 분이
         # 없었다」이고, 키가 아예 없으면 「그날은 이 판정 자체가 없던 버전이다」이다.
         "degraded_checks": degraded,
+        # 2026-08-19 Fix#4. **0은 두 가지다**(규약 C): 키가 있고 0이면 「장전 점검이 제때 있었다」,
+        # 키가 아예 없으면 「그날은 이 판정 자체가 없던 버전이다」. 그 구분이 이 키의 존재 이유다.
+        "missing_check_alerts": missing_check,
         "max_silence_minutes": round(max_gap, 1),
         # 2026-08-12 규약 F — **주장 지표는 절대 건수로 세우지 않는다.**
         #

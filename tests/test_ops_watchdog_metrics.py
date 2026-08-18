@@ -163,3 +163,40 @@ def test_report_shouts_when_the_loop_was_alive_but_empty():
     )
     assert "적재 정지(DEGRADED)" in out
     assert "재기동은 하지 않는다" in out
+
+
+# ===== 2026-08-19 (08-18 보고서 §1-2 / Fix#4) — 장전 점검 미발화 경보 =====
+#
+# 08-18 장전 회차는 08:30 예정에 **13:28:36**(298분 지연)에 떴고, 같은 날 14:30 회차는 정시에
+# 떴다. **예약이 안 뜬 것을 예약으로 감시할 수 없으므로** 10분마다 도는 워치독이 유일한 신호다.
+# 08-17 보고서가 남긴 그 항목이 사흘째 미이행이었다.
+
+
+def test_a_missing_check_alert_is_counted_on_its_own_axis():
+    """`restarts`/`degraded_checks`와 **섞이면 안 된다** — 조치가 완전히 다르다.
+
+    08-18은 인프라가 하루 종일 초록인 채로(재기동 0 · DEGRADED 0) 장전 점검만 298분 늦었다.
+    한 축에 합치면 그 하루가 「아무 일도 없었다」로 인쇄된다.
+    """
+    lines = _healthy_day() + [
+        f"[2026-08-12 09:00:03] {watchdog_metrics.MISSING_CHECK_MARKER} — 오늘 장전 점검 산출물이 없다"
+    ]
+    metrics = watchdog_metrics.parse(lines, _TARGET)
+    assert metrics["missing_check_alerts"] == 1
+    assert metrics["restarts"] == 0
+    assert metrics["degraded_checks"] == 0
+    # 판정한 것은 맞으므로 `checks`에는 들어간다 — 그 분에 워치독이 실제로 돌았다.
+    assert metrics["checks"] == len(_healthy_day()) + 1
+
+
+def test_a_quiet_day_reports_zero_missing_checks_not_a_missing_key():
+    """규약 C — 「점검이 제때 있었다」와 「이 판정이 없던 버전이다」를 소비측이 갈라야 한다."""
+    assert watchdog_metrics.parse(_healthy_day(), _TARGET)["missing_check_alerts"] == 0
+
+
+def test_the_marker_matches_the_script_that_writes_it():
+    """복제본이 갈라지면 경보가 0건으로 세어지고, 그 0은 「점검이 제때 있었다」로 읽힌다."""
+    import importlib
+
+    loop = importlib.import_module("scripts.watchdog_observation_loop")
+    assert loop._MISSING_CHECK_MARKER == watchdog_metrics.MISSING_CHECK_MARKER

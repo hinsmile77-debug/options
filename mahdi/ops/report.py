@@ -201,6 +201,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     lines += _section("9. 느린 REST 호출 — 페이서 vs HTTP 귀속", lambda: _render_slow_calls(metrics))
     lines += _section("9-1. KIS 응답시간 — 서비스 품질 지표",
                       lambda: _render_rest_latency(metrics, previous))
+    lines += _section("9-2. 옵션체인 컷 — 세 원인과 데드라인 라벨 (독립 행)",
+                      lambda: _render_chain_cuts(metrics))
     lines += _section("10. 폴러 실측 위상", lambda: _render_phase(metrics))
     lines += _section("11. 로그 볼륨/정성 항목", lambda: _render_log_volume(metrics))
     if watchdog is not None:
@@ -373,6 +375,39 @@ def _render_ws_disconnects(metrics: dict, db_metrics: dict | None) -> list[str]:
     return out
 
 
+def _delta_baseline_banner(metrics: dict) -> list[str]:
+    """§1 표 **머리**에 붙는 배너 — 기준일이 무엇이고 오늘이 거래일인가 (2026-08-19 / Fix#3).
+
+    08-18에 이 배너가 없어서 「REST수집 평균 ▲18.7 ⚠」·「느린 REST 호출 ▲2,840 ⚠」·「사람이
+    읽는 로그 ▲5,770 ⚠」·「비200 응답 ▲35 ⚠」 **넷이 전부 거짓으로 인쇄됐다.** 전일이
+    광복절 대체휴일이었고, 그 표는 거래일과 휴장일을 뺀 값이었다(규약 G).
+
+    **없는 정보는 인쇄하지 않는다.** `delta_baseline` 절 자체가 없으면(구버전 사이드카)
+    빈 목록이다 — 침묵이 「정상」으로 읽히는 것보다 낫다(그 반대는 08-18이 이미 보여 줬다).
+    """
+    baseline = dig(metrics, "delta_baseline")
+    if not isinstance(baseline, dict):
+        return []
+    lines: list[str] = []
+    # 오늘 자신이 비거래일이면 **그 사실이 먼저다.** 이 산출물 전체가 시장 없는 하루의 것이다.
+    if baseline.get("target_is_trading_day") == 0:
+        name = baseline.get("target_holiday_name") or "주말"
+        lines.append(f"> 🚫 **오늘은 비거래일이다({name}).** 아래 값 전부가 시장 없는 하루의 것이고, "
+                     "**다음 거래일의 기준선으로 쓰면 안 된다** — 08-17이 그렇게 쓰여 08-18의 ⚠ 넷을 만들었다.")
+    skipped = baseline.get("skipped_non_trading_days")
+    if baseline.get("date") is None:
+        lines.append("> ⚠ **직전 거래일을 못 찾았다** — 달력이 답을 못 준다. 델타를 생략했고 "
+                     "**0으로 접지 않았다**(「모름」은 「변화 없음」이 아니다).")
+    elif skipped:
+        lines.append(f"> ⚠ **직전 거래일 {baseline['date']} 기준**이다 — 그 사이 비거래일 {skipped}일을 "
+                     "건너뛰었다. 달력상 «어제»가 아니라 **시장이 마지막으로 열린 날**과 비교한 값이다.")
+    gap = baseline.get("calendar_coverage_gap_days")
+    if gap is None or (isinstance(gap, (int, float)) and gap > 0):
+        lines.append("> ⚠ **휴장일 달력이 오늘을 못 덮는다**(`covered_through` 만료 또는 판독 불가) — "
+                     "위 기준일 판정은 **주말만 반영한 값**일 수 있다. 달력을 갱신할 것.")
+    return lines + [""] if lines else []
+
+
 def _render_headline(metrics: dict, previous: dict | None, db_metrics: dict | None = None) -> list[str]:
     headers = ["지표", "오늘"]
     if previous:
@@ -389,7 +424,9 @@ def _render_headline(metrics: dict, previous: dict | None, db_metrics: dict | No
             out_rows.append(row)
         return out_rows
 
-    out = _table(headers, build_rows(metrics, HEADLINE_METRICS, ""))
+    # 배너는 **표보다 먼저** 온다 — 표를 읽고 나서 「그런데 기준일이 휴장일이었다」를 알면
+    # 이미 읽은 ⚠ 넷을 사람이 되돌려야 하고, 08-18에 그 되돌리기가 일어나지 않았다.
+    out = _delta_baseline_banner(metrics) + _table(headers, build_rows(metrics, HEADLINE_METRICS, ""))
     if not previous:
         out += ["> 전일 지표 사이드카가 없어 델타를 생략했다.", ""]
 
@@ -783,6 +820,139 @@ def _render_slow_calls(metrics: dict) -> list[str]:
                  f"{s['multiplier']:.2f}", s["endpoint"]]
                 for s in sc["samples"]
             ],
+        )
+    return out + _render_censored_calls(sc)
+
+
+# 옵션체인 사이클이 잘리는 **세 원인**. 원인이 다르면 조치가 다르므로 한 지표로 합치지 않는다
+# (`log_metrics`의 `budget_exceeded`/`timeout_abort`/`failure_budget_abort` 주석이 근거다).
+_CHAIN_CUT_CAUSES: list[tuple[str, str, str]] = [
+    ("budget_exceeded", "예산 초과(벽시계)", "우리가 느렸다 — 50초 안에 못 끝냈다"),
+    ("timeout_abort", "연속 타임아웃", "KIS가 read timeout 천장에 닿았다"),
+    ("failure_budget_abort", "실패 예산 소진", "성공과 실패가 섞여 절반이 죽었다"),
+]
+
+
+def _render_chain_cuts(metrics: dict) -> list[str]:
+    """2026-08-19 (08-18 보고서 §2-4 / Fix#5) — **컷을 지연 게이지의 종속 지표로 두지 않는다.**
+
+    08-18에 컷 라벨이 3건 켜졌는데 그 시각의 `p50 ÷ timeout`은 **0.74로 경고선(0.80) 아래**였다.
+    먼저 울린 종은 예산 대비 104%였고, 지연 표만 읽은 회차는 그 세 건을 못 봤다. 그래서
+    **독립 절**로 올린다 — 두 축은 같은 날 반대 방향으로 갈 수 있다.
+
+    ## `데드라인이먼슬리에서끝남` 열을 원인별로 갈라 읽어야 하는 이유
+
+    이 라벨의 옛 이름은 `우선순위위반`이었고, 그 이름이 08-18의 오진을 만들었다.
+    **경로마다 뜻이 다르다**:
+
+      `budget_exceeded`  벽시계가 먼슬리 구간에서 끝났다는 뜻이다. 위클리는 언제나 뒤에
+                         있으므로 이 값은 **위반이 아니라 「먼슬리가 예산을 다 썼다」**이다.
+                         읽어야 할 것은 그 분의 **먼슬리 두께**이지 순서가 아니다.
+      `timeout_abort`    여기서는 **진짜 순서 축**이다. 스코프 컷은 1단계 접기(위클리 선제
+                         강등)를 거치므로 `아니오`가 정보를 담는다 — 0이 아니면 Fix#4가 깨진 것이다.
+    """
+    out: list[str] = []
+    rows = []
+    for key, label, meaning in _CHAIN_CUT_CAUSES:
+        node = metrics.get(key)
+        if not isinstance(node, dict):
+            continue
+        rows.append([
+            label,
+            f"{node.get('count', 0):,}",
+            f"{node.get('skipped_legs_total', 0):,}",
+            _fmt(node.get("priority_cut_minutes"), "{:,.0f}"),
+            _fmt(node.get("priority_before_others_minutes"), "{:,.0f}"),
+            meaning,
+        ])
+    if not rows:
+        return ["> 계측 전 — 이 로그에는 컷 절이 없다. **「컷이 없었다」가 아니라 「안 셌다」**이다.", ""]
+    out += _table(
+        ["원인", "건수", "포기 레그", "먼슬리에 닿은 분", "데드라인이 먼슬리에서 끝난 분", "뜻"],
+        rows,
+    )
+    before = dig(metrics, "timeout_abort.priority_before_others_minutes")
+    if before is None:
+        out += ["> ⚠ `timeout_abort`의 라벨이 **없다**(구버전 로그) — 「순서를 지켰다」가 아니라 "
+                "「못 쟀다」이다(규약 C).", ""]
+    elif before:
+        out += [f"> 🚨 **`timeout_abort` 경로에서 {before}분** — 이쪽은 진짜 순서 축이다. "
+                "스코프 컷은 1단계 접기를 거치므로 0이어야 하고, 0이 아니면 `main.py`의 "
+                "선제 강등(`dropped_non_priority_first`)이 깨진 것이다.", ""]
+    else:
+        out += ["> ✅ `timeout_abort` 경로 **0분** — 스코프 컷은 위클리를 먼저 버렸다(Fix#4 정상).", ""]
+    out += [
+        "> **`budget_exceeded` 쪽의 같은 열을 위반으로 읽지 말 것.** 레그 순서가 이미 먼슬리 "
+        "우선이라(`books[0]`) 위클리는 언제나 뒤에 있고, 벽시계가 먼슬리 구간에서 끝나면 그 "
+        "열은 **구조적으로 켜진다** — 그 분에 위클리는 한 건도 안 불렸다. 08-18 보고서가 이것을 "
+        "「불변식이 처음 깨졌다」로 읽어 P1을 잘못 냈다. **읽어야 할 것은 그 분의 먼슬리 두께**이고, "
+        "그 축은 §12 `monthly_leg_completeness`와 §9-1의 검열 건수에 있다.",
+        "",
+    ]
+    return out
+
+
+def _render_censored_calls(sc: dict) -> list[str]:
+    """2026-08-19 (08-18 보고서 §2-5 / Fix#6) — **타임아웃에 잘린 호출을 따로 인쇄한다.**
+
+    08-18에 판단이 죽은 넉 분(전부 `:01`)을 `p50 ÷ timeout` 게이지가 **원리적으로** 못 봤다.
+    그 분들의 `4.02`초는 응답시간이 아니라 read timeout에 잘린 값(우측 검열)이고, 검열된
+    표본의 분위수는 천장에 눌려 위쪽 꼬리를 잃기 때문이다. 그래서 **분위수가 아니라 건수**를
+    같은 줄에서 센다 — 이 절이 §7-1(정각·30분에 무엇이 겹치는가)의 유일한 입력이다.
+
+    **여기서 판정하지 않는다.** 점유율과 균등선을 나란히 놓고 원인 후보를 적을 뿐이다 —
+    08-18 13:40 회차가 관측 2회로 단정하지 않은 것과 같은 이유이고, 그 유보가 옳았다.
+    """
+    cen = sc.get("censored")
+    if not isinstance(cen, dict):
+        return [
+            "> 계측 전 — 검열(HTTP ≥ read timeout) 집계는 2026-08-19 Fix#6부터 쌓인다. "
+            "그 이전 로그에서는 **「검열이 없었다」가 아니라 「안 셌다」**이다.",
+            "",
+        ]
+    if not cen.get("count"):
+        return ["> ✅ read timeout에 잘린 호출(우측 검열) **0건** — 오늘 p50/p95는 천장에 "
+                "안 눌렸으므로 그 게이지를 액면 그대로 읽어도 된다.", ""]
+    share, base = cen.get("phase_concentration"), cen.get("phase_baseline")
+    minutes = cen.get("phase_minutes") or []
+    out = [
+        f"- ⚠ **검열 {cen['count']}건** (HTTP ≥ 그 엔드포인트의 read timeout) — "
+        "이 호출들의 응답시간은 **실제 값이 아니다**(천장에 잘렸다). "
+        "**p50·p95는 이 건들을 못 본다.**",
+        "",
+    ]
+    if cen.get("by_endpoint"):
+        out += _table(
+            ["엔드포인트", "검열 건수", "그 통로의 천장(초)"],
+            [[e, f"{n:,}", f"{log_metrics.read_timeout_for_label(e):.1f}"]
+             for e, n in cen["by_endpoint"].items()],
+        )
+        out += ["> 통로마다 천장이 다르다 — 08-18 실측: `inquire-price`(4.0초)는 12시부터 눌렸고 "
+                "`inquire-balance`(10.0초)는 최대 7.62초로 **안 닿았다**. 같은 임계로 세면 틀린다.", ""]
+    if share is not None and base is not None:
+        verdict = (
+            "**위상 문제다** — 우리 레그 수를 줄여도 그 분들은 그대로 남을 수 있다"
+            if share >= base * 2
+            else "균등선 근처다 — 특정 분에 몰린 것이 아니다"
+        )
+        out += [
+            f"- 정각·30분 창(`:{minutes[0]:02d}~` 등 {len(minutes)}분) 점유율 **{share:.1%}** "
+            f"/ 균등선 {base:.1%} → {verdict}",
+            "",
+            "> **왜 이 창인가**: 08-18에 `감마플립 산출 불가` 4건이 전부 `:01`이었고, HTTP ≥ 4.0초 "
+            "333건 중 103건(31%)이 이 여덟 분에 있었다. **그 분들의 페이서 대기는 1.0~1.8초로 "
+            "평범했다** — 우리 백오프가 아니라 KIS 응답이다.",
+            "> **원인은 여기서 확정하지 않는다.** 그 분에 우리가 무엇을 더 쏘는지(만기유동성 폴러의 "
+            "`startup_offset`, 5분 주기 매크로, 300초 창 인쇄)를 엔드포인트별 초 단위로 펼쳐야 "
+            "갈린다 — 겹치지 않았는데 HTTP가 천장이면 **KIS 쪽**이고, 그때 레버 E는 이 문제에 "
+            "듣지 않는다(레버 E는 우리 레그 수 축이다).",
+            "",
+        ]
+    if cen.get("samples"):
+        out += _table(
+            ["시각", "HTTP(초)", "페이서(초)", "엔드포인트"],
+            [[s["at"], f"{s['http']:.2f}", f"{s['pacer']:.2f}", s["endpoint"]]
+             for s in cen["samples"]],
         )
     return out
 

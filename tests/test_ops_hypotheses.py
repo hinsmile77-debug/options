@@ -222,6 +222,9 @@ _METRIC_ROOTS = {
     "levers", "watchdog",
     # 2026-08-12 고도화 1 — WS 단절을 **비용**으로 재는 축(시각·시간대별 분포).
     "ws_disconnect",
+    # 2026-08-19 Fix#3 — §1 델타의 **기준일이 무엇이었는가**. `levers`/`watchdog`과 같이
+    # `daily_ops_report.build`가 `metrics`에 실어 넣는다(사이드카에만 넣으면 검정 불가).
+    "delta_baseline",
 }
 
 

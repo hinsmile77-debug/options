@@ -47,8 +47,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mahdi import session
+from mahdi import market_calendar, session
 from mahdi.broker import tr_codes  # noqa: F401 — 아래 market_div_for()가 상수를 쓴다
+from mahdi.broker.order_state_machine import Order, OrderState, order_to_execution_log_row
 from mahdi.broker.rest_client import (
     KISRestClient, format_order_price, normalize_order_no, parse_fill_status,
 )
@@ -65,6 +66,42 @@ _PRICE_AWAY_RATIO = 0.30
 # 격자 판정에서 부동소수 먼지를 흡수하는 여유. 호가단위(0.01)보다 일곱 자리 작아 실제 가격을
 # 한 틱도 옮기지 못한다.
 _TICK_EPSILON = 1e-9
+
+
+# ===== 2026-08-19 (08-18 보고서 §3-2 / Fix#2) — **왕복이 DB에 증거를 남긴다** =====
+#
+# 08-18 14:03의 왕복은 네 단계 전부 `rt_cd=0`으로 성립했는데 `execution_logs`는 **0행**이었다.
+# 이 스크립트가 `db`에서 쓰던 것은 `db.local_now()` 한 곳뿐이었고, 증거는
+# `logs/order_roundtrip_*.json` 파일에만 남았다. 파일은 사람이 열어야 보이고, 지표는 DB를 본다 —
+# 그래서 **성공한 왕복을 그 성공을 증명하도록 설계된 지표가 못 봤다.**
+#
+# ## 왜 실패를 삼키는가
+#
+# 이 함수의 실패가 왕복을 죽이면 **본말이 뒤집힌다.** 접수된 주문이 있는 상태에서 DB 예외로
+# 프로세스가 죽으면 `finally`의 취소가 안 돈다 — 계좌에 잔여 주문이 남는 것이 이 스크립트가
+# 유일하게 피해야 하는 일이다. 그래서 여기서는 **경고만 인쇄하고 계속 간다**. 다만 조용히
+# 넘기지는 않는다(계명 12): 실패 사유를 `record["db_writes"]`에 남겨 json에도 함께 보인다.
+#
+# ## 왜 단계마다 커넥션을 새로 여는가
+#
+# 주문이 접수된 구간(제출~취소) 내내 커넥션을 붙들고 있으면, 그 커넥션이 죽었을 때 취소 경로가
+# 그 사실을 뒤늦게 알게 된다. 왕복 한 번에 최대 3회이므로 연결 비용은 무시할 수 있고,
+# **취소 경로가 DB 상태에 의존하지 않는 것**이 그 비용보다 훨씬 중요하다.
+def _write_execution_log(record: dict, order: Order) -> None:
+    """`execution_logs` 1행을 upsert한다. PK가 `order_id`라 **같은 주문은 같은 행을 갱신**한다 —
+    제출(PENDING) → 조회(실측 상태) → 취소(CANCELLED)가 한 행에 누적된다."""
+    entry: dict = {"order_id": order.order_id, "state": order.state.value}
+    try:
+        with db.get_connection() as conn:
+            db.insert_execution_log(conn, order_to_execution_log_row(order))
+        entry["ok"] = True
+        print(f"  execution_logs upsert: {order.order_id} → {order.state.value}")
+    except Exception as exc:  # noqa: BLE001 — 증거 적재 실패가 취소 경로를 막으면 안 된다
+        entry["ok"] = False
+        entry["error"] = repr(exc)
+        print(f"  ⚠ execution_logs 적재 실패({exc!r}) — 왕복은 계속한다. "
+              "json 원문은 남으므로 사후에 손으로 넣을 수 있다.", file=sys.stderr)
+    record.setdefault("db_writes", []).append(entry)
 
 
 def _log_path() -> Path:
@@ -245,15 +282,26 @@ def main() -> int:
     # ⚠ **`session`은 시각만 본다 — 요일도 공휴일도 모른다.**
     # 그래서 요일은 여기서 따로 막는다(토요일 13시에 실행해도 `is_continuous_trading`은 True다 —
     # 실제로 그렇게 통과하는 것을 확인하고 이 검사를 추가했다).
-    # **공휴일은 여전히 막지 못한다** — 마흐디에는 휴장일 달력이 없다(2026-08-17 광복절
-    # 대체휴일이 그 예다). 그날 실행하면 KIS가 거부하는 것에 의존하게 된다.
+    #
+    # 2026-08-19 — **공휴일도 이제 막는다.** 08-17(광복절 대체휴일)까지는 «마흐디에 휴장일
+    # 달력이 없다»고 적혀 있었고 그날 실행하면 KIS가 거부하는 것에 기대야 했다. 달력은
+    # 08-17에 신설됐다(`mahdi/market_calendar.py`) — 그 주석이 하루 늦게 낡았을 뿐이다.
+    # 달력을 못 읽으면 `is_trading_day()`가 「거래일」쪽으로 접으므로, 이 게이트는 종전보다
+    # 절대 더 막지 않는다(그 비대칭은 그 모듈 docstring이 정한 것이다).
+    holiday = market_calendar.holiday_name(now, market_calendar.load_holiday_calendar())
     is_weekday = now.weekday() < 5
-    if (not is_weekday or not session.is_continuous_trading(now)) and not args.force_outside_hours:
-        reason = "주말" if not is_weekday else f"정규장 시간이 아님({now:%H:%M})"
+    if (
+        (not is_weekday or holiday is not None or not session.is_continuous_trading(now))
+        and not args.force_outside_hours
+    ):
+        reason = (
+            "주말" if not is_weekday
+            else f"휴장일({holiday})" if holiday is not None
+            else f"정규장 시간이 아님({now:%H:%M})"
+        )
         print(
             f"거부: {reason}. 접수 자체가 거부되거나 예약 주문이 될 수 있다.\n"
-            "       정규장(평일 09:00~15:20)에 다시 실행하거나 --force-outside-hours를 붙일 것.\n"
-            "       ⚠ 공휴일은 이 검사가 걸러내지 못한다(휴장일 달력이 없다).",
+            "       정규장(평일 09:00~15:20)에 다시 실행하거나 --force-outside-hours를 붙일 것.",
             file=sys.stderr,
         )
         return 2
@@ -311,6 +359,9 @@ def main() -> int:
         return 0
 
     order_no = None
+    # `finally`(취소 경로)도 읽으므로 **try 밖에서** 초기화한다 — 제출이 던지면 이 이름이
+    # 아예 없어서 취소 블록이 NameError로 죽는다(그러면 잔여 주문이 남는다).
+    order_row: Order | None = None
     try:
         submitted = client.submit_order(args.symbol, args.side, _QTY, price)
         record["steps"].append({"step": "submit_order", "raw": submitted})
@@ -328,6 +379,16 @@ def main() -> int:
         if not order_no:
             print("  ⚠ 주문번호를 못 읽었다 — 응답 구조가 문서와 다르다. 원문을 로그에서 확인할 것.")
 
+        # 2026-08-19 Fix#2 — **접수된 순간 남긴다.** 조회·취소가 실패해도 「주문이 나갔다」는
+        # 사실은 DB에 있어야 한다. `order_id`가 비면 upsert의 PK가 없으므로 그때만 건너뛴다.
+        order_row = Order(  # noqa: F841 — finally의 취소 경로가 읽는다
+            order_id=normalize_order_no(order_no), symbol=args.symbol, side=args.side,
+            order_type="LIMIT", intended_px=price, qty=_QTY,
+            timestamp=db.local_now(), state=OrderState.PENDING,
+        ) if order_no else None
+        if order_row is not None:
+            _write_execution_log(record, order_row)
+
         stamp = now.strftime("%Y%m%d")
         inquiry = client.inquire_ccnl(stamp, stamp, symbol=args.symbol)
         record["steps"].append({"step": "inquire_ccnl", "raw": inquiry})
@@ -338,8 +399,16 @@ def main() -> int:
         print(f"[조회] rt_cd={inquiry.get('rt_cd')} / 전체 {len(inquiry.get('output1') or [])}건 / "
               f"이 주문 {len(found)}건")
         if found:
-            print(f"  상태 매핑 = {parse_fill_status(found[0])}")
-            record["fill_status"] = parse_fill_status(found[0])
+            status = parse_fill_status(found[0])
+            print(f"  상태 매핑 = {status}")
+            record["fill_status"] = status
+            # 조회가 실제로 본 상태를 그대로 옮긴다 — **우리가 기대한 상태가 아니라.**
+            # 체결됐다면(설계상 안 되지만) 그 사실이 DB에 남아야 사람이 즉시 안다.
+            if order_row is not None:
+                order_row.state = OrderState(status["state"])
+                order_row.filled_px = status["filled_px"]
+                order_row.filled_qty = status["filled_qty"]
+                _write_execution_log(record, order_row)
         else:
             print("  ⚠ 방금 낸 주문이 조회에 없다 — 조회 파라미터나 지연을 확인할 것.")
     finally:
@@ -348,6 +417,20 @@ def main() -> int:
                 cancelled = client.cancel_order(order_no)
                 record["steps"].append({"step": "cancel_order", "raw": cancelled})
                 print(f"[취소] rt_cd={cancelled.get('rt_cd')} msg={cancelled.get('msg1')}")
+                # **취소가 업무 성공일 때만 CANCELLED로 내린다.** `rt_cd != 0`이면 주문은 아직
+                # 살아 있고, 그때 DB에 「취소됨」이라고 적으면 잔여 주문을 장부에서 지우는 것이다.
+                # 그 거짓말은 조용하고, 다음날 「주문 0건」으로 읽힌다.
+                #
+                # 조회가 이미 종결 상태(FILLED/REJECTED)를 봤다면 그것을 덮지 않는다 —
+                # `OrderStateMachine._ALLOWED_TRANSITIONS`가 금지하는 전이이고, 체결된 주문을
+                # 「취소됨」으로 적으면 그 체결이 장부에서 사라진다.
+                if (
+                    order_row is not None
+                    and cancelled.get("rt_cd") == "0"
+                    and order_row.state in (OrderState.PENDING, OrderState.PARTIAL)
+                ):
+                    order_row.state = OrderState.CANCELLED
+                    _write_execution_log(record, order_row)
             except Exception as exc:  # noqa: BLE001 — 취소 실패는 사람이 즉시 알아야 한다
                 record["steps"].append({"step": "cancel_order", "error": repr(exc)})
                 print(f"[취소] ⚠ 실패: {exc!r}\n  **HTS에서 잔여 주문을 직접 확인·취소할 것.**",
