@@ -1168,3 +1168,61 @@ def test_submit_and_cancel_use_the_same_price_format():
 
     assert captured[0]["body"]["UNIT_PRICE"] == "350"
     assert captured[1]["body"]["UNIT_PRICE"] == "0"
+
+
+# --- 2026-08-18 왕복 실측 — 같은 주문번호를 두 엔드포인트가 다르게 채운다 -------------------
+#
+#     제출 응답  ODNO = "0000007047"   (0 패딩)
+#     조회 응답  odno = "      7047"   (공백 패딩)
+#
+# 종전 비교(`strip()`만)는 항상 거짓이었고, 그 실패는 **조용하다** —
+# `get_order_fill_status()`가 «못 찾았다»를 PENDING으로 돌려주므로 라이브에서는 모든 주문이
+# 영원히 PENDING에 머문다. 실주문을 한 번 내보기 전에는 드러나지 않았다.
+
+
+def test_the_two_endpoints_pad_the_same_order_number_differently():
+    from mahdi.broker.rest_client import normalize_order_no
+
+    submitted = "0000007047"   # 제출 응답 ODNO (실측)
+    inquired = "      7047"    # 조회 응답 odno (실측)
+
+    assert normalize_order_no(submitted) == normalize_order_no(inquired) == "7047"
+
+
+def test_the_old_comparison_would_have_missed_it():
+    """회귀 방지 — 규칙이 그것을 잡을 수 있는가를 직접 확인한다."""
+    assert "0000007047".strip() != "      7047".strip()
+
+
+def test_an_all_zero_order_number_stays_distinguishable_from_missing():
+    from mahdi.broker.rest_client import normalize_order_no
+
+    assert normalize_order_no("0000000000") == "0"
+    assert normalize_order_no("") == ""
+    assert normalize_order_no(None) == ""
+
+
+def test_a_non_numeric_order_number_survives_normalisation():
+    from mahdi.broker.rest_client import normalize_order_no
+
+    assert normalize_order_no("  AB007  ") == "AB007"
+
+
+def test_the_fill_lookup_matches_across_the_padding_difference():
+    """어댑터가 실제로 그 행을 찾는가 — `confirm_fill()`이 이 경로를 탄다."""
+    from mahdi.broker import rest_client as rc
+
+    class _Fake(rc.KISRestClient):
+        def __init__(self):  # 네트워크·설정 없이 조회 응답만 갈아끼운다
+            pass
+
+        def inquire_ccnl(self, start, end, symbol=None):
+            # 전량 체결된 행 — **찾으면 FILLED, 못 찾으면 PENDING**이라 둘이 명확히 갈린다.
+            return {"output1": [{
+                "odno": "      7047", "ord_qty": "1", "tot_ccld_qty": "1",
+                "qty": "0", "rjct_qty": "0", "avg_idx": "15.40",
+            }]}
+
+    assert _Fake().get_order_fill_status("0000007047")["state"] == rc.OrderState.FILLED.value
+    # 다른 주문번호는 여전히 못 찾아야 한다 — 정규화가 서로 다른 주문을 뭉개면 안 된다.
+    assert _Fake().get_order_fill_status("0000007048")["state"] == rc.OrderState.PENDING.value

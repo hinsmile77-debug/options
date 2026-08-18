@@ -534,6 +534,32 @@ def format_order_price(price: float) -> str:
     return f"{price:.4f}".rstrip("0")
 
 
+def normalize_order_no(raw) -> str:
+    """
+    입력: 주문번호(제출 응답의 `ODNO` 또는 조회 응답의 `odno`).
+    계산: 공백을 걷어내고 **앞자리 0도 걷어낸다.**
+    해석: 2026-08-18 왕복 실측 — 같은 주문번호를 두 엔드포인트가 **다르게 채운다**:
+
+             제출 응답  ODNO = "0000007047"   (0 패딩)
+             조회 응답  odno = "      7047"   (공백 패딩)
+
+         종전 비교는 `str(...).strip()`이라 `"0000007047" == "7047"`이 되어 **항상 거짓**이었다.
+         결과는 조용하다 — `get_order_fill_status()`가 «못 찾았다»를 PENDING으로 돌려주므로,
+         라이브에서는 **모든 주문이 영원히 PENDING에 머물고** 매 사이클 경고만 쌓인다.
+         체결이 나도 상태머신이 그것을 못 본다.
+
+         잔고 조회가 필수 파라미터 누락으로 넉 달간 실패했던 것과 같은 급의 함정이고,
+         이번에도 **실주문을 한 번 내보기 전에는 드러나지 않았다.**
+    실패 조건: 없음. 전부 0인 값("0000000000")은 `"0"`으로 남긴다(빈 문자열이 되면
+              「주문번호 없음」과 구분이 사라진다).
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return ""
+    stripped = text.lstrip("0")
+    return stripped or "0"
+
+
 def _ccnl_int(row: dict, key: str) -> int:
     """조회 응답의 수치는 전부 문자열이고 공란이 올 수 있다 — 공란/None은 0으로 읽는다.
     앞자리 0으로 패딩된 값(`"0000000002"`)도 int()가 그대로 처리한다."""
@@ -1085,7 +1111,8 @@ class KISRestClient:
         response = self.inquire_ccnl(stamp, stamp)
         rows = response.get("output1") or []
         for row in rows:
-            if str(row.get(tr_codes.ORDER_INQUIRY_ORDER_NO_FIELD, "")).strip() == str(order_id).strip():
+            # 2026-08-18 — **패딩이 다르다.** 근거는 `normalize_order_no()`.
+            if normalize_order_no(row.get(tr_codes.ORDER_INQUIRY_ORDER_NO_FIELD)) == normalize_order_no(order_id):
                 return parse_fill_status(row)
         logger.warning(
             "주문번호 %s가 %s 주문체결내역조회에 없다 — PENDING으로 둔다(조회 %d건). "
