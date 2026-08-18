@@ -48,8 +48,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mahdi import session
-from mahdi.broker import tr_codes
-from mahdi.broker.rest_client import KISRestClient, format_order_price, parse_fill_status
+from mahdi.broker import tr_codes  # noqa: F401 — 아래 market_div_for()가 상수를 쓴다
+from mahdi.broker.rest_client import (
+    KISRestClient, format_order_price, normalize_order_no, parse_fill_status,
+)
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.config.settings import PROJECT_ROOT, get_kis_settings
 from mahdi.data import db
@@ -104,7 +106,50 @@ def _acquire_token(daemon: TokenDaemon, attempts: int = 3, wait_seconds: int = 6
     return False
 
 
-def _away_price(reference: float, side: str, tick: float = DEFAULT_TICK_SIZE) -> float:
+# ===== 2026-08-18 — 선물을 옵션으로 조회하고 있었다 =====
+#
+# `KISRestClient.get_quote()`의 `market_div_code` **기본값이 옵션('O')** 인데 이 스크립트는 그
+# 인자를 넘기지 않았다. 그래서 선물 코드(A01609)를 'O'로 물었고 KIS는 **HTTP 200에 전 필드 0**
+# 으로 답했다(`futs_prpr="0.00"`, `futs_last_tr_date="0"`, `dprt=9999.99` 센티널).
+#
+# 실측 대조(2026-08-18 13:5x, 같은 심볼):
+#     F(지수선물) -> futs_prpr='1096.80'  최종거래일='20260910'  잔존일='24'
+#     O(지수옵션) -> futs_prpr='0.00'     최종거래일='0'         잔존일='0'
+#
+# **에러가 아니라 0으로 답한다는 것이 이 결함의 성질이다** — 4xx였다면 즉시 드러났을 것이다.
+# 다행히 뒤이은 `reference <= 0` 검사가 주문 전에 멈춰 세웠다(예행연습 종료코드 3). 즉 실주문
+# 위험은 없었고, **예행연습이 정확히 제 일을 했다.**
+_MARKET_DIV_BY_LENGTH = {6: tr_codes.FID_MRKT_DIV_INDEX_FUTURES, 9: tr_codes.FID_MRKT_DIV_INDEX_OPTION}
+
+
+def _optional_limit(raw) -> float | None:
+    """계산: 상/하한가 필드를 float으로. 못 읽거나 0이면 None(밴드를 모르면 자르지 않는다)."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def market_div_for(symbol: str) -> str:
+    """
+    입력: 단축상품번호.
+    계산: 길이로 시장구분을 가른다 — **선물 6자리 / 옵션 9자리**(저장소 전역 규약,
+         `db/migrations/030_position_snapshots.sql`의 `shtn_pdno` 주석과 같은 근거).
+    해석: 길이를 모르는 값이면 옵션으로 둔다 — `get_quote()`의 기존 기본값과 같아서
+         이 함수가 생기기 전 동작을 바꾸지 않는다(옵션 경로는 원래 맞게 돌고 있었다).
+    실패 조건: 없음.
+    """
+    return _MARKET_DIV_BY_LENGTH.get(len(str(symbol).strip()), tr_codes.FID_MRKT_DIV_INDEX_OPTION)
+
+
+def _away_price(
+    reference: float,
+    side: str,
+    tick: float = DEFAULT_TICK_SIZE,
+    low_limit: float | None = None,
+    high_limit: float | None = None,
+) -> float:
     """
     입력: 현재가, BUY/SELL, 호가단위(기본 `DEFAULT_TICK_SIZE` — 선물·옵션 양쪽에서 유효한 격자).
     계산: 현재가에서 `_PRICE_AWAY_RATIO`만큼 불리한 쪽으로 옮긴 뒤, **더 불리한 쪽으로만**
@@ -117,6 +162,8 @@ def _away_price(reference: float, side: str, tick: float = DEFAULT_TICK_SIZE) ->
          적었지만 첫 실측 대상은 **선물(A01609)** 이었고, 선물 격자는 0.05다. 현재가 2,000개
          실측에서 **1,600개(80%)** 가 격자를 위반하는 지정가를 만들었다. 거래소가 거부하면
          포지션은 안 생기지만, 한 번뿐인 실측이 날아가고 «주문 API가 안 된다»로 오귀속되기 쉽다.
+         `low_limit`/`high_limit`(응답의 `futs_llam`/`futs_mxpr`)을 주면 그 밴드 안으로 자른다 —
+         거래소는 제한폭 밖 지정가를 접수하지 않는다(2026-08-18 실측: `rt_cd=1` 상/하한가 오류).
     실패 조건: 스냅 결과가 0 이하이거나 현재가보다 불리하지 않으면 `ValueError`.
          저가 옵션(프리미엄 0.05 미만)에서 0.05 격자로는 「현재가보다 낮은 양수」를 만들 수 없다 —
          그 경우 조용히 0이나 현재가 위쪽 값을 내보내지 않고 **멈춰서 사람에게 `--tick`을
@@ -127,10 +174,37 @@ def _away_price(reference: float, side: str, tick: float = DEFAULT_TICK_SIZE) ->
 
     is_buy = side.upper() == "BUY"
     raw = reference * (1 - _PRICE_AWAY_RATIO) if is_buy else reference * (1 + _PRICE_AWAY_RATIO)
+
+    def _floor(value: float) -> float:
+        return round(math.floor(value / tick + _TICK_EPSILON) * tick, 4)
+
+    def _ceil(value: float) -> float:
+        return round(math.ceil(value / tick - _TICK_EPSILON) * tick, 4)
+
     # 부동소수 먼지가 격자 판정을 뒤집지 않도록 여유를 준다(예: 13651.999999997 -> 13652).
-    units = raw / tick
-    steps = math.floor(units + _TICK_EPSILON) if is_buy else math.ceil(units - _TICK_EPSILON)
-    price = round(steps * tick, 4)
+    price = _floor(raw) if is_buy else _ceil(raw)
+
+    # ===== 2026-08-18 — 30%는 일일 가격제한폭 밖이었다 =====
+    #
+    # 첫 실주문이 `rt_cd=1 "모의투자 상/하한가 오류"`(msg_cd 40270000)로 거부됐다. 실측:
+    #     현재가 1099.65 · 기준가 1098.90 · 제한폭 1011.00 ~ 1186.80 (기준가 ±8.0%)
+    #     시도한 지정가 769.75 -> 하한보다 241.25 낮다
+    # `_PRICE_AWAY_RATIO=0.30`의 주석은 *"옵션 프리미엄은 변동이 크므로 30%"* 인데, 그 가정을
+    # 선물에 그대로 쓴 것이다(시장구분 결함과 **같은 뿌리** — 옵션용 전제를 선물에 적용).
+    #
+    # 30%를 낮추지 않고 **밴드로 자른다**: 원하는 거리는 그대로 두고 거래소가 허용하는 범위에서
+    # 가장 먼 값을 쓴다. 옵션처럼 밴드가 넓은 상품에서는 30%가 그대로 살아 있다.
+    #
+    # 잘릴 때 격자 스냅 방향이 **뒤집힌다**: 평소에는 «더 멀어지는 쪽»으로 내리지만, 하한에
+    # 붙였을 때 또 내리면 밴드 **밖으로** 나가 다시 거부당한다. 그래서 그때만 올림한다 —
+    # 한 틱 가까워지지만 그 지점은 이미 기준가에서 8% 떨어진 곳이라 체결 위험은 없다.
+    clamped = False
+    if is_buy and low_limit is not None and price < low_limit:
+        price, clamped = _ceil(low_limit), True
+    elif not is_buy and high_limit is not None and price > high_limit:
+        price, clamped = _floor(high_limit), True
+    if clamped and ((is_buy and price < low_limit) or (not is_buy and price > high_limit)):
+        raise ValueError(f"제한폭 경계를 격자로 표현할 수 없다(가격 {price}, 호가단위 {tick})")
 
     if price <= 0:
         raise ValueError(
@@ -151,6 +225,10 @@ def main() -> int:
     parser.add_argument("--side", default="BUY", choices=["BUY", "SELL"])
     parser.add_argument("--confirm", action="store_true", help="실제로 주문을 보낸다(없으면 예행연습)")
     parser.add_argument("--force-outside-hours", action="store_true", help="정규장 밖에서도 진행")
+    parser.add_argument(
+        "--market", default=None,
+        help="FID_COND_MRKT_DIV_CODE (F=지수선물 / O=지수옵션). 생략하면 종목코드 길이로 판별한다.",
+    )
     parser.add_argument(
         "--tick", type=float, default=DEFAULT_TICK_SIZE,
         help=f"호가단위(기본 {DEFAULT_TICK_SIZE} — 선물·옵션 양쪽에서 유효한 격자). "
@@ -190,30 +268,43 @@ def main() -> int:
         return 5
     client = KISRestClient(settings, daemon)
 
-    quote = client.get_quote(args.symbol)
+    market_div = args.market or market_div_for(args.symbol)
+    record["market_div"] = market_div
+    quote = client.get_quote(args.symbol, market_div_code=market_div)
     # 2026-08-18 실측: 옵션을 조회해도 응답에는 `optn_prpr`가 **없다**(공식 문서에는 있으나 그것은
     # 다른 TR의 스키마다). 선물·옵션 모두 `futs_prpr`가 그 종목 자신의 현재가다 —
     # 근거는 `docs/dev_memory/KIS_RAW_FIELD_RANGES.md`. 폴백은 TR이 바뀔 때를 위해 남겨 둔다.
     reference = float(quote.get("output1", {}).get("futs_prpr") or quote.get("output1", {}).get("optn_prpr") or 0)
     record["steps"].append({"step": "get_quote", "reference_price": reference, "raw": quote})
     if reference <= 0:
-        print(f"거부: 현재가를 읽지 못했다(reference={reference}). 종목코드를 확인할 것.", file=sys.stderr)
+        print(
+            f"거부: 현재가를 읽지 못했다(reference={reference}, 시장구분={market_div}). "
+            "종목코드와 **시장구분**을 확인할 것 — KIS는 구분이 어긋나도 4xx가 아니라 "
+            "전 필드 0으로 답한다(2026-08-18 실측). 선물이면 --market F, 옵션이면 --market O.",
+            file=sys.stderr,
+        )
         print(json.dumps(quote, ensure_ascii=False)[:600], file=sys.stderr)
         return 3
 
+    output1 = quote.get("output1", {})
+    low_limit = _optional_limit(output1.get("futs_llam"))
+    high_limit = _optional_limit(output1.get("futs_mxpr"))
     try:
-        price = _away_price(reference, args.side, args.tick)
+        price = _away_price(reference, args.side, args.tick, low_limit, high_limit)
     except ValueError as exc:
         print(f"거부: {exc}", file=sys.stderr)
         return 6
     record["tick"] = args.tick
+    record["price_limit"] = {"low": low_limit, "high": high_limit}
     record["reference_price"] = reference
     record["order_price"] = price
-    print(f"종목 {args.symbol} / {args.side} {_QTY}계약 / 현재가 {reference} → 지정가 {price} "
+    print(f"종목 {args.symbol}(구분 {market_div}) / {args.side} {_QTY}계약 / 현재가 {reference} → 지정가 {price} "
           f"({_PRICE_AWAY_RATIO:.0%} 불리한 쪽 = 체결 방지)")
     # 격자를 **눈으로 확인할 수 있게** 함께 인쇄한다 — 이 줄이 없어서 08-17까지 아무도
     # 지정가가 호가단위를 벗어난다는 것을 몰랐다(거리만 보고 격자는 안 봤다).
     print(f"  호가단위 {args.tick} 격자 스냅 완료 · 전송 문자열 {format_order_price(price)!r}")
+    print(f"  일일 제한폭 {low_limit} ~ {high_limit}"
+          f"{' — 지정가를 그 안으로 잘랐다' if low_limit and (price <= low_limit or price >= high_limit) else ''}")
 
     if not args.confirm:
         print("\n예행연습이다 — 주문을 보내지 않았다. 실제 실행은 --confirm.")
@@ -242,7 +333,7 @@ def main() -> int:
         record["steps"].append({"step": "inquire_ccnl", "raw": inquiry})
         found = [
             r for r in (inquiry.get("output1") or [])
-            if str(r.get(tr_codes.ORDER_INQUIRY_ORDER_NO_FIELD, "")).strip() == order_no
+            if normalize_order_no(r.get(tr_codes.ORDER_INQUIRY_ORDER_NO_FIELD)) == normalize_order_no(order_no)
         ]
         print(f"[조회] rt_cd={inquiry.get('rt_cd')} / 전체 {len(inquiry.get('output1') or [])}건 / "
               f"이 주문 {len(found)}건")

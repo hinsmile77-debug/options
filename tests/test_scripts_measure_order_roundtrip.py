@@ -85,3 +85,69 @@ def test_the_whole_reference_range_is_grid_clean():
         if not _on_grid(_away_price(ref / 10.0, "BUY"), DEFAULT_TICK_SIZE)
     ]
     assert violations == []
+
+
+# --- 2026-08-18 — 선물을 옵션으로 조회하고 있었다 -------------------------------------------
+#
+# `get_quote()`의 `market_div_code` 기본값이 옵션('O')인데 스크립트가 그 인자를 넘기지 않아
+# 선물 코드를 'O'로 물었고, KIS는 **4xx가 아니라 전 필드 0**으로 답했다. 예행연습의
+# `reference <= 0` 검사가 주문 전에 멈춰 세웠지만, 원인을 못 짚으면 매번 다시 밟는다.
+
+
+def test_a_futures_code_is_quoted_as_futures():
+    from mahdi.broker import tr_codes
+    from scripts.measure_order_roundtrip import market_div_for
+
+    assert market_div_for("A01609") == tr_codes.FID_MRKT_DIV_INDEX_FUTURES
+    assert market_div_for("101S03") == tr_codes.FID_MRKT_DIV_INDEX_FUTURES
+
+
+def test_an_option_code_is_quoted_as_options():
+    from mahdi.broker import tr_codes
+    from scripts.measure_order_roundtrip import market_div_for
+
+    assert market_div_for("B09FAWA37") == tr_codes.FID_MRKT_DIV_INDEX_OPTION
+    assert market_div_for("C01609A39") == tr_codes.FID_MRKT_DIV_INDEX_OPTION
+
+
+def test_an_unknown_length_keeps_the_previous_default():
+    """이 함수가 생기기 전 동작(옵션 기본값)을 바꾸지 않는다 — 옵션 경로는 원래 맞았다."""
+    from mahdi.broker import tr_codes
+    from scripts.measure_order_roundtrip import market_div_for
+
+    assert market_div_for("???") == tr_codes.FID_MRKT_DIV_INDEX_OPTION
+
+
+# --- 2026-08-18 — 30%는 일일 가격제한폭 밖이었다 ---------------------------------------------
+#
+# 첫 실주문이 `rt_cd=1 "모의투자 상/하한가 오류"`로 거부됐다. 실측: 현재가 1099.65 /
+# 제한폭 1011.00~1186.80(기준가 ±8.0%) / 시도한 지정가 769.75 -> 하한보다 241.25 낮다.
+
+_LOW, _HIGH = 1011.00, 1186.80
+
+
+def test_the_limit_price_is_clamped_into_the_daily_band():
+    """거래소는 제한폭 밖 지정가를 접수하지 않는다 — 30%를 낮추는 대신 밴드로 자른다."""
+    buy = _away_price(1099.65, "BUY", DEFAULT_TICK_SIZE, _LOW, _HIGH)
+    sell = _away_price(1099.65, "SELL", DEFAULT_TICK_SIZE, _LOW, _HIGH)
+
+    assert _LOW <= buy <= _HIGH and _LOW <= sell <= _HIGH
+    assert buy == _LOW and sell == _HIGH  # 허용 범위에서 가장 먼 값
+
+
+def test_clamping_still_lands_on_the_tick_grid():
+    """하한에 붙였을 때 또 내리면 밴드 밖으로 나가 다시 거부당한다 — 그때만 올림한다."""
+    buy = _away_price(1000.0, "BUY", DEFAULT_TICK_SIZE, 933.33, 1100.0)
+    assert _on_grid(buy, DEFAULT_TICK_SIZE)
+    assert buy >= 933.33  # 밴드 밖으로 나가지 않았다
+
+
+def test_a_wide_band_leaves_the_full_30_percent_intact():
+    """옵션처럼 밴드가 넓으면 30% 거리가 그대로 살아 있어야 한다."""
+    buy = _away_price(1099.65, "BUY", DEFAULT_TICK_SIZE, 1.0, 99999.0)
+    assert buy == pytest.approx(1099.65 * 0.70, abs=DEFAULT_TICK_SIZE)
+
+
+def test_without_a_known_band_the_behaviour_is_unchanged():
+    """밴드를 모르면 자르지 않는다 — 이 인자가 생기기 전과 같아야 한다."""
+    assert _away_price(1099.65, "BUY") == _away_price(1099.65, "BUY", DEFAULT_TICK_SIZE, None, None)
