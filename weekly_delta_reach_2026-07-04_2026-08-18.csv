@@ -1,0 +1,7 @@
+﻿series,option_type,target_delta,current_max_step,regression_a,regression_b,r_squared,needed_step,extra_legs_estimate,sample_total
+weekly_mon,C,0.3,49,0.9468,-0.12908,0.576,16.66,0,74858
+weekly_mon,C,0.2,49,0.9468,-0.12908,0.576,19.8,0,74858
+weekly_mon,P,0.3,72,0.1264,-0.05317,0.8251,25.02,0,74858
+weekly_mon,P,0.2,72,0.1264,-0.05317,0.8251,32.65,0,74858
+weekly_thu,C,0.3,44,-0.2383,-0.05521,0.1783,17.49,0,60856
+weekly_thu,C,0.2,44,-0.2383,-0.05521,0.1783,24.83,0,60856
