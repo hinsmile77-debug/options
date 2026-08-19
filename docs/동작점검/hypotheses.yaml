@@ -2713,7 +2713,12 @@
         **이것이 이 레버의 진짜 대가다** — 종전 문구는 이 자리를 "줄어도 회귀가 아니다"로 적어
         대가를 이득처럼 설명하고 있었다.
       역할: 대가
-    - metric: db.decisions.strategies
+    # 2026-08-19 장후 경로 정정 — `db.decisions.strategies`는 **부모는 있고 잎이 영원히 없는** 경로였다
+    # (`hypotheses.leaf_absent()`가 그날 처음 기계로 잡았다). 실재 키는 `entry_strategies`다. 이 항목은 레버 F의 **대가** 지표이고 무조건발동일이
+    # 2026-08-25다 — 안 고쳤으면 대가를 못 재는 채로 켰다(규약 E 정면 위반).
+    # **소급이 아니다**: `expect`의 부등식은 한 글자도 안 바꿨고, 정정 전 실측이 `None`이라
+    # 어떤 판정도 이 수정으로 뒤집히지 않는다.
+    - metric: db.decisions.entry_strategies
       expect: |
         수기 판정(대가) — **프리미엄 매도 계열(`limited_premium_sell` /
         `highly_limited_premium_sell`)이 새로 열리는지 본다.** 팔레트의 `short_gamma_requires`는
@@ -3011,7 +3016,14 @@
     **29분의 판단이 `regime_hmm` 없이 갔다.** 복원할 재료는 DB에 이미 있다(`step()`이 매분
     `feature_store`에 적재한다).
   예측:
-    - metric: db.regime.warmup_minutes
+    # 2026-08-19 장후 경로 정정 — `db.regime.warmup_minutes`는 **부모는 있고 잎이 영원히 없는** 경로였다
+    # (`hypotheses.leaf_absent()`가 그날 처음 기계로 잡았다). 그 잎은 애초에 **미구현**이었다(재료 `regime_state.is_warmup`은 마이그레이션 025부터
+    # DB에 있었다). 같은 날 `db_metrics._regime()`에 넷을 신설했고, 그중 이 항목이 재려는
+    # 「재기동이 되돌린 분」은 총합이 아니라 `warmup_restart_minutes`다 —
+    # 08-19 실측 총합 87분 / 재기동분 **58분**(보고서가 손으로 구한 값과 일치) / 08-18 0분.
+    # **소급이 아니다**: `expect`의 부등식은 한 글자도 안 바꿨고, 정정 전 실측이 `None`이라
+    # 어떤 판정도 이 수정으로 뒤집히지 않는다.
+    - metric: db.regime.warmup_restart_minutes
       expect: "수기 판정(주장) — 재기동이 있는 날의 warmup 재진입이 **29분 → 5분 이하**. 재기동이 없는 날에는 이 경로가 안 돌므로 판정 불가다"
       역할: 주장
     - metric: db.regime.visits
@@ -3473,7 +3485,12 @@
     나온 이유가 이것이다. 확신도의 분모가 **가용 멤버 수**라서 정보가 줄면 확신도가 오히려
     오를 수 있다(`2026-08-11-eF`의 2026-08-16 정정 참고) — 그래서 개시일 모드는 CONFIRM이다.
   예측:
-    - metric: db.signal_reach.member_availability
+    # 2026-08-19 장후 경로 정정 — `db.signal_reach.member_availability`는 **부모는 있고 잎이 영원히 없는** 경로였다
+    # (`hypotheses.leaf_absent()`가 그날 처음 기계로 잡았다). 그 절에는 멤버별 가용률이 없다 — 실재 경로는 `db.member_availability.members.<멤버>`다
+    # (08-19 실측 369분 · 구조적 미가용 110분).
+    # **소급이 아니다**: `expect`의 부등식은 한 글자도 안 바꿨고, 정정 전 실측이 `None`이라
+    # 어떤 판정도 이 수정으로 뒤집히지 않는다.
+    - metric: db.member_availability.members.options_flow.available_minutes
       expect: |
         수기 판정(주장) — 전멸이 있는 날 `options_flow`의 미가용 분이 **`chain_input_source.none`
         분과 같은 크기인가**(08-14: 73분 vs 78분). 두 값이 크게 갈리면 창이 의도대로 안 도는 것이다.
@@ -4091,4 +4108,72 @@
     않아(250ms 안에 종료) 근거 없는 수정은 하지 않았다.
     다만 **두 문제는 맞물린다**: 고아가 살아 있으면 Fix#9의 청소가 「git.exe 부재」 조건에
     걸려 락을 안 지운다. 그래서 «락을 애초에 안 만드는» 이쪽이 더 중요하다.
+  상태: pending
+
+- id: "2026-08-19-lint-dead-metric-paths"
+  구현일: 2026-08-19
+  검증예정일: 2026-08-20
+  가설: |
+    가설 지표의 **잎 부재**를 기계가 잡으면, 「부모는 있고 잎이 영원히 없는 경로」가 다음 날
+    「실측 없음」의 소음에 묻히지 않는다.
+  대가: |
+    카운터 dict(`db.decisions.reject_reason.<사유>` 등)에 대한 **오탐**. 거짓 경보가 몇 번
+    나면 §0의 「경로 없음」 열 전체가 무시되고, 그러면 08-06이 겪은 사고가 그대로 재현된다.
+    그래서 부모가 list·스칼라이거나 **값이 전부 스칼라인 dict**면 판정을 보류한다(미탐 선택).
+  근거: |
+    08-19 pending 가설의 예측 경로 전수에 잎 부재 검사를 돌려 **3건**을 찾았다. 셋 다
+    `path_exists()`를 통과하고 있었다 — 부모 절이 실재하기 때문이다.
+
+      db.decisions.strategies              레버 F의 **대가** 지표. 실재 키는 `entry_strategies`.
+                                           무조건발동일 2026-08-25 — 대가를 못 재는 채로 켤 뻔했다.
+      db.regime.warmup_minutes             그 잎은 **미구현**이었다(경로가 틀린 게 아니었다).
+      db.signal_reach.member_availability  실재 경로는 `db.member_availability.members.<멤버>`.
+
+    08-18 보고서가 이 결함을 **이틀에 두 번** 각각 다른 사고로 적었다(`c1`의
+    `db.tables.execution_logs` §3-2 · `2026-08-16-fix1` §7-3). **한 구멍이다.**
+  예측:
+    - metric: db.decisions.entry_strategies
+      expect: "수기 판정(주장) — 08-20 §0에서 이 항목의 실측이 「실측 없음」이 **아닐 것**. 08-19 기준선 {straddle_accumulate: 169, small_strangle_buy: 46}"
+      역할: 주장
+    - metric: db.member_availability.members.options_flow.available_minutes
+      expect: "수기 판정(주장) — non-null. 08-19 기준선 369분(구조적 미가용 110분)"
+      역할: 주장
+    - metric: db.decisions.total
+      expect: "수기 판정(대가) — 08-20 §0의 「경로 없음」 표시 건수. 지금 0이다. **오탐이 생기면 이 값이 아니라 그 열이 부푼다** — 이 경로는 표가 실제로 채워졌음을 보이는 앵커다"
+      역할: 대가
+  주의: |
+    ⚠ **이 정정은 소급이 아니다.** `expect`의 부등식은 한 글자도 안 바꿨고, 세 항목 다 정정
+    전 실측이 `None`이라 **어떤 판정도 이 수정으로 뒤집히지 않는다.**
+    ⚠ 회귀는 `tests/test_ops_hypotheses.py`가 지킨다 — 저장소의 pending 가설 전건을 **가장
+    최근 사이드카**에 대고 돌린다. 등재 시점 검사만으로는 부족하다: 등재할 땐 살아 있던 경로가
+    나중에 옮겨지는 형태(`c1`의 `db.tables.execution_logs`)를 못 잡는다.
+  상태: pending
+
+- id: "2026-08-19-regime-warmup-is-measurable"
+  구현일: 2026-08-19
+  검증예정일: 2026-08-20
+  가설: |
+    재기동이 레짐을 warmup으로 되돌린 분 수를 기계가 세면, 그 대가를 사람이 로그를 훑지 않고
+    본다. **레버 `REGIME_RESTORE_SESSION_WINDOW`의 OFF 기준선이 그 값이다.**
+  근거: |
+    `2026-08-12-fix7`의 주장 지표가 `db.regime.warmup_minutes`인데 그 잎이 없었다. 재료는
+    08-05부터 DB에 있었다(마이그레이션 025의 `regime_state.is_warmup`).
+
+    **총합만으로는 그 가설을 판정할 수 없다**는 것이 구현 중에 드러났다: 08-19 총합은 87분인데
+    보고서가 손으로 구한 값은 58분이다. 87 = 29 × **3**이고 첫 29분은 정상 기동의 warmup이라
+    재기동과 무관하다. 그래서 `warmup_runs`와 **첫 구간을 뺀** `warmup_restart_minutes`를
+    함께 낸다.
+  예측:
+    - metric: db.regime.warmup_restart_minutes
+      expect: "수기 판정(주장) — 재기동이 **없는** 날 이 값이 **0**인가(08-18 실측 0 · 08-19 실측 58 = 29×2). 0이 아니면 구간 분리가 틀린 것이다"
+      역할: 주장
+    - metric: db.regime.warmup_unknown_minutes
+      expect: "<= 0"
+      역할: 참고
+  주의: |
+    ⚠ **`NULL`을 0으로 접지 않는다.** 마이그레이션 025 이전 행은 `is_warmup`이 `NULL`이고
+    그것은 「warmup이 아니었다」가 아니라 「안 적었다」다. `warmup_unknown_minutes`가 그날
+    총 분 수와 같으면 이 지표는 판정에 못 쓴다.
+    ⚠ 이 항목은 **레버와 무관하다** — 재는 것은 「대가가 얼마인가」이고, 레버를 켠 뒤 그 값이
+    줄어드는지는 `2026-08-12-fix7`이 맡는다(그쪽에 `전제레버`가 달려 있다).
   상태: pending

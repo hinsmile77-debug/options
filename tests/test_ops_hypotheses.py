@@ -295,6 +295,120 @@ def test_every_repository_metric_path_starts_at_a_real_report_section():
     )
 
 
+# ===== 2026-08-19 장후 — 잎 린트 (`leaf_absent`) =====
+#
+# 위 `test_every_repository_metric_path_starts_at_a_real_report_section`은 **첫 마디**만 본다.
+# 그 규칙을 통과하면서 영원히 값을 못 내는 경로가 08-19에 저장소 안에서 **셋** 발견됐다.
+# 아래가 그 셋을 회귀로 못 박고, 마지막 테스트가 **다음 셋이 생기는 것을 막는다.**
+
+_LEAF_LINT_SAMPLE = {
+    "decisions": {"total": 485, "entry_strategies": {"straddle_accumulate": 169}},
+    "regime": {"visits": [{"regime": "3", "today": 109}], "today_total": 402},
+    "tables": [{"table": "execution_logs", "rows": 0}],
+    "member_availability": {"minutes": 485, "members": [{"member": "options_flow", "available_minutes": 369}]},
+}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "db.decisions.strategies",                 # 실재 키는 entry_strategies (레버 F의 **대가** 지표였다)
+        "db.regime.warmup_minutes",                # 그 잎은 미구현이었다 (같은 날 신설)
+        "db.member_availability.headcount",        # 구조 dict의 잎 오타
+    ],
+)
+def test_a_leaf_that_never_appears_is_caught_even_though_its_parent_exists(path):
+    """이 셋은 `path_exists()`를 **통과한다** — 부모가 실재하기 때문이다. 그것이 그 구멍이었다."""
+    assert hypotheses.path_exists(None, _LEAF_LINT_SAMPLE, path) is True
+    assert hypotheses.leaf_absent(None, _LEAF_LINT_SAMPLE, path) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "db.decisions.entry_strategies",                          # 실재하는 잎
+        "db.decisions.entry_strategies.limited_premium_sell",     # **카운터 dict** — 그날 안 난 전략
+        "db.tables.underlying_spot_1m",                           # 부모가 list(자연 키 색인)
+        "db.decisions.total.whatever",                            # 부모가 스칼라
+        "db.member_availability.members.options_flow.available_minutes",
+        "db.decisions",                                           # 마디 하나 — path_exists의 관할
+    ],
+)
+def test_the_leaf_lint_stays_silent_where_absence_is_normal(path):
+    """**오탐보다 미탐이 낫다.** 거짓 경보가 몇 번 나면 이 열 전체가 무시된다."""
+    assert hypotheses.leaf_absent(None, _LEAF_LINT_SAMPLE, path) is False
+
+
+def test_a_dead_leaf_is_reported_as_a_dead_path_not_as_missing_data():
+    """조치가 다르다 — 「실측 없음」은 내일 다시 보는 것이고 「경로 없음」은 오늘 yaml을 고치는 것이다."""
+    entry = _entry(예측=[{"metric": "db.decisions.strategies", "expect": ">= 1", "역할": hypotheses.ROLE_CLAIM}])
+    [r] = hypotheses.evaluate([entry], date(2026, 8, 3), None, _LEAF_LINT_SAMPLE)
+    assert r["path_dead"] is True
+    assert r["verdict"] == hypotheses.VERDICT_PATH_DEAD
+
+
+def test_a_fix_landed_on_or_after_the_metrics_date_is_exempt_from_the_leaf_lint():
+    """fix를 낸 **당일·다음 날**에 거짓 경보가 뜨면 이 린트는 하루 만에 무시된다.
+
+    같은 날도 면제하는 이유: 사이드카는 15:45에 확정되는데 커밋은 그 뒤에도 들어온다
+    (08-19 17:00 커밋의 `slow_calls.censored.phase_ratio`가 실제로 그 형태였다).
+    """
+    pred = [{"metric": "db.decisions.strategies", "expect": ">= 1", "역할": hypotheses.ROLE_CLAIM}]
+    same_day = _entry(구현일=date(2026, 8, 3), 예측=pred)
+    later = _entry(구현일=date(2026, 8, 4), 예측=pred)
+    earlier = _entry(구현일=date(2026, 8, 2), 예측=pred)
+    assert hypotheses.evaluate([same_day], date(2026, 8, 3), None, _LEAF_LINT_SAMPLE)[0]["path_dead"] is False
+    assert hypotheses.evaluate([later], date(2026, 8, 3), None, _LEAF_LINT_SAMPLE)[0]["path_dead"] is False
+    assert hypotheses.evaluate([earlier], date(2026, 8, 3), None, _LEAF_LINT_SAMPLE)[0]["path_dead"] is True
+
+
+def test_an_entry_without_an_implementation_date_is_still_linted():
+    """모르는 것을 면제로 바꾸면 「구현일을 안 적으면 통과」로 이 린트가 우회된다."""
+    entry = _entry(예측=[{"metric": "db.decisions.strategies", "expect": ">= 1", "역할": hypotheses.ROLE_CLAIM}])
+    entry.pop("구현일")
+    assert hypotheses.evaluate([entry], date(2026, 8, 3), None, _LEAF_LINT_SAMPLE)[0]["path_dead"] is True
+
+
+def test_the_repository_hypotheses_have_no_dead_leaves_against_the_latest_sidecar():
+    """저장소의 pending 가설 전건을 **가장 최근 사이드카**에 대고 돌린다.
+
+    ## 등재 시점 검사만으로는 부족하다
+
+    현행 검사(`test_every_repository_metric_path_starts_at_a_real_report_section`)는 첫 마디만
+    본다. 그리고 등재 시점에 **살아 있던** 경로가 나중에 옮겨지면 어떤 검사도 그것을 못 잡는다 —
+    `c1`의 `db.tables.execution_logs`가 그 형태였다. 그래서 **매일 실측에 대고** 돌린다.
+
+    ## 휴장일·다른 PC에서 죽지 않게
+
+    사이드카가 하나도 없으면 `skip`한다(이식성 규약 — 이 저장소는 여러 PC에서 돌아간다).
+    """
+    import json
+
+    auto = PROJECT_ROOT / "docs" / "동작점검" / "auto"
+    sidecars = sorted(auto.glob("*_지표.json")) if auto.exists() else []
+    if not sidecars:
+        pytest.skip("사이드카가 없다 — 이 검사는 실측이 있어야 뜻이 있다")
+    latest = sidecars[-1]
+    metrics = json.loads(latest.read_text(encoding="utf-8"))
+    target = date.fromisoformat(latest.name[:10])
+    db_metrics = metrics.get("db") or {}
+
+    dead = []
+    for entry in hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml"):
+        if str(entry.get("상태", "pending")).lower() != "pending":
+            continue
+        if not hypotheses.measurable_on(entry, target):
+            continue
+        for prediction in entry.get("예측") or []:
+            metric = str(prediction["metric"])
+            if hypotheses.leaf_absent(metrics, db_metrics, metric):
+                dead.append((entry.get("id"), metric, prediction.get("역할", "참고")))
+    assert not dead, (
+        f"{latest.name}에 잎이 없는 지표 경로: {dead} — 부모가 실재해서 「실측 없음」으로 "
+        "분류되지만 그 값은 **내일도 안 나온다**. yaml의 경로를 고치거나 지표를 신설할 것"
+    )
+
+
 def test_the_2026_08_05_dead_paths_would_now_be_caught():
     """회귀 방지 — 08-05에 실제로 죽어 있던 경로들이 지금 규칙에 걸리는지 본다.
 

@@ -1560,7 +1560,9 @@ def main(argv=None):
         if not outp.is_absolute():
             outp = root / outp
         outp.parent.mkdir(parents=True, exist_ok=True)
-        outp.write_text(text, encoding="utf-8")
+        # newline="\n" — `.gitattributes`의 `eol=lf`를 파이썬 쪽에서도 지킨다
+        # (`tests/test_repo_line_endings.py`. 없으면 Windows에서 CRLF로 되돌아간다).
+        outp.write_text(text, encoding="utf-8", newline="\n")
         eprint(f"[collect_evidence] 저장: {outp} ({fmt_bytes(len(text.encode('utf-8')))})")
         # **오늘 것을 쓴 다음에 지운다.** 순서를 뒤집으면 정리가 실패한 날에 오늘 증거까지
         # 못 만들 수 있다 — 정리는 곁가지이므로 본업 뒤에 온다.

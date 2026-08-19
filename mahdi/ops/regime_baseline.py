@@ -239,6 +239,8 @@ def capture_to_file(conn: ConnectionLike, target: date, path: Path, underlying: 
                 "정말 다시 찍어야 하는 이유를 먼저 적을 것)"
             )
     path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(baseline, ensure_ascii=False, indent=1), encoding="utf-8")
-    md_path.write_text(render(baseline), encoding="utf-8")
+    # newline="\n" — `.gitattributes`의 `eol=lf`를 파이썬 쪽에서도 지킨다
+    # (`tests/test_repo_line_endings.py`. 없으면 Windows에서 CRLF로 되돌아간다).
+    json_path.write_text(json.dumps(baseline, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
+    md_path.write_text(render(baseline), encoding="utf-8", newline="\n")
     return md_path

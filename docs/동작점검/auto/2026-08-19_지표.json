@@ -1,41 +1,43 @@
 {
-  "date": "2026-08-18",
+  "date": "2026-08-19",
   "cycles": {
-    "count": 494,
+    "count": 484,
     "first_start": "07:31",
     "last_start": "15:44",
     "rest_seconds": {
-      "n": 494,
-      "mean": 38.26,
-      "median": 44.99,
-      "max": 55.03
+      "n": 484,
+      "mean": 42.56,
+      "median": 50.45,
+      "max": 55.84
     },
     "over_60s": 0,
     "rows_distribution": {
-      "1": 1,
-      "2": 2,
-      "4": 3,
-      "5": 2,
-      "6": 3,
-      "7": 2,
-      "8": 4,
-      "9": 7,
-      "10": 15,
-      "11": 13,
-      "12": 15,
-      "13": 23,
-      "14": 17,
-      "15": 18,
-      "16": 25,
+      "0": 12,
+      "1": 10,
+      "2": 5,
+      "3": 5,
+      "4": 2,
+      "5": 4,
+      "6": 1,
+      "7": 15,
+      "8": 7,
+      "9": 21,
+      "10": 16,
+      "11": 11,
+      "12": 28,
+      "13": 25,
+      "14": 39,
+      "15": 32,
+      "16": 22,
       "17": 20,
-      "18": 27,
-      "19": 17,
-      "20": 280
+      "18": 15,
+      "19": 15,
+      "20": 179
     },
     "duplicate_poll_minutes": {
       "count": 0,
       "list": [],
-      "labelled": 494
+      "labelled": 484
     },
     "minutes_with_cycle": [
       "07:31",
@@ -177,11 +179,6 @@
       "09:47",
       "09:48",
       "09:49",
-      "09:50",
-      "09:51",
-      "09:52",
-      "09:53",
-      "09:54",
       "09:55",
       "09:56",
       "09:57",
@@ -219,11 +216,6 @@
       "10:29",
       "10:30",
       "10:31",
-      "10:32",
-      "10:33",
-      "10:34",
-      "10:35",
-      "10:36",
       "10:37",
       "10:38",
       "10:39",
@@ -533,415 +525,500 @@
       "15:43",
       "15:44"
     ],
-    "zero_row_minutes": [],
+    "zero_row_minutes": [
+      "10:10",
+      "12:55",
+      "12:56",
+      "12:57",
+      "13:01",
+      "13:02",
+      "13:03",
+      "13:04",
+      "13:05",
+      "13:06",
+      "13:41",
+      "13:42"
+    ],
     "by_hour": [
       {
         "hour": 7,
         "cycles": 29,
         "rest_mean": 19.5,
-        "rest_max": 19.7,
+        "rest_max": 19.8,
         "over_60s": 0,
         "slip_max": 0.0,
         "foreign_sum": 0,
-        "end_second_median": 19.6
+        "end_second_median": 19.7
       },
       {
         "hour": 8,
         "cycles": 60,
         "rest_mean": 19.5,
-        "rest_max": 19.8,
+        "rest_max": 20.7,
         "over_60s": 0,
         "slip_max": 0.0,
         "foreign_sum": 0,
-        "end_second_median": 19.6
+        "end_second_median": 19.8
       },
       {
         "hour": 9,
-        "cycles": 60,
-        "rest_mean": 32.9,
-        "rest_max": 53.4,
+        "cycles": 55,
+        "rest_mean": 41.1,
+        "rest_max": 55.0,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 66,
-        "end_second_median": 30.1
+        "foreign_sum": 117,
+        "end_second_median": 43.9
       },
       {
         "hour": 10,
-        "cycles": 60,
-        "rest_mean": 38.8,
-        "rest_max": 53.1,
+        "cycles": 55,
+        "rest_mean": 50.4,
+        "rest_max": 54.7,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 116,
-        "end_second_median": 41.9
+        "foreign_sum": 187,
+        "end_second_median": 51.1
       },
       {
         "hour": 11,
         "cycles": 60,
-        "rest_mean": 45.0,
-        "rest_max": 53.6,
+        "rest_mean": 49.0,
+        "rest_max": 54.2,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 157,
-        "end_second_median": 50.8
+        "foreign_sum": 219,
+        "end_second_median": 51.6
       },
       {
         "hour": 12,
         "cycles": 60,
-        "rest_mean": 45.4,
-        "rest_max": 54.7,
+        "rest_mean": 49.9,
+        "rest_max": 54.5,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 157,
-        "end_second_median": 50.4
+        "foreign_sum": 193,
+        "end_second_median": 51.7
       },
       {
         "hour": 13,
         "cycles": 60,
-        "rest_mean": 46.4,
-        "rest_max": 53.8,
+        "rest_mean": 51.3,
+        "rest_max": 55.6,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 169,
-        "end_second_median": 50.5
+        "foreign_sum": 187,
+        "end_second_median": 52.5
       },
       {
         "hour": 14,
-        "cycles": 60,
-        "rest_mean": 48.1,
-        "rest_max": 55.0,
+        "cycles": 61,
+        "rest_mean": 50.7,
+        "rest_max": 55.8,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 175,
-        "end_second_median": 51.1
+        "foreign_sum": 237,
+        "end_second_median": 51.3
       },
       {
         "hour": 15,
-        "cycles": 45,
-        "rest_mean": 39.5,
-        "rest_max": 54.3,
+        "cycles": 44,
+        "rest_mean": 39.1,
+        "rest_max": 52.8,
         "over_60s": 0,
         "slip_max": 0.0,
-        "foreign_sum": 89,
-        "end_second_median": 50.8
+        "foreign_sum": 99,
+        "end_second_median": 48.7
       }
     ],
     "by_mod10": [
       {
         "mod10": 0,
         "cycles": 49,
-        "rest_mean": 41.5,
-        "foreign_mean": 0.7,
+        "rest_mean": 42.3,
+        "foreign_mean": 1.3,
         "foreign_by_group": {
-          "투자자수급": 0.7
+          "투자자수급": 1.0,
+          "만기유동성": 0.3
         },
         "over_60s": 0
       },
       {
         "mod10": 1,
-        "cycles": 50,
-        "rest_mean": 39.2,
-        "foreign_mean": 3.4,
+        "cycles": 48,
+        "rest_mean": 42.8,
+        "foreign_mean": 4,
         "foreign_by_group": {
-          "만기유동성": 3.1,
-          "투자자수급": 0.3
+          "만기유동성": 3.3,
+          "투자자수급": 0.5,
+          "매크로": 0.1
         },
         "over_60s": 0
       },
       {
         "mod10": 2,
-        "cycles": 50,
-        "rest_mean": 37.8,
-        "foreign_mean": 3.0,
+        "cycles": 48,
+        "rest_mean": 42.3,
+        "foreign_mean": 3.9,
         "foreign_by_group": {
-          "매크로": 1.8,
-          "투자자수급": 0.3,
-          "만기유동성": 0.9
+          "매크로": 1.6,
+          "만기유동성": 1.6,
+          "투자자수급": 0.7
         },
         "over_60s": 0
       },
       {
         "mod10": 3,
-        "cycles": 50,
-        "rest_mean": 34.6,
-        "foreign_mean": 2.1,
+        "cycles": 48,
+        "rest_mean": 42.6,
+        "foreign_mean": 3.3,
         "foreign_by_group": {
-          "만기유동성": 2.1,
-          "투자자수급": 0.1
+          "만기유동성": 2.8,
+          "투자자수급": 0.5,
+          "계좌잔고": 0.1
         },
         "over_60s": 0
       },
       {
         "mod10": 4,
-        "cycles": 50,
-        "rest_mean": 36.3,
-        "foreign_mean": 1.5,
+        "cycles": 48,
+        "rest_mean": 42.1,
+        "foreign_mean": 3.1,
         "foreign_by_group": {
-          "계좌잔고": 0.5,
-          "투자자수급": 0.4,
-          "만기유동성": 0.5
+          "계좌잔고": 0.6,
+          "투자자수급": 0.5,
+          "만기유동성": 1.9
         },
         "over_60s": 0
       },
       {
         "mod10": 5,
-        "cycles": 49,
-        "rest_mean": 40.3,
-        "foreign_mean": 2.9,
+        "cycles": 47,
+        "rest_mean": 43.5,
+        "foreign_mean": 3,
         "foreign_by_group": {
-          "만기유동성": 2.5,
-          "투자자수급": 0.4
+          "만기유동성": 2.3,
+          "투자자수급": 0.7
         },
         "over_60s": 0
       },
       {
         "mod10": 6,
-        "cycles": 49,
-        "rest_mean": 40.2,
-        "foreign_mean": 1.6,
+        "cycles": 48,
+        "rest_mean": 43.0,
+        "foreign_mean": 2.2,
         "foreign_by_group": {
-          "투자자수급": 0.4,
-          "만기유동성": 1.1
+          "만기유동성": 1.3,
+          "투자자수급": 0.7,
+          "매크로": 0.2
         },
         "over_60s": 0
       },
       {
         "mod10": 7,
-        "cycles": 49,
-        "rest_mean": 39.8,
-        "foreign_mean": 2.6,
+        "cycles": 50,
+        "rest_mean": 42.6,
+        "foreign_mean": 2.8,
         "foreign_by_group": {
-          "매크로": 2.0,
-          "투자자수급": 0.6
+          "매크로": 2.1,
+          "투자자수급": 0.7
         },
         "over_60s": 0
       },
       {
         "mod10": 8,
         "cycles": 49,
-        "rest_mean": 37.1,
-        "foreign_mean": 0.3,
+        "rest_mean": 42.4,
+        "foreign_mean": 0.9,
         "foreign_by_group": {
-          "투자자수급": 0.3
+          "매크로": 0.0,
+          "투자자수급": 0.8,
+          "계좌잔고": 0.1
         },
         "over_60s": 0
       },
       {
         "mod10": 9,
         "cycles": 49,
-        "rest_mean": 35.8,
-        "foreign_mean": 0.8,
+        "rest_mean": 41.9,
+        "foreign_mean": 1.3,
         "foreign_by_group": {
-          "계좌잔고": 0.6,
-          "투자자수급": 0.2
+          "계좌잔고": 0.7,
+          "투자자수급": 0.6
         },
         "over_60s": 0
       }
     ],
     "missing": {
-      "count": 0,
-      "odd": 0,
-      "even": 0,
-      "list": [],
+      "count": 10,
+      "odd": 4,
+      "even": 6,
+      "list": [
+        "09:50",
+        "09:51",
+        "09:52",
+        "09:53",
+        "09:54",
+        "10:32",
+        "10:33",
+        "10:34",
+        "10:35",
+        "10:36"
+      ],
       "recovered_by_catchup": 0,
-      "unrecovered_count": 0,
-      "downtime_count": 0,
-      "downtime_list": [],
+      "unrecovered_count": 10,
+      "downtime_count": 10,
+      "downtime_list": [
+        "09:50",
+        "09:51",
+        "09:52",
+        "09:53",
+        "09:54",
+        "10:32",
+        "10:33",
+        "10:34",
+        "10:35",
+        "10:36"
+      ],
       "infra_count": 0,
       "infra_list": []
     }
   },
   "rest": {
-    "total_calls": 11798,
+    "total_calls": 10266,
     "span_seconds": 29681.2,
     "first_call": "07:30",
     "last_call": "15:45",
-    "calls_per_second": 0.397,
-    "capacity_pct": 39.7,
-    "deficit_threshold_multiplier": 2.52,
+    "calls_per_second": 0.346,
+    "capacity_pct": 34.6,
+    "deficit_threshold_multiplier": 2.89,
     "by_group": {
-      "옵션체인": 8729,
-      "투자자수급": 1485,
-      "만기유동성": 1170,
-      "매크로": 311,
-      "계좌잔고": 99,
-      "기동": 4
+      "옵션체인": 7357,
+      "투자자수급": 1462,
+      "만기유동성": 1054,
+      "매크로": 285,
+      "계좌잔고": 96,
+      "기동": 12
     },
     "by_status": {
-      "200": 11741,
-      "500": 57
+      "200": 10210,
+      "500": 56
     },
     "by_hour": {
       "7": 703,
       "8": 1529,
-      "9": 1582,
-      "10": 1543,
-      "11": 1413,
-      "12": 1381,
-      "13": 1386,
-      "14": 1249,
-      "15": 1012
+      "9": 1406,
+      "10": 1005,
+      "11": 1377,
+      "12": 1114,
+      "13": 901,
+      "14": 1154,
+      "15": 1077
     },
     "non_200": {
-      "count": 57,
-      "pct": 0.48,
+      "count": 56,
+      "pct": 0.55,
       "by_group": {
-        "옵션체인": 26,
-        "매크로": 23,
-        "만기유동성": 6,
+        "매크로": 29,
+        "옵션체인": 18,
+        "만기유동성": 7,
         "계좌잔고": 2
       }
     }
   },
   "backoff": {
-    "expand": 40,
-    "recover": 160,
-    "max_multiplier": 3.32,
+    "expand": 36,
+    "recover": 144,
+    "max_multiplier": 2.25,
     "mean_multiplier_by_hour": {
       "7": 1.0,
       "8": 1.0,
-      "9": 1.046,
-      "10": 1.14,
-      "11": 1.16,
-      "12": 1.087,
-      "13": 1.115,
-      "14": 1.391,
-      "15": 1.144
+      "9": 1.103,
+      "10": 1.06,
+      "11": 1.132,
+      "12": 1.044,
+      "13": 1.261,
+      "14": 1.232,
+      "15": 1.137
     },
-    "mean_multiplier": 1.127
+    "mean_multiplier": 1.114
   },
   "bursts": {
     "기동": {
-      "burst_count": 1,
+      "burst_count": 3,
       "calls_per_burst_median": 4,
       "occupancy_seconds": {
-        "n": 1,
-        "mean": 1.96,
-        "median": 1.96,
-        "max": 1.96
+        "n": 3,
+        "mean": 6.55,
+        "median": 7.72,
+        "max": 9.27
       },
       "start_positions_mod10": {
-        "0:20": 1
+        "0:19": 1,
+        "4:24": 1,
+        "6:23": 1
       }
     },
     "만기유동성": {
-      "burst_count": 117,
-      "calls_per_burst_median": 10,
+      "burst_count": 106,
+      "calls_per_burst_median": 10.0,
       "occupancy_seconds": {
-        "n": 117,
-        "mean": 22.05,
-        "median": 22.16,
-        "max": 57.07
+        "n": 106,
+        "mean": 28.37,
+        "median": 30.42,
+        "max": 54.45
       },
       "start_positions_mod10": {
-        "3:31": 16,
-        "1:35": 12,
-        "1:31": 11
+        "1:35": 10,
+        "1:33": 7,
+        "5:35": 7
       }
     },
     "매크로": {
-      "burst_count": 99,
+      "burst_count": 91,
       "calls_per_burst_median": 3,
       "occupancy_seconds": {
-        "n": 99,
-        "mean": 5.34,
-        "median": 5.02,
-        "max": 14.62
+        "n": 87,
+        "mean": 5.94,
+        "median": 5.4,
+        "max": 24.71
       },
       "start_positions_mod10": {
-        "2:30": 16,
-        "7:30": 15,
-        "2:31": 13
+        "7:32": 17,
+        "2:30": 13,
+        "7:30": 11
       }
     }
   },
   "stalls": [
     {
-      "at": "11:43",
-      "mod10_minute": 3,
-      "gaps": 4,
-      "total_seconds": 22.8,
-      "mean_gap": 5.7
-    },
-    {
-      "at": "11:44",
-      "mod10_minute": 4,
+      "at": "09:37",
+      "mod10_minute": 7,
       "gaps": 3,
-      "total_seconds": 20.1,
-      "mean_gap": 6.7
+      "total_seconds": 26.1,
+      "mean_gap": 8.7
     },
     {
-      "at": "11:55",
+      "at": "09:56",
+      "mod10_minute": 6,
+      "gaps": 3,
+      "total_seconds": 41.4,
+      "mean_gap": 13.8
+    },
+    {
+      "at": "10:15",
       "mod10_minute": 5,
-      "gaps": 4,
-      "total_seconds": 30.9,
-      "mean_gap": 7.7
+      "gaps": 3,
+      "total_seconds": 24.8,
+      "mean_gap": 8.3
+    },
+    {
+      "at": "10:52",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 28.8,
+      "mean_gap": 9.6
+    },
+    {
+      "at": "11:32",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 18.8,
+      "mean_gap": 6.3
+    },
+    {
+      "at": "11:52",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 15.7,
+      "mean_gap": 5.2
     },
     {
       "at": "12:19",
       "mod10_minute": 9,
       "gaps": 3,
-      "total_seconds": 27.9,
-      "mean_gap": 9.3
+      "total_seconds": 36.6,
+      "mean_gap": 12.2
     },
     {
-      "at": "12:58",
+      "at": "12:35",
+      "mod10_minute": 5,
+      "gaps": 5,
+      "total_seconds": 39.8,
+      "mean_gap": 8.0
+    },
+    {
+      "at": "13:14",
+      "mod10_minute": 4,
+      "gaps": 3,
+      "total_seconds": 21.9,
+      "mean_gap": 7.3
+    },
+    {
+      "at": "13:24",
+      "mod10_minute": 4,
+      "gaps": 3,
+      "total_seconds": 42.8,
+      "mean_gap": 14.3
+    },
+    {
+      "at": "13:27",
+      "mod10_minute": 7,
+      "gaps": 3,
+      "total_seconds": 26.0,
+      "mean_gap": 8.7
+    },
+    {
+      "at": "13:28",
       "mod10_minute": 8,
       "gaps": 3,
-      "total_seconds": 28.3,
+      "total_seconds": 16.2,
+      "mean_gap": 5.4
+    },
+    {
+      "at": "13:32",
+      "mod10_minute": 2,
+      "gaps": 4,
+      "total_seconds": 41.3,
+      "mean_gap": 10.3
+    },
+    {
+      "at": "13:36",
+      "mod10_minute": 6,
+      "gaps": 4,
+      "total_seconds": 20.8,
+      "mean_gap": 5.2
+    },
+    {
+      "at": "13:37",
+      "mod10_minute": 7,
+      "gaps": 3,
+      "total_seconds": 30.4,
+      "mean_gap": 10.1
+    },
+    {
+      "at": "13:42",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 28.2,
       "mean_gap": 9.4
     },
     {
-      "at": "13:58",
-      "mod10_minute": 8,
-      "gaps": 3,
-      "total_seconds": 16.8,
-      "mean_gap": 5.6
+      "at": "13:46",
+      "mod10_minute": 6,
+      "gaps": 4,
+      "total_seconds": 28.7,
+      "mean_gap": 7.2
     },
     {
-      "at": "13:59",
-      "mod10_minute": 9,
-      "gaps": 3,
-      "total_seconds": 54.6,
-      "mean_gap": 18.2
-    },
-    {
-      "at": "14:03",
+      "at": "14:13",
       "mod10_minute": 3,
-      "gaps": 5,
-      "total_seconds": 45.2,
-      "mean_gap": 9.0
-    },
-    {
-      "at": "14:04",
-      "mod10_minute": 4,
-      "gaps": 6,
-      "total_seconds": 36.3,
-      "mean_gap": 6.0
-    },
-    {
-      "at": "14:30",
-      "mod10_minute": 0,
       "gaps": 3,
-      "total_seconds": 36.4,
-      "mean_gap": 12.1
+      "total_seconds": 21.9,
+      "mean_gap": 7.3
     },
     {
-      "at": "14:32",
-      "mod10_minute": 2,
-      "gaps": 3,
-      "total_seconds": 17.5,
-      "mean_gap": 5.8
-    },
-    {
-      "at": "15:02",
-      "mod10_minute": 2,
-      "gaps": 3,
-      "total_seconds": 26.9,
-      "mean_gap": 9.0
-    },
-    {
-      "at": "15:04",
+      "at": "15:24",
       "mod10_minute": 4,
       "gaps": 3,
       "total_seconds": 28.6,
@@ -949,101 +1026,108 @@
     }
   ],
   "slow_calls": {
-    "count": 2850,
-    "pacer_dominant": 295,
-    "http_dominant": 2555,
+    "count": 4058,
+    "pacer_dominant": 219,
+    "http_dominant": 3839,
     "total_seconds": {
-      "n": 2850,
-      "mean": 4.0,
-      "median": 3.81,
-      "max": 9.56
+      "n": 4058,
+      "mean": 4.17,
+      "median": 4.03,
+      "max": 10.47
     },
     "pacer_seconds": {
-      "n": 2850,
-      "mean": 1.32,
-      "median": 1.02,
-      "max": 8.84
+      "n": 4058,
+      "mean": 1.22,
+      "median": 1.01,
+      "max": 6.0
     },
     "http_seconds": {
-      "n": 2850,
-      "mean": 2.69,
-      "median": 2.61,
-      "max": 7.62
+      "n": 4058,
+      "mean": 2.95,
+      "median": 2.86,
+      "max": 10.06
     },
     "by_mod10_minute": {
-      "0": 311,
-      "1": 380,
-      "2": 313,
-      "3": 225,
-      "4": 245,
-      "5": 387,
-      "6": 314,
-      "7": 292,
-      "8": 197,
-      "9": 186
+      "0": 345,
+      "1": 490,
+      "2": 433,
+      "3": 507,
+      "4": 390,
+      "5": 491,
+      "6": 386,
+      "7": 395,
+      "8": 330,
+      "9": 291
     },
     "censored": {
-      "count": 290,
+      "count": 747,
       "by_endpoint": {
-        "inquire-price": 282,
-        "overseas-inquire-price": 8
+        "inquire-price": 712,
+        "overseas-inquire-price": 33,
+        "inquire-investor-time-by-market": 1,
+        "inquire-balance": 1
       },
       "by_minute": {
-        "0": 27,
-        "1": 14,
-        "2": 6,
-        "3": 7,
-        "4": 3,
-        "5": 7,
-        "6": 2,
-        "7": 2,
-        "8": 4,
-        "9": 2,
-        "10": 16,
-        "12": 4,
-        "13": 2,
-        "14": 2,
-        "15": 6,
-        "16": 2,
-        "17": 4,
+        "0": 35,
+        "1": 17,
+        "2": 18,
+        "3": 16,
+        "4": 15,
+        "5": 28,
+        "6": 21,
+        "7": 6,
+        "8": 11,
+        "9": 8,
+        "10": 23,
+        "11": 11,
+        "12": 6,
+        "13": 6,
+        "14": 4,
+        "15": 21,
+        "16": 7,
+        "17": 9,
         "18": 3,
-        "20": 8,
-        "21": 5,
-        "22": 4,
-        "24": 2,
-        "25": 2,
-        "26": 2,
-        "27": 7,
-        "28": 4,
-        "30": 25,
-        "31": 11,
-        "32": 2,
-        "33": 6,
-        "34": 2,
-        "35": 1,
-        "36": 2,
+        "19": 6,
+        "20": 23,
+        "21": 12,
+        "22": 16,
+        "23": 9,
+        "24": 3,
+        "25": 19,
+        "26": 12,
+        "27": 17,
+        "28": 9,
+        "29": 9,
+        "30": 35,
+        "31": 15,
+        "32": 20,
+        "33": 11,
+        "34": 1,
+        "35": 8,
+        "36": 5,
         "37": 7,
-        "38": 1,
-        "39": 2,
-        "40": 6,
-        "41": 2,
-        "42": 4,
-        "43": 4,
-        "44": 1,
-        "45": 8,
-        "46": 4,
-        "47": 3,
-        "48": 5,
-        "50": 10,
-        "51": 2,
-        "52": 1,
-        "53": 9,
-        "54": 3,
-        "55": 4,
-        "56": 5,
-        "57": 5,
-        "58": 1,
-        "59": 7
+        "38": 5,
+        "39": 4,
+        "40": 20,
+        "41": 22,
+        "42": 36,
+        "43": 13,
+        "44": 12,
+        "45": 13,
+        "46": 6,
+        "47": 4,
+        "48": 7,
+        "49": 4,
+        "50": 18,
+        "51": 15,
+        "52": 6,
+        "53": 3,
+        "54": 4,
+        "55": 15,
+        "56": 12,
+        "57": 19,
+        "58": 4,
+        "59": 3
       },
       "phase_minutes": [
         0,
@@ -1055,48 +1139,48 @@
         32,
         33
       ],
-      "phase_count": 98,
-      "phase_concentration": 0.338,
+      "phase_count": 167,
+      "phase_concentration": 0.224,
       "phase_baseline": 0.133,
-      "phase_ratio": 2.53,
+      "phase_ratio": 1.68,
       "samples": [
         {
-          "at": "13:30",
-          "total": 5.16,
-          "pacer": 1.0,
-          "http": 4.16,
+          "at": "13:04",
+          "total": 10.47,
+          "pacer": 0.41,
+          "http": 10.06,
+          "multiplier": 1.0,
+          "endpoint": "inquire-balance"
+        },
+        {
+          "at": "10:11",
+          "total": 6.56,
+          "pacer": 1.66,
+          "http": 4.91,
           "multiplier": 1.0,
           "endpoint": "inquire-price"
         },
         {
-          "at": "13:28",
-          "total": 5.08,
+          "at": "10:43",
+          "total": 5.36,
           "pacer": 1.0,
-          "http": 4.08,
+          "http": 4.36,
           "multiplier": 1.0,
           "endpoint": "inquire-price"
         },
         {
-          "at": "13:30",
-          "total": 5.08,
-          "pacer": 1.0,
-          "http": 4.08,
+          "at": "10:05",
+          "total": 5.33,
+          "pacer": 0.99,
+          "http": 4.34,
           "multiplier": 1.0,
           "endpoint": "inquire-price"
         },
         {
-          "at": "13:30",
-          "total": 5.06,
-          "pacer": 0.98,
-          "http": 4.08,
-          "multiplier": 1.0,
-          "endpoint": "inquire-price"
-        },
-        {
-          "at": "13:31",
-          "total": 5.08,
+          "at": "10:45",
+          "total": 5.28,
           "pacer": 1.0,
-          "http": 4.08,
+          "http": 4.28,
           "multiplier": 1.0,
           "endpoint": "inquire-price"
         }
@@ -1104,222 +1188,224 @@
     },
     "samples": [
       {
-        "at": "14:04",
-        "total": 9.56,
-        "pacer": 6.49,
-        "http": 3.08,
-        "multiplier": 3.32,
+        "at": "13:04",
+        "total": 10.47,
+        "pacer": 0.41,
+        "http": 10.06,
+        "multiplier": 1.0,
         "endpoint": "inquire-balance"
       },
       {
-        "at": "14:06",
-        "total": 9.5,
-        "pacer": 7.61,
-        "http": 1.89,
-        "multiplier": 2.69,
+        "at": "14:44",
+        "total": 8.77,
+        "pacer": 0.39,
+        "http": 8.38,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "09:44",
+        "total": 8.75,
+        "pacer": 2.11,
+        "http": 6.64,
+        "multiplier": 1.22,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "14:49",
+        "total": 8.58,
+        "pacer": 1.62,
+        "http": 6.95,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "14:11",
+        "total": 8.12,
+        "pacer": 3.61,
+        "http": 4.51,
+        "multiplier": 1.99,
         "endpoint": "inquire-asking-price"
-      },
-      {
-        "at": "14:06",
-        "total": 9.17,
-        "pacer": 6.75,
-        "http": 2.42,
-        "multiplier": 2.69,
-        "endpoint": "inquire-asking-price"
-      },
-      {
-        "at": "14:06",
-        "total": 8.91,
-        "pacer": 8.84,
-        "http": 0.06,
-        "multiplier": 2.69,
-        "endpoint": "inquire-investor-time-by-market"
-      },
-      {
-        "at": "14:06",
-        "total": 8.78,
-        "pacer": 5.58,
-        "http": 3.2,
-        "multiplier": 2.69,
-        "endpoint": "inquire-price"
       }
     ]
   },
   "rest_latency": {
     "endpoints": {
       "inquire-price": {
-        "calls": 8937,
-        "p50": 0.865,
-        "p95": 2.631,
-        "p99": 2.986,
-        "max": 4.16
+        "calls": 7970,
+        "p50": 1.52,
+        "p95": 2.797,
+        "p99": 2.987,
+        "max": 4.91
       },
       "inquire-investor-time-by-market": {
-        "calls": 1471,
-        "p50": 0.02,
-        "p95": 0.1,
-        "p99": 0.1,
-        "max": 1.14
-      },
-      "inquire-asking-price": {
-        "calls": 1154,
-        "p50": 0.791,
-        "p95": 2.235,
-        "p99": 2.428,
-        "max": 5.89
-      },
-      "overseas-inquire-price": {
-        "calls": 313,
-        "p50": 1.155,
-        "p95": 1.575,
-        "p99": 1.575,
+        "calls": 1440,
+        "p50": 0.021,
+        "p95": 0.133,
+        "p99": 0.133,
         "max": 4.05
       },
+      "inquire-asking-price": {
+        "calls": 1040,
+        "p50": 1.777,
+        "p95": 3.148,
+        "p99": 3.615,
+        "max": 6.66
+      },
+      "overseas-inquire-price": {
+        "calls": 309,
+        "p50": 1.55,
+        "p95": 1.943,
+        "p99": 1.943,
+        "max": 4.11
+      },
       "inquire-balance": {
-        "calls": 98,
-        "p50": 2.786,
-        "p95": 2.786,
-        "p99": 2.786,
-        "max": 7.62
+        "calls": 96,
+        "p50": 3.22,
+        "p95": 3.34,
+        "p99": 3.34,
+        "max": 10.06
       },
       "inquire-daily-chartprice": {
-        "calls": 4,
-        "p50": 0.015,
-        "p95": 0.025,
-        "p99": 0.025,
-        "max": 0.03
+        "calls": 6,
+        "p50": 1.3,
+        "p95": 1.64,
+        "p99": 1.64,
+        "max": 3.02
       }
     },
     "p95_by_hour": {
       "7": {
-        "inquire-balance": 0.068,
+        "inquire-balance": 0.08,
         "inquire-daily-chartprice": 0.02,
-        "inquire-investor-time-by-market": 0.08,
-        "inquire-price": 0.036,
-        "overseas-inquire-price": 0.067
+        "inquire-investor-time-by-market": 0.112,
+        "inquire-price": 0.048,
+        "overseas-inquire-price": 0.069
       },
       "8": {
-        "inquire-asking-price": 0.049,
-        "inquire-balance": 0.077,
-        "inquire-investor-time-by-market": 0.202,
-        "inquire-price": 0.043,
-        "overseas-inquire-price": 0.073
+        "inquire-asking-price": 0.059,
+        "inquire-balance": 0.071,
+        "inquire-investor-time-by-market": 0.081,
+        "inquire-price": 0.038,
+        "overseas-inquire-price": 0.068
       },
       "9": {
-        "inquire-asking-price": 1.346,
-        "inquire-balance": 1.801,
-        "inquire-investor-time-by-market": 0.078,
-        "inquire-price": 2.152,
-        "overseas-inquire-price": 1.024
+        "inquire-asking-price": 1.941,
+        "inquire-balance": 2.708,
+        "inquire-daily-chartprice": 3.02,
+        "inquire-investor-time-by-market": 0.077,
+        "inquire-price": 2.694,
+        "overseas-inquire-price": 1.86
       },
       "10": {
-        "inquire-asking-price": 2.129,
-        "inquire-balance": 2.741,
-        "inquire-investor-time-by-market": 0.072,
-        "inquire-price": 3.096,
-        "overseas-inquire-price": 2.149
+        "inquire-asking-price": 3.738,
+        "inquire-balance": 4.849,
+        "inquire-daily-chartprice": 1.88,
+        "inquire-investor-time-by-market": 0.534,
+        "inquire-price": 3.963,
+        "overseas-inquire-price": 2.802
       },
       "11": {
-        "inquire-asking-price": 2.76,
-        "inquire-balance": 3.954,
-        "inquire-investor-time-by-market": 0.083,
-        "inquire-price": 3.535,
-        "overseas-inquire-price": 1.669
+        "inquire-asking-price": 3.378,
+        "inquire-balance": 3.336,
+        "inquire-investor-time-by-market": 0.067,
+        "inquire-price": 3.699,
+        "overseas-inquire-price": 1.996
       },
       "12": {
-        "inquire-asking-price": 2.738,
-        "inquire-balance": 4.206,
-        "inquire-investor-time-by-market": 0.074,
-        "inquire-price": 3.788,
-        "overseas-inquire-price": 2.414
+        "inquire-asking-price": 3.692,
+        "inquire-balance": 4.025,
+        "inquire-investor-time-by-market": 0.073,
+        "inquire-price": 3.895,
+        "overseas-inquire-price": 2.503
       },
       "13": {
-        "inquire-asking-price": 2.679,
-        "inquire-balance": 3.927,
-        "inquire-daily-chartprice": 0.03,
-        "inquire-investor-time-by-market": 0.076,
-        "inquire-price": 3.736,
-        "overseas-inquire-price": 1.69
+        "inquire-asking-price": 4.263,
+        "inquire-balance": 5.104,
+        "inquire-investor-time-by-market": 0.08,
+        "inquire-price": 4.045,
+        "overseas-inquire-price": 3.627
       },
       "14": {
-        "inquire-asking-price": 2.908,
-        "inquire-balance": 4.026,
-        "inquire-investor-time-by-market": 0.077,
-        "inquire-price": 3.756,
-        "overseas-inquire-price": 1.92
+        "inquire-asking-price": 4.532,
+        "inquire-balance": 5.102,
+        "inquire-investor-time-by-market": 0.073,
+        "inquire-price": 4.004,
+        "overseas-inquire-price": 2.309
       },
       "15": {
-        "inquire-asking-price": 2.357,
-        "inquire-balance": 2.651,
-        "inquire-investor-time-by-market": 0.16,
-        "inquire-price": 2.667,
-        "overseas-inquire-price": 2.602
+        "inquire-asking-price": 2.347,
+        "inquire-balance": 3.067,
+        "inquire-investor-time-by-market": 0.166,
+        "inquire-price": 2.787,
+        "overseas-inquire-price": 1.143
       }
     },
     "p50_by_hour": {
       "7": {
-        "inquire-balance": 0.068,
+        "inquire-balance": 0.08,
         "inquire-daily-chartprice": 0.02,
         "inquire-investor-time-by-market": 0.02,
         "inquire-price": 0.02,
         "overseas-inquire-price": 0.02
       },
       "8": {
-        "inquire-asking-price": 0.02,
-        "inquire-balance": 0.077,
-        "inquire-investor-time-by-market": 0.017,
+        "inquire-asking-price": 0.019,
+        "inquire-balance": 0.071,
+        "inquire-investor-time-by-market": 0.019,
         "inquire-price": 0.02,
-        "overseas-inquire-price": 0.015
+        "overseas-inquire-price": 0.018
       },
       "9": {
-        "inquire-asking-price": 0.195,
-        "inquire-balance": 1.801,
-        "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 0.249,
-        "overseas-inquire-price": 0.807
+        "inquire-asking-price": 1.02,
+        "inquire-balance": 2.708,
+        "inquire-daily-chartprice": 2.08,
+        "inquire-investor-time-by-market": 0.021,
+        "inquire-price": 0.881,
+        "overseas-inquire-price": 1.151
       },
       "10": {
-        "inquire-asking-price": 0.569,
-        "inquire-balance": 2.741,
-        "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 0.588,
-        "overseas-inquire-price": 1.426
+        "inquire-asking-price": 2.397,
+        "inquire-balance": 3.699,
+        "inquire-daily-chartprice": 1.8,
+        "inquire-investor-time-by-market": 0.023,
+        "inquire-price": 2.516,
+        "overseas-inquire-price": 2.548
       },
       "11": {
-        "inquire-asking-price": 1.417,
-        "inquire-balance": 3.954,
-        "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 1.262,
-        "overseas-inquire-price": 1.407
+        "inquire-asking-price": 2.116,
+        "inquire-balance": 3.336,
+        "inquire-investor-time-by-market": 0.025,
+        "inquire-price": 1.881,
+        "overseas-inquire-price": 1.723
       },
       "12": {
-        "inquire-asking-price": 0.669,
-        "inquire-balance": 4.206,
+        "inquire-asking-price": 2.043,
+        "inquire-balance": 4.025,
         "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 1.2,
-        "overseas-inquire-price": 1.724
+        "inquire-price": 2.19,
+        "overseas-inquire-price": 2.035
       },
       "13": {
-        "inquire-asking-price": 0.769,
-        "inquire-balance": 3.927,
-        "inquire-daily-chartprice": 0.01,
+        "inquire-asking-price": 2.294,
+        "inquire-balance": 5.104,
         "inquire-investor-time-by-market": 0.019,
-        "inquire-price": 1.377,
-        "overseas-inquire-price": 1.257
+        "inquire-price": 2.82,
+        "overseas-inquire-price": 3.026
       },
       "14": {
-        "inquire-asking-price": 1.252,
-        "inquire-balance": 4.026,
-        "inquire-investor-time-by-market": 0.021,
-        "inquire-price": 1.552,
-        "overseas-inquire-price": 1.261
+        "inquire-asking-price": 2.422,
+        "inquire-balance": 5.102,
+        "inquire-investor-time-by-market": 0.025,
+        "inquire-price": 2.386,
+        "overseas-inquire-price": 1.795
       },
       "15": {
-        "inquire-asking-price": 1.253,
-        "inquire-balance": 2.651,
+        "inquire-asking-price": 1.218,
+        "inquire-balance": 3.067,
         "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 1.56,
-        "overseas-inquire-price": 2.106
+        "inquire-price": 1.232,
+        "overseas-inquire-price": 0.75
       }
     },
     "p50_max_by_hour": {
@@ -1335,57 +1421,58 @@
         "inquire-balance": 0.09,
         "inquire-investor-time-by-market": 0.02,
         "inquire-price": 0.02,
-        "overseas-inquire-price": 0.02
+        "overseas-inquire-price": 0.03
       },
       "9": {
-        "inquire-asking-price": 0.89,
-        "inquire-balance": 4.48,
-        "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 0.95,
-        "overseas-inquire-price": 2.42
+        "inquire-asking-price": 2.22,
+        "inquire-balance": 6.64,
+        "inquire-daily-chartprice": 2.08,
+        "inquire-investor-time-by-market": 0.03,
+        "inquire-price": 2.08,
+        "overseas-inquire-price": 4.02
       },
       "10": {
-        "inquire-asking-price": 3.19,
-        "inquire-balance": 5.28,
-        "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 1.16,
-        "overseas-inquire-price": 3.11
+        "inquire-asking-price": 3.3,
+        "inquire-balance": 5.51,
+        "inquire-daily-chartprice": 1.8,
+        "inquire-investor-time-by-market": 0.05,
+        "inquire-price": 3.64,
+        "overseas-inquire-price": 4.03
       },
       "11": {
-        "inquire-asking-price": 2.69,
-        "inquire-balance": 7.62,
-        "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 2.2,
-        "overseas-inquire-price": 3.17
+        "inquire-asking-price": 2.94,
+        "inquire-balance": 5.7,
+        "inquire-investor-time-by-market": 0.05,
+        "inquire-price": 2.47,
+        "overseas-inquire-price": 4.05
       },
       "12": {
-        "inquire-asking-price": 3.14,
-        "inquire-balance": 6.88,
+        "inquire-asking-price": 2.22,
+        "inquire-balance": 5.55,
         "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 2.0,
-        "overseas-inquire-price": 3.92
+        "inquire-price": 2.83,
+        "overseas-inquire-price": 4.05
       },
       "13": {
-        "inquire-asking-price": 2.91,
-        "inquire-balance": 6.83,
-        "inquire-daily-chartprice": 0.01,
-        "inquire-investor-time-by-market": 0.03,
-        "inquire-price": 2.17,
-        "overseas-inquire-price": 2.41
+        "inquire-asking-price": 3.23,
+        "inquire-balance": 10.06,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 4.05,
+        "overseas-inquire-price": 4.06
       },
       "14": {
-        "inquire-asking-price": 2.88,
-        "inquire-balance": 5.33,
-        "inquire-investor-time-by-market": 0.03,
-        "inquire-price": 2.95,
-        "overseas-inquire-price": 3.55
+        "inquire-asking-price": 3.01,
+        "inquire-balance": 8.38,
+        "inquire-investor-time-by-market": 0.05,
+        "inquire-price": 2.98,
+        "overseas-inquire-price": 2.52
       },
       "15": {
-        "inquire-asking-price": 2.69,
-        "inquire-balance": 6.17,
+        "inquire-asking-price": 1.88,
+        "inquire-balance": 7.69,
         "inquire-investor-time-by-market": 0.02,
-        "inquire-price": 3.2,
-        "overseas-inquire-price": 3.34
+        "inquire-price": 2.81,
+        "overseas-inquire-price": 2.33
       }
     },
     "p95_warn_threshold": 2.5,
@@ -1393,169 +1480,199 @@
     "global_read_timeout_seconds": 4.0,
     "warnings": [
       {
+        "hour": "9",
+        "endpoint": "inquire-balance",
+        "p95": 2.708
+      },
+      {
+        "hour": "9",
+        "endpoint": "inquire-daily-chartprice",
+        "p95": 3.02
+      },
+      {
+        "hour": "9",
+        "endpoint": "inquire-price",
+        "p95": 2.694
+      },
+      {
+        "hour": "10",
+        "endpoint": "inquire-asking-price",
+        "p95": 3.738
+      },
+      {
         "hour": "10",
         "endpoint": "inquire-balance",
-        "p95": 2.741
+        "p95": 4.849
       },
       {
         "hour": "10",
         "endpoint": "inquire-price",
-        "p95": 3.096
+        "p95": 3.963
       },
       {
-        "hour": "11",
-        "endpoint": "inquire-asking-price",
-        "p95": 2.76
-      },
-      {
-        "hour": "11",
-        "endpoint": "inquire-balance",
-        "p95": 3.954
-      },
-      {
-        "hour": "11",
-        "endpoint": "inquire-price",
-        "p95": 3.535
-      },
-      {
-        "hour": "12",
-        "endpoint": "inquire-asking-price",
-        "p95": 2.738
-      },
-      {
-        "hour": "12",
-        "endpoint": "inquire-balance",
-        "p95": 4.206
-      },
-      {
-        "hour": "12",
-        "endpoint": "inquire-price",
-        "p95": 3.788
-      },
-      {
-        "hour": "13",
-        "endpoint": "inquire-asking-price",
-        "p95": 2.679
-      },
-      {
-        "hour": "13",
-        "endpoint": "inquire-balance",
-        "p95": 3.927
-      },
-      {
-        "hour": "13",
-        "endpoint": "inquire-price",
-        "p95": 3.736
-      },
-      {
-        "hour": "14",
-        "endpoint": "inquire-asking-price",
-        "p95": 2.908
-      },
-      {
-        "hour": "14",
-        "endpoint": "inquire-balance",
-        "p95": 4.026
-      },
-      {
-        "hour": "14",
-        "endpoint": "inquire-price",
-        "p95": 3.756
-      },
-      {
-        "hour": "15",
-        "endpoint": "inquire-balance",
-        "p95": 2.651
-      },
-      {
-        "hour": "15",
-        "endpoint": "inquire-price",
-        "p95": 2.667
-      },
-      {
-        "hour": "15",
+        "hour": "10",
         "endpoint": "overseas-inquire-price",
-        "p95": 2.602
+        "p95": 2.802
+      },
+      {
+        "hour": "11",
+        "endpoint": "inquire-asking-price",
+        "p95": 3.378
+      },
+      {
+        "hour": "11",
+        "endpoint": "inquire-balance",
+        "p95": 3.336
+      },
+      {
+        "hour": "11",
+        "endpoint": "inquire-price",
+        "p95": 3.699
+      },
+      {
+        "hour": "12",
+        "endpoint": "inquire-asking-price",
+        "p95": 3.692
+      },
+      {
+        "hour": "12",
+        "endpoint": "inquire-balance",
+        "p95": 4.025
+      },
+      {
+        "hour": "12",
+        "endpoint": "inquire-price",
+        "p95": 3.895
+      },
+      {
+        "hour": "12",
+        "endpoint": "overseas-inquire-price",
+        "p95": 2.503
+      },
+      {
+        "hour": "13",
+        "endpoint": "inquire-asking-price",
+        "p95": 4.263
+      },
+      {
+        "hour": "13",
+        "endpoint": "inquire-balance",
+        "p95": 5.104
+      },
+      {
+        "hour": "13",
+        "endpoint": "inquire-price",
+        "p95": 4.045
+      },
+      {
+        "hour": "13",
+        "endpoint": "overseas-inquire-price",
+        "p95": 3.627
+      },
+      {
+        "hour": "14",
+        "endpoint": "inquire-asking-price",
+        "p95": 4.532
+      },
+      {
+        "hour": "14",
+        "endpoint": "inquire-balance",
+        "p95": 5.102
+      },
+      {
+        "hour": "14",
+        "endpoint": "inquire-price",
+        "p95": 4.004
+      },
+      {
+        "hour": "15",
+        "endpoint": "inquire-balance",
+        "p95": 3.067
+      },
+      {
+        "hour": "15",
+        "endpoint": "inquire-price",
+        "p95": 2.787
       }
     ]
   },
   "atm_rolls": {
-    "count": 105,
-    "round_trips": 34,
-    "round_trip_pct": 32.4
+    "count": 88,
+    "round_trips": 35,
+    "round_trip_pct": 39.8
   },
   "budget_exceeded": {
-    "count": 177,
-    "skipped_legs_total": 845,
-    "priority_cut_minutes": 3,
-    "priority_before_others_minutes": 3,
-    "labelled": 177,
+    "count": 231,
+    "skipped_legs_total": 1238,
+    "priority_cut_minutes": 4,
+    "priority_before_others_minutes": 4,
+    "labelled": 231,
     "samples": [
       {
-        "at": "09:20",
+        "at": "09:05",
+        "skipped": 2,
+        "collected": 18,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:14",
         "skipped": 2,
         "collected": 18,
         "cut_books": "weekly_mon",
         "priority_violation": "아니오"
       },
       {
-        "at": "09:21",
+        "at": "09:24",
+        "skipped": 4,
+        "collected": 16,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:28",
+        "skipped": 2,
+        "collected": 18,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:29",
         "skipped": 2,
         "collected": 18,
         "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:30",
+        "skipped": 1,
+        "collected": 19,
+        "cut_books": "weekly_mon",
         "priority_violation": "아니오"
       },
       {
         "at": "09:31",
-        "skipped": 4,
-        "collected": 14,
+        "skipped": 5,
+        "collected": 15,
         "cut_books": "weekly_thu",
         "priority_violation": "아니오"
       },
       {
-        "at": "09:42",
-        "skipped": 4,
-        "collected": 16,
+        "at": "09:32",
+        "skipped": 5,
+        "collected": 15,
         "cut_books": "weekly_mon",
         "priority_violation": "아니오"
       },
       {
-        "at": "09:50",
-        "skipped": 3,
-        "collected": 17,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "09:51",
-        "skipped": 3,
-        "collected": 17,
-        "cut_books": "weekly_thu",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "09:55",
+        "at": "09:33",
         "skipped": 4,
         "collected": 16,
         "cut_books": "weekly_thu",
         "priority_violation": "아니오"
       },
       {
-        "at": "09:56",
-        "skipped": 2,
-        "collected": 18,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "10:01",
-        "skipped": 1,
-        "collected": 19,
-        "cut_books": "weekly_thu",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "10:07",
+        "at": "09:35",
         "skipped": 5,
         "collected": 15,
         "cut_books": "weekly_thu",
@@ -1564,96 +1681,111 @@
     ]
   },
   "timeout_abort": {
-    "count": 24,
-    "skipped_legs_total": 255,
-    "priority_cut_minutes": 6,
+    "count": 87,
+    "skipped_legs_total": 1070,
+    "priority_cut_minutes": 49,
     "priority_before_others_minutes": 0,
-    "labelled": 24,
+    "labelled": 87,
     "minutes": [
-      "11:10",
-      "11:30",
-      "12:01",
-      "12:10",
-      "12:18",
-      "12:21",
+      "09:57",
+      "10:00",
+      "10:05",
+      "10:06",
+      "10:08",
+      "10:09",
+      "10:10",
+      "10:10",
+      "10:11",
+      "10:15",
+      "10:22",
+      "10:26",
+      "10:26",
+      "10:27",
+      "10:28",
+      "10:30",
+      "10:31",
+      "10:42",
+      "10:43",
+      "10:46",
+      "10:52",
+      "11:00",
+      "12:07",
+      "12:22",
+      "12:30",
+      "12:32",
+      "12:40",
+      "12:41",
+      "12:42",
+      "12:42",
+      "12:43",
       "12:50",
+      "12:51",
+      "12:55",
+      "12:55",
+      "12:56",
+      "12:56",
+      "12:57",
+      "12:57",
       "13:00",
+      "13:01",
+      "13:01",
+      "13:02",
+      "13:02",
+      "13:03",
+      "13:03",
+      "13:04",
+      "13:04",
+      "13:05",
+      "13:05",
+      "13:06",
+      "13:06",
+      "13:10",
+      "13:17",
+      "13:20",
+      "13:25",
       "13:30",
+      "13:31",
+      "13:32",
       "13:33",
-      "13:37",
-      "13:53",
+      "13:33",
+      "13:35",
+      "13:40",
+      "13:41",
+      "13:41",
+      "13:42",
+      "13:42",
+      "13:48",
+      "13:50",
       "14:00",
       "14:01",
-      "14:27",
+      "14:02",
+      "14:05",
+      "14:10",
+      "14:19",
+      "14:20",
+      "14:21",
       "14:30",
-      "14:46",
-      "14:48",
-      "14:50",
-      "14:56",
+      "14:32",
+      "14:35",
+      "14:37",
+      "14:44",
+      "14:45",
       "15:00",
-      "15:01",
-      "15:02",
+      "15:03",
+      "15:15",
       "15:20"
     ],
     "samples": [
       {
-        "at": "11:10",
+        "at": "09:57",
         "consecutive": 0,
-        "skipped": 10,
-        "collected": 6,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "11:30",
-        "consecutive": 1,
         "skipped": 10,
         "collected": 4,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "12:01",
-        "consecutive": 0,
-        "skipped": 10,
-        "collected": 6,
         "cut_books": "weekly_thu",
         "priority_violation": "아니오"
       },
       {
-        "at": "12:10",
-        "consecutive": 0,
-        "skipped": 10,
-        "collected": 6,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "12:18",
-        "consecutive": 0,
-        "skipped": 10,
-        "collected": 7,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "12:21",
-        "consecutive": 0,
-        "skipped": 10,
-        "collected": 7,
-        "cut_books": "weekly_thu",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "12:50",
-        "consecutive": 0,
-        "skipped": 10,
-        "collected": 7,
-        "cut_books": "weekly_mon",
-        "priority_violation": "아니오"
-      },
-      {
-        "at": "13:00",
+        "at": "10:00",
         "consecutive": 3,
         "skipped": 13,
         "collected": 1,
@@ -1661,7 +1793,23 @@
         "priority_violation": "아니오"
       },
       {
-        "at": "13:30",
+        "at": "10:05",
+        "consecutive": 3,
+        "skipped": 11,
+        "collected": 3,
+        "cut_books": "regular,weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:06",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 5,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:08",
         "consecutive": 3,
         "skipped": 13,
         "collected": 1,
@@ -1669,10 +1817,42 @@
         "priority_violation": "아니오"
       },
       {
-        "at": "13:33",
+        "at": "10:09",
+        "consecutive": 1,
+        "skipped": 10,
+        "collected": 5,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:10",
+        "consecutive": 3,
+        "skipped": 14,
+        "collected": 0,
+        "cut_books": "regular,weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:10",
+        "consecutive": 1,
+        "skipped": 16,
+        "collected": 0,
+        "cut_books": "regular,weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:11",
+        "consecutive": 3,
+        "skipped": 14,
+        "collected": 0,
+        "cut_books": "regular,weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:15",
         "consecutive": 0,
         "skipped": 10,
-        "collected": 6,
+        "collected": 5,
         "cut_books": "weekly_thu",
         "priority_violation": "아니오"
       }
@@ -1683,10 +1863,10 @@
     "minutes": []
   },
   "priority_retry": {
-    "cycles": 46,
-    "attempted": 84,
-    "recovered": 72,
-    "recovery_pct": 85.7
+    "cycles": 61,
+    "attempted": 142,
+    "recovered": 90,
+    "recovery_pct": 63.4
   },
   "ws_disconnect": {
     "count": 0,
@@ -1700,179 +1880,207 @@
     "계좌잔고": {
       "mode_second": 30,
       "top_seconds": {
-        "30": 23,
+        "30": 19,
         "34": 17,
-        "35": 15
+        "33": 16
       },
       "minutes_mod10": {
-        "4": 50,
+        "4": 47,
         "9": 49
       },
-      "burst_count": 99
+      "burst_count": 96
     },
     "기동": {
-      "mode_second": 20,
+      "mode_second": 19,
       "top_seconds": {
-        "20": 1
-      },
-      "minutes_mod10": {
-        "0": 1
-      },
-      "burst_count": 1
-    },
-    "만기유동성": {
-      "mode_second": 31,
-      "top_seconds": {
-        "31": 34,
-        "35": 27,
-        "33": 13
-      },
-      "minutes_mod10": {
-        "1": 42,
-        "3": 39,
-        "5": 36
-      },
-      "burst_count": 117
-    },
-    "매크로": {
-      "mode_second": 30,
-      "top_seconds": {
-        "30": 31,
-        "32": 21,
-        "31": 20
-      },
-      "minutes_mod10": {
-        "2": 50,
-        "7": 49
-      },
-      "burst_count": 99
-    },
-    "옵션체인": {
-      "mode_second": 22,
-      "top_seconds": {
-        "22": 1,
-        "27": 1,
-        "32": 1
+        "19": 1,
+        "24": 1,
+        "23": 1
       },
       "minutes_mod10": {
         "0": 1,
-        "1": 2
+        "4": 1,
+        "6": 1
       },
       "burst_count": 3
     },
-    "투자자수급": {
-      "mode_second": 52,
+    "만기유동성": {
+      "mode_second": 35,
       "top_seconds": {
-        "52": 11,
-        "53": 4,
-        "50": 1
+        "35": 22,
+        "36": 19,
+        "37": 14
+      },
+      "minutes_mod10": {
+        "1": 38,
+        "3": 37,
+        "5": 31
+      },
+      "burst_count": 106
+    },
+    "매크로": {
+      "mode_second": 32,
+      "top_seconds": {
+        "32": 27,
+        "30": 24,
+        "31": 13
+      },
+      "minutes_mod10": {
+        "2": 44,
+        "7": 47
+      },
+      "burst_count": 91
+    },
+    "옵션체인": {
+      "mode_second": 29,
+      "top_seconds": {
+        "29": 4,
+        "34": 2,
+        "54": 2
       },
       "minutes_mod10": {
         "0": 1,
         "1": 8,
-        "3": 2,
-        "5": 5
+        "2": 1,
+        "3": 3,
+        "4": 1,
+        "6": 3,
+        "7": 1,
+        "8": 1,
+        "9": 1
       },
-      "burst_count": 16
+      "burst_count": 20
+    },
+    "투자자수급": {
+      "mode_second": 52,
+      "top_seconds": {
+        "52": 6,
+        "50": 3,
+        "53": 2
+      },
+      "minutes_mod10": {
+        "0": 2,
+        "1": 5,
+        "3": 3,
+        "4": 1,
+        "5": 3,
+        "6": 1
+      },
+      "burst_count": 15
     }
   },
   "log_volume": {
-    "total_bytes": 3653567,
-    "total_lines": 18778,
-    "httpx_bytes": 2606219,
-    "httpx_pct": 71.3,
-    "human_lines": 6728,
-    "traceback_lines": 252,
-    "httpx_lines": 11798,
+    "total_bytes": 3567886,
+    "total_lines": 18551,
+    "httpx_bytes": 2267239,
+    "httpx_pct": 63.5,
+    "human_lines": 7774,
+    "traceback_lines": 511,
+    "httpx_lines": 10266,
     "by_level": {
-      "INFO": 18143,
-      "WARNING": 383
+      "INFO": 17369,
+      "WARNING": 659,
+      "ERROR": 12
     }
   },
   "qualitative": {
-    "kis_error_response": 36,
-    "egw00201": 28,
-    "remote_protocol_error": 29,
-    "read_timeout": 263,
-    "gamma_flip_out_of_leg_range": 7,
-    "http_status_error": 2,
-    "cycle_total_failure": 1
+    "event_calendar_not_covered": 10,
+    "kis_error_response": 39,
+    "egw00201": 29,
+    "remote_protocol_error": 36,
+    "read_timeout": 654,
+    "cycle_total_failure": 19,
+    "chain_cycle_empty": 12,
+    "gamma_flip_out_of_leg_range": 1,
+    "http_status_error": 2
   },
   "qualitative_suppressed": {
-    "read_timeout": 147
+    "read_timeout": 439
   },
   "process_starts": [
-    27019.653
+    27019.345,
+    35663.353,
+    38182.458
   ],
   "parser_audit": {
     "blind": {},
     "loose_counts": {
-      "cycles": 494,
-      "kis_error_response": 36,
-      "rest_latency": 98,
-      "atm_rolls": 315,
-      "slow_calls": 2850,
-      "backoff": 200,
-      "remote_protocol_error": 29,
-      "budget_exceeded": 177,
-      "read_timeout": 118,
-      "gamma_flip_out_of_leg_range": 7,
-      "timeout_abort": 24,
-      "failure_budget_abort": 2
+      "event_calendar_not_covered": 10,
+      "cycles": 484,
+      "kis_error_response": 39,
+      "rest_latency": 96,
+      "atm_rolls": 264,
+      "slow_calls": 4058,
+      "backoff": 180,
+      "budget_exceeded": 231,
+      "remote_protocol_error": 36,
+      "read_timeout": 221,
+      "timeout_abort": 87,
+      "chain_cycle_empty": 12,
+      "gamma_flip_out_of_leg_range": 1
     }
   },
   "failures": {
-    "옵션 체인 폴링 실패": 110,
-    "만기 유동성 만기확인 조회 실패": 14,
-    "ZN(10년 국채선물) 근월물 조회 실패": 9,
-    "ES(E-mini S&P500) 근월물 조회 실패": 9,
-    "VIX 근월물 조회 실패": 7,
-    "만기 유동성 폴링 실패": 6,
-    "USDCNH 선물 조회 실패": 5,
-    "Signal Fusion 사이클 실패": 4,
-    "계좌 잔고 폴링 사이클 실패": 2,
-    "VIX 차근월물 조회 실패": 1,
-    "옵션 체인 폴링 전체 실패": 1
+    "옵션 체인 폴링 실패": 173,
+    "만기 유동성 만기확인 조회 실패": 21,
+    "옵션 체인 폴링 전체 실패": 19,
+    "VIX 근월물 조회 실패": 16,
+    "USDCNH 선물 조회 실패": 13,
+    "VIX 차근월물 조회 실패": 12,
+    "옵션 체인 폴링 재시도도 실패": 12,
+    "ZN(10년 국채선물) 근월물 조회 실패": 10,
+    "ES(E-mini S&P500) 근월물 조회 실패": 10,
+    "매크로 스냅샷 폴링 전체 실패": 8,
+    "만기 유동성 폴링 실패": 7,
+    "계좌 잔고 폴링 사이클 실패": 3,
+    "투자자 수급 폴링 실패": 1
   },
   "failures_by_cause": {
-    "Signal Fusion 사이클 실패": {
-      "other": 4
-    },
     "ZN(10년 국채선물) 근월물 조회 실패": {
-      "kis_error": 8,
-      "read_timeout": 1
+      "kis_error": 10
     },
     "ES(E-mini S&P500) 근월물 조회 실패": {
-      "kis_error": 9
-    },
-    "옵션 체인 폴링 실패": {
-      "read_timeout": 98,
-      "egw00201": 10,
-      "other": 2
+      "kis_error": 10
     },
     "만기 유동성 만기확인 조회 실패": {
-      "read_timeout": 8,
-      "egw00201": 6
-    },
-    "VIX 근월물 조회 실패": {
-      "egw00201": 4,
-      "read_timeout": 3
-    },
-    "USDCNH 선물 조회 실패": {
-      "read_timeout": 3,
-      "egw00201": 2
+      "read_timeout": 17,
+      "egw00201": 4
     },
     "만기 유동성 폴링 실패": {
-      "egw00201": 6
+      "egw00201": 7
     },
-    "계좌 잔고 폴링 사이클 실패": {
-      "other": 2
+    "옵션 체인 폴링 실패": {
+      "read_timeout": 160,
+      "egw00201": 9,
+      "other": 4
+    },
+    "VIX 근월물 조회 실패": {
+      "read_timeout": 12,
+      "egw00201": 4
     },
     "VIX 차근월물 조회 실패": {
-      "read_timeout": 1
+      "read_timeout": 9,
+      "egw00201": 2,
+      "other": 1
+    },
+    "USDCNH 선물 조회 실패": {
+      "read_timeout": 10,
+      "egw00201": 3
+    },
+    "매크로 스냅샷 폴링 전체 실패": {
+      "other": 8
     },
     "옵션 체인 폴링 전체 실패": {
-      "other": 1
+      "other": 19
+    },
+    "옵션 체인 폴링 재시도도 실패": {
+      "other": 12
+    },
+    "투자자 수급 폴링 실패": {
+      "read_timeout": 1
+    },
+    "계좌 잔고 폴링 사이클 실패": {
+      "other": 3
     }
   },
   "overrun": {
@@ -1881,27 +2089,24 @@
     "total_seconds": 0
   },
   "failure_budget_abort": {
-    "count": 2,
-    "skipped_legs_total": 18,
-    "priority_cut_minutes": 0,
-    "priority_before_others_minutes": 0,
-    "labelled": 2,
-    "minutes": [
-      "14:03",
-      "14:31"
-    ]
+    "count": 0,
+    "skipped_legs_total": 0,
+    "priority_cut_minutes": null,
+    "priority_before_others_minutes": null,
+    "labelled": 0,
+    "minutes": []
   },
   "overrun_by_poller": {
     "만기 유동성 폴링": {
       "count": 1,
-      "max_seconds": 10.6,
-      "total_seconds": 10.6
+      "max_seconds": 1.6,
+      "total_seconds": 1.6
     }
   },
   "delta_baseline": {
-    "date": "2026-08-14",
+    "date": "2026-08-18",
     "baseline_is_trading_day": 1,
-    "skipped_non_trading_days": 3,
+    "skipped_non_trading_days": 0,
     "target_is_trading_day": 1,
     "target_holiday_name": null,
     "calendar_coverage_gap_days": 0,
@@ -1952,19 +2157,19 @@
         "on": false
       }
     ],
-    "git_head": "ccdbeec"
+    "git_head": "cd594df"
   },
   "watchdog": {
-    "checks": 49,
-    "restarts": 0,
+    "checks": 53,
+    "restarts": 2,
     "restart_failures": 0,
     "alert_only": 0,
     "degraded_checks": 0,
     "missing_check_alerts": 0,
     "stale_lock_sweeps": 0,
-    "max_silence_minutes": 10.0,
-    "silence_over_cadence_ratio": 1.0,
-    "max_silence_window": "08:30~08:40",
+    "max_silence_minutes": 10.1,
+    "silence_over_cadence_ratio": 1.01,
+    "max_silence_window": "15:00~15:10",
     "first_at": "07:40:01",
     "last_at": "15:40:02",
     "silence_warn_minutes": 20.0
@@ -1981,82 +2186,82 @@
     "monthly_coverage": {
       "expiry": "2026-09-10",
       "expiry_source": "expiry_liquidity",
-      "minutes": 494,
+      "minutes": 472,
       "elapsed_minutes": 494,
-      "coverage_pct": 100.0,
+      "coverage_pct": 95.5,
       "over_100": false
     },
     "tables": [
       {
         "table": "option_analysis_1m",
-        "rows": 8583,
-        "minutes": 494,
+        "rows": 7214,
+        "minutes": 472,
         "note": "옵션체인 그릭스"
       },
       {
         "table": "underlying_spot_1m",
-        "rows": 380,
-        "minutes": 380,
+        "rows": 358,
+        "minutes": 358,
         "note": "기초자산 스팟"
       },
       {
         "table": "market_raw_1m",
-        "rows": 3875,
-        "minutes": 410,
+        "rows": 1396,
+        "minutes": 402,
         "note": "WS 체결 1분봉"
       },
       {
         "table": "investor_flow_1m",
-        "rows": 492,
-        "minutes": 492,
+        "rows": 484,
+        "minutes": 484,
         "note": "투자자 수급"
       },
       {
         "table": "expiry_liquidity_1m",
-        "rows": 117,
-        "minutes": 117,
+        "rows": 104,
+        "minutes": 104,
         "note": "만기 유동성"
       },
       {
         "table": "macro_snapshot_5m",
-        "rows": 99,
-        "minutes": 99,
+        "rows": 89,
+        "minutes": 89,
         "note": "매크로"
       },
       {
         "table": "account_balance_snapshots",
-        "rows": 97,
-        "minutes": 97,
+        "rows": 94,
+        "minutes": 94,
         "note": "계좌 잔고"
       },
       {
         "table": "signal_decisions",
-        "rows": 490,
-        "minutes": 490,
+        "rows": 485,
+        "minutes": 485,
         "note": "판단"
       },
       {
         "table": "risk_snapshots",
-        "rows": 490,
-        "minutes": 490,
+        "rows": 485,
+        "minutes": 485,
         "note": "리스크 스냅샷"
       },
       {
         "table": "regime_state",
-        "rows": 410,
-        "minutes": 410,
+        "rows": 402,
+        "minutes": 402,
         "note": "레짐"
       },
       {
         "table": "feature_store",
-        "rows": 410,
-        "minutes": 410,
+        "rows": 402,
+        "minutes": 402,
         "note": "레짐 피처"
       },
       {
         "table": "rate_limiter_status_history",
-        "rows": 494,
-        "minutes": 494,
+        "rows": 484,
+        "minutes": 484,
         "note": "레이트리밋 이력"
       },
       {
@@ -2067,8 +2272,8 @@
       },
       {
         "table": "decision_outcomes",
-        "rows": 345,
-        "minutes": 345,
+        "rows": 215,
+        "minutes": 215,
         "note": "판단 사후 평가"
       },
       {
@@ -2081,20 +2286,67 @@
     "chain_minute_coverage": {
       "available": true,
       "span_minutes": 494,
-      "minutes_with_rows": 494,
-      "zero_row_minutes": [],
-      "zero_row_count": 0,
+      "minutes_with_rows": 472,
+      "zero_row_minutes": [
+        "09:50",
+        "09:51",
+        "09:52",
+        "09:53",
+        "09:54",
+        "10:10",
+        "10:32",
+        "10:33",
+        "10:34",
+        "10:35",
+        "10:36",
+        "12:55",
+        "12:56",
+        "12:57",
+        "13:01",
+        "13:02",
+        "13:03",
+        "13:04",
+        "13:05",
+        "13:06",
+        "13:41",
+        "13:42"
+      ],
+      "zero_row_count": 22,
       "zero_row_longest_run": {
-        "length": 0,
-        "start": null,
-        "end": null
+        "length": 6,
+        "start": "13:01",
+        "end": "13:06"
       },
       "zero_row_run_alert_minutes": 20,
       "over_design_minutes": [],
       "over_design_count": 0,
       "zero_row_by_cause": {
-        "collection_wiped": [],
-        "no_cycle": [],
+        "collection_wiped": [
+          "10:10",
+          "12:55",
+          "12:56",
+          "12:57",
+          "13:01",
+          "13:02",
+          "13:03",
+          "13:04",
+          "13:05",
+          "13:06",
+          "13:41",
+          "13:42"
+        ],
+        "no_cycle": [
+          "09:50",
+          "09:51",
+          "09:52",
+          "09:53",
+          "09:54",
+          "10:32",
+          "10:33",
+          "10:34",
+          "10:35",
+          "10:36"
+        ],
         "written_elsewhere": [],
         "labelled": true
       }
@@ -2102,11 +2354,11 @@
     "monthly_leg_completeness": {
       "available": true,
       "expiry": "2026-09-10",
-      "minutes": 494,
+      "minutes": 472,
       "design_legs": 10,
-      "below_design_count": 84,
-      "below_design_pct": 17.0,
-      "below_flip_minimum_count": 8,
+      "below_design_count": 161,
+      "below_design_pct": 34.1,
+      "below_flip_minimum_count": 26,
       "legs_median": 10.0,
       "legs_min": 1
     },
@@ -2114,9 +2366,9 @@
       "available": true,
       "futures_symbol": "A01609",
       "live_window_end": "15:20",
-      "minutes": 380,
-      "max_pct": 0.445,
-      "median_pct": 0.104,
+      "minutes": 358,
+      "max_pct": 5.555,
+      "median_pct": 0.061,
       "index_frozen_minutes": 0,
       "index_frozen_max_run": 0
     },
@@ -2124,97 +2376,97 @@
       {
         "series": "regular",
         "expiry": "2026-09-10",
-        "minutes": 494,
+        "minutes": 472,
         "coverage_pct": 100.0
       },
       {
         "series": "weekly_mon",
-        "expiry": "2026-08-18",
-        "minutes": 230,
-        "coverage_pct": 46.6
+        "expiry": "2026-08-24",
+        "minutes": 199,
+        "coverage_pct": 42.2
       },
       {
         "series": "weekly_thu",
         "expiry": "2026-08-20",
-        "minutes": 236,
-        "coverage_pct": 47.8
+        "minutes": 210,
+        "coverage_pct": 44.5
       }
     ],
     "book_gamma_map": [
       {
-        "expiry": "2026-08-18",
-        "legs": 10,
-        "gex": 602474410489.5,
-        "gamma_flip": null,
-        "pin_strike": 1080.0,
-        "pin_concentration_pct": 48.4,
-        "expiry_today": true
-      },
-      {
         "expiry": "2026-08-20",
         "legs": 10,
-        "gex": 199675815893.25,
+        "gex": -12170815893.5472,
         "gamma_flip": null,
-        "pin_strike": 1082.5,
-        "pin_concentration_pct": 42.5,
+        "pin_strike": 1020.0,
+        "pin_concentration_pct": 50.8,
+        "expiry_today": false
+      },
+      {
+        "expiry": "2026-08-24",
+        "legs": 10,
+        "gex": -15891805.1808,
+        "gamma_flip": null,
+        "pin_strike": 1010.0,
+        "pin_concentration_pct": 50.0,
         "expiry_today": false
       },
       {
         "expiry": "2026-09-10",
         "legs": 10,
-        "gex": -399647862.0,
+        "gex": -5291202166.891199,
         "gamma_flip": null,
-        "pin_strike": 1087.5,
-        "pin_concentration_pct": 29.4,
+        "pin_strike": 1010.0,
+        "pin_concentration_pct": 55.1,
         "expiry_today": false
       }
     ],
     "wide_oi_landscape": [
       {
-        "expiry": "2026-08-18",
-        "strikes": 33,
-        "strike_min": 1067.5,
-        "strike_max": 1147.5,
-        "search_pct": 6.15,
-        "net_call_put_oi": 8002,
-        "call_heavy_strikes": 22,
-        "put_heavy_strikes": 11,
-        "wide_gamma_flip": null,
-        "flip_possible": false
-      },
-      {
         "expiry": "2026-08-20",
-        "strikes": 33,
-        "strike_min": 1067.5,
-        "strike_max": 1147.5,
-        "search_pct": 6.15,
-        "net_call_put_oi": 7799,
-        "call_heavy_strikes": 19,
+        "strikes": 21,
+        "strike_min": 1000.0,
+        "strike_max": 1087.5,
+        "search_pct": 7.4,
+        "net_call_put_oi": 7862,
+        "call_heavy_strikes": 14,
         "put_heavy_strikes": 7,
         "wide_gamma_flip": null,
         "flip_possible": false
       },
       {
+        "expiry": "2026-08-24",
+        "strikes": 22,
+        "strike_min": 1000.0,
+        "strike_max": 1087.5,
+        "search_pct": 7.4,
+        "net_call_put_oi": -3,
+        "call_heavy_strikes": 3,
+        "put_heavy_strikes": 4,
+        "wide_gamma_flip": null,
+        "flip_possible": false
+      },
+      {
         "expiry": "2026-09-10",
-        "strikes": 33,
-        "strike_min": 1067.5,
-        "strike_max": 1147.5,
-        "search_pct": 6.15,
-        "net_call_put_oi": 1491,
-        "call_heavy_strikes": 20,
-        "put_heavy_strikes": 12,
+        "strikes": 22,
+        "strike_min": 1000.0,
+        "strike_max": 1087.5,
+        "search_pct": 7.4,
+        "net_call_put_oi": -591,
+        "call_heavy_strikes": 8,
+        "put_heavy_strikes": 14,
         "wide_gamma_flip": null,
         "flip_possible": false
       }
     ],
     "member_availability": {
       "available": true,
-      "minutes": 490,
+      "minutes": 485,
       "members": [
         {
           "member": "regime_hmm",
-          "available_minutes": 419,
-          "available_pct": 85.5,
+          "available_minutes": 410,
+          "available_pct": 84.5,
           "top_unavailable_reason": "regime_state 없음",
           "structural_minutes": 0,
           "implemented": true
@@ -2237,23 +2489,23 @@
         },
         {
           "member": "options_flow",
-          "available_minutes": 383,
-          "available_pct": 78.2,
+          "available_minutes": 369,
+          "available_pct": 76.1,
           "top_unavailable_reason": "장전(스팟 미적재)",
-          "structural_minutes": 106,
+          "structural_minutes": 110,
           "implemented": true
         },
         {
           "member": "orderflow_ofi_vpin",
-          "available_minutes": 410,
-          "available_pct": 83.7,
+          "available_minutes": 401,
+          "available_pct": 82.7,
           "top_unavailable_reason": "ofi/queue_imbalance 없음",
           "structural_minutes": 9,
           "implemented": true
         },
         {
           "member": "flow_position",
-          "available_minutes": 490,
+          "available_minutes": 485,
           "available_pct": 100.0,
           "top_unavailable_reason": null,
           "structural_minutes": 0,
@@ -2262,8 +2514,8 @@
       ],
       "regime_hmm": {
         "member": "regime_hmm",
-        "available_minutes": 419,
-        "available_pct": 85.5,
+        "available_minutes": 410,
+        "available_pct": 84.5,
         "top_unavailable_reason": "regime_state 없음",
         "structural_minutes": 0,
         "implemented": true
@@ -2286,23 +2538,23 @@
       },
       "options_flow": {
         "member": "options_flow",
-        "available_minutes": 383,
-        "available_pct": 78.2,
+        "available_minutes": 369,
+        "available_pct": 76.1,
         "top_unavailable_reason": "장전(스팟 미적재)",
-        "structural_minutes": 106,
+        "structural_minutes": 110,
         "implemented": true
       },
       "orderflow_ofi_vpin": {
         "member": "orderflow_ofi_vpin",
-        "available_minutes": 410,
-        "available_pct": 83.7,
+        "available_minutes": 401,
+        "available_pct": 82.7,
         "top_unavailable_reason": "ofi/queue_imbalance 없음",
         "structural_minutes": 9,
         "implemented": true
       },
       "flow_position": {
         "member": "flow_position",
-        "available_minutes": 490,
+        "available_minutes": 485,
         "available_pct": 100.0,
         "top_unavailable_reason": null,
         "structural_minutes": 0,
@@ -2314,77 +2566,77 @@
       "members": [
         {
           "member": "regime_hmm",
-          "scored_minutes": 419,
+          "scored_minutes": 410,
           "mean": 0.0,
           "positive": 0,
           "negative": 0,
-          "zero": 419
+          "zero": 410
         },
         {
           "member": "options_flow",
-          "scored_minutes": 383,
-          "mean": -0.2689,
-          "positive": 131,
-          "negative": 234,
-          "zero": 18
+          "scored_minutes": 369,
+          "mean": 0.0081,
+          "positive": 170,
+          "negative": 167,
+          "zero": 32
         },
         {
           "member": "orderflow_ofi_vpin",
-          "scored_minutes": 410,
-          "mean": -0.039,
-          "positive": 195,
-          "negative": 211,
-          "zero": 4
+          "scored_minutes": 401,
+          "mean": 0.0798,
+          "positive": 215,
+          "negative": 183,
+          "zero": 3
         },
         {
           "member": "flow_position",
-          "scored_minutes": 490,
-          "mean": -0.0469,
-          "positive": 198,
-          "negative": 221,
-          "zero": 71
+          "scored_minutes": 485,
+          "mean": -0.8412,
+          "positive": 1,
+          "negative": 409,
+          "zero": 75
         }
       ],
       "pairs": [
         {
           "a": "flow_position",
           "b": "options_flow",
-          "both_nonzero_minutes": 365,
-          "same_sign_minutes": 220,
-          "same_sign_pct": 60.3
+          "both_nonzero_minutes": 337,
+          "same_sign_minutes": 166,
+          "same_sign_pct": 49.3
         },
         {
           "a": "flow_position",
           "b": "orderflow_ofi_vpin",
-          "both_nonzero_minutes": 406,
-          "same_sign_minutes": 201,
-          "same_sign_pct": 49.5
+          "both_nonzero_minutes": 398,
+          "same_sign_minutes": 184,
+          "same_sign_pct": 46.2
         },
         {
           "a": "options_flow",
           "b": "orderflow_ofi_vpin",
-          "both_nonzero_minutes": 361,
-          "same_sign_minutes": 157,
-          "same_sign_pct": 43.5
+          "both_nonzero_minutes": 334,
+          "same_sign_minutes": 187,
+          "same_sign_pct": 56.0
         }
       ]
     },
     "strike_window_quality": {
       "available": true,
       "expiry": "2026-09-10",
-      "minutes": 380,
-      "atm_covered_pct": 98.4,
-      "atm_covered_pct_by_futures": 98.4,
-      "atm_covered_pct_by_index_same_minutes": 98.4,
-      "atm_source_gap_pt": 0.0,
-      "futures_cross_check_minutes": 380,
-      "window_covered_pct": 40.8,
+      "minutes": 358,
+      "atm_covered_pct": 92.7,
+      "atm_covered_pct_by_futures": 92.2,
+      "atm_covered_pct_by_index_same_minutes": 92.7,
+      "atm_source_gap_pt": -0.5,
+      "futures_cross_check_minutes": 358,
+      "window_covered_pct": 41.1,
       "atm_offset_strikes_median": 1.0,
-      "atm_offset_strikes_max": 3.0,
+      "atm_offset_strikes_max": 23.0,
       "design_strikes": 5,
-      "snapshot_strikes_median": 6.0,
+      "snapshot_strikes_median": 5.0,
       "snapshot_strikes_max": 11,
-      "width_jitter": 1.2,
+      "width_jitter": 1.0,
       "snapshot_window_minutes": 5
     },
     "signal_decisions": [
@@ -2392,255 +2644,250 @@
         "decision": "ENTER",
         "conviction": "STANDARD",
         "reject_reason": null,
-        "count": 286
+        "count": 142
       },
       {
         "decision": "REJECT",
         "conviction": "NO_TRADE",
         "reject_reason": "meta_label:no_trade",
-        "count": 77
+        "count": 79
       },
       {
         "decision": "ENTER",
         "conviction": "SMALL_TEST",
         "reject_reason": null,
-        "count": 36
+        "count": 73
       },
       {
-        "decision": "ENTER",
-        "conviction": "HIGH_CONVICTION",
+        "decision": "REJECT",
+        "conviction": "STANDARD",
         "reject_reason": null,
-        "count": 23
+        "count": 71
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "SMALL_TEST",
+        "reject_reason": null,
+        "count": 46
       },
       {
         "decision": "REJECT",
         "conviction": "STANDARD",
         "reject_reason": "entry_cutoff",
-        "count": 21
+        "count": 26
       },
       {
         "decision": "REJECT",
         "conviction": "SMALL_TEST",
         "reject_reason": "conflict_resolution:no_clear_consensus",
-        "count": 16
+        "count": 26
       },
       {
         "decision": "REJECT",
         "conviction": "STANDARD",
-        "reject_reason": null,
+        "reject_reason": "strategy_palette:short_gamma_requires_not_met",
         "count": 9
       },
       {
         "decision": "REJECT",
         "conviction": "STANDARD",
         "reject_reason": "strategy_palette:wait_only",
-        "count": 7
+        "count": 9
       },
       {
         "decision": "REJECT",
         "conviction": "SMALL_TEST",
-        "reject_reason": null,
-        "count": 6
-      },
-      {
-        "decision": "REJECT",
-        "conviction": "SMALL_TEST",
-        "reject_reason": "entry_cutoff",
+        "reject_reason": "strategy_palette:short_gamma_requires_not_met",
         "count": 4
-      },
-      {
-        "decision": "REJECT",
-        "conviction": "HIGH_CONVICTION",
-        "reject_reason": "entry_cutoff",
-        "count": 4
-      },
-      {
-        "decision": "REJECT",
-        "conviction": "HIGH_CONVICTION",
-        "reject_reason": null,
-        "count": 1
       }
     ],
     "decisions": {
-      "total": 490,
+      "total": 485,
       "member_count": {
         "available": true,
-        "available_mean": 3.47,
-        "effective_mean": 2.43,
-        "dead_axis_mean": 1.04,
+        "available_mean": 3.43,
+        "effective_mean": 2.36,
+        "dead_axis_mean": 1.07,
         "effective_min": 0,
-        "minutes_with_dead_axis": 490,
+        "minutes_with_dead_axis": 485,
         "dead_axis_by_member": {
-          "regime_hmm": 419,
-          "flow_position": 71,
-          "options_flow": 18,
-          "orderflow_ofi_vpin": 4
+          "regime_hmm": 410,
+          "flow_position": 75,
+          "options_flow": 32,
+          "orderflow_ofi_vpin": 3
         }
       },
       "decision": {
-        "ENTER": 345,
-        "REJECT": 145
+        "ENTER": 215,
+        "REJECT": 270
       },
       "conviction": {
-        "HIGH_CONVICTION": 28,
-        "NO_TRADE": 77,
-        "SMALL_TEST": 62,
-        "STANDARD": 323
+        "NO_TRADE": 79,
+        "SMALL_TEST": 149,
+        "STANDARD": 257
       },
       "reject_reason": {
-        "conflict_resolution:no_clear_consensus": 16,
-        "entry_cutoff": 29,
-        "meta_label:no_trade": 77,
-        "strategy_palette:wait_only": 7
+        "conflict_resolution:no_clear_consensus": 26,
+        "entry_cutoff": 26,
+        "meta_label:no_trade": 79,
+        "strategy_palette:short_gamma_requires_not_met": 13,
+        "strategy_palette:wait_only": 9
       },
       "vrp": {
-        "non_null": 382,
-        "non_null_ratio": 0.78
+        "non_null": 366,
+        "non_null_ratio": 0.755
       },
       "entry_strategies": {
-        "small_strangle_buy": 216,
-        "straddle_accumulate": 129
+        "straddle_accumulate": 169,
+        "small_strangle_buy": 46
       },
       "distinct_entry_strategies": 2,
       "entry_cutoff": {
         "cutoff_time": "14:50",
         "forced_flat_time": "15:10",
-        "blocked_count": 29,
+        "blocked_count": 26,
         "enter_after_cutoff": 0,
         "enter_after_forced_flat": 0
       },
       "selected_instruments": {
         "available": true,
-        "recorded_minutes": 490,
-        "enter_minutes": 345,
-        "enter_minutes_with_candidate": 127,
-        "enter_minutes_with_candidate_pct": 36.8,
+        "recorded_minutes": 485,
+        "enter_minutes": 215,
+        "enter_minutes_with_candidate": 151,
+        "enter_minutes_with_candidate_pct": 70.2,
         "reason": {
-          "no_strike_match": 218,
-          "no_entry_strategy": 116
+          "no_entry_strategy": 244,
+          "no_strike_match": 53,
+          "no_eligible_book": 13
         },
-        "leg_count": 312,
+        "leg_count": 350,
         "symbol_resolved_pct": 100.0,
         "expiry_day_leg_count": 0,
         "order_submitted_true_count": 0,
         "strategy_attempts": {
-          "small_strangle_buy": 216,
-          "straddle_accumulate": 129
+          "small_strangle_buy": 46,
+          "straddle_accumulate": 169
         },
         "strategy_rejected": {
-          "small_strangle_buy": 216,
-          "straddle_accumulate": 2
+          "small_strangle_buy": 45,
+          "straddle_accumulate": 6
         }
       }
     },
     "signal_reach": {
       "available": true,
-      "decisions": 490,
+      "decisions": 485,
       "member_count_max": 4,
       "gamma_flip_count": 0,
       "gamma_flip_pct": 0.0,
       "chain_leg_median": 10.0,
       "chain_leg_max": 10,
-      "chain_age_seconds_median": 70.057038,
-      "chain_age_seconds_max": 250.04056,
+      "chain_age_seconds_median": 70.180296,
+      "chain_age_seconds_max": 250.08531,
       "chain_leg_over_design_minutes": 0,
       "chain_leg_excess_max": 0,
-      "gex_input_missing_minutes": 0,
+      "gex_input_missing_minutes": 6,
       "gamma_flip_out_of_range_count": 0,
       "chain_input_source": {
         "available": true,
         "counts": {
-          "stale": 490
+          "none": 6,
+          "stale": 479
         },
-        "stale_pct": 100.0
+        "stale_pct": 98.8
       },
-      "decisions_after_open": 405,
+      "decisions_after_open": 396,
       "warnings": [
         "감마플립 산출률 0.0% — 이 북에서는 0%가 정상일 수 있다(08-04 §2-3: 전 구간 단조). 판정은 아래 범위 밖 건수로 한다",
-        "체인 스냅샷 최고령 레그 4분 — 신선도 경계가 깨졌다"
+        "체인 스냅샷 최고령 레그 4분 — 신선도 경계가 깨졌다",
+        "GEX 입력이 없던 분 6분 — 그 분의 판단은 감마 지형을 못 봤다. §4의 「0행 분 원인」에서 `수집 전멸`인지 확인할 것"
       ],
       "notes": []
     },
     "decision_outcomes": {
       "available": true,
-      "entries": 345,
+      "entries": 215,
       "horizons": {
         "5m": {
-          "sample": 345,
-          "hits": 184,
-          "hit_pct": 53.3,
-          "abs_move_pct": 0.269
+          "sample": 191,
+          "hits": 97,
+          "hit_pct": 50.8,
+          "abs_move_pct": 0.22
         },
         "15m": {
-          "sample": 344,
-          "hits": 171,
-          "hit_pct": 49.7,
-          "abs_move_pct": 0.488
+          "sample": 190,
+          "hits": 101,
+          "hit_pct": 53.2,
+          "abs_move_pct": 0.335
         },
         "30m": {
-          "sample": 344,
-          "hits": 163,
-          "hit_pct": 47.4,
-          "abs_move_pct": 0.696
+          "sample": 194,
+          "hits": 121,
+          "hit_pct": 62.4,
+          "abs_move_pct": 0.424
         }
       },
       "control": {
         "available": true,
-        "rejects": 145,
+        "rejects": 270,
         "horizons": {
           "5m": {
-            "sample": 30,
-            "hits": 19,
-            "hit_pct": 63.3
+            "sample": 143,
+            "hits": 89,
+            "hit_pct": 62.2
           },
           "15m": {
-            "sample": 20,
-            "hits": 9,
-            "hit_pct": 45.0
+            "sample": 130,
+            "hits": 79,
+            "hit_pct": 60.8
           },
           "30m": {
-            "sample": 5,
-            "hits": 3,
-            "hit_pct": 60.0
+            "sample": 111,
+            "hits": 69,
+            "hit_pct": 62.2
           }
         },
         "shared_hours": [
           "09",
+          "10",
+          "11",
+          "12",
+          "13",
           "14"
         ],
         "time_matched": {
           "enter": {
             "5m": {
-              "sample": 105,
-              "hits": 74,
-              "hit_pct": 70.5
+              "sample": 191,
+              "hits": 97,
+              "hit_pct": 50.8
             },
             "15m": {
-              "sample": 105,
-              "hits": 78,
-              "hit_pct": 74.3
+              "sample": 190,
+              "hits": 101,
+              "hit_pct": 53.2
             },
             "30m": {
-              "sample": 105,
-              "hits": 73,
-              "hit_pct": 69.5
+              "sample": 194,
+              "hits": 121,
+              "hit_pct": 62.4
             }
           },
           "reject": {
             "5m": {
-              "sample": 15,
-              "hits": 9,
-              "hit_pct": 60.0
+              "sample": 128,
+              "hits": 81,
+              "hit_pct": 63.3
             },
             "15m": {
-              "sample": 15,
-              "hits": 9,
+              "sample": 125,
+              "hits": 75,
               "hit_pct": 60.0
             },
             "30m": {
-              "sample": 5,
-              "hits": 3,
-              "hit_pct": 60.0
+              "sample": 111,
+              "hits": 69,
+              "hit_pct": 62.2
             }
           }
         }
@@ -2649,29 +2896,29 @@
         "available": true,
         "sources": {
           "stale": {
-            "entries": 345,
+            "entries": 215,
             "horizons": {
               "5m": {
-                "sample": 345,
-                "hit_pct": 53.3,
-                "abs_move_pct": 0.269
+                "sample": 191,
+                "hit_pct": 50.8,
+                "abs_move_pct": 0.22
               },
               "15m": {
-                "sample": 344,
-                "hit_pct": 49.7,
-                "abs_move_pct": 0.488
+                "sample": 190,
+                "hit_pct": 53.2,
+                "abs_move_pct": 0.335
               },
               "30m": {
-                "sample": 344,
-                "hit_pct": 47.4,
-                "abs_move_pct": 0.696
+                "sample": 194,
+                "hit_pct": 62.4,
+                "abs_move_pct": 0.424
               }
             }
           }
         }
       }
     },
-    "risk_gate_distinct": 388,
+    "risk_gate_distinct": 353,
     "regime": {
       "visits": [
         {
@@ -2682,40 +2929,40 @@
         },
         {
           "regime": "3",
-          "today": 234,
-          "total": 677,
-          "days": 4
+          "today": 109,
+          "total": 786,
+          "days": 5
         },
         {
           "regime": "5",
-          "today": 176,
-          "total": 1310,
-          "days": 5
+          "today": 293,
+          "total": 1603,
+          "days": 6
         }
       ],
-      "today_total": 410,
+      "today_total": 402,
       "trend_minutes": 0,
-      "warmup_minutes": 29,
-      "warmup_runs": 1,
-      "warmup_restart_minutes": 0,
+      "warmup_minutes": 87,
+      "warmup_runs": 3,
+      "warmup_restart_minutes": 58,
       "warmup_unknown_minutes": 0
     },
     "regime_vs_futures_bars": {
       "available": true,
       "futures_symbol": "A01609",
-      "futures_bar_minutes": 410,
-      "regime_minutes": 410,
+      "futures_bar_minutes": 402,
+      "regime_minutes": 402,
       "gap": 0,
       "minutes": []
     },
     "feature_store": {
-      "today": 410,
-      "total": 10258,
+      "today": 402,
+      "total": 10660,
       "hmm_threshold": 8000,
-      "hmm_progress_pct": 128.2,
+      "hmm_progress_pct": 133.2,
       "non_neutral_pct": {
         "rv_ratio": 100.0,
-        "book_thinning": 99.5
+        "book_thinning": 97.8
       },
       "model": {
         "trained_at": "2026-08-10T16:56:34",
@@ -2728,61 +2975,61 @@
     },
     "macro": {
       "vix_front": {
-        "non_null": 92,
-        "distinct": 17
+        "non_null": 81,
+        "distinct": 13
       },
       "vix_next": {
-        "non_null": 98,
-        "distinct": 16
+        "non_null": 85,
+        "distinct": 9
       },
       "vix_term_structure": {
-        "non_null": 91,
-        "distinct": 46
+        "non_null": 78,
+        "distinct": 28
       },
       "usdcnh": {
-        "non_null": 94,
-        "distinct": 1
+        "non_null": 84,
+        "distinct": 35
       },
       "es_front": {
-        "non_null": 99,
-        "distinct": 63
+        "non_null": 89,
+        "distinct": 47
       },
       "zn_front": {
-        "non_null": 9,
-        "distinct": 4
+        "non_null": 10,
+        "distinct": 8
       },
       "us10y_yield": {
-        "non_null": 2,
+        "non_null": 3,
         "distinct": 1
       },
       "usdkrw": {
-        "non_null": 2,
-        "distinct": 2
+        "non_null": 3,
+        "distinct": 3
       },
       "move_index": {
-        "non_null": 2,
+        "non_null": 3,
         "distinct": 1
       }
     },
     "market_halt": {
-      "updated_at": "15:40:26",
+      "updated_at": "15:41:36",
       "last_message_at": null
     },
     "ws_status": {
-      "updated_at": "15:40:26",
-      "connected_since": "07:30:22",
-      "last_message_at": "15:34:59",
+      "updated_at": "15:41:36",
+      "connected_since": "10:36:29",
+      "last_message_at": "15:35:00",
       "reconnect_count_today": 0,
-      "market_op_subscribed_at": "07:30:23",
-      "atm_roll_count_today": 105,
-      "atm_roll_dropped_subs_today": 528
+      "market_op_subscribed_at": "10:36:36",
+      "atm_roll_count_today": 48,
+      "atm_roll_dropped_subs_today": 151
     },
     "remaining_processes": 0,
     "rate_limiter": {
-      "rows": 494,
+      "rows": 484,
       "overrun_rows": 0,
-      "max_multiplier": 3.322,
-      "mean_multiplier": 1.137
+      "max_multiplier": 2.25,
+      "mean_multiplier": 1.124
     },
     "positions": {
       "available": true,

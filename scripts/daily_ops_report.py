@@ -75,6 +75,109 @@ def _delta_baseline_metric(
     }
 
 
+# ===== 2026-08-19 장후 (08-19 보고서 Fix#8) — **과거 날짜 재생성은 일부 값을 파괴한다** =====
+#
+# ## 무엇이 일어났는가
+#
+# 08-19 보고서 Fix#8이 *"`--date 2026-08-18`로 재실행하면 된다. **DB는 남아 있으므로 복구
+# 가능하다**"* 라고 적었다. 절반만 맞다. 실제로 돌려 보니 08-18 사이드카는 **키를 하나도
+# 잃지 않고 125개를 얻었지만**(`execution_logs` 행 포함 — 그것이 `c1` 판정의 전부였다)
+# **기존 값 14개가 오늘 값으로 덮였다.**
+#
+#     db.ws_status.connected_since        07:30:22  ->  10:36:29   ← 08-19의 재기동 시각
+#     db.feature_store.total                 10258  ->     10660   ← 08-19치가 누적에 섞였다
+#     db.regime.visits[].total / .days       (누적)                 ← 같은 형태
+#     levers.git_head                      ccdbeec  ->   63a3100   ← 그날 돌던 코드가 아니다
+#
+# ## 왜 그런가 — 두 종류의 지표가 섞여 있다
+#
+# `db_metrics.collect()`의 절 중 **넷은 `target`을 아예 안 쓴다**(`ws_status` · `market_halt` ·
+# `remaining_processes` · `slack_alerts`). 싱글턴 테이블의 **지금 상태**를 읽기 때문이다.
+# 그 값들은 그날 15:45의 실행만이 관측할 수 있었고 **사후 복원이 원리적으로 불가능하다.**
+# `levers`도 같다 — 이 파일의 json 저장부 주석이 이미 그렇게 적어 뒀다:
+# *"레버는 그날의 코드 상태라 사후 복원이 불가능하다"*. 그 문장이 옳았는데 **재생성 경로가
+# 그것을 안 지켰다.**
+#
+# 누적 지표(`feature_store.total` · `regime.visits[].total/days`)는 세 번째 종류다. 날짜로
+# 필터되지만 **분모가 전 기간**이라 하루가 지나면 값이 달라진다.
+#
+# ## 규칙 — 과거 날짜를 다시 낼 때는 「그때만 알 수 있던 값」을 그대로 둔다
+#
+# 대상 날짜가 **오늘보다 이르고** 그 사이드카가 이미 있으면, 아래 경로들을 옛 파일에서
+# 그대로 옮겨 싣는다. 새로 생긴 키는 **전부 받는다**(그것이 재생성의 이유다).
+#
+# ⚠ **조용히 하지 않는다.** 옮긴 경로는 한 줄씩 로그에 남는다 — 이 목록이 낡으면 그 사실이
+# 로그에 안 나타나는 방식으로 드러나야 하고, 그래서 「몇 건 보존」이 아니라 경로를 인쇄한다.
+_RUN_TIME_SECTIONS = (
+    # `db_metrics.collect()`에서 `target`을 인자로만 받고 **쓰지 않는** 절들.
+    # 이 목록이 갈라지면 `tests/test_scripts_daily_ops_report.py`가 먼저 깨진다.
+    "db.ws_status",
+    "db.market_halt",
+    "db.remaining_processes",
+    "db.slack_alerts",
+    # 그날의 **코드 상태**. 위 json 저장부 주석의 「사후 복원 불가능」이 가리키는 것이 이것이다.
+    "levers",
+)
+# 절 전체가 아니라 **잎만** 누적인 것들. 형제 잎(`feature_store.today` 등)은 날짜로 필터되므로
+# 재생성이 옳게 낸다 — 절 단위로 보존하면 그 개선까지 함께 막힌다.
+_CUMULATIVE_LEAVES = (
+    "db.feature_store.total",
+    "db.feature_store.hmm_progress_pct",
+)
+# `db.regime.visits`는 **한 행 안에서** 갈린다: `today`는 그날치(재생성이 옳다),
+# `total`/`days`는 전 기간 누적(그때 값이어야 한다). 행은 `regime`으로 맞춘다.
+_CUMULATIVE_ROW_LEAVES = {"db.regime.visits": ("regime", ("total", "days"))}
+
+
+def _restore_run_time_fields(payload: dict, previous_run: dict) -> list[str]:
+    """과거 날짜 재생성에서 **그때만 알 수 있던 값**을 옛 사이드카에서 되돌린다. 반환: 되돌린 경로들.
+
+    입력: 이번에 만든 지표 dict, 같은 날짜의 **기존** 사이드카 dict.
+    계산: 위 세 목록(절 전체 · 누적 잎 · 행 안의 누적 잎)만 덮어쓴다. 그 밖은 손대지 않는다.
+    해석: 상세 근거는 위 절 주석. **새로 생긴 키는 하나도 막지 않는다** — 재생성의 목적이
+         그것이고, 되돌리는 것은 「재생성이 알 수 없는 것」뿐이다.
+    실패 조건: 없다. 옛 파일에 그 경로가 없으면 건너뛴다(그날엔 그 지표가 없었다는 뜻이다).
+    """
+    restored: list[str] = []
+
+    def _split(path):
+        head, _, tail = path.partition(".")
+        return (payload.get("db"), previous_run.get("db"), tail) if head == "db" else (payload, previous_run, path)
+
+    for path in _RUN_TIME_SECTIONS:
+        new_root, old_root, key = _split(path)
+        if isinstance(new_root, dict) and isinstance(old_root, dict) and key in old_root:
+            new_root[key] = old_root[key]
+            restored.append(path)
+
+    for path in _CUMULATIVE_LEAVES:
+        new_root, old_root, rest = _split(path)
+        section, _, leaf = rest.rpartition(".")
+        new_node = (new_root or {}).get(section)
+        old_node = (old_root or {}).get(section)
+        if isinstance(new_node, dict) and isinstance(old_node, dict) and leaf in old_node:
+            new_node[leaf] = old_node[leaf]
+            restored.append(path)
+
+    for path, (index_field, leaves) in _CUMULATIVE_ROW_LEAVES.items():
+        new_root, old_root, rest = _split(path)
+        section, _, listname = rest.rpartition(".")
+        new_rows = ((new_root or {}).get(section) or {}).get(listname)
+        old_rows = ((old_root or {}).get(section) or {}).get(listname)
+        if not isinstance(new_rows, list) or not isinstance(old_rows, list):
+            continue
+        by_key = {r.get(index_field): r for r in old_rows if isinstance(r, dict)}
+        for row in new_rows:
+            old_row = by_key.get(row.get(index_field)) if isinstance(row, dict) else None
+            if not isinstance(old_row, dict):
+                continue
+            for leaf in leaves:
+                if leaf in old_row and row.get(leaf) != old_row[leaf]:
+                    row[leaf] = old_row[leaf]
+                    restored.append(f"{path}[{row.get(index_field)}].{leaf}")
+    return restored
+
+
 def build(target: date, out_dir: Path, use_db: bool) -> Path:
     """
     계산: 로그 지표 → (선택) DB 지표 → (선택) 전일 델타/가설 검정 → 마크다운 + JSON 저장.
@@ -184,6 +287,42 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
     if crash_result is not None:
         metrics["crash"] = crash_result
 
+    # 2026-08-19 (Fix#8) — **재생성이 「그때만 알 수 있던 값」을 덮지 않게 한다.**
+    # 근거는 `_restore_run_time_fields` 위 절 주석.
+    #
+    # ## 조건이 「과거 날짜」가 아니라 **「사이드카가 이미 있는가」**인 이유
+    #
+    # 장마감 배치는 그날의 **첫 실행**이라 파일이 없다 — 그래서 평소에는 이 블록이 통째로
+    # 안 돈다. 파일이 있다는 것은 곧 **재실행**이라는 뜻이고, 그때 보존해야 하는 것은
+    # 날짜가 과거인지와 무관하다. 08-19가 그 반례를 바로 냈다: 같은 날 21:30에 다시 돌리니
+    # `levers.git_head`가 **장중 HEAD(`cd594df`)에서 장후 커밋(`63a3100`)으로** 바뀌었다.
+    # 그날 돌던 코드는 `cd594df`다 — 날짜는 같은데 값은 틀린 것이다.
+    #
+    # **가설 검정보다 먼저** 돌린다 — 판정이 지금 값을 그날 값인 척 읽으면 그 재생성은
+    # 사실을 복구한 것이 아니라 틀린 판정을 하나 더 만든 것이다.
+    existing = out_dir / f"{target.isoformat()}_지표.json"
+    if existing.exists():
+        try:
+            merged = dict(metrics)
+            if db_metrics_result:
+                merged["db"] = db_metrics_result
+            restored = _restore_run_time_fields(
+                merged, json.loads(existing.read_text(encoding="utf-8"))
+            )
+            for key in _RUN_TIME_SECTIONS:
+                if not key.startswith("db.") and key in merged:
+                    metrics[key] = merged[key]  # 얕은 복사라 최상위 절은 다시 실어야 한다
+            lever_state = metrics.get("levers", lever_state)
+            for path in restored:
+                logger.info("재생성 — 기존 값 보존: %s", path)
+            if restored:
+                logger.info(
+                    "%s 재생성: 그때만 알 수 있던 값 %d개를 보존했다(나머지는 새로 냈다)",
+                    existing.name, len(restored),
+                )
+        except Exception:
+            logger.warning("기존 사이드카 보존 실패 — 새 값으로 덮는다", exc_info=True)
+
     hypothesis_results = None
     try:
         from mahdi.ops import hypotheses
@@ -206,7 +345,13 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
     payload = dict(metrics)
     if db_metrics_result:
         payload["db"] = db_metrics_result
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8", newline="\n",
+    )  # newline="\n" — 없으면 Windows에서 `os.linesep`(CRLF)로 되돌아간다.
+    # `.gitattributes`가 `eol=lf`를 정했고 `tests/test_repo_line_endings.py`가 그것을 지킨다
+    # (2026-08-19 17:48~17:56). **저장소에 남는 파일을 쓰는 자리는 전부 이 인자가 필요하다** —
+    # 08-19 사이드카 재생성이 그 사실을 실측으로 드러냈다(2,801줄이 CRLF로 되돌아갔다).
 
     # 2026-08-18 — 검증 캠페인은 **위 json을 쓴 뒤에** 평가한다. 캠페인의 유일한 입력이
     # `auto/*_지표.json`이므로, 순서를 뒤집으면 **오늘치가 누적에서 빠진다** — 매일 하루씩
@@ -230,7 +375,7 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
             levers=lever_state, watchdog=watchdog_result,
             campaign=campaign_results, crash=crash_result,
         ),
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",  # 위 json과 같은 이유
     )
     return md_path
 

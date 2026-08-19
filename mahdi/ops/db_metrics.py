@@ -184,7 +184,7 @@ def _fetchone(conn: ConnectionLike, sql: str, params: tuple = ()) -> tuple | Non
         return cur.fetchone()
 
 
-def slack_alerts(conn: ConnectionLike, target: date) -> dict:
+def slack_alerts(conn: ConnectionLike, _target: date) -> dict:
     """
     입력: DB 커넥션, 대상 날짜(쓰지 않는다 — 토글은 시점 상태다).
     계산: `slack_alert_settings.enabled`의 현재 값.
@@ -1792,6 +1792,40 @@ def _regime(conn: ConnectionLike, target: date) -> dict:
 
     **「엔진이 도는가」와 「엔진이 추세를 봤는가」는 다른 질문이다.** `trend_minutes == 0`이면
     `regime_hmm`이 0점인 것은 **정상이고 반증이 아니다** — 그때 판정은 「판정 불가」여야 한다.
+
+    ## `warmup_minutes` — 재기동의 대가 (2026-08-19 장후)
+
+    `2026-08-12-fix7-regime-session-window-restore`의 **주장 지표**가 `db.regime.warmup_minutes`
+    인데 그 잎이 여기 없었다. 부모(`db.regime`)가 실재하므로 「경로 없음」이 아니라 **「실측
+    없음」**으로 분류돼 왔고, 그것은 **내일도 안 나온다**(같은 날 `hypotheses.leaf_absent()`가
+    이 구멍을 처음 기계로 잡았다).
+
+    재료는 08-05부터 DB에 있었다 — 마이그레이션 025가 `regime_state.is_warmup`을 넣었고
+    `main.handle_message`가 매분 그 값을 적재한다. 세면 끝나는 일이었다.
+
+    **08-19가 이 값을 처음 필요로 한 날이다**: 워치독 재기동 2회(09:54 · 10:36) 뒤 레짐이 각각
+    **29분**씩 `warmup_fallback` 위에서 돌았고(58분 = 정규장의 15.3%), 그 58분을 사람이 로그
+    전이 줄을 손으로 훑어 구했다. 08-12 실측도 29분이었다 — **29분은 우연이 아니라 상수다**
+    (warmup 최소창 30분).
+
+    ⚠ **`NULL`을 0으로 접지 않는다.** 마이그레이션 025 **이전**(08-05 이전)의 행은 `is_warmup`이
+    `NULL`이고, 그것은 「warmup이 아니었다」가 아니라 **「안 적었다」**다. 그래서 `TRUE`인 분만
+    세고 `NULL`인 분 수를 `warmup_unknown_minutes`로 **따로** 낸다 — 규약 C의 두 가지 0을
+    가르는 것과 같은 형태이고, 그 값이 그날 총 분 수와 같으면 이 지표는 판정에 못 쓴다.
+
+    ## 총합만으로는 그 가설을 판정할 수 없다 — **구간 수**를 함께 낸다
+
+    08-19 총합은 **87분**인데 보고서가 손으로 구한 값은 **58분**이었다. 둘 다 맞다:
+    87 = 29 × **3**이고, 그중 첫 29분(08:46~09:15)은 **정상 기동의 warmup**이라 재기동과 무관하다.
+    가설이 재려는 것은 **「재기동이 되돌린 분」**(58분)이지 하루 총합이 아니다.
+
+    총합만 인쇄하면 「29분 → 5분 이하」라는 예측 옆에 **87**이 찍히고, 표만 보는 사람은
+    레버가 반대로 작동했다고 읽는다 — 08-12에 레버 F가 정확히 그렇게 오독됐다(그날 91건).
+
+    그래서 `warmup_runs`(끊어진 구간의 수)와 `warmup_restart_minutes`(**첫 구간을 뺀** 합)를
+    함께 낸다. 기동이 한 번뿐인 날은 `warmup_restart_minutes = 0`이고, 그것이 이 지표의
+    **정상값**이다. 한 분이라도 끊기면 다른 구간으로 센다 — 레짐은 매분 한 행이므로
+    연속성이 곧 같은 warmup 창이다.
     """
     today = dict(
         (int(r[0]), int(r[1]))
@@ -1803,6 +1837,20 @@ def _regime(conn: ConnectionLike, target: date) -> dict:
         conn,
         "SELECT regime, count(*), count(DISTINCT timestamp::date) FROM regime_state GROUP BY 1 ORDER BY 1",
     )
+    warmup_at = [
+        r[0] for r in _fetchall(
+            conn,
+            "SELECT timestamp FROM regime_state "
+            "WHERE timestamp::date=%s AND is_warmup ORDER BY 1",
+            (target,),
+        )
+    ]
+    unknown = _fetchone(
+        conn,
+        "SELECT count(*) FROM regime_state WHERE timestamp::date=%s AND is_warmup IS NULL",
+        (target,),
+    )
+    warmup_runs = _contiguous_minute_runs(warmup_at)
     return {
         "visits": [
             {"regime": str(regime), "today": today.get(int(regime), 0),
@@ -1811,7 +1859,31 @@ def _regime(conn: ConnectionLike, target: date) -> dict:
         ],
         "today_total": sum(today.values()),
         "trend_minutes": sum(today.get(r, 0) for r in DIRECTIONAL_REGIMES),
+        # 위 독스트링 참고 — 총합·구간 수·재기동분·「모름」을 **넷 다** 낸다.
+        # 어느 하나만 두면 그 하나가 나머지 셋인 척한다.
+        "warmup_minutes": len(warmup_at),
+        "warmup_runs": len(warmup_runs),
+        "warmup_restart_minutes": sum(warmup_runs[1:]),
+        "warmup_unknown_minutes": int(unknown[0]) if unknown and unknown[0] is not None else 0,
     }
+
+
+def _contiguous_minute_runs(stamps: list) -> list[int]:
+    """반환: 분 단위 타임스탬프 목록을 **끊긴 곳에서 잘라** 각 구간의 길이 목록으로. 정렬 입력 전제.
+
+    입력: 오름차순 `datetime` 목록(같은 분의 중복은 하나로 접는다).
+    계산: 직전 분과 정확히 1분 차이면 같은 구간, 아니면 새 구간.
+    해석: `_regime()`의 warmup 구간 분리에 쓴다 — 상세 근거는 그 독스트링.
+    실패 조건: 없다. 빈 입력이면 빈 목록.
+    """
+    minutes = sorted({s.replace(second=0, microsecond=0) for s in stamps})
+    runs: list[int] = []
+    for i, at in enumerate(minutes):
+        if i and (at - minutes[i - 1]).total_seconds() == 60:
+            runs[-1] += 1
+        else:
+            runs.append(1)
+    return runs
 
 
 def regime_vs_futures_bars(

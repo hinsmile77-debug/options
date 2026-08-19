@@ -476,6 +476,100 @@ def path_exists(metrics: dict | None, db_metrics: dict | None, path: str) -> boo
     return dig(root, parent) is not None
 
 
+# ===== 2026-08-19 장후 — **부모는 있고 잎이 영원히 없는 경로** =====
+#
+# `path_exists()`는 부모만 본다. 그 판별은 08-06에 옳았고 지금도 옳다 — 잎은 그날 데이터에
+# 따라 없을 수 있다. 그러나 그 규칙에는 **한 종류의 오타가 통째로 빠져나가는 구멍**이 있다:
+# 부모 절 이름은 맞게 적고 **잎 이름만 틀린** 경우다.
+#
+#     db.decisions.strategies         ->  dig() = None,  path_exists() = True
+#     db.signal_reach.member_availability
+#     db.regime.warmup_minutes
+#
+# 셋 다 「경로 없음」이 아니라 **「실측 없음」**(= 그날 값이 안 나왔다, 내일 다시 본다)으로
+# 분류된다. **그 잎은 내일도, 다음 달에도 안 나온다.** 가설은 조용히 무력화되고, 아무도
+# 그것을 신고하지 않는다 — 08-18 보고서가 이 결함을 **이틀에 두 번** 각각 다른 사고로 적었다
+# (`c1`의 `db.tables.execution_logs` 3-2 · `2026-08-16-fix1`의 `db.signal_reach...` 7-3).
+# 한 구멍이다.
+#
+# **가장 비쌌던 실례**: `2026-08-11-eF-effective-member-denominator`의 **대가** 지표가
+# `db.decisions.strategies`인데 실재 키는 `entry_strategies`다. 레버 F의 무조건발동일은
+# 2026-08-25 — 이 린트가 없었으면 **대가를 못 재는 채로 켰다**(규약 E 정면 위반).
+#
+# ## 왜 「부모가 dict일 때만」 판정하는가 — 오탐보다 미탐이 낫다
+#
+# 부모가 list면 `dig()`가 자연 키로 색인한다(`db.tables.<이름>`). 그 리스트에 그 이름의 행이
+# 없는 것은 **오타가 아니라 「그날 그 테이블에 행이 없었다」**일 수 있다. 스칼라면 경로 자체가
+# 더 깊이 들어갈 수 없으므로 이미 `path_exists()`의 관할이다. 둘 다 **판정하지 않는다.**
+#
+# ## 카운터 dict를 반드시 비켜 가야 한다
+#
+# `db.decisions.reject_reason.<사유>` · `db.decisions.entry_strategies.<전략>`처럼 **키가 그날의
+# 데이터인** dict가 있다. 거기서 잎의 부재는 정상이다(그 사유가 오늘 안 났다). 판별은
+# **값의 모양**으로 한다 — 부모 dict의 값이 **전부 스칼라**면 그것은 집계 카운터이므로
+# 판정을 보류한다. 구조 dict는 거의 언제나 dict나 list를 하나 이상 품는다.
+#
+# 이 규칙이 틀리는 날이 오면(전부 스칼라인 구조 dict에서 잎 오타가 나면) 이 린트는 **침묵한다.**
+# 그 방향의 실패를 고른 것이다 — 거짓 경보가 몇 번 나면 이 열 전체가 무시되고, 그러면
+# 08-06 「경로 없음」이 겪은 일이 그대로 재현된다.
+_SCALAR_TYPES = (str, int, float, bool)
+
+
+def leaf_absent(metrics: dict | None, db_metrics: dict | None, path: str) -> bool:
+    """반환: 부모는 구조로서 실재하는데 **그 잎 키가 부모 dict에 없는가**(= 영원히 값이 안 나온다).
+
+    입력: 로그 지표 · DB 지표 · 점 표기 경로.
+    계산: 부모를 `dig()`로 꺼내 **dict인 경우에만** 잎 키의 부재를 본다. list·스칼라·None이면
+         판정하지 않는다(False). 값이 전부 스칼라인 dict는 **집계 카운터**로 보고 역시
+         판정하지 않는다 — 상세 근거는 위 절 주석.
+    해석: 이 값이 참이면 `VERDICT_PATH_DEAD`("경로 없음")다. **「실측 없음」과 조치가 다르다** —
+         내일 다시 보는 것이 아니라 오늘 yaml을 고쳐야 한다.
+    실패 조건: 없다. 어떤 입력에도 예외를 내지 않는다(판정 못 하면 False).
+    """
+    from mahdi.ops.report import dig
+
+    is_db = path.startswith("db.")
+    root = (db_metrics or {}) if is_db else (metrics or {})
+    rest = path[3:] if is_db else path
+    parent_path, _, leaf = rest.rpartition(".")
+    if not parent_path or not leaf:
+        return False  # 마디가 하나뿐인 경로는 `path_exists()`의 관할이다
+    parent = dig(root, parent_path)
+    if not isinstance(parent, dict) or not parent:
+        return False
+    if all(v is None or isinstance(v, _SCALAR_TYPES) for v in parent.values()):
+        return False  # 집계 카운터 dict — 잎의 부재가 정상이다
+    return leaf not in parent
+
+
+def measurable_on(entry: dict, target: date) -> bool:
+    """반환: 이 가설의 지표가 **그날 사이드카에 존재할 수 있었는가**.
+
+    `구현일`이 대상 날짜보다 **뒤**면 그날 지표에 그 키가 없는 것이 정상이다 — 잎 린트를
+    거기에 걸면 **fix를 낸 다음 날마다 거짓 경보가 뜬다.** 08-19에 실제로 그 형태를 만났다:
+    `2026-08-19-fix4-missing-check-alert`의 `watchdog.missing_check_alerts`는 08-18 지표에
+    없는 것이 맞다(그날은 구현 이전이다).
+
+    ## 같은 날도 면제한다 — 사이드카는 15:45에 확정되고 커밋은 그 뒤에도 들어온다
+
+    `구현일 == 지표 날짜`인 항목은 **하루 안의 순서**에 답이 달려 있고 우리는 그것을 모른다.
+    08-19가 그 형태를 바로 냈다: `2026-08-19-fix7-censored-phase-is-a-ratio-not-a-verdict`의
+    `slow_calls.censored.phase_ratio`는 **17:00 커밋**으로 생겼는데 그날 사이드카는 **15:45**에
+    확정됐다 — 키가 없는 것이 맞고, 그것은 오타가 아니다. **모르는 것은 판정하지 않는다.**
+
+    `구현일`이 없거나 형식이 어긋나면 **검사한다** — 모르는 것을 면제로 바꾸면 이 린트가
+    「구현일을 안 적으면 통과」로 우회된다. 위 면제와 방향이 반대인 이유는 대상이 다르기
+    때문이다: 저기서 모르는 것은 **하루 안의 시각**이고 여기서 모르는 것은 **날짜 자체**다.
+    """
+    made = entry.get("구현일")
+    if isinstance(made, str):
+        try:
+            made = date.fromisoformat(made)
+        except ValueError:
+            return True
+    return not (isinstance(made, date) and made >= target)
+
+
 def _verdict(actual: Any, expect: str) -> str:
     if actual is None:
         return VERDICT_NO_DATA
@@ -541,9 +635,13 @@ def evaluate(
                 # 집계가 아예 비어 있으면 이 판별을 하지 않는다(전부 경로 없음으로 뜨면
                 # 진짜 오타가 그 소음에 묻힌다 — 이 fix가 고치려던 바로 그 실패다).
                 collected = bool(metrics) or bool(db_metrics)
-                dead_path = (
-                    collected and actual is None
-                    and not path_exists(metrics, db_metrics, path)
+                # 2026-08-19 장후 — **잎 부재를 OR로 합친다.** 새 판정 열을 만들지 않는다
+                # (규약 N — 라벨을 하나 늘리면 리포트·수집기·테스트 3종 세트 비용이 붙는다).
+                # `measurable_on()`이 「구현일이 이 날짜보다 뒤」인 항목을 빼 준다 — 그 예외가
+                # 없으면 fix를 낸 다음 날마다 거짓 경보가 뜬다.
+                dead_path = collected and actual is None and (
+                    not path_exists(metrics, db_metrics, path)
+                    or (measurable_on(entry, target) and leaf_absent(metrics, db_metrics, path))
                 )
                 out.append(
                     {
