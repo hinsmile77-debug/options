@@ -265,3 +265,48 @@ def test_every_repository_metric_path_starts_at_a_real_report_section():
 ])
 def test_the_rule_language_is_exactly_two_forms_in_phase_1(rule, kind):
     assert campaign.rule_kind(rule) == kind
+
+
+# --- 2026-08-19 규약 — 레버가 켜지면 채널을 닫고 새로 연다 ------------------------------------
+#
+# C1이 첫 사례다. 계열 로테이션이 켜지면서 체제가 갈렸고, 동시에 그 채널의 주장 지표가
+# «밴드가 창 안에 있는가»와 «팔레트가 그 셀을 열었는가»를 **곱해서** 재고 있었다는 것이
+# 드러났다(주변 비율 63.2%->22.5%인데 조건부는 두 날 다 100.0%).
+
+
+def test_closing_a_channel_requires_saying_why():
+    """사유가 없으면 다음 세션은 «표본이 모자라서»와 «답이 나와서»를 구분할 수 없다."""
+    problems = campaign.validate(_channel(상태="closed"))
+    assert any("결과" in p for p in problems)
+
+    ok = campaign.validate(_channel(상태="closed", 결과="답이 나왔다 — 조건부 1.000"))
+    assert ok == []
+
+
+def test_two_open_channels_may_not_claim_the_same_metric():
+    """v1을 닫지 않은 채 v2를 열면 같은 질문에 두 판정이 난다."""
+    v1 = _channel(id="c1")
+    v2 = _channel(id="c2")
+    assert campaign.duplicate_claim_metrics([v1, v2]) == {_CLAIM: ["c1", "c2"]}
+
+    # v1을 닫으면 중복이 사라진다 — 이것이 규약이 요구하는 순서다.
+    v1_closed = _channel(id="c1", 상태="closed", 결과="닫은 이유")
+    assert campaign.duplicate_claim_metrics([v1_closed, v2]) == {}
+
+
+def test_observe_only_channels_never_collide():
+    """관측 채널은 주장이 아니므로 같은 지표를 여럿이 봐도 판정이 갈리지 않는다."""
+    a = _channel(id="a", 판정=[{"metric": _CLAIM, "rule": "관측", "역할": "참고"}])
+    b = _channel(id="b", 판정=[{"metric": _CLAIM, "rule": "관측", "역할": "참고"}])
+    assert campaign.duplicate_claim_metrics([a, b]) == {}
+
+
+def test_the_repository_file_has_no_duplicate_claims():
+    cfg = campaign.load(_CAMPAIGN_PATH)
+    assert campaign.duplicate_claim_metrics(cfg["channels"]) == {}
+
+
+def test_every_repository_channel_validates_including_closed_ones():
+    """`evaluate()`는 closed를 건너뛰므로, 스키마 검사는 이 테스트가 대신 맡는다."""
+    for channel in campaign.load(_CAMPAIGN_PATH)["channels"]:
+        assert campaign.validate(channel) == [], f"{channel.get('id')}: 스키마 위반"

@@ -1449,6 +1449,39 @@ def _selected_instruments(conn: ConnectionLike, target: date) -> dict:
     legs, resolved, expiry_day_legs = (
         (int(leg_row[0]), int(leg_row[1]), int(leg_row[2])) if leg_row else (0, 0, 0)
     )
+    # ===== 2026-08-19 — **주변 비율과 조건부 비율은 다른 것을 잰다** =====
+    #
+    # 08-18/08-19 실측이 그것을 드러냈다:
+    #
+    #     날짜    small_strangle_buy 시도  실패   조건부   ENTER 전체  주변비율
+    #     08-18            216            216   100.0%      345       63.2%
+    #     08-19             20             20   100.0%       89       22.5%
+    #
+    # 주변 비율(`reason.no_strike_match / enter_minutes`)이 63.2% -> 22.5%로 급락했는데
+    # **조건부 비율은 두 날 다 100.0%로 미동도 없다.** 움직인 것은 팔레트가 그 전략을 연
+    # 빈도뿐이다. 즉 주변 비율은 «밴드가 창 안에 있는가»와 «그 셀이 열렸는가»를 **곱해서**
+    # 재고 있었고, 그 둘은 원인이 완전히 다르다.
+    #
+    # 그래서 전략별 시도/실패를 따로 낸다. 캠페인 채널이 이 둘을 분자·분모로 잡으면
+    # 팔레트 구성이 약분돼 사라진다.
+    attempt_rows = _fetchall(
+        conn,
+        "SELECT s, count(*) FROM signal_decisions,"
+        "     LATERAL jsonb_array_elements_text(risk_gate_state->'entry_strategies') s"
+        " WHERE timestamp::date=%s AND decision='ENTER'"
+        "   AND jsonb_typeof(risk_gate_state->'entry_strategies')='array'"
+        " GROUP BY 1",
+        (target,),
+    )
+    rejected_rows = _fetchall(
+        conn,
+        "SELECT r->>'strategy', count(*) FROM signal_decisions,"
+        "     LATERAL jsonb_array_elements(coalesce(selected_instruments->'rejected','[]'::jsonb)) r"
+        " WHERE timestamp::date=%s AND decision='ENTER' AND r->>'strategy' IS NOT NULL"
+        " GROUP BY 1",
+        (target,),
+    )
+
     submitted_row = _fetchone(
         conn,
         "SELECT count(*) FROM signal_decisions WHERE timestamp::date=%s"
@@ -1471,6 +1504,10 @@ def _selected_instruments(conn: ConnectionLike, target: date) -> dict:
         "expiry_day_leg_count": expiry_day_legs,
         # **불변식 — main.py에 order_manager.submit() 호출부가 없으므로 나올 수 없어야 한다.**
         "order_submitted_true_count": int(submitted_row[0]) if submitted_row else 0,
+        # 2026-08-19 — 전략별 **시도**와 **실패**. 근거는 위 주석.
+        # 캠페인이 이 둘을 분모·분자로 쓰면 팔레트 구성이 약분된다.
+        "strategy_attempts": {str(k): int(n) for k, n in attempt_rows},
+        "strategy_rejected": {str(k): int(n) for k, n in rejected_rows},
     }
 
 

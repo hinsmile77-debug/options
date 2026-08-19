@@ -195,6 +195,12 @@ def validate(channel: dict) -> list[str]:
         problems.append("질문 없음")
     if channel.get("상태") not in STATUSES:
         problems.append(f"상태가 {sorted(STATUSES)} 중 하나가 아니다: {channel.get('상태')!r}")
+    # 2026-08-19 — **닫을 때는 왜 닫았는지 남긴다.** 레버가 켜지면 그 레버가 움직이는 지표를
+    # 주장으로 쓰는 채널은 닫고 새로 여는 것이 규약인데(`validation_campaign.yaml` 머리말),
+    # 그때 사유가 안 남으면 다음 세션은 «표본이 모자라서 닫았나 / 답이 나와서 닫았나»를
+    # 구분할 수 없다. C1이 그 첫 사례이고, 그 채널은 **답이 나와서** 닫혔다.
+    if channel.get("상태") == STATUS_CLOSED and not str(channel.get("결과") or "").strip():
+        problems.append("closed인데 `결과`가 없다 — 왜 닫았는지 없으면 그 채널은 사라진 것과 같다")
 
     sample = channel.get("표본") or {}
     if not sample.get("metric"):
@@ -219,6 +225,27 @@ def validate(channel: dict) -> list[str]:
         if violates_market_state_rule(role, metric, rule):
             problems.append(f"{metric}: 시장 상태 의존 지표는 관측으로만 등록한다(규약 G)")
     return problems
+
+
+def duplicate_claim_metrics(channels: list[dict]) -> dict[str, list[str]]:
+    """
+    입력: 채널 목록.
+    계산: **열린** 채널들이 같은 지표를 주장으로 쓰고 있는가 — 지표별 채널 id 목록을 돌려준다
+         (둘 이상인 것만).
+    해석: 2026-08-19 규약. v1을 닫지 않은 채 v2를 열면 리포트가 같은 질문에 **두 판정**을 내고,
+         그때부터 어느 쪽이 유효한지 사람이 기억해야 한다 — 미륵이가 판정과 결정을 분리해
+         막으려던 혼동이 판정 축 안에서 재발하는 형태다.
+    실패 조건: 없음 — 중복이 없으면 빈 dict.
+    """
+    by_metric: dict[str, list[str]] = {}
+    for channel in channels:
+        if channel.get("상태") != STATUS_OPEN:
+            continue
+        for j in channel.get("판정") or []:
+            if str(j.get("역할")) != ROLE_CLAIM:
+                continue
+            by_metric.setdefault(str(j.get("metric")), []).append(str(channel.get("id")))
+    return {m: ids for m, ids in by_metric.items() if len(ids) > 1}
 
 
 def accumulate(channel: dict, daily_metrics: list[tuple[date, dict]]) -> dict:
