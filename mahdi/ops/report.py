@@ -161,7 +161,7 @@ def _section(title: str, builder: Callable[[], list[str]]) -> list[str]:
 def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None = None,
            hypotheses: list[dict] | None = None, history: list[dict] | None = None,
            levers: dict | None = None, watchdog: dict | None = None,
-           campaign: list[dict] | None = None) -> str:
+           campaign: list[dict] | None = None, crash: dict | None = None) -> str:
     """
     입력: 오늘 로그 지표, (선택) 전일 지표, (선택) DB 지표, (선택) 가설 검정 결과,
          (선택) **직전 영업일들의 지표**(최신순, 2026-08-07 고도화#5).
@@ -208,6 +208,9 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     if watchdog is not None:
         lines += _section("11-1. 워치독 — 감시자가 돌기는 했는가",
                           lambda: _render_watchdog(watchdog))
+    if crash is not None:
+        lines += _section("11-1-1. 관측 루프는 **왜** 죽었는가",
+                          lambda: _render_crash(crash, metrics))
     lines += _section("11-2. WS 재연결 — 비용으로 읽는다",
                       lambda: _render_ws_disconnects(metrics, db_metrics))
     if db_metrics:
@@ -316,6 +319,62 @@ def _render_watchdog(watchdog: dict) -> list[str]:
         "",
     ]
     return out
+
+
+def _render_crash(crash: dict, metrics: dict | None = None) -> list[str]:
+    """2026-08-19 — 재기동 옆에 **사유**를 놓는다.
+
+    08-19에 워치독이 두 번 재기동했고(09:54 · 10:36) 리포트는 그 사실까지만 말했다.
+    첫 번째의 사유(`psycopg.OperationalError` — DB 컨테이너가 09:50:56에 재시작됐다)는
+    `logs/observation_loop_crash.log`에만 있었고 **그 파일을 읽는 코드가 없었다.**
+    `observation_loop.log`에는 `OperationalError`가 0건이다 — 예외가 로깅을 거치지 않고
+    프로세스를 끝냈기 때문이다. 08-18 §3-2와 같은 계열의 결함이다.
+
+    **기동 수와 사유 수를 나란히 낸다.** 둘이 다르면 「몇 번은 사유가 안 남았다」가 드러난다.
+    """
+    if not crash.get("marker_present"):
+        return [
+            "> ⚠ **크래시 로그에 그날의 기동 표식이 없다** — 사유를 날짜에 귀속할 수 없다. "
+            "`start_mahdi_premarket.bat`이 2026-08-19부터 표식을 남기므로, 그 이전 날짜이거나 "
+            "그 커밋이 안 실린 기동이다. **「크래시가 없었다」가 아니라 「셀 수 없었다」이다.**",
+            "",
+        ] + _render_crash_unattributed(crash)
+    starts, crashes = crash.get("starts", 0), crash.get("crashes", 0)
+    out = [f"- 기동 **{starts}회** · 사유가 남은 죽음 **{crashes}건**", ""]
+    if crashes:
+        out += _table(
+            ["기동 시각", "사유", "마지막 프레임", "상세"],
+            [[e.get("at") or "—", f"`{e['cause']}`", e.get("last_frame") or "—",
+              (e.get("detail") or "—")[:80]]
+             for e in crash.get("events") or []],
+        )
+        out += ["> **시각은 그 프로세스가 «뜬» 시각이다** — 죽은 시각이 아니다. 죽은 시각은 "
+                "`observation_loop.log`의 공백과 워치독의 `RESTART` 줄이 답한다(§11-1).", ""]
+    # **기동은 여러 번인데 사유가 그보다 적으면** 그 차이가 곧 「모르는 죽음」이다.
+    # 정상 종료(장마감 taskkill)도 사유를 안 남기므로 그 1건은 빼고 읽는다.
+    silent = starts - crashes - 1
+    if silent > 0:
+        out += [f"> ⚠ **사유 없이 끝난 기동 {silent}건** — 정상 종료 1건을 뺀 값이다. "
+                "그 프로세스는 예외 없이(외부 종료·행) 사라졌다. 08-19 10:32가 그 형태였고, "
+                "3분 공백 뒤 워치독이 되살렸다.", ""]
+    if crash.get("causes"):
+        out += ["> 사유별: " + " · ".join(f"`{k}` {v}건" for k, v in crash["causes"].items()), ""]
+    return out + _render_crash_unattributed(crash)
+
+
+def _render_crash_unattributed(crash: dict) -> list[str]:
+    """날짜를 모르는 트레이스백 — **0으로 접지 않는다.**
+
+    표식을 넣기 전(2026-08-19 이전)에 쌓인 것들이다. 이 값이 0이 될 때까지는 그날 표가
+    「그날 전부」라고 단정할 수 없다(규약 C).
+    """
+    n = crash.get("unattributed") or 0
+    if not n:
+        return []
+    return [f"> ⚠ **날짜를 모르는 트레이스백 {n}건**(상한) — 기동 표식 **이전**에 쌓인 것이다"
+            "(이 파일은 2026-07-19부터 타임스탬프 없이 append돼 왔다). "
+            "「오늘 것이 아니다」가 아니라 **「어느 날 것인지 모른다」**이다. "
+            "예외 연쇄(`During handling of ...`)가 있으면 실제 죽음보다 많이 세어지므로 상한이다.", ""]
 
 
 def _render_ws_disconnects(metrics: dict, db_metrics: dict | None) -> list[str]:
@@ -930,18 +989,28 @@ def _render_censored_calls(sc: dict) -> list[str]:
         out += ["> 통로마다 천장이 다르다 — 08-18 실측: `inquire-price`(4.0초)는 12시부터 눌렸고 "
                 "`inquire-balance`(10.0초)는 최대 7.62초로 **안 닿았다**. 같은 임계로 세면 틀린다.", ""]
     if share is not None and base is not None:
-        verdict = (
-            "**위상 문제다** — 우리 레그 수를 줄여도 그 분들은 그대로 남을 수 있다"
-            if share >= base * 2
-            else "균등선 근처다 — 특정 분에 몰린 것이 아니다"
-        )
+        # 2026-08-19 — **판정어를 뺐다. 배수만 인쇄한다.**
+        #
+        # 종전 이 자리에는 `점유율 >= 균등선 x 2`로 「위상 문제다 / 균등선 근처다」를 단정하는
+        # 문장이 있었다. 08-19 실측 22.4%(1.68배)가 그 임계 밑으로 떨어져 **「균등선 근처다 —
+        # 특정 분에 몰린 것이 아니다」**로 인쇄됐는데, 13.3%의 1.68배는 「근처」가 아니다.
+        # 뭉툭한 임계 하나로 연속량을 이분한 것이고, 그 문장은 **매일 틀린 채로 인쇄된다.**
+        ratio = dig(sc, "censored.phase_ratio")
+        ratio_text = f" → **{ratio:.2f}배**" if isinstance(ratio, (int, float)) else ""
         out += [
             f"- 정각·30분 창(`:{minutes[0]:02d}~` 등 {len(minutes)}분) 점유율 **{share:.1%}** "
-            f"/ 균등선 {base:.1%} → {verdict}",
+            f"/ 균등선 {base:.1%}{ratio_text}",
             "",
-            "> **왜 이 창인가**: 08-18에 `감마플립 산출 불가` 4건이 전부 `:01`이었고, HTTP ≥ 4.0초 "
-            "333건 중 103건(31%)이 이 여덟 분에 있었다. **그 분들의 페이서 대기는 1.0~1.8초로 "
-            "평범했다** — 우리 백오프가 아니라 KIS 응답이다.",
+            "> **배수만 인쇄하고 판정하지 않는다.** 이틀 실측이 그 이유다 — 08-18 **2.54배** → "
+            "08-19 **1.68배**. 같은 축이 이틀 만에 크게 움직였으므로 하루치로는 위상 문제라고도 "
+            "아니라고도 말할 수 없다. 임계 하나로 이분하면 **경계 근처의 날이 매번 틀리게 인쇄된다** "
+            "(08-19가 그랬다).",
+            "> **왜 이 창인가**: 08-18에 `감마플립 산출 불가` 4건이 **전부 `:01`**이었고, HTTP ≥ 4.0초 "
+            "333건 중 103건(31%)이 이 여덟 분에 있었다. 그 분들의 페이서 대기는 1.0~1.8초로 "
+            "평범했다 — 우리 백오프가 아니라 KIS 응답이다.",
+            "> ⚠ **그 관측은 08-19에 재현되지 않았다**: 산출 불가 **24건 중 위상창 6건(25%)**이다. "
+            "08-18의 「전부 `:01`」은 표본이 **넷**이었다. 오늘은 훨씬 나쁜 날이었는데 **덜** "
+            "위상적이었다(검열 290 → 747건, 점유율 33.8% → 22.4%).",
             "> **원인은 여기서 확정하지 않는다.** 그 분에 우리가 무엇을 더 쏘는지(만기유동성 폴러의 "
             "`startup_offset`, 5분 주기 매크로, 300초 창 인쇄)를 엔드포인트별 초 단위로 펼쳐야 "
             "갈린다 — 겹치지 않았는데 HTTP가 천장이면 **KIS 쪽**이고, 그때 레버 E는 이 문제에 "

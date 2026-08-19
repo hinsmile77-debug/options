@@ -1440,6 +1440,20 @@ def _censored_metrics(slow: list[dict]) -> dict:
         "phase_concentration": round(in_phase / len(censored), 3) if censored else None,
         # 여덟 분 / 60분. 이 값을 함께 내야 「31%」가 큰지 사람이 판단할 수 있다.
         "phase_baseline": round(len(CENSORED_PHASE_MINUTES) / 60.0, 3),
+        # 2026-08-19 — **점유율 ÷ 균등선.** 리포트가 이 배수를 그대로 인쇄한다.
+        #
+        # 종전에는 리포트가 `점유율 >= 균등선 x 2`로 「위상 문제다 / 균등선 근처다」를 **단정**했다.
+        # 08-19 실측 22.4%(= 1.68배)가 그 임계 밑으로 떨어져 **「균등선 근처다 — 특정 분에 몰린
+        # 것이 아니다」로 인쇄됐는데, 13.3%의 1.68배를 「근처」라고 부를 수는 없다.**
+        # 뭉툭한 임계 하나로 연속량을 이분한 것이고, 규약 F/G가 반복해 막아 온 것과 같은 형태다.
+        #
+        # 이틀 실측이 그 위험을 그대로 보여 준다: 08-18 **2.54배** → 08-19 **1.68배**.
+        # 같은 축이 이틀 만에 크게 움직였으므로 **하루치로는 위상 문제라고도 아니라고도 못 한다.**
+        # 그래서 값만 내고 판정은 사람이 한다 — 이 모듈의 다른 절과 같은 원칙이다.
+        "phase_ratio": (
+            round((in_phase / len(censored)) / (len(CENSORED_PHASE_MINUTES) / 60.0), 2)
+            if censored else None
+        ),
         "samples": sorted(censored, key=lambda s: -s["http"])[:5],
     }
 

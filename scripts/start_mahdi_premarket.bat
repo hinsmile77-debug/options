@@ -171,6 +171,17 @@ REM 이 리다이렉트가 계속 원래 경로에 append해 덮어써 로테이
 REM 누적됐던 원인) — 이제 Python이 그 파일을 직접 소유하므로 stdout은 콘솔 창에만 보이게 두고,
 REM stderr(로깅 설정이 끝나기 전 극초반 크래시 등 로깅으로 못 잡는 것)만 별도의 회전 없는
 REM 크래시 전용 로그로 남긴다.
+REM 2026-08-19 — **크래시 로그에 기동 표식을 남긴다.**
+REM
+REM 08-19 09:51:02에 관측 루프가 psycopg.OperationalError로 죽었다(DB 컨테이너가 09:50:56에
+REM 재시작돼 커넥션이 끊겼다). 그 사유는 **이 파일에만** 있었고 observation_loop.log에는
+REM 한 줄도 없다 — 그 파일을 읽는 지표가 없어서 「오늘 왜 두 번 재기동했나」에 아무도 답을
+REM 못 했다. 08-18 보고서 §3-2(성공한 왕복이 어떤 지표에도 안 잡힌다)와 같은 계열이다.
+REM
+REM 더 나쁜 것은 이 파일이 `2>>` append이면서 **타임스탬프가 하나도 없다**는 점이다.
+REM 2026-07-19부터 트레이스백 세 개가 날짜 없이 쌓여 있어 어느 것이 오늘 것인지 가릴 수 없다.
+REM 이 한 줄이 그 경계를 만들고, mahdi/ops/crash_metrics.py가 그것을 읽는다.
+echo [%date% %time%] ===== 관측 루프 기동 ===== >> "%PROJECT_DIR%\logs\observation_loop_crash.log"
 start "Mahdi Observation Loop" cmd /k "cd /d %PROJECT_DIR% && uv run python -m mahdi.main 2>>logs\observation_loop_crash.log"
 
 REM 2026-08-06 Fix#2 — 기동이 끝났으므로 워치독의 판정 보류를 푼다. 관측 루프는 방금 떴고

@@ -225,6 +225,9 @@ _METRIC_ROOTS = {
     # 2026-08-19 Fix#3 — §1 델타의 **기준일이 무엇이었는가**. `levers`/`watchdog`과 같이
     # `daily_ops_report.build`가 `metrics`에 실어 넣는다(사이드카에만 넣으면 검정 불가).
     "delta_baseline",
+    # 2026-08-19 — 관측 루프가 **왜** 죽었는가(`observation_loop_crash.log`).
+    # 예외가 로깅을 거치지 않고 프로세스를 끝내므로 `log_metrics`가 읽는 파일에는 안 남는다.
+    "crash",
 }
 
 

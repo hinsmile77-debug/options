@@ -1052,3 +1052,60 @@ def test_an_unlabelled_log_says_it_did_not_measure():
 def test_a_log_without_the_cut_sections_is_honest_about_it():
     out = "\n".join(report._render_chain_cuts({}))
     assert "안 셌다" in out
+
+
+# ===== 2026-08-19 — 검열 위상은 **배수로 인쇄하고 판정하지 않는다** =====
+#
+# 08-19에 점유율 22.4%(균등선 13.3%의 **1.68배**)가 「균등선 근처다 — 특정 분에 몰린 것이
+# 아니다」로 인쇄됐다. 1.68배를 「근처」라고 부를 수는 없다 — 임계(2배) 하나로 연속량을 이분한
+# 결과이고, 경계 근처의 날마다 그 문장이 틀린다.
+
+
+def _censored(**over):
+    base = {
+        "count": 747, "by_endpoint": {"inquire-price": 712},
+        "phase_minutes": [0, 1, 2, 3, 30, 31, 32, 33],
+        "phase_count": 167, "phase_concentration": 0.224,
+        "phase_baseline": 0.133, "phase_ratio": 1.68, "samples": [],
+    }
+    base.update(over)
+    return "\n".join(report._render_censored_calls({"count": 4058, "censored": base}))
+
+
+def test_the_phase_share_is_printed_as_a_multiple():
+    out = _censored()
+    assert "22.4%" in out and "13.3%" in out and "1.68배" in out
+
+
+def test_no_verdict_word_is_asserted_either_way():
+    """**이 절은 판정하지 않는다.** 두 문장 다 하루치로는 말할 수 없는 주장이다."""
+    for ratio, share in ((1.68, 0.224), (2.54, 0.338), (0.9, 0.12)):
+        out = _censored(phase_ratio=ratio, phase_concentration=share)
+        assert "균등선 근처다" not in out
+        assert "특정 분에 몰린 것이 아니다" not in out
+        assert "**위상 문제다**" not in out
+
+
+def test_both_days_are_quoted_so_one_day_cannot_decide():
+    out = _censored()
+    assert "2.54배" in out and "1.68배" in out
+
+
+def test_the_day_two_non_replication_is_stated_next_to_the_number():
+    """08-18의 「전부 :01」은 표본이 넷이었다 — 그 사실이 같은 자리에 있어야 한다."""
+    out = _censored()
+    assert "재현되지 않았다" in out and "24건" in out
+
+
+def test_an_old_sidecar_without_the_ratio_still_renders():
+    """구버전 사이드카에는 `phase_ratio`가 없다 — 배수만 빠지고 나머지는 그대로 나와야 한다.
+
+    설명 인용부의 「08-18 2.54배 → 08-19 1.68배」는 **고정 문장**이라 언제나 남는다.
+    빠져야 하는 것은 **그날 값이 들어가는 불릿 줄**뿐이므로 그 줄만 본다.
+    """
+    bullet = next(
+        line for line in _censored(phase_ratio=None).splitlines()
+        if line.startswith("- 정각·30분 창")
+    )
+    assert "22.4%" in bullet and "13.3%" in bullet
+    assert "배**" not in bullet and "→" not in bullet

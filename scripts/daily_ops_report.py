@@ -162,6 +162,18 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
     except Exception:
         logger.warning("워치독 지표 건너뜀", exc_info=True)
 
+    # 2026-08-19 — 관측 루프가 **왜 죽었는가**. 역시 **다른 파일**이다
+    # (`observation_loop_crash.log` — 예외가 로깅을 거치지 않고 프로세스를 끝내므로
+    # `observation_loop.log`에는 한 줄도 안 남는다). 08-19에 재기동 2회의 사유가 그 파일에만
+    # 있었고 그것을 읽는 코드가 없었다 — 상세 근거는 `mahdi/ops/crash_metrics.py` 모듈 docstring.
+    crash_result = None
+    try:
+        from mahdi.ops import crash_metrics
+
+        crash_result = crash_metrics.collect(LOG_DIR, target)
+    except Exception:
+        logger.warning("크래시 지표 건너뜀", exc_info=True)
+
     # **가설이 참조할 수 있으려면 `metrics` 본체에 실려야 한다.** 사이드카에만 넣으면
     # `hypotheses._lookup`이 못 찾아 그 가설이 「경로 없음」으로 영원히 검정 불가가 된다
     # (08-06 §3-1이 정확히 그 사고였고, 도입 당일 `test_ops_hypotheses`가 이것을 잡았다).
@@ -169,6 +181,8 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
         metrics["levers"] = lever_state
     if watchdog_result is not None:
         metrics["watchdog"] = watchdog_result
+    if crash_result is not None:
+        metrics["crash"] = crash_result
 
     hypothesis_results = None
     try:
@@ -214,7 +228,7 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
             metrics, previous=previous, db_metrics=db_metrics_result,
             hypotheses=hypothesis_results, history=history,
             levers=lever_state, watchdog=watchdog_result,
-            campaign=campaign_results,
+            campaign=campaign_results, crash=crash_result,
         ),
         encoding="utf-8",
     )
