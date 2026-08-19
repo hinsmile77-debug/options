@@ -1415,6 +1415,73 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     return "\n".join(L)
 
 
+# ===== 증거 다이제스트 정리 (2026-08-19 신설) =====
+#
+# **정리 대상은 `_증거_*.md` 하나뿐이다.** 다른 산출물은 여기서 절대 건드리지 않는다 —
+# 08-19에 보관 기간을 실측으로 따져 본 결과가 그렇게 갈렸다:
+#
+#   `_증거_*.md`   수명 **하루**. 08-13~08-18 점검 문서 13편이 증거 파일을 30번 인용했는데
+#                  **전부 당일 것이고 과거분 인용은 0건**이었다. 게다가 로그가 남아 있으면
+#                  이 스크립트로 언제든 다시 만든다. → 지워도 되는 유일한 것.
+#   `_지표.json`   `mahdi/ops/campaign.py`가 여러 날을 접는 **시계열 원자재**(min_days 10).
+#                  08-19부터 git 추적이다(.gitignore 참고). → 절대 삭제 금지.
+#   `_지표.md`     연 10MB 남짓. 지울 이유가 없다. → 대상 아님.
+#   루트 보고서    git 추적이라 지워도 용량이 안 줄고 **grep 대상만 잃는다.** 소급 인용 꼬리가
+#                  43일까지 간다(「고쳤다고 기록된 것이 재발」이 그 꼬리를 타고 나온다).
+#                  → 대상 아님. 애초에 이 함수는 out-dir(=auto/) 밖을 보지 않는다.
+#
+# 기본값은 **끔**이다. 조용히 지우는 정리는 언젠가 지우면 안 되는 것을 지운다.
+
+# `YYYY-MM-DD_증거_{국면}[_HHMM].md` 만 통과시킨다. `_지표.`는 이 패턴에 걸리지 않는다.
+_EVIDENCE_NAME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})_증거_(?:pre|intra|post)(?:_\d{4})?\.md$"
+)
+
+
+def prune_evidence(out_dir: Path, keep_days: int, today: _date) -> list[Path]:
+    """반환: 실제로 지운 파일 목록.
+
+    **mtime이 아니라 파일명의 날짜로 판정한다** — 파일을 복사하거나 백업에서 되돌리면
+    mtime은 바뀌지만 그 증거가 어느 날 것인지는 안 바뀐다.
+
+    실패 조건: `keep_days < 1`이면 아무것도 안 지우고 빈 목록을 돌려준다(0을 「전부 지워라」로
+              읽지 않는다 — 그 오독의 대가가 비대칭이다). 개별 파일 삭제 실패는 경고만 내고
+              넘어간다. 정리는 점검의 곁가지이므로 여기서 예외를 올려 **점검 자체를 죽이면 안 된다.**
+    """
+    if keep_days < 1:
+        eprint(f"[collect_evidence] --prune-days {keep_days} 는 1 미만이라 무시한다.")
+        return []
+    if not out_dir.is_dir():
+        return []
+
+    cutoff = today - timedelta(days=keep_days)
+    removed: list[Path] = []
+    for p in sorted(out_dir.iterdir()):
+        m = _EVIDENCE_NAME_RE.match(p.name)
+        if not m:
+            continue
+        try:
+            fday = _date.fromisoformat(m.group(1))
+        except ValueError:
+            continue  # 날짜로 안 읽히면 손대지 않는다
+        if fday > cutoff:
+            continue
+        try:
+            p.unlink()
+        except OSError as exc:
+            eprint(f"[collect_evidence] 정리 실패(건너뜀): {p.name} — {exc!r}")
+            continue
+        removed.append(p)
+
+    # **지운 것은 반드시 인쇄한다.** 조용한 정리는 사고가 나도 아무도 모른다.
+    if removed:
+        eprint(f"[collect_evidence] 정리: {cutoff.isoformat()} 이전 증거 {len(removed)}건 삭제 "
+               f"(보관 {keep_days}일) — " + ", ".join(p.name for p in removed))
+    else:
+        eprint(f"[collect_evidence] 정리: 대상 없음 (보관 {keep_days}일, 기준 {cutoff.isoformat()})")
+    return removed
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="마흐디 일일 운영점검 증거 수집기")
     ap.add_argument("--phase", choices=["pre", "intra", "post", "all"], default="post",
@@ -1427,6 +1494,10 @@ def main(argv=None):
     # (`daily_ops_report.py --out-dir`과 같은 이유·같은 이름).
     ap.add_argument("--out-dir", default=None,
                     help="디렉터리에 `{날짜}_증거_{국면}.md` 로 저장 (--out 보다 우선순위 낮음)")
+    # 기본 None = **끔**. 인자를 줘야만 지운다.
+    ap.add_argument("--prune-days", type=int, default=None, metavar="N",
+                    help="--out-dir 안의 `_증거_*.md` 중 N일보다 오래된 것을 지운다"
+                         " (지표.json·지표.md·보고서는 대상이 아니다. 기본: 끔)")
     args = ap.parse_args(argv)
 
     start = Path(args.root) if args.root else Path(__file__).resolve().parent
@@ -1460,6 +1531,10 @@ def main(argv=None):
         outp.parent.mkdir(parents=True, exist_ok=True)
         outp.write_text(text, encoding="utf-8")
         eprint(f"[collect_evidence] 저장: {outp} ({fmt_bytes(len(text.encode('utf-8')))})")
+        # **오늘 것을 쓴 다음에 지운다.** 순서를 뒤집으면 정리가 실패한 날에 오늘 증거까지
+        # 못 만들 수 있다 — 정리는 곁가지이므로 본업 뒤에 온다.
+        if args.prune_days is not None:
+            prune_evidence(outp.parent, args.prune_days, day)
         print(str(outp))
     else:
         try:

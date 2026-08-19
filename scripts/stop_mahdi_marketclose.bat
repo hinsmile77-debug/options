@@ -67,7 +67,18 @@ REM stdlib만 쓰므로 DB/Docker가 꺼져 있어도 돈다. 실패해도 아�
 REM (배치는 오류에서 멈추지 않는다) — **종료 절차를 막지 않는 것이 이 자리의 조건**이다.
 REM 날짜는 스크립트가 KST로 계산한다(`--out-dir`). `%date%`는 OS 로캘을 따라 형식이 바뀌어
 REM PC마다 다른 파일명을 만든다 — daily_ops_report.py가 `--out-dir`을 두는 것과 같은 이유다.
-uv run python "docs\동작점검\tools\collect_evidence.py" --phase post --out-dir "docs\동작점검\auto" >> "%LOG_FILE%" 2>&1
+REM 2026-08-19: `--prune-days 7` — 증거 다이제스트만 7일치를 남긴다.
+REM
+REM **하루에 한 번, 여기서만 돈다.** 장전·장중 회차에 붙이면 같은 일을 하루 네 번 시도하게
+REM 되고, 그중 하나가 밀린 실행이면(08-17 486분·08-18 298분) 엉뚱한 시각에 지운다.
+REM 종료 배치는 하루의 끝이 확정된 자리라 여기가 맞다.
+REM
+REM **왜 증거만인가** — 08-19 실측: 08-13~08-18 점검 문서 13편이 증거 파일을 30번 인용했는데
+REM 전부 당일 것이고 과거분 인용은 0건이었다(수명 하루). 반면 `_지표.json`은 08-18 신설된
+REM `mahdi/ops/campaign.py`가 여러 날을 접는 원자재라(min_days 10) 삭제 대상이 아니고,
+REM 루트 보고서는 git 추적이라 지워도 용량이 안 줄고 grep 대상만 잃는다(소급 인용 꼬리 43일).
+REM 스크립트가 `_증거_*.md` 파일명 패턴으로만 지우므로 여기서 숫자를 바꿔도 그 범위는 안 넓어진다.
+uv run python "docs\동작점검\tools\collect_evidence.py" --phase post --out-dir "docs\동작점검\auto" --prune-days 7 >> "%LOG_FILE%" 2>&1
 
 echo [%date% %time%] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"
 
