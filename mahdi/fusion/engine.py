@@ -217,9 +217,18 @@ class SignalFusionEngine:
         if shape == self._last_shape:
             return
         previous, self._last_shape = self._last_shape, shape
+        # ===== 2026-08-19 §3-5 / Fix#6 — **가용 4/6이 실질 2.36이었다** =====
+        #
+        # 그날 장중 회차가 이 줄의 `4/6`을 보고 축 가용성을 ✅로 읽었고, 장후 DB 축에서만
+        # 실질 2.36이 보였다(죽은 축 1.07 — `regime_hmm` 410분 전량 중립). **0점은 중립이지
+        # 의견이 아닌데**(`ensemble.EnsembleResult` 주석) 0점 멤버도 「가용멤버」에는 남는다.
+        #
+        # 값은 이미 여기 있었다 — `decision.effective_member_count`. 로그에만 없었다.
+        # 파서는 옛 문구와 새 문구를 **둘 다** 읽는다(`collect_evidence.MEMBER_RE`) —
+        # 08-04에 문구가 바뀌며 정규식이 눈이 멀어 362건을 0건으로 보고한 전례가 있다.
         logger.info(
-            "판단 형태 전이: 가용멤버 %s(%d/%d) · %s · 사유 %s · 전략 %s%s",
-            list(available), len(available), len(MEMBER_FIELDS),
+            "판단 형태 전이: 가용멤버 %s(%d/%d, 비영 %d) · %s · 사유 %s · 전략 %s%s",
+            list(available), len(available), len(MEMBER_FIELDS), decision.effective_member_count,
             decision.trade_permission.value,
             list(decision.reject_reasons) or "없음",
             list(decision.allowed_strategies) or "없음",

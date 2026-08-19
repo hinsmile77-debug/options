@@ -175,7 +175,21 @@ CHAIN_ENDPOINT = "inquire-price"
 #
 # 이 줄에 답이 그대로 들어 있다 — 가용 멤버 집합과 최초 편입 시각. 세면 끝나는 일이었다.
 MEMBER_TOKEN = "판단 형태 전이"
-MEMBER_RE = re.compile(r"가용멤버 \[(.*?)\]\((\d+)/(\d+)\)(?: · (\w+))?")
+# ===== 2026-08-19 §3-5 / Fix#6 — **가용 4/6이 실질 2.36이었다** =====
+#
+# 08-19 장중 회차가 이 줄의 `4/6`을 보고 축 가용성을 ✅로 읽었다. 장후 DB 축이 같은 날의
+# 실질 멤버를 **2.36**으로 냈다 — 죽은 축 1.07(`regime_hmm` 410분 전량 중립).
+# **0점은 중립이지 의견이 아니다**(`fusion/ensemble.EnsembleResult` 주석). 그런데 0점 멤버도
+# 「가용멤버」 목록에는 그대로 남으므로, 이 줄만 보는 눈은 그 차이를 **구조적으로 못 본다.**
+#
+# 값은 이미 있었다 — `conflict.effective_member_count`가 08-06부터 계산돼 판단에 실려 있고
+# `signal_decisions.risk_gate_state`에 적재된다. 로그에만 없었다.
+#
+# ⚠ **파서를 먼저 이중화하고 나서 문구를 바꾼다.** 08-04에 로그 레벨이 WARNING→INFO로
+# 내려가며 정규식이 눈이 멀어 **362건이 0건으로 보고**됐다. 08-18의 `데드라인이먼슬리에서끝남`
+# 개명이 그 순서를 지켜 성공했다(옛 라벨·새 라벨 양쪽을 같은 파서가 읽는다).
+# 그래서 `(4/6)`(옛)과 `(4/6, 비영 2)`(새)를 **한 정규식이 둘 다** 받는다.
+MEMBER_RE = re.compile(r"가용멤버 \[(.*?)\]\((\d+)/(\d+)(?:, 비영 (\d+))?\)(?: · (\w+))?")
 MEMBER_NAME_RE = re.compile(r"'([\w]+)'")
 # 마지막 관측이 로그 끝보다 이만큼 이르면 「도중에 빠졌다」로 본다.
 # 30분인 이유: 판단은 분마다 나지만 **형태 전이 줄은 형태가 바뀔 때만** 찍힌다 — 안정된 구간은
@@ -479,6 +493,9 @@ class LoopScan:
         self.member_last_seen = {}                        # 멤버 -> 마지막 관측 시각
         self.member_transitions = 0
         self.member_shape = collections.Counter()         # "4/6" -> 전이 건수
+        # 2026-08-19 Fix#6 — 새 문구가 실은 「비영 N」들. 옛 로그에서는 **빈 목록**이고,
+        # 그것은 「비영이 0이었다」가 아니라 **「안 셌다」**다.
+        self.member_nonzero = []
         self.member_conviction = collections.Counter()
         self.member_total = None                          # 분모(6) — 로그가 알려 준다
         # 2026-08-14 고도화 3 — 계측 부재 신고. 상세 근거는 `MEASUREMENT_MAP` 주석.
@@ -531,8 +548,12 @@ class LoopScan:
                 self.member_transitions += 1
                 self.member_total = int(mm.group(3))
                 self.member_shape[f"{mm.group(2)}/{mm.group(3)}"] += 1
-                if mm.group(4):
-                    self.member_conviction[mm.group(4)] += 1
+                # 2026-08-19 Fix#6 — 옛 문구에는 없는 값이다. **없는 것을 0으로 접지 않는다**:
+                # 「비영 0」과 「안 셌다」는 조치가 다르다(전자는 사고, 후자는 옛 로그다).
+                if mm.group(4) is not None:
+                    self.member_nonzero.append(int(mm.group(4)))
+                if mm.group(5):
+                    self.member_conviction[mm.group(5)] += 1
                 for name in MEMBER_NAME_RE.findall(mm.group(1)):
                     self.member_first_seen.setdefault(name, hhmmss)
                     self.member_last_seen[name] = hhmmss
@@ -1143,6 +1164,19 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         A("")
         shapes = ", ".join(f"{k} ×{v}" for k, v in sorted(scan.member_shape.items(), reverse=True))
         A(f"- 형태 분포: {shapes}")
+        # 2026-08-19 Fix#6 — **가용과 실질을 나란히 둔다.** 상세 근거는 `MEMBER_RE` 위 절 주석.
+        if scan.member_nonzero:
+            lo, hi = min(scan.member_nonzero), max(scan.member_nonzero)
+            A(f"- **비영 멤버**(0점이 아닌 축): 최소 **{lo}** · 최대 **{hi}** "
+              f"(전이 {len(scan.member_nonzero)}건 기준, 분모 {scan.member_total}종)")
+            if scan.member_total and hi * 2 <= scan.member_total:
+                flags.append(
+                    f"비영 멤버가 최대 **{hi}/{scan.member_total}** — 「가용」 목록은 그보다 넓다. "
+                    "**0점은 중립이지 의견이 아니다**(08-19 실질 2.36 vs 가용 3.43)"
+                )
+        else:
+            A("- 비영 멤버: **안 셌다** — 이 로그는 Fix#6(2026-08-19) 이전 문구다. "
+              "**「비영이 0이었다」가 아니다.**")
         if scan.member_conviction:
             A("- 확신도: " + ", ".join(f"{k} ×{v}" for k, v in scan.member_conviction.most_common()))
         A("")
