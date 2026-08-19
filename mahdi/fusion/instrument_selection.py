@@ -44,6 +44,38 @@ REASON_NO_STRIKE_MATCH = "no_strike_match"
 
 _CALL, _PUT = "C", "P"
 
+# ===== 종목(만기북) 로테이션 — SERIES_ROTATION_RULE_v1 =====
+#
+# "어느 북에서 진입 후보를 고를 것인가"(거래 목표북)를 요일+실측 만기로 정한다. 30거래일
+# 검증 29/29(스펙 §0). **수집 우선순위(먼슬리 고정, main.py `OPTION_CHAIN_PRIORITY_SERIES`)
+# 와는 별개의 질문이다** — 그쪽은 GEX/감마플립 입력용이고 이쪽은 오늘 거래할 북이다(스펙 §2-1).
+SERIES_REGULAR = "regular"
+SERIES_WEEKLY_MON = "weekly_mon"
+SERIES_WEEKLY_THU = "weekly_thu"
+# 규칙 1의 순회 순서 — 같은 날 두 북이 동시에 만기인 사례는 아직 관측된 적 없지만,
+# 순서를 고정해 두면 그날이 와도 판정이 결정론적이다.
+_ROTATION_SERIES_ORDER = (SERIES_REGULAR, SERIES_WEEKLY_MON, SERIES_WEEKLY_THU)
+
+# 규칙 1(만기 당일 최우선) 스위치. 종전 `select_book()`은 만기 당일 북을 0DTE 전용으로
+# 제외했고, 로테이션 스펙 §1-1은 그 북을 최우선 목표로 삼는다 — 문서화된 두 결정의 충돌이다.
+# 스펙을 따르되(08-18 실측 165건 실패가 정확히 그 제외의 산물, 거래량 75배), 재검증에서
+# 뒤집히면 **이 상수만 꺼서** 규칙 2~4는 살린 채 되돌린다(PLAN_SERIES_ROTATION_IMPL_v1 §0-2).
+# 0DTE 위험 자체는 이 층이 아니라 exit 층이 통제한다 — `is_expiry_day()`가 같은 관측에서
+# 참이 되어 `EXPIRY_DAY_0DTE` 파라미터(stop/time_stop/size_cap)를 문다.
+ALLOW_EXPIRY_DAY_TARGET = True
+
+# `target_series_reason` 값 — 어느 순위에서 결정됐는지(스펙 §3). 사후에 "규칙이 낡았는가"를
+# 물으려면 판정 결과만이 아니라 **어느 규칙이 그 판정을 냈는지**가 남아야 한다.
+TARGET_RULE_EXPIRY_DAY = "rule1_expiry_day"
+TARGET_RULE_MONTHLY_WEEK = "rule2_monthly_week"
+TARGET_RULE_TUE_THU = "rule3_tue_thu"
+TARGET_RULE_FRI_MON = "rule4_fri_mon"
+TARGET_RULE_NONE = "no_rule"
+"""주말 등 어느 규칙에도 해당 없음 — 거래일이 아니므로 정상 경로에선 나오지 않아야 한다."""
+TARGET_RULE_FALLBACK_NEAREST = "fallback_nearest"
+"""전 레그 series 미상(마이그레이션 033 이전 행·구 백테스트 픽스처) — 종전 최근접 규칙으로
+후퇴했다는 기록. 침묵 폴백이 아니라 **폴백했다는 사실 자체를 남긴다**(규약 C)."""
+
 
 @dataclass(frozen=True, slots=True)
 class ChainLeg:
@@ -60,6 +92,10 @@ class ChainLeg:
     oi: int | None = None
     volume: int | None = None
     spread_state: int | None = None
+    # 2026-08-18 — 만기북 라벨(마이그레이션 033, SERIES_ROTATION_RULE_v1). None은 「모른다」
+    # (구행·구 픽스처)이지 어느 북도 아니라는 뜻이 아니다 — 로테이션 판정에서만 빠지고
+    # 레그 자체는 만기 기준으로 계속 쓰인다.
+    series: str | None = None
     # 2026-08-18 — 프리미엄(마이그레이션 032). 선택에는 쓰지 않고 **실행 계획에 실어 보낸다** —
     # Passive-first 지정가의 기준가다. 여기서 가격으로 후보를 거르지 않는 이유: 유동성 판정은
     # `LiquidityThresholds`의 일이고, 가격은 «얼마에 살 것인가»이지 «살 수 있는가»가 아니다.
@@ -91,6 +127,7 @@ def legs_from_chain_snapshot(rows: Iterable[dict]) -> list[ChainLeg]:
                 volume=None if row.get("volume") is None else int(row["volume"]),
                 spread_state=None if row.get("spread_state") is None else int(row["spread_state"]),
                 price=None if row.get("price") is None else float(row["price"]),
+                series=row.get("series"),
             )
         )
     return legs
@@ -174,21 +211,128 @@ def is_expiry_day(legs: Sequence[ChainLeg], today: date) -> bool:
     return any(leg.expiry == today for leg in legs)
 
 
-def select_book(legs: Sequence[ChainLeg], today: date) -> tuple[date | None, str | None]:
+def observed_expiries_by_series(legs: Sequence[ChainLeg], today: date) -> dict[str, date]:
     """
     입력: 체인 레그 목록, 오늘 날짜.
-    계산: 관측된 만기 중 **오늘을 제외한** 가장 가까운 만기를 고른다.
-    해석: 만기 당일 북은 0DTE 플레이북 전용이라 일반 전략의 후보에서 제외한다(§11.4/§11.5).
-         잔존만기 0일에는 감마플립이 정의되지 않고 핀 리스크만 의미를 갖는다.
-    실패 조건: 쓸 만기가 없으면 `(None, REASON_NO_ELIGIBLE_BOOK)`. 체인 자체가 비었으면
-              `(None, REASON_NO_CHAIN)` — 둘은 다른 사건이라 사유를 가른다.
+    계산: series를 아는 레그만 모아, series별로 **오늘 이후(당일 포함) 가장 가까운** 만기를 뽑는다.
+    해석: `target_series_for()`의 입력. 달력을 계산하지 않고 마흐디 자신이 관측한 만기를 쓴다
+         (스펙 §1-1 "요일 규칙으로 만들지 않는 이유" — 08-18 만기는 대체공휴일 이월로
+         **화요일**이었다). series=None(구행·구 픽스처)은 여기서만 빠진다 — 그 레그가 판정에서
+         빠지는 것이지 후보에서 빠지는 것이 아니다.
+    실패 조건: 없음 — series를 아는 레그가 하나도 없으면 빈 dict(호출측이 폴백으로 다룬다).
+    """
+    out: dict[str, date] = {}
+    for leg in legs:
+        if leg.series is None or leg.expiry < today:
+            continue
+        current = out.get(leg.series)
+        if current is None or leg.expiry < current:
+            out[leg.series] = leg.expiry
+    return out
+
+
+def target_series_for(today: date, expiries: dict[str, date]) -> tuple[str | None, str]:
+    """
+    입력: 오늘 날짜, `observed_expiries_by_series()`가 만든 series별 관측 만기.
+    계산: SERIES_ROTATION_RULE_v1 §1의 4단계 우선순위(위가 이긴다) —
+         1. 만기 당일인 북(요일 무관, `ALLOW_EXPIRY_DAY_TARGET`이 참일 때만).
+         2. 먼슬리 만기가 속한 ISO 주의 화·수·목 → regular.
+         3. 그 외 화·수·목 → weekly_thu.  4. 금·월 → weekly_mon.
+    해석: 반환 2번째 값은 어느 순위에서 결정됐는지(`TARGET_RULE_*`) — `signal_decisions`에
+         그대로 실려 사후 검증(목표 vs 실측 거래량 1위 괴리)의 축이 된다(스펙 §3).
+         규칙 2의 "먼슬리 만기 주"는 요일 근사가 아니라 `isocalendar()[:2]` 비교다(스펙 §1-2).
+    실패 조건: 주말 등 규칙 밖이면 `(None, TARGET_RULE_NONE)` — 거래일이 아니므로 정상
+              경로에선 나오지 않아야 하고, 나오면 그 자체가 기록할 가치가 있는 이상이다.
+    """
+    if ALLOW_EXPIRY_DAY_TARGET:
+        for series in _ROTATION_SERIES_ORDER:
+            if expiries.get(series) == today:
+                return series, TARGET_RULE_EXPIRY_DAY
+
+    regular_expiry = expiries.get(SERIES_REGULAR)
+    weekday = today.weekday()  # 0=월 ... 4=금
+    if (
+        regular_expiry is not None
+        and today.isocalendar()[:2] == regular_expiry.isocalendar()[:2]
+        and weekday in (1, 2, 3)
+    ):
+        return SERIES_REGULAR, TARGET_RULE_MONTHLY_WEEK
+
+    if weekday in (1, 2, 3):
+        return SERIES_WEEKLY_THU, TARGET_RULE_TUE_THU
+    if weekday in (4, 0):
+        return SERIES_WEEKLY_MON, TARGET_RULE_FRI_MON
+    return None, TARGET_RULE_NONE
+
+
+@dataclass(frozen=True, slots=True)
+class BookSelection:
+    """`select_book()` 1회 판정 — 무엇을 골랐고(expiry/series) **무엇이 골랐는가**(target_reason).
+
+    `reason`은 실패했을 때만 채워진다(REASON_* 어휘). 목표 series가 정해졌는데 체인에
+    미관측이면 `series`/`target_reason`은 채워진 채 `reason`만 실패다 — "무엇을 찾다
+    실패했는가"가 남아야 사후에 수집 결손과 규칙 오판을 가를 수 있다.
+    """
+
+    expiry: date | None = None
+    series: str | None = None
+    target_reason: str | None = None
+    reason: str | None = None
+
+
+def select_book(legs: Sequence[ChainLeg], today: date) -> BookSelection:
+    """
+    입력: 체인 레그 목록, 오늘 날짜.
+    계산: `target_series_for()`가 정한 목표 series의 관측 만기를 채택한다 — 종전의
+         "가장 가까운 만기를 고르고 series는 역산"을 **"series를 먼저 정하고 만기는 그 결과"**
+         로 뒤집었다(SERIES_ROTATION_RULE_v1 §2-2). 2026-08-18 12:30 실측 — 최근접 규칙이
+         고른 북에 전략이 요구하는 델타의 유동성이 없어 165건 중 163건이 `no_strike_match`.
+    해석: 목표 series가 체인에 미관측이면(수집 실패 등) **다른 북으로 조용히 넘어가지 않고**
+         `REASON_NO_ELIGIBLE_BOOK`으로 후퇴한다 — 넘어가면 "오늘 왜 그 북을 안 골랐는가"가
+         로그에서 사라진다(스펙 §2-2, 규약 C).
+         전 레그가 series 미상이면(마이그레이션 033 이전 행만 남은 과도기·구 백테스트 픽스처)
+         종전 최근접 규칙(만기 당일 제외)으로 후퇴하되 `TARGET_RULE_FALLBACK_NEAREST`로 그
+         사실을 남긴다 — 이 경로의 만기 당일 제외는 종전 동작 보존이고, 규칙 1의 만기 당일
+         **채택**은 series를 아는 정상 경로에서만 일어난다.
+    실패 조건: 체인이 비었으면 `reason=REASON_NO_CHAIN`, 쓸 북이 없으면
+              `reason=REASON_NO_ELIGIBLE_BOOK` — 둘은 다른 사건이라 사유를 가른다.
     """
     if not legs:
-        return None, REASON_NO_CHAIN
-    future = [expiry for expiry in observed_expiries(legs) if expiry > today]
-    if not future:
-        return None, REASON_NO_ELIGIBLE_BOOK
-    return future[0], None
+        return BookSelection(reason=REASON_NO_CHAIN)
+
+    expiries = observed_expiries_by_series(legs, today)
+    if not expiries:
+        future = [expiry for expiry in observed_expiries(legs) if expiry > today]
+        if not future:
+            return BookSelection(target_reason=TARGET_RULE_FALLBACK_NEAREST, reason=REASON_NO_ELIGIBLE_BOOK)
+        return BookSelection(expiry=future[0], target_reason=TARGET_RULE_FALLBACK_NEAREST)
+
+    series, target_reason = target_series_for(today, expiries)
+    if series is None:
+        return BookSelection(target_reason=target_reason, reason=REASON_NO_ELIGIBLE_BOOK)
+    expiry = expiries.get(series)
+    if expiry is None:
+        return BookSelection(series=series, target_reason=target_reason, reason=REASON_NO_ELIGIBLE_BOOK)
+    return BookSelection(expiry=expiry, series=series, target_reason=target_reason)
+
+
+def volume_leader_series(legs: Sequence[ChainLeg]) -> str | None:
+    """
+    입력: 체인 레그 목록.
+    계산: series를 알고 volume이 있는 레그의 거래량을 series별로 합해 1위를 돌려준다.
+         동률이면 이름 오름차순 첫 번째(결정론적이면 충분하다).
+    해석: 스펙 §3의 사후 검증용 — 목표북과 실측 1위가 자주 갈리면 규칙이 낡았다는 신호다.
+         관측 창(ATM±N) 안의 합이라 시장 전체 거래량이 아니지만, 북 간 **비교**에는 같은 창
+         조건이라 충분하다(절대값을 읽는 지표가 아니다).
+    실패 조건: 없음 — 잴 수 있는 레그가 없으면 None(「모른다」이지 0이 아니다).
+    """
+    totals: dict[str, int] = {}
+    for leg in legs:
+        if leg.series is not None and leg.volume is not None:
+            totals[leg.series] = totals.get(leg.series, 0) + leg.volume
+    if not totals:
+        return None
+    return max(sorted(totals), key=lambda series: totals[series])
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,12 +382,20 @@ class SelectionResult:
     """선택기 1회 실행 결과.
 
     `candidates`가 비어 있어도 `reason`과 `rejected`가 **왜**를 담는다 — 그것이 이 기록의 값이다.
+
+    2026-08-18(SERIES_ROTATION_RULE_v1 §3) — 로테이션 판정 세 필드를 함께 싣는다:
+    `target_series`(규칙이 고른 북), `target_series_reason`(어느 순위에서 결정됐는지),
+    `volume_leader_series`(그 분 관측 거래량 1위 — 목표와 자주 갈리면 규칙이 낡았다는 신호).
+    이것이 없으면 다음에 규칙이 틀렸을 때 사람이 이틀치 로그를 겹쳐 읽어야 한다.
     """
 
     candidates: tuple[InstrumentCandidate, ...] = ()
     book_expiry: date | None = None
     reason: str | None = None
     rejected: tuple[dict, ...] = ()
+    target_series: str | None = None
+    target_series_reason: str | None = None
+    volume_leader_series: str | None = None
 
     def to_record(self) -> dict:
         return {
@@ -251,6 +403,9 @@ class SelectionResult:
             "book_expiry": self.book_expiry.isoformat() if self.book_expiry else None,
             "reason": self.reason,
             "rejected": list(self.rejected),
+            "target_series": self.target_series,
+            "target_series_reason": self.target_series_reason,
+            "volume_leader_series": self.volume_leader_series,
         }
 
 
@@ -407,7 +562,8 @@ def select_instruments(
     입력: §11.4가 남긴 **진입** 전략 목록(`entry_strategies()`로 관망 계열이 이미 걸러진 것),
          체인 레그, ATM 기준가(선물 체결가), 오늘 날짜, 방향(FusionDecision.direction 부호),
          유동성 하한, 단축코드 변환 콜백(`(option_type, strike, expiry) -> symbol | None`).
-    계산: (1) 만기 당일을 제외한 최근접 북을 고른다. (2) 전략마다 §11.5 표의 다리 규칙을 적용해
+    계산: (1) 요일 로테이션 규칙(SERIES_ROTATION_RULE_v1, `select_book()`)으로 목표북을 고른다.
+         (2) 전략마다 §11.5 표의 다리 규칙을 적용해
          레그를 고른다. (3) 고른 레그 전부가 유동성 하한을 통과해야 그 전략이 후보가 된다 —
          **한 다리라도 걸리면 그 전략 전체를 뺀다**(스프레드의 한 다리만 유동성이 없으면 그
          전략은 실행 불가다). (4) 남은 후보가 하나도 없으면 사유를 정한다.
@@ -422,12 +578,20 @@ def select_instruments(
     thresholds = thresholds or LiquidityThresholds()
     if not legs:
         return SelectionResult(reason=REASON_NO_CHAIN)
-    if spot is None:
-        return SelectionResult(reason=REASON_SPOT_UNAVAILABLE)
 
-    book_expiry, book_reason = select_book(legs, today)
-    if book_expiry is None:
-        return SelectionResult(reason=book_reason)
+    # 로테이션 판정은 spot 유무와 무관하다 — spot이 죽은 분에도 목표북 기록은 쌓여야
+    # 재검증(§3) 표본이 매분이 된다. 판정을 먼저 하고 spot 검사로 넘어간다.
+    book = select_book(legs, today)
+    rotation = {
+        "target_series": book.series,
+        "target_series_reason": book.target_reason,
+        "volume_leader_series": volume_leader_series(legs),
+    }
+    if spot is None:
+        return SelectionResult(reason=REASON_SPOT_UNAVAILABLE, **rotation)
+    if book.expiry is None:
+        return SelectionResult(reason=book.reason, **rotation)
+    book_expiry = book.expiry
 
     candidates: list[InstrumentCandidate] = []
     rejected: list[dict] = []
@@ -484,7 +648,7 @@ def select_instruments(
 
     if candidates:
         return SelectionResult(
-            candidates=tuple(candidates), book_expiry=book_expiry, rejected=tuple(rejected)
+            candidates=tuple(candidates), book_expiry=book_expiry, rejected=tuple(rejected), **rotation
         )
 
     # 비었을 때의 사유 — **유동성으로 걸린 것이 하나라도 있으면 그것이 사유다**(§11.5가 이름
@@ -496,4 +660,23 @@ def select_instruments(
         reason = str(rejected[-1]["reason"])
     else:
         reason = None
-    return SelectionResult(book_expiry=book_expiry, reason=reason, rejected=tuple(rejected))
+    return SelectionResult(book_expiry=book_expiry, reason=reason, rejected=tuple(rejected), **rotation)
+
+
+def rotation_snapshot(legs: Sequence[ChainLeg], today: date) -> dict:
+    """
+    입력: 체인 레그 목록(선택기와 같은 스냅샷), 오늘 날짜.
+    계산: 로테이션 판정 세 필드만 뽑아 dict로 돌려준다(`SelectionResult.to_record()`의 부분집합).
+    해석: 진입 전략이 없어 `select_instruments()`를 안 돌리는 분에도 목표북 기록은 매분
+         쌓여야 한다(스펙 §3) — 규칙 재검증 표본은 진입 후보 유무와 무관하다. main.py의
+         관망 분기가 이것을 `selection_record`에 합쳐 싣는다.
+    실패 조건: 없음 — 체인이 비면 세 필드 모두 None(「판정 못 했다」가 그대로 남는다).
+    """
+    if not legs:
+        return {"target_series": None, "target_series_reason": None, "volume_leader_series": None}
+    book = select_book(legs, today)
+    return {
+        "target_series": book.series,
+        "target_series_reason": book.target_reason,
+        "volume_leader_series": volume_leader_series(legs),
+    }

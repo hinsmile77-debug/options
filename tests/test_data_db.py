@@ -495,7 +495,7 @@ def test_latest_expiry_liquidity_maps_rows_to_dicts():
 def test_latest_option_chain_maps_rows_to_dicts():
     rows = [
         (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72,
-         0.51, 120, 1, 7.25)
+         0.51, 120, 1, 7.25, "weekly_thu")
     ]
     conn = FakeReadConnection(rows)
 
@@ -517,6 +517,8 @@ def test_latest_option_chain_maps_rows_to_dicts():
             "volume": 120,
             "spread_state": 1,
             "price": 7.25,
+            # 2026-08-18 마이그레이션 033 — 만기북 라벨. 로테이션 규칙의 입력.
+            "series": "weekly_thu",
         }
     ]
 
@@ -527,7 +529,7 @@ def test_latest_option_chain_keeps_missing_rv_as_none_not_zero():
     # 그 분은 항상 극단적 고평가로 판정된다(08-05 위클리 두 북이 실제로 rv_5d=0이었다).
     rows = [
         (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), None,
-         0.51, 120, 1, 7.25)
+         0.51, 120, 1, 7.25, "regular")
     ]
 
     chain = db.latest_option_chain(FakeReadConnection(rows), "KOSPI200")
@@ -628,7 +630,7 @@ def test_market_bars_between_empty_range_is_empty():
 def test_option_chain_as_of_matches_latest_option_chain_shape():
     rows = [
         (1340.0, "C", 363, 0.9, 0.0047, 123.4, date(2026, 7, 9), datetime(2026, 7, 6, 9, 31), 0.72,
-         0.51, 120, 1, 7.25)
+         0.51, 120, 1, 7.25, "weekly_thu")
     ]
     conn = FakeReadConnection(rows)
 
@@ -639,6 +641,7 @@ def test_option_chain_as_of_matches_latest_option_chain_shape():
             "strike": 1340.0, "option_type": "C", "oi": 363.0, "iv": 0.9, "gamma": 0.0047,
             "gex": 123.4, "expiry": date(2026, 7, 9), "timestamp": datetime(2026, 7, 6, 9, 31),
             "rv_5d": 0.72, "delta": 0.51, "volume": 120, "spread_state": 1, "price": 7.25,
+            "series": "weekly_thu",
         }
     ]
     assert "timestamp <= %s" in conn.store["query"]
@@ -669,9 +672,13 @@ def test_chain_snapshot_bounds_freshness_and_expiry():
     )
 
 
-def _chain_row(strike, option_type, expiry, ts):
-    """`_CHAIN_SNAPSHOT_SQL` 컬럼 순서 그대로의 한 행 — 창 자르기 테스트에서 값은 무관하다."""
-    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15, 0.5, 10, 1, 7.25)
+def _chain_row(strike, option_type, expiry, ts, series="regular"):
+    """`_CHAIN_SNAPSHOT_SQL` 컬럼 순서 그대로의 한 행 — 창 자르기 테스트에서 값은 무관하다.
+
+    새 컬럼은 **끝에만** 붙는다(`_restrict_to_latest_cycle_window`가 위치 인덱스로 읽는다) —
+    033 series가 중간에 끼어 있었다면 이 헬퍼를 쓰는 창 자르기 테스트들이 그것을 잡았어야 한다.
+    """
+    return (strike, option_type, 100, 0.2, 0.001, 1.0, expiry, ts, 0.15, 0.5, 10, 1, 7.25, series)
 
 
 def test_chain_snapshot_drops_strikes_outside_the_latest_cycle_window():

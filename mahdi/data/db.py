@@ -75,6 +75,10 @@ _OPTION_ANALYSIS_1M_COLUMNS = (
     "volume", "spread_state",
     # 마이그레이션 032 (2026-08-18) — 옵션 현재가(프리미엄). 필드명 확정 근거는 그 파일.
     "price",
+    # 마이그레이션 033 (2026-08-18) — 만기북 라벨(regular/weekly_mon/weekly_thu). 수집 루프가
+    # 레그마다 알던 값을 종전엔 적재 직전에 버렸다 — 종목 로테이션 규칙(SERIES_ROTATION_RULE_v1)
+    # 의 입력이라 싣는다. 기존 행은 NULL(백필 안 함 — 선택기 창은 5분이라 다음 사이클부터 찬다).
+    "series",
 )
 
 
@@ -1069,7 +1073,7 @@ _CHAIN_SNAPSHOT_COLUMNS = ("strike", "option_type", "oi", "iv", "gamma", "gex", 
 _CHAIN_SNAPSHOT_SQL = """
     SELECT DISTINCT ON (expiry, strike, option_type)
         strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d,
-        delta, volume, spread_state, price
+        delta, volume, spread_state, price, series
     FROM option_analysis_1m
     WHERE underlying=%s
       AND timestamp <= %s
@@ -1081,8 +1085,9 @@ _CHAIN_SNAPSHOT_SQL = """
 
 def _restrict_to_latest_cycle_window(rows: list[tuple]) -> list[tuple]:
     """
-    입력: `_CHAIN_SNAPSHOT_SQL`이 돌려준 행 목록 — (strike, option_type, oi, iv, gamma, gex,
-         expiry, timestamp, rv_5d) 순서에 의존한다.
+    입력: `_CHAIN_SNAPSHOT_SQL`이 돌려준 행 목록 — 컬럼 **순서**에 의존한다(아래 `_STRIKE`/
+         `_EXPIRY`/`_TIMESTAMP` 인덱스). SQL에 컬럼을 더할 때는 **끝에만** 붙일 것 — 중간에
+         끼우면 이 인덱스가 조용히 다른 컬럼을 읽는다(033 series도 그래서 끝에 붙었다).
     계산: **만기별로** 그 북의 가장 최근 사이클(= 그 만기의 최대 timestamp)이 수집한 행사가의
          [최소, 최대] 범위를 구하고, 그 범위 **밖** 행사가를 떨어뜨린다. 범위 안쪽 행사가는
          이번 사이클에 실패해 직전 값이 이월된 것이라도 그대로 남긴다.
@@ -1160,10 +1165,13 @@ def _chain_snapshot(conn: ConnectionLike, underlying: str, as_of: datetime) -> l
             # 「그 분에 가격을 못 읽었다」와 「심외가라 0이다」는 다른 사실이고, 후자로 오인하면
             # 지정가가 0 근처에서 만들어진다.
             "price": float(price) if price is not None else None,
+            # 2026-08-18 마이그레이션 033 — 만기북 라벨. NULL(구행)을 보존한다 — 선택기가
+            # 「모른다」를 「regular다」로 읽으면 로테이션 판정이 거짓 근거로 돈다.
+            "series": series,
         }
         for (
             strike, option_type, oi, iv, gamma, gex, expiry, timestamp, rv_5d,
-            delta, volume, spread_state, price,
+            delta, volume, spread_state, price, series,
         ) in rows
     ]
 

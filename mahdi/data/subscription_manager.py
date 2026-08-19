@@ -250,8 +250,12 @@ class RollingSubscriptionManager:
         symbol_formatter=None,
         hysteresis_ratio: float = ATM_ROLL_HYSTERESIS_RATIO,
         retention_pool: SubscriptionRetentionPool | None = None,
+        label: str = "",
     ) -> None:
         self._ws = ws_client
+        # 진단 로그용 이름(예: series "regular"). 동작에는 안 쓴다 — 창 고착 WARNING(아래
+        # `window_stuck_distance()` 호출측)이 "어느 북의 창인가"를 사람이 읽을 수 있게만 한다.
+        self.label = label
         # None이면 종전 동작(창을 벗어나는 즉시 해제) — 기존 테스트와 백테스트 경로가 그대로 돈다.
         self._retention = retention_pool
         self._tr_id = tr_id
@@ -329,6 +333,25 @@ class RollingSubscriptionManager:
     @property
     def desired_strikes(self) -> frozenset[float]:
         return frozenset(self._desired_strikes)
+
+    def window_stuck_distance(self, spot: float) -> float | None:
+        """
+        입력: 방금 `roll_to_spot()`을 시도한 뒤의 최신 스팟.
+        계산: 지금도 롤링이 걸려야 하는 상태면(`should_roll_atm()` 참) 스팟↔창 중심 거리를,
+             아니면 None을 돌려준다.
+        해석: 2026-08-18(SERIES_ROTATION_RULE_v1 §6-3) — **롤 직후에 재는 값이라 정상이면 항상
+             None이다.** 값이 나오는 것 자체가 "롤링이 걸렸어야 하는데 창이 안 움직였다"는
+             뜻이고, 그것이 다음 사이클에도 줄지 않으면 08-04 이전의 창 고착 사고(하루치 체인이
+             5.5% 외가격으로 방치)가 재발한 것이다 — 지속 판정과 WARNING은 호출측
+             (`main._reroll_books_to_spot`)이 맡는다. `should_roll_atm()`을 그대로 쓰는 이유:
+             "임계는 넘었지만 같은 격자 칸"인 경계 상태를 고착으로 오판하지 않기 위해서다.
+        실패 조건: 창이 아직 없으면(기동 직전) None — 고착이 아니라 미기동이다.
+        """
+        if self._current_atm is None:
+            return None
+        if not should_roll_atm(self._current_atm, spot, self._strike_interval, self._hysteresis_ratio):
+            return None
+        return abs(spot - self._current_atm)
 
     def rebind(self, ws_client: KISWebSocketClient) -> None:
         """

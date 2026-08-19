@@ -15,13 +15,21 @@ from mahdi.fusion.instrument_selection import (
     REASON_NO_SELECTION_RULE,
     REASON_NO_STRIKE_MATCH,
     REASON_SPOT_UNAVAILABLE,
+    TARGET_RULE_EXPIRY_DAY,
+    TARGET_RULE_FALLBACK_NEAREST,
+    TARGET_RULE_FRI_MON,
+    TARGET_RULE_MONTHLY_WEEK,
+    TARGET_RULE_TUE_THU,
     ChainLeg,
     LiquidityThresholds,
     is_expiry_day,
     legs_from_chain_snapshot,
     liquidity_reject_reason,
+    rotation_snapshot,
     select_book,
     select_instruments,
+    target_series_for,
+    volume_leader_series,
 )
 
 TODAY = date(2026, 8, 17)
@@ -29,8 +37,12 @@ NEAR = date(2026, 8, 18)  # 화요일 만기(대체공휴일 이월) — 요일 
 FAR = date(2026, 9, 10)
 
 
-def _chain(expiry=NEAR, strikes=(340.0, 345.0, 350.0, 355.0, 360.0), *, delta_scale=True, **overrides):
-    """ATM 350 근처의 단순 체인. 델타는 행사가에서 단조 감소하도록 만든다."""
+def _chain(expiry=NEAR, strikes=(340.0, 345.0, 350.0, 355.0, 360.0), *, delta_scale=True, series=None, **overrides):
+    """ATM 350 근처의 단순 체인. 델타는 행사가에서 단조 감소하도록 만든다.
+
+    `series` 기본 None — 종전 테스트들이 그대로 **series 미상 폴백 경로**(마이그레이션 033
+    이전 행과 같은 상태)를 검증하게 된다. 로테이션 규칙 테스트는 series를 명시해 만든다.
+    """
     legs = []
     for strike in strikes:
         for option_type in ("C", "P"):
@@ -48,6 +60,7 @@ def _chain(expiry=NEAR, strikes=(340.0, 345.0, 350.0, 355.0, 360.0), *, delta_sc
                     oi=overrides.get("oi", 1000),
                     volume=overrides.get("volume", 500),
                     spread_state=overrides.get("spread_state", 1),
+                    series=series,
                 )
             )
     return legs
@@ -70,12 +83,17 @@ def test_negative_direction_picks_a_put_for_directional_strategies():
     assert leg.option_type == "P"
 
 
-def test_the_expiry_day_book_is_excluded_because_it_is_0dte_only():
-    """만기 당일 북은 §11.4가 0DTE 플레이북 전용으로 못박은 것 — 일반 전략 후보가 될 수 없다."""
+def test_seriesless_fallback_still_excludes_the_expiry_day_book():
+    """series 미상 폴백(마이그레이션 033 이전 행) — 종전 규칙(만기 당일 제외 최근접)을 보존한다.
+
+    만기 당일 **채택**(로테이션 규칙 1)은 series를 아는 정상 경로에서만 일어난다 — 폴백에서
+    허용하면 어느 북인지도 모르는 채 0DTE 후보를 만드는 셈이다.
+    """
     legs = _chain(expiry=TODAY) + _chain(expiry=FAR)
     result = select_instruments(["atm_long"], legs, spot=350.0, today=TODAY)
     assert result.book_expiry == FAR
     assert all(leg.expiry == FAR for c in result.candidates for leg in c.legs)
+    assert result.target_series_reason == TARGET_RULE_FALLBACK_NEAREST
 
 
 def test_only_the_expiry_day_book_left_is_a_verdict_not_a_crash():
@@ -84,9 +102,12 @@ def test_only_the_expiry_day_book_left_is_a_verdict_not_a_crash():
     assert result.reason == REASON_NO_ELIGIBLE_BOOK
 
 
-def test_nearest_non_expiry_book_wins_over_the_far_one():
-    expiry, reason = select_book(_chain(expiry=FAR) + _chain(expiry=NEAR), TODAY)
-    assert (expiry, reason) == (NEAR, None)
+def test_seriesless_fallback_picks_the_nearest_book_and_records_the_fallback():
+    """침묵 폴백 금지 — 폴백으로 골랐다는 사실 자체가 기록에 남아야 한다(규약 C)."""
+    book = select_book(_chain(expiry=FAR) + _chain(expiry=NEAR), TODAY)
+    assert (book.expiry, book.reason) == (NEAR, None)
+    assert book.series is None
+    assert book.target_reason == TARGET_RULE_FALLBACK_NEAREST
 
 
 def test_is_expiry_day_is_the_single_source_shared_with_the_exit_stack():
@@ -258,3 +279,137 @@ def test_multiple_strategies_each_get_their_own_verdict():
     assert [c.strategy for c in result.candidates] == ["atm_long"]
     assert result.rejected == ({"strategy": "long_gamma", "reason": REASON_NO_SELECTION_RULE},)
     assert result.reason is None  # 후보가 하나라도 있으면 사유는 비어야 한다
+
+
+# ===== 종목(만기북) 로테이션 — SERIES_ROTATION_RULE_v1 =====
+#
+# 아래 날짜들은 스펙 §1의 실측 사례를 그대로 옮긴 것이다. 특히 "만기가 공휴일로 밀린 날"과
+# "먼슬리 만기 주 월요일" 두 케이스는 1차 순수 요일 규칙이 실제로 틀렸던(28/30) 그 두 날이다.
+
+TUE_SHIFTED_EXPIRY = date(2026, 8, 18)  # 화. 원래 월(08-17) 만기가 대체공휴일로 이월된 날
+MONTHLY_EXPIRY = date(2026, 8, 13)      # 목. 먼슬리 만기
+SEP_MONTHLY = date(2026, 9, 10)
+
+
+def _books(**series_to_expiry):
+    """series별 만기를 지정해 3북 체인을 합친다. 예: _books(regular=..., weekly_thu=...)"""
+    legs = []
+    for series, expiry in series_to_expiry.items():
+        legs += _chain(expiry=expiry, series=series)
+    return legs
+
+
+def test_rule1_a_holiday_shifted_expiry_day_beats_the_weekday_rule():
+    """08-18(화) 실측 — 요일 규칙(화=weekly_thu)대로면 틀렸다. 만기 당일 거래량 75배가 이긴다."""
+    legs = _books(
+        regular=SEP_MONTHLY, weekly_mon=TUE_SHIFTED_EXPIRY, weekly_thu=date(2026, 8, 20)
+    )
+    book = select_book(legs, today=TUE_SHIFTED_EXPIRY)
+    assert (book.series, book.expiry) == ("weekly_mon", TUE_SHIFTED_EXPIRY)
+    assert book.target_reason == TARGET_RULE_EXPIRY_DAY
+    assert book.reason is None
+
+
+def test_rule1_expiry_day_candidates_stay_consistent_with_the_exit_stack():
+    """규칙 1로 만기 당일 북이 목표가 된 날은 `is_expiry_day()`도 참이어야 한다 — 같은 관측에서
+    나오므로 진입은 0DTE 북에서 하는데 청산은 일반 파라미터를 무는 상태가 생길 수 없다."""
+    legs = _books(regular=SEP_MONTHLY, weekly_mon=TUE_SHIFTED_EXPIRY, weekly_thu=date(2026, 8, 20))
+    result = select_instruments(["atm_long"], legs, spot=350.0, today=TUE_SHIFTED_EXPIRY)
+    assert result.book_expiry == TUE_SHIFTED_EXPIRY
+    assert all(leg.expiry == TUE_SHIFTED_EXPIRY for c in result.candidates for leg in c.legs)
+    assert is_expiry_day(legs, TUE_SHIFTED_EXPIRY) is True
+
+
+@pytest.mark.parametrize("today", [date(2026, 8, 11), date(2026, 8, 12)])  # 화, 수
+def test_rule2_monthly_expiry_week_tue_wed_targets_the_monthly_book(today):
+    legs = _books(regular=MONTHLY_EXPIRY, weekly_mon=date(2026, 8, 18), weekly_thu=MONTHLY_EXPIRY)
+    # 위클리 목과 먼슬리가 같은 날 만기인 주(08-13) — 실제 8월이 그랬다. 규칙 1(만기 당일)이
+    # 아니므로 규칙 2가 판정한다.
+    book = select_book(legs, today=today)
+    assert (book.series, book.target_reason) == ("regular", TARGET_RULE_MONTHLY_WEEK)
+
+
+def test_rule2_does_not_claim_monday_of_the_monthly_week():
+    """08-10(월) 실측 regular 21,800 vs weekly_mon 768,915 — 무게중심이 아직 안 넘어왔다.
+    월요일은 규칙 4(금·월→weekly_mon)가 그대로 답이다. 1차 요일 규칙이 놓친 두 사례 중 하나."""
+    monday = date(2026, 8, 10)
+    # 만기 당일(규칙 1)이 판정을 가로채지 않도록 weekly_mon 만기를 이월된 형태(08-11)로 둔다 —
+    # 규칙 4 자체가 월요일을 weekly_mon으로 보내는 것을 검증하는 테스트다.
+    legs = _books(regular=MONTHLY_EXPIRY, weekly_mon=date(2026, 8, 11), weekly_thu=MONTHLY_EXPIRY)
+    book = select_book(legs, today=monday)
+    assert (book.series, book.target_reason) == ("weekly_mon", TARGET_RULE_FRI_MON)
+
+
+def test_rule3_ordinary_tuesday_targets_weekly_thu():
+    tuesday = date(2026, 8, 4)  # 먼슬리 만기(08-13)와 다른 ISO 주
+    legs = _books(regular=MONTHLY_EXPIRY, weekly_mon=date(2026, 8, 10), weekly_thu=date(2026, 8, 6))
+    book = select_book(legs, today=tuesday)
+    assert (book.series, book.target_reason) == ("weekly_thu", TARGET_RULE_TUE_THU)
+
+
+def test_rule4_friday_targets_weekly_mon():
+    friday = date(2026, 8, 14)
+    legs = _books(regular=SEP_MONTHLY, weekly_mon=TUE_SHIFTED_EXPIRY, weekly_thu=date(2026, 8, 20))
+    book = select_book(legs, today=friday)
+    assert (book.series, book.target_reason) == ("weekly_mon", TARGET_RULE_FRI_MON)
+
+
+def test_a_missing_target_book_fails_loudly_instead_of_switching_books():
+    """목표북이 체인에 없으면(수집 실패 등) 다른 북으로 조용히 넘어가지 않는다 — 넘어가면
+    "오늘 왜 그 북을 안 골랐는가"가 로그에서 사라진다(스펙 §2-2). 무엇을 찾다 실패했는지는 남는다."""
+    tuesday = date(2026, 8, 4)
+    legs = _books(regular=MONTHLY_EXPIRY, weekly_mon=date(2026, 8, 10))  # weekly_thu 미관측
+    book = select_book(legs, today=tuesday)
+    assert book.expiry is None
+    assert book.reason == REASON_NO_ELIGIBLE_BOOK
+    assert (book.series, book.target_reason) == ("weekly_thu", TARGET_RULE_TUE_THU)
+
+    result = select_instruments(["atm_long"], legs, spot=350.0, today=tuesday)
+    assert result.candidates == ()
+    assert result.reason == REASON_NO_ELIGIBLE_BOOK
+    assert result.target_series == "weekly_thu"
+
+
+def test_target_series_for_returns_no_rule_on_weekends():
+    saturday = date(2026, 8, 15)
+    series, reason = target_series_for(saturday, {"regular": SEP_MONTHLY})
+    assert series is None
+    assert reason == "no_rule"
+
+
+def test_volume_leader_series_compares_books_and_ignores_unknowns():
+    legs = (
+        _chain(expiry=TUE_SHIFTED_EXPIRY, series="weekly_mon", volume=1000)
+        + _chain(expiry=date(2026, 8, 20), series="weekly_thu", volume=10)
+        + _chain(expiry=SEP_MONTHLY, series=None, volume=999_999)  # series 미상 — 판정에서 제외
+    )
+    assert volume_leader_series(legs) == "weekly_mon"
+    assert volume_leader_series(_chain(series=None)) is None  # 잴 수 있는 레그 없음 = 「모른다」
+
+
+def test_rotation_fields_travel_in_the_record():
+    """§3 로깅 — 목표북/판정 순위/거래량 1위가 signal_decisions JSONB까지 그대로 가야 한다."""
+    legs = _books(regular=SEP_MONTHLY, weekly_mon=TUE_SHIFTED_EXPIRY, weekly_thu=date(2026, 8, 20))
+    record = select_instruments(["atm_long"], legs, spot=350.0, today=TUE_SHIFTED_EXPIRY).to_record()
+    assert record["target_series"] == "weekly_mon"
+    assert record["target_series_reason"] == TARGET_RULE_EXPIRY_DAY
+    assert record["volume_leader_series"] in ("regular", "weekly_mon", "weekly_thu")
+
+
+def test_rotation_snapshot_reports_even_when_no_strategy_runs():
+    """관망 분에도 목표북 기록은 매분 쌓인다 — 재검증 표본은 진입 후보 유무와 무관하다."""
+    legs = _books(regular=SEP_MONTHLY, weekly_mon=TUE_SHIFTED_EXPIRY, weekly_thu=date(2026, 8, 20))
+    snapshot = rotation_snapshot(legs, TUE_SHIFTED_EXPIRY)
+    assert snapshot["target_series"] == "weekly_mon"
+    assert snapshot["target_series_reason"] == TARGET_RULE_EXPIRY_DAY
+
+    empty = rotation_snapshot([], TUE_SHIFTED_EXPIRY)
+    assert empty == {"target_series": None, "target_series_reason": None, "volume_leader_series": None}
+
+
+def test_rotation_targets_spot_less_minutes_too():
+    """spot이 죽은 분에도 로테이션 판정은 기록된다 — 판정은 spot과 무관하다."""
+    legs = _books(regular=SEP_MONTHLY, weekly_mon=TUE_SHIFTED_EXPIRY, weekly_thu=date(2026, 8, 20))
+    result = select_instruments(["atm_long"], legs, spot=None, today=TUE_SHIFTED_EXPIRY)
+    assert result.reason == REASON_SPOT_UNAVAILABLE
+    assert result.target_series == "weekly_mon"

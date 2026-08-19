@@ -112,6 +112,32 @@ def test_should_roll_atm_moves_once_the_spot_really_leaves():
     assert should_roll_atm(1000.0, spot=997.5, strike_interval=2.5) is True
 
 
+def test_window_stuck_distance_is_none_while_the_window_tracks_the_spot():
+    """2026-08-18(SERIES_ROTATION_RULE_v1 §6-3) — 창 고착 계측의 단위 규칙.
+
+    롤 직후에 재는 값이라 정상이면 항상 None이고, 값이 나오는 것 자체가 "롤링이 걸렸어야
+    하는데 안 걸렸다"는 뜻이다(지속 판정·WARNING은 main._reroll_books_to_spot의 몫).
+    """
+    ws = KISWebSocketClient(approval_key="APV", connection=FakeConnection())
+    manager = RollingSubscriptionManager(ws, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1)
+    assert manager.window_stuck_distance(1001.0) is None  # 창이 아직 없다 — 미기동이지 고착이 아니다
+
+    _run(manager.roll_to_spot(1000.0))
+    assert manager.window_stuck_distance(1001.8) is None   # 임계(1.875) 안 — 정상 유지
+    assert manager.window_stuck_distance(1006.0) == 6.0    # 임계 밖인데 창이 그대로 = 고착 거리
+
+
+def test_window_stuck_distance_respects_the_same_grid_cell_guard():
+    # `should_roll_atm()`의 "임계는 넘었지만 같은 격자 칸" 가드를 그대로 물려받는다 —
+    # 롤링이 정당하게 안 도는 상태를 고착으로 오판하면 이 경보는 신뢰를 잃는다.
+    ws = KISWebSocketClient(approval_key="APV", connection=FakeConnection())
+    manager = RollingSubscriptionManager(
+        ws, tr_id="H0IOCNT0", strike_interval=2.5, strikes_each_side=1, hysteresis_ratio=0.3
+    )
+    _run(manager.roll_to_spot(1000.0))
+    assert manager.window_stuck_distance(1001.0) is None
+
+
 def test_should_roll_atm_does_not_roll_when_the_rounded_grid_point_is_unchanged():
     """임계는 넘었지만 반올림 결과가 같은 칸이면 구독 변경이 없다 — 헛도는 롤링을 만들지 않는다.
 
