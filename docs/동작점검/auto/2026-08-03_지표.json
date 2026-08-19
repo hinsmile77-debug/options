@@ -1,0 +1,837 @@
+{
+  "date": "2026-08-03",
+  "cycles": {
+    "count": 454,
+    "first_start": "07:31",
+    "last_start": "15:44",
+    "rest_seconds": {
+      "n": 454,
+      "mean": 30.39,
+      "median": 29.02,
+      "max": 108.06
+    },
+    "over_60s": 39,
+    "rows_distribution": {
+      "9": 13,
+      "10": 194,
+      "28": 1,
+      "29": 57,
+      "30": 189
+    },
+    "by_hour": [
+      {
+        "hour": 7,
+        "cycles": 28,
+        "rest_mean": 19.0,
+        "rest_max": 29.1,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 0
+      },
+      {
+        "hour": 8,
+        "cycles": 60,
+        "rest_mean": 19.0,
+        "rest_max": 29.4,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 0
+      },
+      {
+        "hour": 9,
+        "cycles": 59,
+        "rest_mean": 25.6,
+        "rest_max": 61.0,
+        "over_60s": 1,
+        "slip_max": 1.2,
+        "foreign_sum": 21
+      },
+      {
+        "hour": 10,
+        "cycles": 59,
+        "rest_mean": 27.7,
+        "rest_max": 108.1,
+        "over_60s": 1,
+        "slip_max": 48.2,
+        "foreign_sum": 46
+      },
+      {
+        "hour": 11,
+        "cycles": 54,
+        "rest_mean": 34.0,
+        "rest_max": 81.8,
+        "over_60s": 6,
+        "slip_max": 22.0,
+        "foreign_sum": 70
+      },
+      {
+        "hour": 12,
+        "cycles": 51,
+        "rest_mean": 35.1,
+        "rest_max": 71.0,
+        "over_60s": 9,
+        "slip_max": 11.2,
+        "foreign_sum": 77
+      },
+      {
+        "hour": 13,
+        "cycles": 51,
+        "rest_mean": 40.0,
+        "rest_max": 97.5,
+        "over_60s": 9,
+        "slip_max": 37.7,
+        "foreign_sum": 118
+      },
+      {
+        "hour": 14,
+        "cycles": 51,
+        "rest_mean": 40.3,
+        "rest_max": 91.3,
+        "over_60s": 9,
+        "slip_max": 31.5,
+        "foreign_sum": 118
+      },
+      {
+        "hour": 15,
+        "cycles": 41,
+        "rest_mean": 30.6,
+        "rest_max": 106.9,
+        "over_60s": 4,
+        "slip_max": 47.1,
+        "foreign_sum": 61
+      }
+    ],
+    "by_mod10": [
+      {
+        "mod10": 0,
+        "cycles": 48,
+        "rest_mean": 51.4,
+        "foreign_mean": 2.5,
+        "foreign_by_group": {
+          "투자자수급": 1.6,
+          "만기유동성": 0.9
+        },
+        "over_60s": 16
+      },
+      {
+        "mod10": 1,
+        "cycles": 34,
+        "rest_mean": 12.9,
+        "foreign_mean": 0.3,
+        "foreign_by_group": {
+          "만기유동성": 0.3
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 2,
+        "cycles": 49,
+        "rest_mean": 40.1,
+        "foreign_mean": 1.4,
+        "foreign_by_group": {
+          "투자자수급": 0.8,
+          "매크로": 0.6,
+          "만기유동성": 0.0
+        },
+        "over_60s": 4
+      },
+      {
+        "mod10": 3,
+        "cycles": 46,
+        "rest_mean": 12.4,
+        "foreign_mean": 0.2,
+        "foreign_by_group": {
+          "만기유동성": 0.2
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 4,
+        "cycles": 50,
+        "rest_mean": 39.9,
+        "foreign_mean": 1.2,
+        "foreign_by_group": {
+          "투자자수급": 1.0,
+          "계좌잔고": 0.2
+        },
+        "over_60s": 4
+      },
+      {
+        "mod10": 5,
+        "cycles": 45,
+        "rest_mean": 19.2,
+        "foreign_mean": 2.1,
+        "foreign_by_group": {
+          "만기유동성": 2.0,
+          "투자자수급": 0.1
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 6,
+        "cycles": 49,
+        "rest_mean": 45.1,
+        "foreign_mean": 1.6,
+        "foreign_by_group": {
+          "투자자수급": 1.4,
+          "만기유동성": 0.1
+        },
+        "over_60s": 8
+      },
+      {
+        "mod10": 7,
+        "cycles": 41,
+        "rest_mean": 14.1,
+        "foreign_mean": 0,
+        "foreign_by_group": {},
+        "over_60s": 0
+      },
+      {
+        "mod10": 8,
+        "cycles": 49,
+        "rest_mean": 44.6,
+        "foreign_mean": 1.4,
+        "foreign_by_group": {
+          "투자자수급": 1.4
+        },
+        "over_60s": 7
+      },
+      {
+        "mod10": 9,
+        "cycles": 43,
+        "rest_mean": 12.1,
+        "foreign_mean": 0,
+        "foreign_by_group": {},
+        "over_60s": 0
+      }
+    ],
+    "missing": {
+      "count": 41,
+      "odd": 39,
+      "even": 2,
+      "list": [
+        "07:32",
+        "08:50",
+        "09:39",
+        "10:01",
+        "11:17",
+        "11:19",
+        "11:21",
+        "11:31",
+        "11:39",
+        "11:41",
+        "12:11",
+        "12:13",
+        "12:15",
+        "12:17",
+        "12:19",
+        "12:21",
+        "12:31",
+        "12:45",
+        "12:47",
+        "13:05",
+        "13:07",
+        "13:09",
+        "13:11",
+        "13:17",
+        "13:31",
+        "13:39",
+        "13:47",
+        "13:51",
+        "14:03",
+        "14:09",
+        "14:11",
+        "14:21",
+        "14:23",
+        "14:31",
+        "14:37",
+        "14:47",
+        "14:51",
+        "15:01",
+        "15:11",
+        "15:13",
+        "15:15"
+      ],
+      "recovered_by_catchup": 35,
+      "unrecovered_count": 6
+    }
+  },
+  "rest": {
+    "total_calls": 13364,
+    "span_seconds": 29639.0,
+    "first_call": "07:31",
+    "last_call": "15:45",
+    "calls_per_second": 0.451,
+    "capacity_pct": 45.1,
+    "deficit_threshold_multiplier": 2.22,
+    "by_group": {
+      "옵션체인": 9972,
+      "만기유동성": 1488,
+      "투자자수급": 1482,
+      "매크로": 319,
+      "계좌잔고": 99,
+      "기동": 4
+    },
+    "by_status": {
+      "200": 13255,
+      "500": 109
+    },
+    "by_hour": {
+      "7": 779,
+      "8": 1628,
+      "9": 1627,
+      "10": 1618,
+      "11": 1626,
+      "12": 1628,
+      "13": 1618,
+      "14": 1624,
+      "15": 1216
+    },
+    "non_200": {
+      "count": 109,
+      "pct": 0.82,
+      "by_group": {
+        "옵션체인": 66,
+        "매크로": 24,
+        "만기유동성": 18,
+        "투자자수급": 1
+      }
+    }
+  },
+  "backoff": {
+    "expand": 91,
+    "recover": 362,
+    "max_multiplier": 2.76,
+    "mean_multiplier_by_hour": {
+      "7": 1.0,
+      "8": 1.0,
+      "9": 1.269,
+      "10": 1.248,
+      "11": 1.449,
+      "12": 1.357,
+      "13": 1.385,
+      "14": 1.218,
+      "15": 1.16
+    },
+    "mean_multiplier": 1.249
+  },
+  "bursts": {
+    "기동": {
+      "burst_count": 1,
+      "calls_per_burst_median": 4,
+      "occupancy_seconds": {
+        "n": 1,
+        "mean": 2.15,
+        "median": 2.15,
+        "max": 2.15
+      },
+      "start_positions_mod10": {
+        "1:01": 1
+      }
+    },
+    "만기유동성": {
+      "burst_count": 149,
+      "calls_per_burst_median": 10,
+      "occupancy_seconds": {
+        "n": 149,
+        "mean": 13.89,
+        "median": 11.47,
+        "max": 54.36
+      },
+      "start_positions_mod10": {
+        "3:16": 33,
+        "5:16": 29,
+        "1:16": 28
+      }
+    },
+    "매크로": {
+      "burst_count": 99,
+      "calls_per_burst_median": 3,
+      "occupancy_seconds": {
+        "n": 99,
+        "mean": 3.28,
+        "median": 2.56,
+        "max": 9.48
+      },
+      "start_positions_mod10": {
+        "7:48": 41,
+        "2:48": 38,
+        "7:49": 6
+      }
+    }
+  },
+  "stalls": [
+    {
+      "at": "10:00",
+      "mod10_minute": 0,
+      "gaps": 4,
+      "total_seconds": 24.5,
+      "mean_gap": 6.1
+    },
+    {
+      "at": "12:29",
+      "mod10_minute": 9,
+      "gaps": 5,
+      "total_seconds": 37.3,
+      "mean_gap": 7.5
+    },
+    {
+      "at": "13:09",
+      "mod10_minute": 9,
+      "gaps": 4,
+      "total_seconds": 34.3,
+      "mean_gap": 8.6
+    },
+    {
+      "at": "13:29",
+      "mod10_minute": 9,
+      "gaps": 6,
+      "total_seconds": 43.6,
+      "mean_gap": 7.3
+    },
+    {
+      "at": "14:09",
+      "mod10_minute": 9,
+      "gaps": 4,
+      "total_seconds": 33.0,
+      "mean_gap": 8.3
+    },
+    {
+      "at": "14:19",
+      "mod10_minute": 9,
+      "gaps": 4,
+      "total_seconds": 38.3,
+      "mean_gap": 9.6
+    },
+    {
+      "at": "14:59",
+      "mod10_minute": 9,
+      "gaps": 4,
+      "total_seconds": 44.2,
+      "mean_gap": 11.0
+    },
+    {
+      "at": "15:19",
+      "mod10_minute": 9,
+      "gaps": 4,
+      "total_seconds": 34.0,
+      "mean_gap": 8.5
+    }
+  ],
+  "slow_calls": {
+    "count": 933,
+    "pacer_dominant": 450,
+    "http_dominant": 483,
+    "total_seconds": {
+      "n": 933,
+      "mean": 3.9,
+      "median": 3.61,
+      "max": 10.0
+    },
+    "pacer_seconds": {
+      "n": 933,
+      "mean": 1.78,
+      "median": 1.61,
+      "max": 6.73
+    },
+    "http_seconds": {
+      "n": 933,
+      "mean": 2.12,
+      "median": 2.05,
+      "max": 10.0
+    },
+    "by_mod10_minute": {
+      "0": 168,
+      "1": 139,
+      "2": 84,
+      "3": 53,
+      "4": 69,
+      "5": 178,
+      "6": 102,
+      "7": 34,
+      "8": 89,
+      "9": 17
+    },
+    "samples": [
+      {
+        "at": "15:00",
+        "total": 10.0,
+        "pacer": 0.0,
+        "http": 10.0,
+        "multiplier": 1.35,
+        "endpoint": "inquire-price"
+      },
+      {
+        "at": "14:30",
+        "total": 9.14,
+        "pacer": 0.78,
+        "http": 8.36,
+        "multiplier": 1.82,
+        "endpoint": "inquire-price"
+      },
+      {
+        "at": "13:45",
+        "total": 8.92,
+        "pacer": 0.0,
+        "http": 8.92,
+        "multiplier": 1.29,
+        "endpoint": "inquire-price"
+      },
+      {
+        "at": "15:00",
+        "total": 8.72,
+        "pacer": 0.0,
+        "http": 8.72,
+        "multiplier": 1.35,
+        "endpoint": "inquire-price"
+      },
+      {
+        "at": "13:15",
+        "total": 8.27,
+        "pacer": 3.42,
+        "http": 4.84,
+        "multiplier": 1.16,
+        "endpoint": "inquire-asking-price"
+      }
+    ]
+  },
+  "catchups": {
+    "count": 35,
+    "minutes": [
+      "09:39",
+      "11:17",
+      "11:19",
+      "11:21",
+      "11:31",
+      "11:39",
+      "11:41",
+      "12:11",
+      "12:13",
+      "12:15",
+      "12:17",
+      "12:19",
+      "12:21",
+      "12:31",
+      "12:45",
+      "12:47",
+      "13:05",
+      "13:07",
+      "13:09",
+      "13:17",
+      "13:31",
+      "13:39",
+      "13:47",
+      "13:51",
+      "14:03",
+      "14:09",
+      "14:11",
+      "14:21",
+      "14:23",
+      "14:31",
+      "14:37",
+      "14:47",
+      "14:51",
+      "15:13",
+      "15:15"
+    ]
+  },
+  "poller_phase": {
+    "계좌잔고": {
+      "mode_second": 48,
+      "top_seconds": {
+        "48": 53,
+        "50": 18,
+        "51": 10
+      },
+      "minutes_mod10": {
+        "4": 50,
+        "9": 49
+      },
+      "burst_count": 99
+    },
+    "기동": {
+      "mode_second": 1,
+      "top_seconds": {
+        "1": 1
+      },
+      "minutes_mod10": {
+        "1": 1
+      },
+      "burst_count": 1
+    },
+    "만기유동성": {
+      "mode_second": 16,
+      "top_seconds": {
+        "16": 90,
+        "18": 16,
+        "19": 11
+      },
+      "minutes_mod10": {
+        "1": 50,
+        "3": 50,
+        "5": 49
+      },
+      "burst_count": 149
+    },
+    "매크로": {
+      "mode_second": 48,
+      "top_seconds": {
+        "48": 79,
+        "49": 7,
+        "52": 5
+      },
+      "minutes_mod10": {
+        "2": 50,
+        "7": 49
+      },
+      "burst_count": 99
+    },
+    "옵션체인": {
+      "mode_second": 3,
+      "top_seconds": {
+        "3": 1
+      },
+      "minutes_mod10": {
+        "1": 1
+      },
+      "burst_count": 1
+    },
+    "투자자수급": {
+      "mode_second": 42,
+      "top_seconds": {
+        "42": 11,
+        "43": 6,
+        "40": 1
+      },
+      "minutes_mod10": {
+        "0": 1,
+        "1": 2,
+        "4": 3,
+        "6": 7,
+        "8": 5
+      },
+      "burst_count": 18
+    }
+  },
+  "log_volume": {
+    "total_bytes": 3491132,
+    "total_lines": 17993,
+    "httpx_bytes": 2955232,
+    "httpx_pct": 84.6,
+    "human_lines": 4629,
+    "by_level": {
+      "INFO": 14307,
+      "WARNING": 1087
+    }
+  },
+  "qualitative": {
+    "http_status_error": 105,
+    "egw00201": 87,
+    "remote_protocol_error": 8,
+    "read_timeout": 1
+  },
+  "failures": {
+    "옵션 체인 폴링 실패": 69,
+    "만기 유동성 폴링 실패": 20,
+    "ZN(10년 국채선물) 근월물 조회 실패": 9,
+    "ES(E-mini S&P500) 근월물 조회 실패": 9,
+    "VIX 차근월물 조회 실패": 4,
+    "USDCNH 선물 조회 실패": 2,
+    "투자자 수급 폴링 실패": 1
+  },
+  "overrun": {
+    "count": 39,
+    "max_seconds": 48.2,
+    "total_seconds": 487.8
+  },
+  "db": {
+    "monthly_coverage": {
+      "expiry": "2026-08-13",
+      "minutes": 489,
+      "elapsed_minutes": 495,
+      "coverage_pct": 98.8
+    },
+    "tables": [
+      {
+        "table": "option_analysis_1m",
+        "rows": 9755,
+        "minutes": 489,
+        "note": "옵션체인 그릭스"
+      },
+      {
+        "table": "underlying_spot_1m",
+        "rows": 489,
+        "minutes": 489,
+        "note": "기초자산 스팟"
+      },
+      {
+        "table": "market_raw_1m",
+        "rows": 1798,
+        "minutes": 410,
+        "note": "WS 체결 1분봉"
+      },
+      {
+        "table": "investor_flow_1m",
+        "rows": 494,
+        "minutes": 494,
+        "note": "투자자 수급"
+      },
+      {
+        "table": "expiry_liquidity_1m",
+        "rows": 131,
+        "minutes": 131,
+        "note": "만기 유동성"
+      },
+      {
+        "table": "macro_snapshot_5m",
+        "rows": 99,
+        "minutes": 99,
+        "note": "매크로"
+      },
+      {
+        "table": "account_balance_snapshots",
+        "rows": 99,
+        "minutes": 99,
+        "note": "계좌 잔고"
+      },
+      {
+        "table": "signal_decisions",
+        "rows": 494,
+        "minutes": 494,
+        "note": "판단"
+      },
+      {
+        "table": "risk_snapshots",
+        "rows": 494,
+        "minutes": 494,
+        "note": "리스크 스냅샷"
+      },
+      {
+        "table": "regime_state",
+        "rows": 410,
+        "minutes": 410,
+        "note": "레짐"
+      },
+      {
+        "table": "feature_store",
+        "rows": 410,
+        "minutes": 410,
+        "note": "레짐 피처"
+      },
+      {
+        "table": "rate_limiter_status_history",
+        "rows": 454,
+        "minutes": 454,
+        "note": "레이트리밋 이력"
+      },
+      {
+        "table": "market_halt_event_history",
+        "rows": 0,
+        "minutes": 0,
+        "note": "CB 전이 이력"
+      }
+    ],
+    "book_coverage": [
+      {
+        "series": "regular",
+        "expiry": "2026-08-13",
+        "minutes": 489,
+        "coverage_pct": 100.0
+      },
+      {
+        "series": "weekly_mon",
+        "expiry": "2026-08-03",
+        "minutes": 247,
+        "coverage_pct": 50.5
+      },
+      {
+        "series": "weekly_thu",
+        "expiry": "2026-08-06",
+        "minutes": 247,
+        "coverage_pct": 50.5
+      }
+    ],
+    "signal_decisions": [
+      {
+        "decision": "REJECT",
+        "conviction": "STANDARD",
+        "reject_reason": "strategy_palette:wait_only",
+        "count": 419
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "NO_TRADE",
+        "reject_reason": "meta_label:no_trade",
+        "count": 75
+      }
+    ],
+    "risk_gate_distinct": 4,
+    "regime": [
+      {
+        "regime": "2",
+        "today": 410,
+        "total": 7791,
+        "days": 20
+      }
+    ],
+    "feature_store": {
+      "today": 410,
+      "total": 6213,
+      "hmm_threshold": 8000,
+      "hmm_progress_pct": 77.7,
+      "non_neutral_pct": {
+        "rv_ratio": 0.0,
+        "book_thinning": 99.0
+      }
+    },
+    "macro": {
+      "vix_front": {
+        "non_null": 99,
+        "distinct": 11
+      },
+      "vix_next": {
+        "non_null": 95,
+        "distinct": 9
+      },
+      "vix_term_structure": {
+        "non_null": 95,
+        "distinct": 26
+      },
+      "usdcnh": {
+        "non_null": 97,
+        "distinct": 42
+      },
+      "es_front": {
+        "non_null": 99,
+        "distinct": 53
+      },
+      "zn_front": {
+        "non_null": 9,
+        "distinct": 4
+      },
+      "us10y_yield": {
+        "non_null": 2,
+        "distinct": 1
+      },
+      "usdkrw": {
+        "non_null": 2,
+        "distinct": 2
+      },
+      "move_index": {
+        "non_null": 2,
+        "distinct": 1
+      }
+    },
+    "market_halt": {
+      "updated_at": "15:41:06",
+      "last_message_at": null
+    },
+    "remaining_processes": 0,
+    "rate_limiter": {
+      "rows": 454,
+      "overrun_rows": 39,
+      "max_multiplier": 2.46,
+      "mean_multiplier": 1.217
+    }
+  }
+}
