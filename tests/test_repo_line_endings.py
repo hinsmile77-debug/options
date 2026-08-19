@@ -74,6 +74,36 @@ def test_no_tracked_file_mixes_line_endings():
     )
 
 
+def test_every_text_file_in_the_working_tree_is_lf():
+    """**`.gitattributes`가 정한 것은 워킹트리도 LF라는 것이다**(`* text=auto eol=lf`).
+
+    mixed만 막으면 절반이다 — 파일 **전체**가 CRLF로 되돌아가는 회귀는 그 검사를 통과한다.
+    그리고 그 회귀는 실제로 일어난다: 2026-08-19에 정규화를 마친 직후, 문서를 편집한
+    파이썬 한 줄이 두 파일을 통째로 CRLF로 되돌렸다.
+
+        pathlib.Path(p).write_text(s)      # Windows에서 \\n -> \\r\\n (os.linesep)
+
+    텍스트 모드의 기본 `newline=None`이 **쓸 때** `os.linesep`으로 변환하기 때문이다.
+    고치는 법은 `newline="\\n"`을 넘기거나(`open(p, "w", newline="\\n")`),
+    이 저장소처럼 **테스트가 잡게 하는 것**이다. git은 커밋 시 조용히 정규화하므로
+    인덱스만 보면 이 회귀는 영원히 안 보인다.
+
+    위반을 고치는 법: `rm <파일> && git checkout -- <파일>`(커밋된 내용으로 재체크아웃).
+    """
+    offenders = []
+    for path in _tracked_files():
+        if path.suffix.lower() in (".bat", ".cmd"):
+            continue  # 아래 테스트가 따로 지킨다 — 이쪽은 CRLF가 규칙이다
+        crlf, lf = _line_endings(path)
+        if crlf:
+            offenders.append(f"{path.relative_to(PROJECT_ROOT)} (CRLF {crlf}줄)")
+    assert not offenders, (
+        "워킹트리에 CRLF 텍스트 파일이 있다 — `.gitattributes`는 `eol=lf`를 정했고, "
+        "이것을 되돌리는 흔한 원인은 파이썬 `write_text()`(Windows에서 os.linesep 변환)다. "
+        f"`rm <파일> && git checkout -- <파일>`로 되돌릴 것: {offenders}"
+    )
+
+
 def test_windows_batch_files_stay_crlf():
     """`.bat`은 **우리가 안 짜는 파서(cmd.exe)** 에 넘기는 유일한 파일이다.
 
