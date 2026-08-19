@@ -560,7 +560,9 @@ class LoopScan:
         if LATENCY_TOKEN in msg:
             for it in LATENCY_ITEM_RE.finditer(msg):
                 if it.group(1) == CHAIN_ENDPOINT:
-                    self.latency_p50[hh].append((int(it.group(2)), float(it.group(3))))
+                    # 2026-08-19 Fix#7 — **창 시각을 함께 싣는다.** 종전에는 `(건수, p50)`만
+                    # 남겨 5분 창의 시계열이 시간대 안에서 사라졌다. 근거는 `window_latency_p50`.
+                    self.latency_p50[hh].append((hhmmss, int(it.group(2)), float(it.group(3))))
 
         for key, tokens in ALWAYS_QUOTE.items():
             if any(t in msg for t in tokens):
@@ -620,10 +622,42 @@ class LoopScan:
         **그 20~60분 뒤 84분 전멸이 시작됐다.** 평균만 보는 눈은 선행 신호를 평탄화해 버린다.
         """
         items = self.latency_p50.get(hour) or []
-        total = sum(n for n, _ in items)
+        total = sum(n for _at, n, _p in items)
         if not total:
             return None, None
-        return round(sum(n * p for n, p in items) / total, 2), round(max(p for _, p in items), 2)
+        return (round(sum(n * p for _at, n, p in items) / total, 2),
+                round(max(p for _at, _n, p in items), 2))
+
+    def window_latency_p50(self):
+        """반환: 그날 전 창을 시각순으로 `[(창시각, 호출 수, p50)]`. 없으면 빈 목록.
+
+        ## 시간대 표는 절벽을 눌러 없앤다 (2026-08-19 §2-5 / Fix#7)
+
+        08-19 13시 행은 「창 최대 1.01 ⛔」 **한 줄**인데 실제로는
+        `13:01` 0.84 → `13:06` **1.01** → `13:11` 0.69로 **6분 만에 오르내렸다.**
+        그 시계열을 14:30 회차가 **손으로 다시 파싱해야 했다.**
+
+        정답이 있는 검증: 08-14는 `13:51` 0.90(경고 최초)·`14:06` 1.01(위험 최초)이고
+        그 두 숫자는 사람이 이미 손으로 구해 뒀다 —
+        `tests/test_evidence_collector_latency.py`가 그것으로 이 함수를 잡는다.
+        """
+        out = []
+        for hour in sorted(self.latency_p50):
+            out.extend(self.latency_p50[hour])
+        return sorted(out)
+
+    def first_latency_breach(self, timeout, ratio):
+        """반환: `p50/timeout`이 `ratio`에 **처음 닿은** 창 `(창시각, 호출 수, p50, 비율)`. 없으면 None.
+
+        **최대가 아니라 최초다.** 최대는 「얼마나 나빴나」이고 최초는 **「언제부터 나빴나」**다.
+        08-14에 위험선 최초 돌파(`14:06`)와 전멸 시작(`14:00`) 사이가 그 하루의 전부였다.
+        """
+        if not timeout:
+            return None
+        for at, n, p50 in self.window_latency_p50():
+            if p50 / timeout >= ratio:
+                return at, n, p50, round(p50 / timeout, 2)
+        return None
 
     def anchor_hits(self, phases):
         out = []
@@ -1090,6 +1124,28 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         A(f"수집 예산 **{CHAIN_COLLECT_BUDGET_SECONDS:.0f}초** · "
           f"`{CHAIN_ENDPOINT}` read timeout **{timeout:.1f}초**")
         A("")
+        # ===== 2026-08-19 §2-5 / Fix#7 — **시간대 표는 절벽을 눌러 없앤다** =====
+        #
+        # 08-19 13시 행은 「창 최대 1.01 ⛔」 한 줄인데 실제로는 `13:01` 0.84 → `13:06` **1.01**
+        # → `13:11` 0.69로 **6분 만에 오르내렸다.** 14:30 회차가 그 시계열을 손으로 다시
+        # 파싱해야 했다. 최초 돌파 창을 한 줄로 인쇄한다 — **최대는 「얼마나 나빴나」이고
+        # 최초는 「언제부터 나빴나」다.** 08-14에 위험선 최초 돌파(14:06)와 전멸 시작(14:00)
+        # 사이가 그 하루의 전부였다.
+        warn_at = scan.first_latency_breach(timeout, P50_TIMEOUT_WARN_RATIO)
+        danger_at = scan.first_latency_breach(timeout, 1.0)
+        windows = scan.window_latency_p50()
+        if windows:
+            def _breach(label, hit, mark):
+                if hit is None:
+                    return f"- {label} 최초 돌파: **없음**"
+                at, n, p50, ratio = hit
+                return f"- {label} 최초 돌파: **{at[:5]}** — p50 {p50:.2f}초 / {n}건 (비율 **{ratio:.2f}**) {mark}"
+            A(_breach(f"경고선(비율 {P50_TIMEOUT_WARN_RATIO:.2f})", warn_at, "⚠"))
+            A(_breach("위험선(비율 1.00)", danger_at, "⛔"))
+            tsv = write_latency_windows(root, day, windows, timeout)
+            A(f"- 전체 **{len(windows)}창**: "
+              + (f"`auto/{D}_지연창.tsv`" if tsv else "⚠ 파일로 못 뺐다(본문만 유효)"))
+            A("")
         A("| 시간대 | 사이클 | rows=0 | REST수집 평균(초) | 예산 대비 | p50 평균 | 창 최대 p50 | 최대/timeout | |")
         A("|---|---|---|---|---|---|---|---|---|")
         for hh in sorted(scan.cycle_rest):
@@ -1105,7 +1161,11 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                 mark = "⛔"
             elif (ratio is not None and ratio >= P50_TIMEOUT_WARN_RATIO) or budget_ratio >= BUDGET_WARN_RATIO:
                 mark = "⚠"
-            A(f"| {hh:02d}시 | {len(rests)} | {sum(1 for r in rows if r == 0)} | {mean:.1f} | "
+            # 2026-08-19 §2-5 — **그 시간대에 재기동이 있었으면 숫자가 오염돼 있다.**
+            # 08-19 10시가 그랬는데 표만 보면 알 수 없었다(10:36 재기동).
+            restarts = [t[:5] for t, _m in scan.process_starts if t[:2] == f"{hh:02d}"]
+            hour_label = f"{hh:02d}시" + ("".join(f" ⟳{t}" for t in restarts) if restarts else "")
+            A(f"| {hour_label} | {len(rests)} | {sum(1 for r in rows if r == 0)} | {mean:.1f} | "
               f"{budget_ratio * 100:.0f}% | {'—' if p50 is None else f'{p50:.2f}'} | "
               f"{'—' if p50_max is None else f'{p50_max:.2f}'} | "
               f"{'—' if ratio is None else f'{ratio:.2f}'} | {mark or '—'} |")
@@ -1579,6 +1639,34 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     A("")
     A(f"*원본이 필요하면: `grep '{D}' logs/observation_loop.log*` 로 그 줄만 직접 열 것.*")
     return "\n".join(L)
+
+
+def write_latency_windows(root: Path, day: _date, windows, timeout) -> Path | None:
+    """5분 창 전량을 `auto/{날짜}_지연창.tsv`로 뺀다. 반환: 쓴 경로(못 쓰면 None).
+
+    입력: 리포 루트 · 날짜 · `LoopScan.window_latency_p50()` · 그날 실제 read timeout.
+    계산: `창시각 · 호출수 · p50 · p50/timeout` 네 열. 정렬은 시각순(입력 그대로).
+    해석: 표는 **돌파 창만** 인쇄하고 전량은 여기로 뺀다 — 98창을 md에 실으면 그 표가
+         §5-1을 통째로 밀어낸다. 손으로 다시 파싱하는 일(08-19 14:30 회차)이 없어지는 것이
+         이 파일의 전부다.
+    실패 조건: 쓰기에 실패해도 **조용히 None** — 증거 본문이 이것 때문에 안 나오면 안 된다.
+    """
+    if not windows:
+        return None
+    try:
+        out = root / "docs" / "동작점검" / "auto" / f"{day.isoformat()}_지연창.tsv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # 탭·개행은 `chr()`로 적는다 — 이 파일은 소스에 탭 문자를 두지 않는다.
+        tab, lf = chr(9), chr(10)
+        head = tab.join(("창시각", "호출수", "p50초", "p50/timeout"))
+        rows = [head]
+        for at, n, p50 in windows:
+            ratio = f"{p50 / timeout:.2f}" if timeout else "-"
+            rows.append(tab.join((at, str(n), f"{p50:.2f}", ratio)))
+        out.write_text(lf.join(rows) + lf, encoding="utf-8", newline=lf)
+        return out
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ===== 증거 다이제스트 정리 (2026-08-19 신설) =====

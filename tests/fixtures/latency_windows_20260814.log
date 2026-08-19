@@ -1,0 +1,5 @@
+2026-08-14 13:46:13,101 INFO:mahdi.main:REST 응답시간(300초 창): inquire-price=61건 2.98/4.01/4.05/4.05초 overseas-inquire-price=5건 3.10/4.03/4.03/4.03초
+2026-08-14 13:51:13,139 INFO:mahdi.main:REST 응답시간(300초 창): inquire-price=60건 3.53/4.05/4.05/4.05초 overseas-inquire-price=5건 3.59/4.03/4.03/4.03초
+2026-08-14 13:56:13,140 INFO:mahdi.main:REST 응답시간(300초 창): inquire-price=58건 3.21/4.05/4.05/4.05초
+2026-08-14 14:06:13,142 INFO:mahdi.main:REST 응답시간(300초 창): inquire-price=53건 4.03/4.06/4.08/4.08초 overseas-inquire-price=3건 4.05/4.06/4.06/4.06초
+2026-08-14 14:11:13,150 INFO:mahdi.main:REST 응답시간(300초 창): inquire-price=49건 4.06/4.09/4.09/4.09초
