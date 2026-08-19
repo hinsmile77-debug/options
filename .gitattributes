@@ -1,0 +1,65 @@
+# 줄바꿈 정규화 — **저장소가 자기 규칙을 스스로 들고 다닌다** (2026-08-19, 08-17 Fix#4 / 08-18 Fix#9)
+#
+# ## 왜 필요한가 — 규칙이 PC 설정에 얹혀 있었다
+#
+# 이 PC의 `core.autocrlf=true`는 **시스템 gitconfig**(`C:/Program Files/Git/etc/gitconfig`)에서
+# 온다. 저장소 것도, 사용자 것도 아니다. 즉 **줄바꿈 규칙이 저장소 밖에 있었고**, 다른 PC가
+# 그 값을 다르게 들고 있으면 같은 커밋이 다른 바이트로 체크아웃된다.
+# 「어느 PC서 pull해도 동작해야 한다」는 이 저장소의 규약이 정확히 이 자리에서 깨져 있었다.
+#
+# ## 08-19 실측 — 워킹트리가 세 갈래로 갈려 있었다
+#
+#     인덱스   전부 LF (i/lf 305 · i/-text 25 · i/none 13)   ← 이미 정규화돼 있다
+#     워킹트리 CRLF 154 · LF 145 · **mixed 6**
+#
+# **인덱스가 이미 LF라 이 파일을 넣어도 커밋 diff가 없다.** 바뀌는 것은 워킹트리뿐이고,
+# 그래서 지금(작업 트리가 깨끗한 날) 착수하는 것이 08-18 Fix#9가 기다리던 조건이었다.
+#
+# ## mixed 6건이 진짜 오염이다
+#
+# 한 파일 안에 CRLF 줄과 LF 줄이 섞여 있었다. 원인은 **heredoc/스크립트 append**다 —
+# `cat >> file` 이나 파이썬이 쓴 줄은 LF인데 원본은 CRLF라 그 파일이 반반이 된다.
+# 08-19에 `scripts/start_mahdi_premarket.bat`이 그렇게 됐다(추가한 11줄만 LF).
+#
+# 그 bat은 08-20 07:30 기동에 쓰이므로 격리 환경에서 **실제로 cmd로 돌려 확인했다** —
+# LF 줄도 정상 실행된다(단순 `echo`). 즉 그날의 운영 위험은 없었다. 그래도 오염은 오염이고,
+# `goto` 레이블·괄호 블록이 나중에 들어가면 그때는 실제로 깨진다.
+#
+# ## 왜 `eol=lf`인가 — 도구가 쓰는 것과 맞춘다
+#
+# 이 저장소를 실제로 쓰는 것은 파이썬·pytest·에이전트의 파일 쓰기이고 **전부 LF를 쓴다.**
+# 워킹트리를 CRLF로 두면 (1) 매 `git add`가 「LF will be replaced by CRLF」 경고를 뿌리고
+# (2) append할 때마다 mixed가 새로 생기며 (3) 읽고 쓸 때마다 변환 비용을 낸다.
+# LF로 통일하면 셋 다 사라진다. **Windows 전용 운영이지만 그 사실이 CRLF를 요구하지 않는다** —
+# 파이썬도 git도 LF를 문제없이 읽는다.
+#
+# 예외는 `.bat`/`.cmd`뿐이다. cmd.exe가 LF를 처리한다는 것은 위에서 실측했지만, 배치는
+# **우리가 안 짜는 파서에 넘기는 유일한 파일**이라 보수적으로 CRLF에 못 박는다.
+# 여기서 아끼는 것은 없고, 틀렸을 때 잃는 것은 아침 기동 전체다.
+
+# 기본: 텍스트로 판정되는 모든 파일은 인덱스·워킹트리 모두 LF.
+* text=auto eol=lf
+
+# Windows 배치 — cmd.exe에 넘기는 파일이라 CRLF를 강제한다(위 주석).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 바이너리 — 변환 금지. `text=auto` 자동 판정에 맡기지 않고 명시한다:
+# 자동 판정은 파일 앞부분만 보므로 드물게 텍스트로 오판할 수 있고, 그때 그 파일은 조용히 깨진다.
+*.xls  binary
+*.xlsx binary
+*.pdf  binary
+*.pptx binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.gz   binary
+*.pkl  binary
+*.joblib binary
+*.parquet binary
+*.db   binary
+*.sqlite binary
+*.sqlite3 binary
