@@ -43,6 +43,11 @@ WATCHDOG_LOG_FILENAME = "watchdog.log"
 # 「점검이 제때 있었다」로 읽히므로, `tests/test_ops_watchdog_metrics.py`가 일치를 강제한다.
 MISSING_CHECK_MARKER = "MISSING_CHECK"
 
+# `watchdog_observation_loop._LOCK_SWEEP_MARKER`의 복제본(2026-08-19). 같은 이유로 계약
+# 테스트가 일치를 강제한다 — 갈라지면 청소 건수가 0으로 세어지고, 그 0은 「락이 안 남았다」로
+# 읽힌다. 실제로는 **세션 teardown이 git을 죽이고 있다**는 신호를 통째로 잃는 것이다.
+LOCK_SWEEP_MARKER = "LOCK_SWEPT"
+
 # `[2026-08-12 10:14:01] RESTART — ...` / `[...] OK — ...` / `[...] 재기동 시도: ...`
 _LINE_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})\]\s*(.*)$")
 
@@ -78,6 +83,7 @@ def parse(lines: list[str], target: date) -> dict:
     alert_only = 0
     degraded = 0
     missing_check = 0
+    lock_swept = 0
     for line in lines:
         m = _LINE_RE.match(line.rstrip("\n"))
         if not m:
@@ -89,7 +95,11 @@ def parse(lines: list[str], target: date) -> dict:
         )
         body = m.group(5)
         stamps.append(at)
-        if body.startswith(MISSING_CHECK_MARKER):
+        if body.startswith(LOCK_SWEEP_MARKER):
+            # 2026-08-19 — **관측 루프와 무관한 축이다.** 저장소가 막혀 있던 것이고, 워치독은
+            # 그것을 연 것뿐이다. `restarts`/`degraded`와 섞으면 「루프가 아팠다」로 읽힌다.
+            lock_swept += 1
+        elif body.startswith(MISSING_CHECK_MARKER):
             # 2026-08-19 (08-18 §1-2 / Fix#4) — **관측 루프 이상이 아니다.** 루프는 멀쩡한데
             # 사람의 장전 점검이 09:00까지 안 뜬 것이고, 08-18에는 인프라가 하루 종일 초록인
             # 채로 그 회차가 298분 늦었다. `restarts`/`degraded`와 섞으면 조치가 뒤섞인다.
@@ -129,6 +139,10 @@ def parse(lines: list[str], target: date) -> dict:
         # 2026-08-19 Fix#4. **0은 두 가지다**(규약 C): 키가 있고 0이면 「장전 점검이 제때 있었다」,
         # 키가 아예 없으면 「그날은 이 판정 자체가 없던 버전이다」. 그 구분이 이 키의 존재 이유다.
         "missing_check_alerts": missing_check,
+        # 2026-08-19. **0은 두 가지다**(규약 C): 키가 있고 0이면 「버려진 락이 없었다」,
+        # 키가 없으면 「그날은 이 청소 자체가 없던 버전이다」. 그리고 이 값이 **자라는 것 자체가
+        # 신호**다 — 세션 teardown이 git 프로세스를 자주 죽이고 있다는 뜻이다.
+        "stale_lock_sweeps": lock_swept,
         "max_silence_minutes": round(max_gap, 1),
         # 2026-08-12 규약 F — **주장 지표는 절대 건수로 세우지 않는다.**
         #

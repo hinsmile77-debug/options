@@ -285,12 +285,24 @@ def _render_watchdog(watchdog: dict) -> list[str]:
         # RESTART는 「조치했다」이고 DEGRADED는 「조치하지 않기로 했다」이다(원인이 KIS 쪽이면
         # 재기동은 관측만 끊는다). 둘을 합치면 다음날 "워치독이 몇 번 개입했나"에 답할 수 없다.
         ["적재 정지(DEGRADED)", _fmt(watchdog.get("degraded_checks"), "{}")],
+        # 2026-08-19 — **관측 루프와 무관한 축.** 저장소가 막혀 있던 것을 워치독이 연 것이고,
+        # 이 값이 자라는 것 자체가 「세션 teardown이 git을 죽이고 있다」는 신호다.
+        ["버려진 git 락 청소", _fmt(watchdog.get("stale_lock_sweeps"), "{}")],
         ["첫 판정 / 마지막 판정",
          f"{watchdog.get('first_at') or '—'} / {watchdog.get('last_at') or '—'}"],
         ["**최장 무판정 구간**",
          f"**{_fmt(silence, '{:.0f}')}분** ({watchdog.get('max_silence_window') or '—'})"],
     ]
     out = _table(["지표", "값"], rows)
+    swept = watchdog.get("stale_lock_sweeps")
+    if swept:
+        out.append(
+            f"> 🧹 **버려진 `.git/index.lock`을 {swept}건 열었다.** 0바이트 락이 10분 넘게 "
+            "방치돼 있었고 그 사이 git 프로세스가 0개였다 — **트리 킬의 지문**이다"
+            "(08-18 16:20 · 08-19 12:41에 각각 자동 점검 세션이 마지막 산출물을 쓴 그 분에 생겼다). "
+            "워치독이 열지 않으면 사람이 다음 커밋을 시도할 때까지 조용하다 — 08-19에 4시간 18분이 "
+            "그랬다. **잦아지면 청소가 아니라 원인을 봐야 한다**(`mahdi/git_lock.py`)."
+        )
     if watchdog.get("checks") == 0:
         out.append(
             "> ⛔ **그날 워치독이 한 줄도 안 남겼다** — 미등록이거나 통째로 안 돈 날이다. "

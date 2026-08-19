@@ -200,3 +200,51 @@ def test_the_marker_matches_the_script_that_writes_it():
 
     loop = importlib.import_module("scripts.watchdog_observation_loop")
     assert loop._MISSING_CHECK_MARKER == watchdog_metrics.MISSING_CHECK_MARKER
+
+
+# ===== 2026-08-19 — 버려진 git 락 청소 =====
+#
+# 0바이트 `.git/index.lock`이 이틀 연속 남아 다음 git 작업을 전부 막았다(08-18 16:20 ·
+# 08-19 12:41). 워치독이 그것을 열고, 이 지표가 **연 횟수**를 센다 — 그 값이 자라는 것 자체가
+# 「세션 teardown이 git을 죽이고 있다」는 신호다.
+
+
+def test_a_lock_sweep_is_counted_on_its_own_axis():
+    """**관측 루프와 무관한 축이다.** 저장소가 막혀 있던 것이고 루프는 멀쩡했다."""
+    lines = _healthy_day() + [
+        f"[2026-08-12 16:20:01] {watchdog_metrics.LOCK_SWEEP_MARKER} — 버려진 git 락을 열었다: .git/index.lock"
+    ]
+    metrics = watchdog_metrics.parse(lines, _TARGET)
+    assert metrics["stale_lock_sweeps"] == 1
+    assert metrics["restarts"] == 0
+    assert metrics["degraded_checks"] == 0
+    assert metrics["missing_check_alerts"] == 0
+
+
+def test_a_quiet_day_reports_zero_sweeps_not_a_missing_key():
+    """규약 C — 「버려진 락이 없었다」와 「이 청소가 없던 버전이다」를 소비측이 갈라야 한다."""
+    assert watchdog_metrics.parse(_healthy_day(), _TARGET)["stale_lock_sweeps"] == 0
+
+
+def test_the_sweep_marker_matches_the_script_that_writes_it():
+    """갈라지면 청소 건수가 0으로 세어지고, 그 0은 「락이 안 남았다」로 읽힌다."""
+    import importlib
+
+    loop = importlib.import_module("scripts.watchdog_observation_loop")
+    assert loop._LOCK_SWEEP_MARKER == watchdog_metrics.LOCK_SWEEP_MARKER
+
+
+def test_report_shouts_when_it_had_to_open_a_lock():
+    out = report.render(
+        {"date": "2026-08-19"},
+        watchdog={
+            "checks": 53, "restarts": 0, "restart_failures": 0, "alert_only": 0,
+            "degraded_checks": 0, "missing_check_alerts": 0, "stale_lock_sweeps": 2,
+            "max_silence_minutes": 10.0, "max_silence_window": "08:50~09:00",
+            "first_at": "07:40:02", "last_at": "15:40:01",
+            "silence_warn_minutes": watchdog_metrics.SILENCE_WARN_MINUTES,
+        },
+    )
+    assert "버려진 git 락 청소" in out
+    assert "트리 킬의 지문" in out
+    assert "잦아지면 청소가 아니라 원인을 봐야 한다" in out

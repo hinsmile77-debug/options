@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mahdi import liveness, market_calendar, notify
+from mahdi import git_lock, liveness, market_calendar, notify
 from mahdi.config.settings import PROJECT_ROOT
 from mahdi.data import db
 
@@ -88,6 +88,27 @@ _MISSING_CHECK_MARKER = "MISSING_CHECK"
 # **매번 새 dict를 만들어** 세 키만 남기기 때문이다 — 거기 얹은 값은 조용히 사라지고, 그러면
 # 경보가 매분 울린다. 08-12 Fix#8이 `.watchdog_last_check.json`을 따로 만든 것과 같은 형태다.
 _MISSING_CHECK_STATE = LOG_DIR / ".watchdog_missing_check.json"
+
+# ===== 2026-08-19 — 버려진 `.git/index.lock`을 연다 =====
+#
+# 0바이트 락이 이틀 연속 남아 다음 git 작업을 전부 막았다(08-18 16:20 · 08-19 12:41, 각각
+# 자동 점검 세션이 마지막 산출물을 쓴 그 분). 원인·안전 조건·재현은 `mahdi/git_lock.py`
+# 모듈 docstring에 있다 — 요지는 **0바이트 index.lock이 트리 킬의 지문**이라는 것이다.
+#
+# ## 왜 창 밖에서도 도는가
+#
+# 락 #1은 **16:20**에 생겼다 — `liveness.WATCH_WINDOW_END`(15:45) 밖이다. 감시 창에 가두면
+# 그 락은 영영 안 치워진다. 사람은 장이 끝난 뒤에 커밋하고, 이 결함은 **그때 처음 보인다**
+# (08-19에 실제로 4시간 18분을 그렇게 있었다).
+#
+# ## 왜 `stopped_at`/`holiday` 게이트를 안 쓰는가
+#
+# 그 둘은 「시장이 없으니 관측을 판정하지 않는다」는 뜻이다. 버려진 락은 시장과 무관하고,
+# **사람이 시스템을 꺼 둔 날에도 저장소는 쓴다.** 게이트를 물리면 가장 필요한 날에 안 돈다.
+_LOCK_SWEEP_REPO = PROJECT_ROOT
+# `ops.watchdog_metrics`가 이 마커로 그 줄을 센다 — 복제본이고, 계약 테스트가 일치를 지킨다
+# (`_MISSING_CHECK_MARKER`와 같은 규약: 로직은 모듈에, 스크립트는 얇게).
+_LOCK_SWEEP_MARKER = "LOCK_SWEPT"
 
 
 def _premarket_check_missing(now: datetime) -> bool:
@@ -269,6 +290,16 @@ def _recent_ingest_minutes(now: datetime) -> int | None:
 
 def main() -> None:
     now = db.local_now()
+    # 2026-08-19 — **모든 게이트보다 먼저, 감시 창과 무관하게.** 위 `_LOCK_SWEEP_REPO` 주석 참고:
+    # 락 #1이 16:20(창 밖)에 생겼고, 사람이 커밋을 시도할 때까지 4시간 18분 조용했다.
+    # 조용히 치우지 않는다 — 지운 사실은 로그에 남고 `ops.watchdog_metrics`가 그것을 센다.
+    for swept in git_lock.sweep(_LOCK_SWEEP_REPO, now):
+        _log(
+            f"[{now:%Y-%m-%d %H:%M:%S}] {_LOCK_SWEEP_MARKER} — 버려진 git 락을 열었다: "
+            f"{swept['path']} ({swept['size']}바이트 · {swept['age_minutes']}분 방치 · "
+            "그 사이 git 프로세스 0개). **세션 teardown이 git을 죽인 흔적이다** — "
+            "잦아지면 원인을 다시 볼 것(mahdi/git_lock.py)."
+        )
     beat = liveness.read_heartbeat(liveness.heartbeat_path(LOG_DIR))
     state = _read_state()
     # 2026-08-17 — 사람이 일부러 껐는가. **적재 조회보다 먼저 본다**: 정지 중이라면 DB를 열

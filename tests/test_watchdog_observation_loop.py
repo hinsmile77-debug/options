@@ -25,10 +25,11 @@
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -202,3 +203,62 @@ def test_a_new_day_alerts_again(monkeypatch, tmp_path):
     watchdog._alert_missing_premarket_check(datetime(2026, 8, 18, 9, 0))
     assert watchdog._alert_missing_premarket_check(datetime(2026, 8, 19, 9, 0)) is True
     assert len(sent) == 2
+
+
+# ===== 2026-08-19 — 버려진 git 락 청소가 **모든 게이트보다 먼저** 돈다 =====
+#
+# 락 #1은 **16:20**에 생겼다 — `liveness.WATCH_WINDOW_END`(15:45) **밖**이다. 감시 창이나
+# 휴장일 게이트에 가두면 그 락은 영영 안 치워지고, 사람이 다음 커밋을 시도할 때까지 조용하다
+# (08-19에 실제로 4시간 18분이 그랬다).
+
+
+def _stage_orphan_lock(monkeypatch, tmp_path, *, age_seconds=None):
+    """0바이트 index.lock을 «오래된» 상태로 만들어 둔다 — 관측된 잔재와 같은 모양."""
+    from mahdi import git_lock
+
+    age = git_lock.STALE_LOCK_MIN_AGE_SECONDS + 120 if age_seconds is None else age_seconds
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir(parents=True, exist_ok=True)
+    lock = git_dir / "index.lock"
+    lock.write_bytes(b"")
+    stamp = (datetime(2026, 8, 19, 16, 20) - timedelta(seconds=age)).timestamp()
+    os.utime(lock, (stamp, stamp))
+    monkeypatch.setattr(watchdog, "_LOCK_SWEEP_REPO", tmp_path)
+    monkeypatch.setattr(watchdog, "WATCHDOG_LOG", tmp_path / "watchdog.log")
+    monkeypatch.setattr(watchdog, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(watchdog.git_lock, "git_processes_running", lambda: False)
+    return lock
+
+
+def test_the_sweep_runs_outside_the_watch_window(monkeypatch, tmp_path):
+    """16:20은 감시 창 밖이다 — 그 시각의 락이 이 fix의 출발점이었다."""
+    lock = _stage_orphan_lock(monkeypatch, tmp_path)
+    # 창 밖 시각으로 고정하고, 판정 경로는 IDLE로 즉시 빠지게 둔다.
+    monkeypatch.setattr(watchdog.db, "local_now", lambda: datetime(2026, 8, 19, 16, 20))
+    monkeypatch.setattr(watchdog.liveness, "read_heartbeat", lambda _p: None)
+    monkeypatch.setattr(watchdog, "_read_state", lambda: None)
+    monkeypatch.setattr(watchdog, "_write_state", lambda _s: None)
+    monkeypatch.setattr(watchdog, "_restart", lambda: (True, "테스트"))
+    monkeypatch.setattr(watchdog.notify, "notify_sync", lambda *a, **k: None)
+
+    watchdog.main()
+
+    assert not lock.exists(), "감시 창 밖이라고 청소를 건너뛰면 그 락은 영영 안 열린다"
+    logged = (tmp_path / "watchdog.log").read_text(encoding="utf-8")
+    assert watchdog._LOCK_SWEEP_MARKER in logged
+    assert "세션 teardown" in logged
+
+
+def test_a_young_lock_survives_the_watchdog(monkeypatch, tmp_path):
+    """정상 작업 중인 락을 워치독이 열면 그 작업이 깨진다 — 임계 미만은 손대지 않는다."""
+    lock = _stage_orphan_lock(monkeypatch, tmp_path, age_seconds=30)
+    monkeypatch.setattr(watchdog.db, "local_now", lambda: datetime(2026, 8, 19, 16, 20))
+    monkeypatch.setattr(watchdog.liveness, "read_heartbeat", lambda _p: None)
+    monkeypatch.setattr(watchdog, "_read_state", lambda: None)
+    monkeypatch.setattr(watchdog, "_write_state", lambda _s: None)
+    monkeypatch.setattr(watchdog, "_restart", lambda: (True, "테스트"))
+    monkeypatch.setattr(watchdog.notify, "notify_sync", lambda *a, **k: None)
+
+    watchdog.main()
+
+    assert lock.exists()
