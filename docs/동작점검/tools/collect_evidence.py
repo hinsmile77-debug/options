@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import re
 import subprocess
 import sys
@@ -314,11 +315,41 @@ def normalize(msg):
     return truncate(re.sub(r"\d+(\.\d+)?", "N", msg), 110)
 
 
+# ===== 2026-08-19 — **이 수집기는 저장소를 잠글 수 없어야 한다** =====
+#
+# `.git/index.lock` 0바이트 잔재가 이틀 연속 저장소를 막았다(08-18 16:20 · 08-19 12:41).
+# 두 락 모두 **이 수집기를 돌린 세션이 마지막 산출물을 쓴 그 분**에 생겼고, 락을 쥔 것은
+# 아래 §1의 `git status --porcelain`이다 — status는 다음 실행을 빠르게 하려고 인덱스 캐시를
+# 갱신하는데, 그 갱신에 락이 필요하다(실측 5~6ms 보유 · 0바이트). 그 순간 세션 teardown의
+# 트리 킬을 맞으면 atexit 정리가 안 돌아 락이 남는다(원인 전말은 `mahdi/git_lock.py`).
+#
+# `GIT_OPTIONAL_LOCKS=0`은 **그 선택적 갱신을 포기하게** 한다. 실측(343개 touch 후 = 최악 조건):
+#
+#     기본                    262~343ms · index.lock 관측 5~6회(매번)
+#     GIT_OPTIONAL_LOCKS=0    371~395ms · index.lock 관측 **0회** · 출력 동일
+#
+# **락을 못 만들면 트리 킬이 락을 남길 수 없다.** 워치독의 청소(`git_lock.sweep`)보다 한 자리
+# 앞선 조치다 — 그쪽은 이미 생긴 락을 여는 것이고, 이쪽은 생기지 않게 한다.
+# 환경변수로 거는 이유는 `run_git`을 거치는 **다섯 호출 전부**에 한 번에 적용되기 때문이다.
+#
+# ## 왜 §1을 없애지 않는가
+#
+# 「말미 git 명령을 빼면 되지 않나」가 첫 제안이었는데, 그 절은 `phases.md`가 요구하는 판정
+# 근거다: *"커밋 시각 < 관측 루프 기동 시각이어야 한다"*. 이것으로 가설 상태를 `refuted`가
+# 아니라 `untested`로 가른다(2026-08-04 p4 — 15분 차이로 하루를 잃은 그 규약).
+# **없애면 그 판정 근거가 사라진다.** 고쳐야 하는 것은 호출이 아니라 잠글 수 있음이다.
+_GIT_ENV = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
+
 def run_git(root, args, timeout=25):
     try:
         p = subprocess.run(
             ["git", *args], cwd=str(root), capture_output=True, text=True,
             timeout=timeout, encoding="utf-8", errors="replace",
+            # 표준 입력을 끊는다 — git이 자격증명·pager 등으로 입력을 기다리면 `timeout`이
+            # 만료될 때까지 세션이 매달린다. 이 수집기는 사람과 대화하지 않는다.
+            stdin=subprocess.DEVNULL,
+            env=_GIT_ENV,
         )
         return p.stdout.strip() if p.returncode == 0 else f"(git 실패 rc={p.returncode}) {p.stderr.strip()[:300]}"
     except Exception as e:  # noqa: BLE001
