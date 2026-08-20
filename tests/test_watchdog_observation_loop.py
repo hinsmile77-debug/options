@@ -163,16 +163,51 @@ def test_after_the_open_a_missing_document_fires(monkeypatch, tmp_path):
 
 
 def test_a_document_that_exists_silences_it(monkeypatch, tmp_path):
+    """2026-08-20부터의 정본 이름 — 하루 한 파일(`{날짜}_마흐디_일일점검.md`)."""
     monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
-    (tmp_path / "2026-08-18_점검_pre.md").write_text("x", encoding="utf-8")
-    assert watchdog._premarket_check_missing(datetime(2026, 8, 18, 13, 28)) is False
+    (tmp_path / "2026-08-21_마흐디_일일점검.md").write_text("x", encoding="utf-8")
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 21, 13, 28)) is False
+
+
+def test_the_legacy_name_still_silences_it_during_the_transition(monkeypatch, tmp_path):
+    """**전환기의 오보는 방향만 반대일 뿐 같은 결함이다.**
+
+    리포 밖(Claude 앱 예약 3종)의 프롬프트가 아직 옛 이름을 지시하는 동안 새 이름만
+    받으면 매일 09:00에 거짓 경보가 울린다 — 08-15~16의 `ALERT_ONLY` 94·113줄과 같은
+    형태다. 이 경보가 묻는 것은 *"오늘 장전 점검이 떴는가"*이지 *"이름을 규약대로
+    지었는가"*가 아니다.
+    """
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    (tmp_path / "2026-08-21_점검_pre.md").write_text("x", encoding="utf-8")
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 21, 13, 28)) is False
+
+
+def test_the_canonical_name_is_the_one_the_alert_tells_you_to_make(monkeypatch, tmp_path):
+    """옛 이름을 **받아 주기는** 하되, 사람에게 시키는 이름은 새 이름 하나여야 한다 —
+    안 그러면 옛 이름이 영원히 재생산된다."""
+    assert watchdog._CHECK_DOC_PATTERN == "{date}_마흐디_일일점검.md"
+    assert watchdog._CHECK_DOC_PATTERNS[0] == watchdog._CHECK_DOC_PATTERN
+    assert "{date}_점검_pre.md" in watchdog._CHECK_DOC_LEGACY_PATTERNS
 
 
 def test_yesterdays_document_does_not_count_as_todays(monkeypatch, tmp_path):
-    """**날짜가 요점이다.** 08-18에 08-17본이 있다고 오늘 점검이 뜬 것은 아니다."""
+    """**날짜가 요점이다.** 08-21에 08-20본이 있다고 오늘 점검이 뜬 것은 아니다."""
     monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
-    (tmp_path / "2026-08-17_점검_pre.md").write_text("x", encoding="utf-8")
-    assert watchdog._premarket_check_missing(datetime(2026, 8, 18, 9, 30)) is True
+    (tmp_path / "2026-08-20_마흐디_일일점검.md").write_text("x", encoding="utf-8")
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 21, 9, 30)) is True
+
+
+def test_an_unrelated_markdown_file_does_not_silence_it(monkeypatch, tmp_path):
+    """이름 후보를 늘렸으니 **넓어지지 않았는지**도 못 박는다. 증거 다이제스트나 옛 국면별
+    보고서가 그날 점검의 대역이 되면 이 경보는 조용히 무의미해진다."""
+    monkeypatch.setattr(watchdog, "_CHECK_DOC_DIR", tmp_path)
+    for name in (
+        "2026-08-21_점검_intra.md",
+        "2026-08-21_마흐디_운영점검보고서.md",
+        "auto_2026-08-21_증거_pre.md",
+    ):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    assert watchdog._premarket_check_missing(datetime(2026, 8, 21, 9, 30)) is True
 
 
 def test_it_alerts_once_a_day_not_once_a_minute(monkeypatch, tmp_path):

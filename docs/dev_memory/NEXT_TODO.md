@@ -2083,3 +2083,38 @@ poll_expiry_liquidity/poll_macro_snapshot)가 공유하는 단일 `_RateLimiter`
   - [x] (2026-07-10 완료) DB에 남아있던 옛 `series='weekly'` 179건을 사용자 확인 후
         `DELETE FROM expiry_liquidity_1m WHERE series='weekly'`로 완전 삭제 —
         `expiry_liquidity_1m`엔 이제 regular/weekly_mon/weekly_thu 세 series만 존재.
+
+---
+
+## [MW0601] 2026-08-20 — 하루 한 파일 전환 (`_마흐디_일일점검.md`)
+
+> 코드 5곳은 이 커밋에서 끝났다. 남은 것은 **리포 밖 설정**과 **전환 확인**이다.
+> 상세는 [[DECISION_LOG]] 2026-08-20 항목, 규약은 `docs/동작점검/tools/phases.md` 「산출물 규약」.
+
+### 사용자 조치 — 자동으로 못 한다
+
+- [ ] **Claude 앱 예약 작업 3종의 프롬프트를 새 파일명으로 고친다.**
+      `mahdi-premarket-check` / `mahdi-intraday-check` / `mahdi-intraday-check-1430` /
+      「Mahdi postmarket check」가 아직 `_점검_pre.md` 등을 지시한다.
+      - 장전: `docs/동작점검/{날짜}_마흐디_일일점검.md` **생성**
+      - 장중 ①·②·장후: 같은 파일에 **append**(앞 절 본문 수정 금지)
+      - **이것을 안 고치면 코드만 바뀌고 산출물은 옛 이름 그대로다.** 워치독은 전환기 동안
+        둘 다 받으므로 경보는 안 울린다 — 즉 **조용히 전환이 안 된 채로 간다.**
+- [ ] (같은 건) 예약 회차 시각 통일 — `mahdi-premarket-check` cron `"30 8 * * 1-5"` →
+      `"0 8 * * 1-5"`. 08-18 Fix#7 → 08-19 Fix#10 → 08-20 §1-5 **이월 4일째**.
+      얻는 것은 매일 뜨는 「31분 밀렸다 ⚠」 허위 적신호 제거뿐이고, 그것도 실재하는 이득이다.
+
+### 전환 확인 — 새 이름으로 도는 첫 거래일에 본다
+
+- [ ] `watchdog.missing_check_alerts == 0` — 예측치 `2026-08-20-daily-check-is-one-file-per-day`.
+      **1이면 워치독이 옛 이름을 보고 있는 것**이다.
+- [ ] 증거 §9 산출물 표에 `_점검_pre/intra/intra_1430` 「없음 ⚠」 3줄이 **사라졌는가**.
+- [ ] 증거 §8-1이 직전 보고서를 **찾았는가**. 「못 찾았다」로 인쇄되면 glob이 좁은 것이다.
+- [ ] `watchdog.checks`가 08-20 실측 **57** 근처인가(대가 지표 — 줄면 워치독이 느려진 것).
+
+### 켤 것 — 전환이 끝난 뒤에만
+
+- [ ] **`_CHECK_DOC_LEGACY_PATTERNS`를 비운다.**
+      조건 둘을 **함께** 만족한 뒤: (a) 위 예약 3종이 새 이름으로 바뀌었고,
+      (b) `docs/동작점검/`에 새로 생긴 `_점검_pre.md`가 **한 거래일도 없다**.
+      **그 전에 지우면 매일 09:00에 거짓 경보가 울린다** — 이 경보가 원래 막으려던 그 실패다.

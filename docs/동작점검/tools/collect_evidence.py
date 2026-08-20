@@ -84,11 +84,16 @@ ANCHOR_WINDOW_MIN = 5
 #   Claude 앱 예약 작업 (점검 세션 — `mahdi-daily-check` 스킬, 로컬 실행)
 #     장전 점검 / 장중 점검 / 장후 점검(「Mahdi postmarket check」, 평일 16:00)
 #
-# 08-14 실측이 그 분업을 그대로 보여 준다:
-#     08:31 `_증거_pre.md`   → 08:37 `_점검_pre.md`     (장전 세션이 둘 다 만든다)
-#     12:34 `_증거_intra.md` → 12:40 `_점검_intra.md`   (장중 세션)
-#     15:45 `_증거_post.md`·`_지표.md`                  (**종료 배치**가 만든다)
-#     16:19 `_마흐디_운영점검보고서.md`                  (장후 세션이 위 산출물을 읽어 쓴다)
+# 08-14 실측이 그 분업을 그대로 보여 준다(**증거는 국면마다 하나, 보고서는 하루에 하나**):
+#     08:31 `_증거_pre.md`      → 08:37 `_마흐디_일일점검.md` **생성**   (장전 세션)
+#     12:34 `_증거_intra.md`    → 12:40 같은 파일에 **append**          (장중 세션 ①)
+#     14:39 `_증거_intra_1430.md` → 같은 파일에 **append**              (장중 세션 ②)
+#     15:45 `_증거_post.md`·`_지표.md`                                  (**종료 배치**가 만든다)
+#     16:19 같은 파일에 **append + 종합 완성**                          (장후 세션)
+#
+# ⚠ 2026-08-21 이전(`ONE_FILE_SINCE`)은 국면마다 별도 보고서였다 — `_점검_pre.md` /
+#   `_점검_intra.md` / `_점검_intra_1430.md` / `_마흐디_운영점검보고서.md` 넷. 그 날짜를
+#   재집계할 때는 §9가 그 넷을 기대한다. **옛 날의 산출물 규약은 옛 규약으로 판정한다.**
 #
 # 그래서 아래 `post`는 **15:45**다 — 이 스크립트가 `--phase post`로 도는 시각은 종료 배치
 # 안이지 16:00 세션이 아니다. `pre`/`intra`는 세션이 이 스크립트를 직접 돌리므로 세션 시각과 같다.
@@ -111,6 +116,13 @@ PHASE_LATE_TOLERANCE_MIN = 15
 # 장중 14:30 회차(`mahdi-intraday-check-1430`)가 등록된 첫 영업일. 그 이전 날짜를 재집계할 때
 # 14:30 산출물을 기대하면 거짓 누락이 뜬다 — 규약이 생기기 전의 날은 없는 게 정상이다.
 INTRA_1430_SINCE = _date(2026, 8, 17)
+# 점검 산출물이 **하루 한 파일**(`{날짜}_마흐디_일일점검.md`)로 바뀐 첫 영업일.
+# 장전이 만들고 장중·장후가 append한다(`mahdi-daily-check` 대원칙 B).
+#
+# **`INTRA_1430_SINCE`와 같은 이유로 날짜를 박는다**: 이 날 이전을 재집계하면 그날의 산출물은
+# 국면별 4파일이 맞고, 새 이름을 기대하면 **하루도 빠짐없이 거짓 누락이 뜬다.** 과거 20여 편을
+# 개명해 옮기지 않는 이유는 그 이름들이 이미 커밋 이력과 보고서 상호참조에 박혀 있어서다.
+ONE_FILE_SINCE = _date(2026, 8, 21)
 # 이보다 더 늦으면 「밀린 점검」이 아니라 **사후 재집계**로 본다. 다음 회차(장중 12:30 → 14:30,
 # 간격 120분)를 이미 지나쳤다면 그 회차가 대신 돌았어야 하므로, 이 실행은 그날의 정규 점검이
 # 아니라 나중에 다시 돌린 것이다. 실제로 이 스크립트의 `--date`가 그 용도다.
@@ -759,7 +771,14 @@ def discarded_items(root: Path):
 
 # ---------------------------------------------------------------- 전일 지시 대조
 # 2026-08-14 장전 §6 / 고도화 1. 상세 근거는 §8-1 절 말미의 인용.
-_REPORT_GLOB = "*_마흐디_운영점검보고서.md"
+#
+# 2026-08-20 — 점검 산출물이 **하루 한 파일**(`{날짜}_마흐디_일일점검.md`)로 바뀌었다.
+# **옛 이름을 함께 찾는다.** 새 이름만 찾으면 전환일 이후 이 절이 **영구히 빈다** —
+# 2026-07-16~08-20의 20여 편이 옛 이름이고, 「전일 보고서」는 달력이 아니라 **파일**이
+# 진실원천이기 때문이다(`latest_report_before` docstring). 옛 편을 개명해 옮기지 않는 이유는
+# 그 파일들이 이미 커밋 이력·보고서 상호참조에 이름으로 박혀 있어서다 — **읽는 쪽을 넓히는
+# 것이 쓰는 쪽을 고쳐 쓰는 것보다 싸다.**
+_REPORT_GLOBS = ("*_마흐디_일일점검.md", "*_마흐디_운영점검보고서.md")
 # 보고서 본문에 등장하는 가설 id. yaml의 `- id:` 규약(`YYYY-MM-DD-슬러그`)과 같은 모양이다.
 HYPOTHESIS_ID_RE = re.compile(r"\b(20\d\d-\d\d-\d\d-[a-z0-9][a-z0-9-]*)\b")
 
@@ -786,20 +805,26 @@ def matched_phase_slot(phase: str, day: _date, now: datetime):
 
 
 def latest_report_before(root: Path, day: _date):
-    """반환: `day`보다 **이전** 날짜의 운영점검보고서 중 가장 최근 것(없으면 None).
+    """반환: `day`보다 **이전** 날짜의 점검 보고서 중 가장 최근 것(없으면 None).
 
     「전 영업일」을 달력으로 계산하지 않는 이유: 공휴일·미가동일이 있으면 그 날짜의 파일이
     아예 없고, 그때 달력 계산은 존재하지 않는 파일을 가리킨다. **파일이 진실원천이다.**
+
+    신·구 두 이름을 함께 훑는다(`_REPORT_GLOBS`). **같은 날짜에 둘 다 있으면 새 이름이
+    이긴다** — 전환일 하루는 두 파일이 공존하고, 그날 「전일 보고서」로 읽어야 할 것은
+    종합 완성본인 새 파일이다. 파일 경로로 타이브레이크하면 정렬 순서에 답이 끌려간다.
     """
     found = []
-    for p in (root / "docs" / "동작점검").glob(_REPORT_GLOB):
-        try:
-            when = _date.fromisoformat(p.name[:10])
-        except ValueError:
-            continue
-        if when < day:
-            found.append((when, p))
-    return max(found)[1] if found else None
+    base = root / "docs" / "동작점검"
+    for rank, pattern in enumerate(_REPORT_GLOBS):  # rank 0 = 새 이름 = 우선
+        for p in base.glob(pattern):
+            try:
+                when = _date.fromisoformat(p.name[:10])
+            except ValueError:
+                continue
+            if when < day:
+                found.append((when, -rank, p))
+    return max(found)[2] if found else None
 
 
 def report_hypothesis_ids(text: str):
@@ -1429,7 +1454,8 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     A("")
     prev_report = latest_report_before(root, day)
     if prev_report is None:
-        A("(직전 운영점검보고서를 못 찾았다 — 첫날이거나 파일명 규약이 다르다)")
+        A(f"(직전 점검 보고서를 못 찾았다 — 첫날이거나 파일명 규약이 다르다. "
+          f"찾은 패턴: {' · '.join('`' + g + '`' for g in _REPORT_GLOBS)})")
         A("")
     else:
         prev_label = prev_report.name[:10]
@@ -1523,21 +1549,32 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     targets = [
         (f"docs/동작점검/auto/{D}_지표.md", "post"),
         (f"docs/동작점검/auto/{D}_지표.json", "post"),
-        (f"docs/동작점검/{D}_마흐디_운영점검보고서.md", "post"),
         (f"docs/동작점검/auto/{prev_hint}_지표.json", "pre"),
-        # 장후 회차가 **흡수해야 할 원본들**. 없으면 그날 보고서는 오전/오후 중 한쪽을
-        # 못 보고 쓰인다 — 08-14 장후가 장전·장중을 흡수하면서 그 둘을 「보존한다」고
-        # 명시한 것이 이 규약이고, 여기서 그 존재를 기계로 확인한다.
-        (f"docs/동작점검/{D}_점검_pre.md", "post"),
-        (f"docs/동작점검/{D}_점검_intra.md", "post"),
     ]
-    # 2026-08-17부터 장중이 두 회차다(`mahdi-intraday-check-1430`). 그 이전 날짜를 재집계할 때
-    # 이 파일을 기대하면 **매번 거짓 누락**이 뜬다 — 규약이 생기기 전의 날은 없는 게 정상이다.
-    if day >= INTRA_1430_SINCE:
+    if day >= ONE_FILE_SINCE:
+        # **하루 한 파일.** 장전이 만들고 장중·장후가 이어 붙인다 — 그래서 확인할 것은 하나다.
+        #
+        # 기대 국면을 `post`로 두는 이유: 이 열은 「없으면 적신호를 낼 국면」이지 「생겨야 할
+        # 국면」이 아니다(플래그 조건이 `ph == "post"`다). **장전 회차가 이 수집기를 돌리는
+        # 시점에는 아직 그 회차가 파일을 안 썼다** — 그때 적신호를 내면 매일 아침 거짓 경보가
+        # 뜬다. 표에는 「없음 ⚠」으로 보이되(사실이다) 판정은 장후가 한다.
+        targets.append((f"docs/동작점검/{D}_마흐디_일일점검.md", "post"))
+    else:
+        # 2026-08-20까지의 국면별 4파일 체제. 장후 회차가 **흡수해야 할 원본들**이라
+        # 없으면 그날 보고서는 오전/오후 중 한쪽을 못 보고 쓰인다.
         targets += [
-            (f"docs/동작점검/{D}_점검_intra_1430.md", "post"),
-            (f"docs/동작점검/auto/{D}_증거_intra_1430.md", "post"),
+            (f"docs/동작점검/{D}_마흐디_운영점검보고서.md", "post"),
+            (f"docs/동작점검/{D}_점검_pre.md", "post"),
+            (f"docs/동작점검/{D}_점검_intra.md", "post"),
         ]
+        # 2026-08-17부터 장중이 두 회차다(`mahdi-intraday-check-1430`). 그 이전 날짜를
+        # 재집계할 때 이 파일을 기대하면 **매번 거짓 누락**이 뜬다.
+        if day >= INTRA_1430_SINCE:
+            targets.append((f"docs/동작점검/{D}_점검_intra_1430.md", "post"))
+    # 증거 다이제스트는 **기계 산출물**이라 파일명 전환과 무관하다(수집기가 국면마다 하나씩
+    # 낸다). 14:30 회차분만 규약 시작일에 걸린다.
+    if day >= INTRA_1430_SINCE:
+        targets.append((f"docs/동작점검/auto/{D}_증거_intra_1430.md", "post"))
     A("| 파일 | 기대 국면 | 상태 | 크기 | 최종기록 |")
     A("|---|---|---|---|---|")
     for rel, ph in targets:

@@ -80,7 +80,24 @@ _PREMARKET_CHECK_DEADLINE = dtime(9, 0)
 # 그날 장전 점검이 남겼어야 할 산출물. 이름 규칙은 `docs/동작점검/README.md`의 규약이고,
 # `collect_evidence.py`가 같은 규칙으로 쓴다. **`auto/`가 아니라 루트**다(사람이 쓰는 문서).
 _CHECK_DOC_DIR = PROJECT_ROOT / "docs" / "동작점검"
-_CHECK_DOC_PATTERN = "{date}_점검_pre.md"
+# 2026-08-20 — 점검 산출물이 **하루 한 파일**로 바뀌었다(`mahdi-daily-check` 대원칙 B).
+# 장전이 만들고 장중·장후가 append하므로, 장전 시점에 존재하는 이름은 이제 이것 하나다.
+_CHECK_DOC_PATTERN = "{date}_마흐디_일일점검.md"
+# ## 왜 옛 이름을 함께 받는가 — **전환기의 오보는 방향만 반대일 뿐 같은 결함이다**
+#
+# 이 상수를 새 이름 **하나로만** 두면, 리포 밖(Claude 앱 예약 3종)의 프롬프트가 아직 옛
+# 이름을 지시하는 동안 **매일 09:00에 오보가 울린다.** 그것은 이 경보가 원래 막으려던 것과
+# 정확히 같은 실패다 — 08-15~16에 `ALERT_ONLY` 94·113줄이 아무도 안 읽히고 끝난 그 형태다.
+#
+# **비대칭이 판단 근거다**: 옛 이름을 함께 받아 잃는 것은 「이름이 틀렸다」를 여기서 강제하지
+# 못하는 것뿐이고, 그것은 애초에 이 경보의 일이 아니다(이 경보가 묻는 것은 *"오늘 장전 점검이
+# 떴는가"*이지 *"이름을 규약대로 지었는가"*가 아니다). 반대로 안 받으면 **경보 자체가 죽는다.**
+# 이름 규약의 강제는 스킬·프롬프트·이 파일의 계약 테스트가 맡는다.
+#
+# **언제 지우는가**: Claude 앱 예약 3종이 새 이름으로 바뀌고, `docs/동작점검/`에 새로 생기는
+# `_점검_pre.md`가 **한 거래일도 없는 것**을 확인한 뒤. 그때 이 튜플을 한 원소로 줄인다.
+_CHECK_DOC_LEGACY_PATTERNS = ("{date}_점검_pre.md",)
+_CHECK_DOC_PATTERNS = (_CHECK_DOC_PATTERN, *_CHECK_DOC_LEGACY_PATTERNS)
 # 하루에 한 번만 울린다. 09:00~15:45 사이 매분 울리면 397건이고, 그 소음은 08-15~16에
 # `ALERT_ONLY` 94·113줄로 이미 한 번 겪었다 — 그때 아무도 안 읽었다.
 _MISSING_CHECK_MARKER = "MISSING_CHECK"
@@ -114,17 +131,23 @@ _LOCK_SWEEP_MARKER = "LOCK_SWEPT"
 def _premarket_check_missing(now: datetime) -> bool:
     """반환: 지금이 09:00을 넘겼는데 **오늘 날짜의 장전 점검 산출물이 없는가**.
 
-    입력: 현재 시각. 계산: 파일 존재 확인 한 번(디렉터리 순회도 DB 접속도 하지 않는다).
+    입력: 현재 시각. 계산: 파일 존재 확인 **최대 두 번**(디렉터리 순회도 DB 접속도 하지 않는다).
     해석: 상세 근거는 위 `_PREMARKET_CHECK_DEADLINE` 주석. 이 함수는 **판정만** 하고,
          휴장일·의도적 정지 게이트는 호출측이 이미 통과시킨 것을 전제한다(그 둘을 여기서 다시
          보면 같은 사실이 두 곳에 적힌다 — 규약 B).
+         **이름 후보가 여럿인 이유**는 `_CHECK_DOC_LEGACY_PATTERNS` 주석에 있다 — 하나라도
+         있으면 「장전 점검은 떴다」이고, 그것이 이 경보가 묻는 전부다.
     실패 조건: 없다. 경로를 못 읽으면 「없다」로 본다 — 이 경보의 대가는 오경보 한 줄이고,
          침묵의 대가는 08-18처럼 하루를 통째로 놓치는 것이다. 비대칭이 반대 방향이다.
     """
     if now.time() < _PREMARKET_CHECK_DEADLINE:
         return False
+    today = now.date().isoformat()
     try:
-        return not (_CHECK_DOC_DIR / _CHECK_DOC_PATTERN.format(date=now.date().isoformat())).exists()
+        return not any(
+            (_CHECK_DOC_DIR / pattern.format(date=today)).exists()
+            for pattern in _CHECK_DOC_PATTERNS
+        )
     except OSError:
         return True
 
