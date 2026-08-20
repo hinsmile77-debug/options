@@ -1,0 +1,3324 @@
+{
+  "date": "2026-08-20",
+  "cycles": {
+    "count": 494,
+    "first_start": "07:31",
+    "last_start": "15:44",
+    "rest_seconds": {
+      "n": 494,
+      "mean": 41.82,
+      "median": 49.63,
+      "max": 55.94
+    },
+    "over_60s": 0,
+    "rows_distribution": {
+      "0": 49,
+      "1": 17,
+      "2": 14,
+      "3": 12,
+      "4": 13,
+      "5": 13,
+      "6": 6,
+      "7": 8,
+      "8": 18,
+      "9": 12,
+      "10": 20,
+      "11": 20,
+      "12": 21,
+      "13": 14,
+      "14": 11,
+      "15": 17,
+      "16": 15,
+      "17": 9,
+      "18": 12,
+      "19": 7,
+      "20": 186
+    },
+    "duplicate_poll_minutes": {
+      "count": 0,
+      "list": [],
+      "labelled": 494
+    },
+    "minutes_with_cycle": [
+      "07:31",
+      "07:32",
+      "07:33",
+      "07:34",
+      "07:35",
+      "07:36",
+      "07:37",
+      "07:38",
+      "07:39",
+      "07:40",
+      "07:41",
+      "07:42",
+      "07:43",
+      "07:44",
+      "07:45",
+      "07:46",
+      "07:47",
+      "07:48",
+      "07:49",
+      "07:50",
+      "07:51",
+      "07:52",
+      "07:53",
+      "07:54",
+      "07:55",
+      "07:56",
+      "07:57",
+      "07:58",
+      "07:59",
+      "08:00",
+      "08:01",
+      "08:02",
+      "08:03",
+      "08:04",
+      "08:05",
+      "08:06",
+      "08:07",
+      "08:08",
+      "08:09",
+      "08:10",
+      "08:11",
+      "08:12",
+      "08:13",
+      "08:14",
+      "08:15",
+      "08:16",
+      "08:17",
+      "08:18",
+      "08:19",
+      "08:20",
+      "08:21",
+      "08:22",
+      "08:23",
+      "08:24",
+      "08:25",
+      "08:26",
+      "08:27",
+      "08:28",
+      "08:29",
+      "08:30",
+      "08:31",
+      "08:32",
+      "08:33",
+      "08:34",
+      "08:35",
+      "08:36",
+      "08:37",
+      "08:38",
+      "08:39",
+      "08:40",
+      "08:41",
+      "08:42",
+      "08:43",
+      "08:44",
+      "08:45",
+      "08:46",
+      "08:47",
+      "08:48",
+      "08:49",
+      "08:50",
+      "08:51",
+      "08:52",
+      "08:53",
+      "08:54",
+      "08:55",
+      "08:56",
+      "08:57",
+      "08:58",
+      "08:59",
+      "09:00",
+      "09:01",
+      "09:02",
+      "09:03",
+      "09:04",
+      "09:05",
+      "09:06",
+      "09:07",
+      "09:08",
+      "09:09",
+      "09:10",
+      "09:11",
+      "09:12",
+      "09:13",
+      "09:14",
+      "09:15",
+      "09:16",
+      "09:17",
+      "09:18",
+      "09:19",
+      "09:20",
+      "09:21",
+      "09:22",
+      "09:23",
+      "09:24",
+      "09:25",
+      "09:26",
+      "09:27",
+      "09:28",
+      "09:29",
+      "09:30",
+      "09:31",
+      "09:32",
+      "09:33",
+      "09:34",
+      "09:35",
+      "09:36",
+      "09:37",
+      "09:38",
+      "09:39",
+      "09:40",
+      "09:41",
+      "09:42",
+      "09:43",
+      "09:44",
+      "09:45",
+      "09:46",
+      "09:47",
+      "09:48",
+      "09:49",
+      "09:50",
+      "09:51",
+      "09:52",
+      "09:53",
+      "09:54",
+      "09:55",
+      "09:56",
+      "09:57",
+      "09:58",
+      "09:59",
+      "10:00",
+      "10:01",
+      "10:02",
+      "10:03",
+      "10:04",
+      "10:05",
+      "10:06",
+      "10:07",
+      "10:08",
+      "10:09",
+      "10:10",
+      "10:11",
+      "10:12",
+      "10:13",
+      "10:14",
+      "10:15",
+      "10:16",
+      "10:17",
+      "10:18",
+      "10:19",
+      "10:20",
+      "10:21",
+      "10:22",
+      "10:23",
+      "10:24",
+      "10:25",
+      "10:26",
+      "10:27",
+      "10:28",
+      "10:29",
+      "10:30",
+      "10:31",
+      "10:32",
+      "10:33",
+      "10:34",
+      "10:35",
+      "10:36",
+      "10:37",
+      "10:38",
+      "10:39",
+      "10:40",
+      "10:41",
+      "10:42",
+      "10:43",
+      "10:44",
+      "10:45",
+      "10:46",
+      "10:47",
+      "10:48",
+      "10:49",
+      "10:50",
+      "10:51",
+      "10:52",
+      "10:53",
+      "10:54",
+      "10:55",
+      "10:56",
+      "10:57",
+      "10:58",
+      "10:59",
+      "11:00",
+      "11:01",
+      "11:02",
+      "11:03",
+      "11:04",
+      "11:05",
+      "11:06",
+      "11:07",
+      "11:08",
+      "11:09",
+      "11:10",
+      "11:11",
+      "11:12",
+      "11:13",
+      "11:14",
+      "11:15",
+      "11:16",
+      "11:17",
+      "11:18",
+      "11:19",
+      "11:20",
+      "11:21",
+      "11:22",
+      "11:23",
+      "11:24",
+      "11:25",
+      "11:26",
+      "11:27",
+      "11:28",
+      "11:29",
+      "11:30",
+      "11:31",
+      "11:32",
+      "11:33",
+      "11:34",
+      "11:35",
+      "11:36",
+      "11:37",
+      "11:38",
+      "11:39",
+      "11:40",
+      "11:41",
+      "11:42",
+      "11:43",
+      "11:44",
+      "11:45",
+      "11:46",
+      "11:47",
+      "11:48",
+      "11:49",
+      "11:50",
+      "11:51",
+      "11:52",
+      "11:53",
+      "11:54",
+      "11:55",
+      "11:56",
+      "11:57",
+      "11:58",
+      "11:59",
+      "12:00",
+      "12:01",
+      "12:02",
+      "12:03",
+      "12:04",
+      "12:05",
+      "12:06",
+      "12:07",
+      "12:08",
+      "12:09",
+      "12:10",
+      "12:11",
+      "12:12",
+      "12:13",
+      "12:14",
+      "12:15",
+      "12:16",
+      "12:17",
+      "12:18",
+      "12:19",
+      "12:20",
+      "12:21",
+      "12:22",
+      "12:23",
+      "12:24",
+      "12:25",
+      "12:26",
+      "12:27",
+      "12:28",
+      "12:29",
+      "12:30",
+      "12:31",
+      "12:32",
+      "12:33",
+      "12:34",
+      "12:35",
+      "12:36",
+      "12:37",
+      "12:38",
+      "12:39",
+      "12:40",
+      "12:41",
+      "12:42",
+      "12:43",
+      "12:44",
+      "12:45",
+      "12:46",
+      "12:47",
+      "12:48",
+      "12:49",
+      "12:50",
+      "12:51",
+      "12:52",
+      "12:53",
+      "12:54",
+      "12:55",
+      "12:56",
+      "12:57",
+      "12:58",
+      "12:59",
+      "13:00",
+      "13:01",
+      "13:02",
+      "13:03",
+      "13:04",
+      "13:05",
+      "13:06",
+      "13:07",
+      "13:08",
+      "13:09",
+      "13:10",
+      "13:11",
+      "13:12",
+      "13:13",
+      "13:14",
+      "13:15",
+      "13:16",
+      "13:17",
+      "13:18",
+      "13:19",
+      "13:20",
+      "13:21",
+      "13:22",
+      "13:23",
+      "13:24",
+      "13:25",
+      "13:26",
+      "13:27",
+      "13:28",
+      "13:29",
+      "13:30",
+      "13:31",
+      "13:32",
+      "13:33",
+      "13:34",
+      "13:35",
+      "13:36",
+      "13:37",
+      "13:38",
+      "13:39",
+      "13:40",
+      "13:41",
+      "13:42",
+      "13:43",
+      "13:44",
+      "13:45",
+      "13:46",
+      "13:47",
+      "13:48",
+      "13:49",
+      "13:50",
+      "13:51",
+      "13:52",
+      "13:53",
+      "13:54",
+      "13:55",
+      "13:56",
+      "13:57",
+      "13:58",
+      "13:59",
+      "14:00",
+      "14:01",
+      "14:02",
+      "14:03",
+      "14:04",
+      "14:05",
+      "14:06",
+      "14:07",
+      "14:08",
+      "14:09",
+      "14:10",
+      "14:11",
+      "14:12",
+      "14:13",
+      "14:14",
+      "14:15",
+      "14:16",
+      "14:17",
+      "14:18",
+      "14:19",
+      "14:20",
+      "14:21",
+      "14:22",
+      "14:23",
+      "14:24",
+      "14:25",
+      "14:26",
+      "14:27",
+      "14:28",
+      "14:29",
+      "14:30",
+      "14:31",
+      "14:32",
+      "14:33",
+      "14:34",
+      "14:35",
+      "14:36",
+      "14:37",
+      "14:38",
+      "14:39",
+      "14:40",
+      "14:41",
+      "14:42",
+      "14:43",
+      "14:44",
+      "14:45",
+      "14:46",
+      "14:47",
+      "14:48",
+      "14:49",
+      "14:50",
+      "14:51",
+      "14:52",
+      "14:53",
+      "14:54",
+      "14:55",
+      "14:56",
+      "14:57",
+      "14:58",
+      "14:59",
+      "15:00",
+      "15:01",
+      "15:02",
+      "15:03",
+      "15:04",
+      "15:05",
+      "15:06",
+      "15:07",
+      "15:08",
+      "15:09",
+      "15:10",
+      "15:11",
+      "15:12",
+      "15:13",
+      "15:14",
+      "15:15",
+      "15:16",
+      "15:17",
+      "15:18",
+      "15:19",
+      "15:20",
+      "15:21",
+      "15:22",
+      "15:23",
+      "15:24",
+      "15:25",
+      "15:26",
+      "15:27",
+      "15:28",
+      "15:29",
+      "15:30",
+      "15:31",
+      "15:32",
+      "15:33",
+      "15:34",
+      "15:35",
+      "15:36",
+      "15:37",
+      "15:38",
+      "15:39",
+      "15:40",
+      "15:41",
+      "15:42",
+      "15:43",
+      "15:44"
+    ],
+    "zero_row_minutes": [
+      "11:30",
+      "12:34",
+      "12:40",
+      "12:41",
+      "13:01",
+      "13:02",
+      "13:03",
+      "13:06",
+      "13:11",
+      "13:12",
+      "13:14",
+      "13:15",
+      "13:16",
+      "13:18",
+      "13:19",
+      "13:21",
+      "13:22",
+      "13:23",
+      "13:31",
+      "13:32",
+      "13:33",
+      "14:01",
+      "14:02",
+      "14:03",
+      "14:04",
+      "14:05",
+      "14:06",
+      "14:07",
+      "14:08",
+      "14:09",
+      "14:10",
+      "14:11",
+      "14:12",
+      "14:13",
+      "14:14",
+      "14:15",
+      "14:16",
+      "15:16",
+      "15:17",
+      "15:18",
+      "15:19",
+      "15:20",
+      "15:21",
+      "15:22",
+      "15:23",
+      "15:24",
+      "15:25",
+      "15:26",
+      "15:27"
+    ],
+    "by_hour": [
+      {
+        "hour": 7,
+        "cycles": 29,
+        "rest_mean": 19.6,
+        "rest_max": 22.1,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 0,
+        "end_second_median": 19.6
+      },
+      {
+        "hour": 8,
+        "cycles": 60,
+        "rest_mean": 19.6,
+        "rest_max": 23.4,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 0,
+        "end_second_median": 19.7
+      },
+      {
+        "hour": 9,
+        "cycles": 60,
+        "rest_mean": 37.0,
+        "rest_max": 53.6,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 122,
+        "end_second_median": 38.1
+      },
+      {
+        "hour": 10,
+        "cycles": 60,
+        "rest_mean": 46.5,
+        "rest_max": 54.5,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 190,
+        "end_second_median": 51.0
+      },
+      {
+        "hour": 11,
+        "cycles": 60,
+        "rest_mean": 51.1,
+        "rest_max": 54.8,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 237,
+        "end_second_median": 52.0
+      },
+      {
+        "hour": 12,
+        "cycles": 60,
+        "rest_mean": 51.4,
+        "rest_max": 55.9,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 181,
+        "end_second_median": 52.0
+      },
+      {
+        "hour": 13,
+        "cycles": 60,
+        "rest_mean": 49.8,
+        "rest_max": 54.9,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 107,
+        "end_second_median": 52.3
+      },
+      {
+        "hour": 14,
+        "cycles": 60,
+        "rest_mean": 49.1,
+        "rest_max": 54.5,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 153,
+        "end_second_median": 52.2
+      },
+      {
+        "hour": 15,
+        "cycles": 45,
+        "rest_mean": 40.5,
+        "rest_max": 54.9,
+        "over_60s": 0,
+        "slip_max": 0.0,
+        "foreign_sum": 63,
+        "end_second_median": 51.4
+      }
+    ],
+    "by_mod10": [
+      {
+        "mod10": 0,
+        "cycles": 50,
+        "rest_mean": 44.9,
+        "foreign_mean": 1.2,
+        "foreign_by_group": {
+          "투자자수급": 1.2
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 1,
+        "cycles": 49,
+        "rest_mean": 42.3,
+        "foreign_mean": 2.7,
+        "foreign_by_group": {
+          "만기유동성": 2.1,
+          "투자자수급": 0.5
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 2,
+        "cycles": 50,
+        "rest_mean": 41.9,
+        "foreign_mean": 3.8,
+        "foreign_by_group": {
+          "매크로": 1.7,
+          "투자자수급": 0.6,
+          "만기유동성": 1.6
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 3,
+        "cycles": 50,
+        "rest_mean": 41.2,
+        "foreign_mean": 2.2,
+        "foreign_by_group": {
+          "만기유동성": 1.8,
+          "투자자수급": 0.5
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 4,
+        "cycles": 50,
+        "rest_mean": 41.2,
+        "foreign_mean": 2.4,
+        "foreign_by_group": {
+          "만기유동성": 1.0,
+          "투자자수급": 0.8,
+          "계좌잔고": 0.6
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 5,
+        "cycles": 50,
+        "rest_mean": 42.8,
+        "foreign_mean": 2.4,
+        "foreign_by_group": {
+          "만기유동성": 1.7,
+          "투자자수급": 0.7
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 6,
+        "cycles": 48,
+        "rest_mean": 41.7,
+        "foreign_mean": 1.9,
+        "foreign_by_group": {
+          "만기유동성": 1.3,
+          "투자자수급": 0.6
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 7,
+        "cycles": 49,
+        "rest_mean": 43.0,
+        "foreign_mean": 2.6,
+        "foreign_by_group": {
+          "매크로": 1.7,
+          "투자자수급": 0.9
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 8,
+        "cycles": 49,
+        "rest_mean": 39.0,
+        "foreign_mean": 0.6,
+        "foreign_by_group": {
+          "투자자수급": 0.6
+        },
+        "over_60s": 0
+      },
+      {
+        "mod10": 9,
+        "cycles": 49,
+        "rest_mean": 40.1,
+        "foreign_mean": 1.4,
+        "foreign_by_group": {
+          "계좌잔고": 0.6,
+          "투자자수급": 0.8
+        },
+        "over_60s": 0
+      }
+    ],
+    "missing": {
+      "count": 0,
+      "odd": 0,
+      "even": 0,
+      "list": [],
+      "recovered_by_catchup": 0,
+      "unrecovered_count": 0,
+      "downtime_count": 0,
+      "downtime_list": [],
+      "infra_count": 0,
+      "infra_list": []
+    }
+  },
+  "rest": {
+    "total_calls": 9079,
+    "span_seconds": 29672.7,
+    "first_call": "07:30",
+    "last_call": "15:45",
+    "calls_per_second": 0.306,
+    "capacity_pct": 30.6,
+    "deficit_threshold_multiplier": 3.27,
+    "by_group": {
+      "옵션체인": 6373,
+      "투자자수급": 1485,
+      "만기유동성": 870,
+      "매크로": 253,
+      "계좌잔고": 94,
+      "기동": 4
+    },
+    "by_status": {
+      "200": 9030,
+      "500": 49
+    },
+    "by_hour": {
+      "7": 703,
+      "8": 1529,
+      "9": 1564,
+      "10": 1386,
+      "11": 1087,
+      "12": 673,
+      "13": 478,
+      "14": 955,
+      "15": 704
+    },
+    "non_200": {
+      "count": 49,
+      "pct": 0.54,
+      "by_group": {
+        "매크로": 22,
+        "옵션체인": 16,
+        "만기유동성": 11
+      }
+    }
+  },
+  "backoff": {
+    "expand": 32,
+    "recover": 128,
+    "max_multiplier": 2.25,
+    "mean_multiplier_by_hour": {
+      "7": 1.0,
+      "8": 1.0,
+      "9": 1.194,
+      "10": 1.197,
+      "11": 1.109,
+      "12": 1.263,
+      "13": 1.052,
+      "14": 1.151,
+      "15": 1.118
+    },
+    "mean_multiplier": 1.128
+  },
+  "bursts": {
+    "기동": {
+      "burst_count": 1,
+      "calls_per_burst_median": 4,
+      "occupancy_seconds": {
+        "n": 1,
+        "mean": 2.48,
+        "median": 2.48,
+        "max": 2.48
+      },
+      "start_positions_mod10": {
+        "0:28": 1
+      }
+    },
+    "만기유동성": {
+      "burst_count": 87,
+      "calls_per_burst_median": 10,
+      "occupancy_seconds": {
+        "n": 87,
+        "mean": 28.87,
+        "median": 31.24,
+        "max": 53.43
+      },
+      "start_positions_mod10": {
+        "1:31": 7,
+        "3:31": 7,
+        "5:36": 7
+      }
+    },
+    "매크로": {
+      "burst_count": 85,
+      "calls_per_burst_median": 3,
+      "occupancy_seconds": {
+        "n": 81,
+        "mean": 5.61,
+        "median": 5.36,
+        "max": 15.27
+      },
+      "start_positions_mod10": {
+        "7:30": 14,
+        "2:30": 13,
+        "2:33": 10
+      }
+    }
+  },
+  "stalls": [
+    {
+      "at": "10:07",
+      "mod10_minute": 7,
+      "gaps": 3,
+      "total_seconds": 17.1,
+      "mean_gap": 5.7
+    },
+    {
+      "at": "10:41",
+      "mod10_minute": 1,
+      "gaps": 3,
+      "total_seconds": 18.8,
+      "mean_gap": 6.3
+    },
+    {
+      "at": "10:42",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 18.4,
+      "mean_gap": 6.1
+    },
+    {
+      "at": "11:18",
+      "mod10_minute": 8,
+      "gaps": 4,
+      "total_seconds": 38.2,
+      "mean_gap": 9.5
+    },
+    {
+      "at": "11:24",
+      "mod10_minute": 4,
+      "gaps": 3,
+      "total_seconds": 17.0,
+      "mean_gap": 5.7
+    },
+    {
+      "at": "11:42",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 19.4,
+      "mean_gap": 6.5
+    },
+    {
+      "at": "11:44",
+      "mod10_minute": 4,
+      "gaps": 3,
+      "total_seconds": 38.5,
+      "mean_gap": 12.8
+    },
+    {
+      "at": "11:55",
+      "mod10_minute": 5,
+      "gaps": 5,
+      "total_seconds": 29.6,
+      "mean_gap": 5.9
+    },
+    {
+      "at": "12:06",
+      "mod10_minute": 6,
+      "gaps": 3,
+      "total_seconds": 18.1,
+      "mean_gap": 6.0
+    },
+    {
+      "at": "12:17",
+      "mod10_minute": 7,
+      "gaps": 3,
+      "total_seconds": 41.4,
+      "mean_gap": 13.8
+    },
+    {
+      "at": "12:27",
+      "mod10_minute": 7,
+      "gaps": 5,
+      "total_seconds": 49.7,
+      "mean_gap": 9.9
+    },
+    {
+      "at": "12:28",
+      "mod10_minute": 8,
+      "gaps": 4,
+      "total_seconds": 36.7,
+      "mean_gap": 9.2
+    },
+    {
+      "at": "12:30",
+      "mod10_minute": 0,
+      "gaps": 5,
+      "total_seconds": 45.8,
+      "mean_gap": 9.2
+    },
+    {
+      "at": "12:32",
+      "mod10_minute": 2,
+      "gaps": 4,
+      "total_seconds": 25.4,
+      "mean_gap": 6.4
+    },
+    {
+      "at": "12:43",
+      "mod10_minute": 3,
+      "gaps": 3,
+      "total_seconds": 36.9,
+      "mean_gap": 12.3
+    },
+    {
+      "at": "12:44",
+      "mod10_minute": 4,
+      "gaps": 3,
+      "total_seconds": 39.4,
+      "mean_gap": 13.1
+    },
+    {
+      "at": "12:46",
+      "mod10_minute": 6,
+      "gaps": 4,
+      "total_seconds": 39.6,
+      "mean_gap": 9.9
+    },
+    {
+      "at": "12:57",
+      "mod10_minute": 7,
+      "gaps": 3,
+      "total_seconds": 38.2,
+      "mean_gap": 12.7
+    },
+    {
+      "at": "12:58",
+      "mod10_minute": 8,
+      "gaps": 3,
+      "total_seconds": 41.7,
+      "mean_gap": 13.9
+    },
+    {
+      "at": "13:26",
+      "mod10_minute": 6,
+      "gaps": 3,
+      "total_seconds": 41.2,
+      "mean_gap": 13.7
+    },
+    {
+      "at": "13:41",
+      "mod10_minute": 1,
+      "gaps": 3,
+      "total_seconds": 18.0,
+      "mean_gap": 6.0
+    },
+    {
+      "at": "13:47",
+      "mod10_minute": 7,
+      "gaps": 3,
+      "total_seconds": 33.8,
+      "mean_gap": 11.3
+    },
+    {
+      "at": "13:53",
+      "mod10_minute": 3,
+      "gaps": 7,
+      "total_seconds": 45.0,
+      "mean_gap": 6.4
+    },
+    {
+      "at": "13:54",
+      "mod10_minute": 4,
+      "gaps": 3,
+      "total_seconds": 57.9,
+      "mean_gap": 19.3
+    },
+    {
+      "at": "13:55",
+      "mod10_minute": 5,
+      "gaps": 3,
+      "total_seconds": 44.0,
+      "mean_gap": 14.7
+    },
+    {
+      "at": "13:58",
+      "mod10_minute": 8,
+      "gaps": 3,
+      "total_seconds": 30.2,
+      "mean_gap": 10.1
+    },
+    {
+      "at": "14:18",
+      "mod10_minute": 8,
+      "gaps": 3,
+      "total_seconds": 27.0,
+      "mean_gap": 9.0
+    },
+    {
+      "at": "14:22",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 19.4,
+      "mean_gap": 6.5
+    },
+    {
+      "at": "14:25",
+      "mod10_minute": 5,
+      "gaps": 4,
+      "total_seconds": 21.7,
+      "mean_gap": 5.4
+    },
+    {
+      "at": "14:52",
+      "mod10_minute": 2,
+      "gaps": 3,
+      "total_seconds": 15.8,
+      "mean_gap": 5.3
+    },
+    {
+      "at": "15:04",
+      "mod10_minute": 4,
+      "gaps": 5,
+      "total_seconds": 35.1,
+      "mean_gap": 7.0
+    },
+    {
+      "at": "15:09",
+      "mod10_minute": 9,
+      "gaps": 3,
+      "total_seconds": 23.7,
+      "mean_gap": 7.9
+    },
+    {
+      "at": "15:10",
+      "mod10_minute": 0,
+      "gaps": 4,
+      "total_seconds": 47.5,
+      "mean_gap": 11.9
+    },
+    {
+      "at": "15:12",
+      "mod10_minute": 2,
+      "gaps": 5,
+      "total_seconds": 47.1,
+      "mean_gap": 9.4
+    }
+  ],
+  "slow_calls": {
+    "count": 4033,
+    "pacer_dominant": 257,
+    "http_dominant": 3776,
+    "total_seconds": {
+      "n": 4033,
+      "mean": 4.47,
+      "median": 4.53,
+      "max": 10.56
+    },
+    "pacer_seconds": {
+      "n": 4033,
+      "mean": 1.21,
+      "median": 1.0,
+      "max": 5.94
+    },
+    "http_seconds": {
+      "n": 4033,
+      "mean": 3.26,
+      "median": 3.51,
+      "max": 10.05
+    },
+    "by_mod10_minute": {
+      "0": 375,
+      "1": 479,
+      "2": 499,
+      "3": 440,
+      "4": 399,
+      "5": 471,
+      "6": 369,
+      "7": 439,
+      "8": 242,
+      "9": 320
+    },
+    "censored": {
+      "count": 1482,
+      "by_endpoint": {
+        "inquire-price": 1410,
+        "overseas-inquire-price": 67,
+        "inquire-balance": 5
+      },
+      "by_minute": {
+        "0": 39,
+        "1": 35,
+        "2": 31,
+        "3": 25,
+        "4": 22,
+        "5": 27,
+        "6": 26,
+        "7": 24,
+        "8": 19,
+        "9": 23,
+        "10": 29,
+        "11": 36,
+        "12": 41,
+        "13": 34,
+        "14": 41,
+        "15": 45,
+        "16": 38,
+        "17": 47,
+        "18": 27,
+        "19": 27,
+        "20": 38,
+        "21": 38,
+        "22": 31,
+        "23": 28,
+        "24": 29,
+        "25": 22,
+        "26": 21,
+        "27": 27,
+        "28": 13,
+        "29": 9,
+        "30": 38,
+        "31": 28,
+        "32": 23,
+        "33": 20,
+        "34": 21,
+        "35": 23,
+        "36": 14,
+        "37": 13,
+        "38": 3,
+        "39": 11,
+        "40": 32,
+        "41": 22,
+        "42": 23,
+        "43": 14,
+        "44": 17,
+        "45": 25,
+        "46": 18,
+        "47": 19,
+        "48": 12,
+        "49": 14,
+        "50": 32,
+        "51": 24,
+        "52": 21,
+        "53": 14,
+        "54": 16,
+        "55": 23,
+        "56": 17,
+        "57": 26,
+        "58": 13,
+        "59": 14
+      },
+      "phase_minutes": [
+        0,
+        1,
+        2,
+        3,
+        30,
+        31,
+        32,
+        33
+      ],
+      "phase_count": 239,
+      "phase_concentration": 0.161,
+      "phase_baseline": 0.133,
+      "phase_ratio": 1.21,
+      "samples": [
+        {
+          "at": "14:04",
+          "total": 10.47,
+          "pacer": 0.42,
+          "http": 10.05,
+          "multiplier": 1.0,
+          "endpoint": "inquire-balance"
+        },
+        {
+          "at": "14:09",
+          "total": 10.44,
+          "pacer": 0.39,
+          "http": 10.05,
+          "multiplier": 1.0,
+          "endpoint": "inquire-balance"
+        },
+        {
+          "at": "14:14",
+          "total": 10.44,
+          "pacer": 0.39,
+          "http": 10.05,
+          "multiplier": 1.0,
+          "endpoint": "inquire-balance"
+        },
+        {
+          "at": "15:19",
+          "total": 10.56,
+          "pacer": 0.51,
+          "http": 10.05,
+          "multiplier": 1.0,
+          "endpoint": "inquire-balance"
+        },
+        {
+          "at": "15:24",
+          "total": 10.45,
+          "pacer": 0.42,
+          "http": 10.03,
+          "multiplier": 1.0,
+          "endpoint": "inquire-balance"
+        }
+      ]
+    },
+    "samples": [
+      {
+        "at": "15:19",
+        "total": 10.56,
+        "pacer": 0.51,
+        "http": 10.05,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "14:04",
+        "total": 10.47,
+        "pacer": 0.42,
+        "http": 10.05,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "15:24",
+        "total": 10.45,
+        "pacer": 0.42,
+        "http": 10.03,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "14:09",
+        "total": 10.44,
+        "pacer": 0.39,
+        "http": 10.05,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      },
+      {
+        "at": "14:14",
+        "total": 10.44,
+        "pacer": 0.39,
+        "http": 10.05,
+        "multiplier": 1.0,
+        "endpoint": "inquire-balance"
+      }
+    ]
+  },
+  "rest_latency": {
+    "endpoints": {
+      "inquire-price": {
+        "calls": 7713,
+        "p50": 1.609,
+        "p95": 2.758,
+        "p99": 2.991,
+        "max": 5.05
+      },
+      "inquire-investor-time-by-market": {
+        "calls": 1470,
+        "p50": 0.021,
+        "p95": 0.093,
+        "p99": 0.093,
+        "max": 1.03
+      },
+      "inquire-asking-price": {
+        "calls": 854,
+        "p50": 1.608,
+        "p95": 3.017,
+        "p99": 3.221,
+        "max": 6.14
+      },
+      "overseas-inquire-price": {
+        "calls": 313,
+        "p50": 1.844,
+        "p95": 2.374,
+        "p99": 2.374,
+        "max": 4.12
+      },
+      "inquire-balance": {
+        "calls": 98,
+        "p50": 4.085,
+        "p95": 4.085,
+        "p99": 4.085,
+        "max": 10.05
+      },
+      "inquire-daily-chartprice": {
+        "calls": 4,
+        "p50": 0.285,
+        "p95": 1.05,
+        "p99": 1.05,
+        "max": 2.08
+      }
+    },
+    "p95_by_hour": {
+      "7": {
+        "inquire-balance": 0.064,
+        "inquire-daily-chartprice": 0.02,
+        "inquire-investor-time-by-market": 0.098,
+        "inquire-price": 0.046,
+        "overseas-inquire-price": 0.064
+      },
+      "8": {
+        "inquire-asking-price": 0.028,
+        "inquire-balance": 0.062,
+        "inquire-investor-time-by-market": 0.072,
+        "inquire-price": 0.042,
+        "overseas-inquire-price": 0.059
+      },
+      "9": {
+        "inquire-asking-price": 1.598,
+        "inquire-balance": 2.049,
+        "inquire-investor-time-by-market": 0.074,
+        "inquire-price": 2.506,
+        "overseas-inquire-price": 1.279
+      },
+      "10": {
+        "inquire-asking-price": 3.517,
+        "inquire-balance": 3.564,
+        "inquire-investor-time-by-market": 0.094,
+        "inquire-price": 3.561,
+        "overseas-inquire-price": 2.255
+      },
+      "11": {
+        "inquire-asking-price": 4.202,
+        "inquire-balance": 4.497,
+        "inquire-investor-time-by-market": 0.157,
+        "inquire-price": 4.001,
+        "overseas-inquire-price": 3.307
+      },
+      "12": {
+        "inquire-asking-price": 5.38,
+        "inquire-balance": 6.582,
+        "inquire-investor-time-by-market": 0.107,
+        "inquire-price": 4.055,
+        "overseas-inquire-price": 3.42
+      },
+      "13": {
+        "inquire-asking-price": 5.549,
+        "inquire-balance": 7.003,
+        "inquire-daily-chartprice": 2.08,
+        "inquire-investor-time-by-market": 0.079,
+        "inquire-price": 4.057,
+        "overseas-inquire-price": 3.679
+      },
+      "14": {
+        "inquire-asking-price": 3.738,
+        "inquire-balance": 5.513,
+        "inquire-investor-time-by-market": 0.079,
+        "inquire-price": 3.915,
+        "overseas-inquire-price": 3.052
+      },
+      "15": {
+        "inquire-asking-price": 2.183,
+        "inquire-balance": 5.416,
+        "inquire-investor-time-by-market": 0.074,
+        "inquire-price": 3.028,
+        "overseas-inquire-price": 3.148
+      }
+    },
+    "p50_by_hour": {
+      "7": {
+        "inquire-balance": 0.064,
+        "inquire-daily-chartprice": 0.01,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 0.02,
+        "overseas-inquire-price": 0.018
+      },
+      "8": {
+        "inquire-asking-price": 0.024,
+        "inquire-balance": 0.062,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 0.02,
+        "overseas-inquire-price": 0.02
+      },
+      "9": {
+        "inquire-asking-price": 0.479,
+        "inquire-balance": 2.049,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 0.324,
+        "overseas-inquire-price": 0.446
+      },
+      "10": {
+        "inquire-asking-price": 1.449,
+        "inquire-balance": 3.564,
+        "inquire-investor-time-by-market": 0.021,
+        "inquire-price": 1.256,
+        "overseas-inquire-price": 1.667
+      },
+      "11": {
+        "inquire-asking-price": 2.404,
+        "inquire-balance": 4.497,
+        "inquire-investor-time-by-market": 0.019,
+        "inquire-price": 2.482,
+        "overseas-inquire-price": 2.016
+      },
+      "12": {
+        "inquire-asking-price": 3.386,
+        "inquire-balance": 6.582,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 3.535,
+        "overseas-inquire-price": 2.62
+      },
+      "13": {
+        "inquire-asking-price": 4.113,
+        "inquire-balance": 7.003,
+        "inquire-daily-chartprice": 0.56,
+        "inquire-investor-time-by-market": 0.022,
+        "inquire-price": 3.682,
+        "overseas-inquire-price": 3.501
+      },
+      "14": {
+        "inquire-asking-price": 2.314,
+        "inquire-balance": 5.513,
+        "inquire-investor-time-by-market": 0.022,
+        "inquire-price": 2.467,
+        "overseas-inquire-price": 2.668
+      },
+      "15": {
+        "inquire-asking-price": 1.456,
+        "inquire-balance": 5.416,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 1.989,
+        "overseas-inquire-price": 2.941
+      }
+    },
+    "p50_max_by_hour": {
+      "7": {
+        "inquire-balance": 0.08,
+        "inquire-daily-chartprice": 0.01,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 0.02,
+        "overseas-inquire-price": 0.02
+      },
+      "8": {
+        "inquire-asking-price": 0.06,
+        "inquire-balance": 0.08,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 0.02,
+        "overseas-inquire-price": 0.03
+      },
+      "9": {
+        "inquire-asking-price": 2.22,
+        "inquire-balance": 5.81,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 1.76,
+        "overseas-inquire-price": 2.05
+      },
+      "10": {
+        "inquire-asking-price": 2.95,
+        "inquire-balance": 6.72,
+        "inquire-investor-time-by-market": 0.03,
+        "inquire-price": 2.41,
+        "overseas-inquire-price": 4.03
+      },
+      "11": {
+        "inquire-asking-price": 3.45,
+        "inquire-balance": 6.81,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 3.64,
+        "overseas-inquire-price": 4.0
+      },
+      "12": {
+        "inquire-asking-price": 4.45,
+        "inquire-balance": 8.8,
+        "inquire-investor-time-by-market": 0.03,
+        "inquire-price": 4.03,
+        "overseas-inquire-price": 4.05
+      },
+      "13": {
+        "inquire-asking-price": 4.7,
+        "inquire-balance": 8.7,
+        "inquire-daily-chartprice": 0.56,
+        "inquire-investor-time-by-market": 0.05,
+        "inquire-price": 4.05,
+        "overseas-inquire-price": 4.05
+      },
+      "14": {
+        "inquire-asking-price": 3.56,
+        "inquire-balance": 10.05,
+        "inquire-investor-time-by-market": 0.05,
+        "inquire-price": 4.05,
+        "overseas-inquire-price": 4.05
+      },
+      "15": {
+        "inquire-asking-price": 4.16,
+        "inquire-balance": 10.05,
+        "inquire-investor-time-by-market": 0.02,
+        "inquire-price": 4.05,
+        "overseas-inquire-price": 4.06
+      }
+    },
+    "p95_warn_threshold": 2.5,
+    "p50_timeout_ratio_warn": 0.8,
+    "global_read_timeout_seconds": 4.0,
+    "warnings": [
+      {
+        "hour": "9",
+        "endpoint": "inquire-price",
+        "p95": 2.506
+      },
+      {
+        "hour": "10",
+        "endpoint": "inquire-asking-price",
+        "p95": 3.517
+      },
+      {
+        "hour": "10",
+        "endpoint": "inquire-balance",
+        "p95": 3.564
+      },
+      {
+        "hour": "10",
+        "endpoint": "inquire-price",
+        "p95": 3.561
+      },
+      {
+        "hour": "11",
+        "endpoint": "inquire-asking-price",
+        "p95": 4.202
+      },
+      {
+        "hour": "11",
+        "endpoint": "inquire-balance",
+        "p95": 4.497
+      },
+      {
+        "hour": "11",
+        "endpoint": "inquire-price",
+        "p95": 4.001
+      },
+      {
+        "hour": "11",
+        "endpoint": "overseas-inquire-price",
+        "p95": 3.307
+      },
+      {
+        "hour": "12",
+        "endpoint": "inquire-asking-price",
+        "p95": 5.38
+      },
+      {
+        "hour": "12",
+        "endpoint": "inquire-balance",
+        "p95": 6.582
+      },
+      {
+        "hour": "12",
+        "endpoint": "inquire-price",
+        "p95": 4.055
+      },
+      {
+        "hour": "12",
+        "endpoint": "overseas-inquire-price",
+        "p95": 3.42
+      },
+      {
+        "hour": "13",
+        "endpoint": "inquire-asking-price",
+        "p95": 5.549
+      },
+      {
+        "hour": "13",
+        "endpoint": "inquire-balance",
+        "p95": 7.003
+      },
+      {
+        "hour": "13",
+        "endpoint": "inquire-price",
+        "p95": 4.057
+      },
+      {
+        "hour": "13",
+        "endpoint": "overseas-inquire-price",
+        "p95": 3.679
+      },
+      {
+        "hour": "14",
+        "endpoint": "inquire-asking-price",
+        "p95": 3.738
+      },
+      {
+        "hour": "14",
+        "endpoint": "inquire-balance",
+        "p95": 5.513
+      },
+      {
+        "hour": "14",
+        "endpoint": "inquire-price",
+        "p95": 3.915
+      },
+      {
+        "hour": "14",
+        "endpoint": "overseas-inquire-price",
+        "p95": 3.052
+      },
+      {
+        "hour": "15",
+        "endpoint": "inquire-balance",
+        "p95": 5.416
+      },
+      {
+        "hour": "15",
+        "endpoint": "inquire-price",
+        "p95": 3.028
+      },
+      {
+        "hour": "15",
+        "endpoint": "overseas-inquire-price",
+        "p95": 3.148
+      }
+    ]
+  },
+  "atm_rolls": {
+    "count": 89,
+    "round_trips": 23,
+    "round_trip_pct": 25.8
+  },
+  "budget_exceeded": {
+    "count": 166,
+    "skipped_legs_total": 1112,
+    "priority_cut_minutes": 17,
+    "priority_before_others_minutes": 17,
+    "labelled": 166,
+    "samples": [
+      {
+        "at": "09:20",
+        "skipped": 3,
+        "collected": 17,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:23",
+        "skipped": 2,
+        "collected": 18,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:24",
+        "skipped": 2,
+        "collected": 18,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:25",
+        "skipped": 4,
+        "collected": 16,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:30",
+        "skipped": 3,
+        "collected": 16,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:37",
+        "skipped": 6,
+        "collected": 12,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:45",
+        "skipped": 2,
+        "collected": 16,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:46",
+        "skipped": 5,
+        "collected": 15,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:47",
+        "skipped": 3,
+        "collected": 17,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "09:51",
+        "skipped": 3,
+        "collected": 17,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      }
+    ]
+  },
+  "timeout_abort": {
+    "count": 204,
+    "skipped_legs_total": 2698,
+    "priority_cut_minutes": 149,
+    "priority_before_others_minutes": 0,
+    "labelled": 204,
+    "minutes": [
+      "09:50",
+      "10:02",
+      "10:15",
+      "10:20",
+      "10:40",
+      "11:11",
+      "11:24",
+      "11:26",
+      "11:30",
+      "11:30",
+      "11:31",
+      "11:35",
+      "11:40",
+      "11:41",
+      "11:42",
+      "11:45",
+      "11:46",
+      "11:47",
+      "11:49",
+      "11:50",
+      "11:53",
+      "11:55",
+      "11:56",
+      "12:00",
+      "12:01",
+      "12:02",
+      "12:06",
+      "12:08",
+      "12:10",
+      "12:13",
+      "12:14",
+      "12:15",
+      "12:16",
+      "12:17",
+      "12:18",
+      "12:20",
+      "12:21",
+      "12:23",
+      "12:24",
+      "12:27",
+      "12:28",
+      "12:30",
+      "12:32",
+      "12:33",
+      "12:34",
+      "12:34",
+      "12:35",
+      "12:36",
+      "12:39",
+      "12:40",
+      "12:40",
+      "12:41",
+      "12:41",
+      "12:42",
+      "12:44",
+      "12:46",
+      "12:49",
+      "12:50",
+      "12:51",
+      "12:52",
+      "12:53",
+      "12:54",
+      "12:55",
+      "12:56",
+      "12:57",
+      "12:59",
+      "13:00",
+      "13:01",
+      "13:01",
+      "13:02",
+      "13:02",
+      "13:03",
+      "13:03",
+      "13:04",
+      "13:05",
+      "13:06",
+      "13:06",
+      "13:09",
+      "13:10",
+      "13:11",
+      "13:11",
+      "13:12",
+      "13:12",
+      "13:13",
+      "13:14",
+      "13:14",
+      "13:15",
+      "13:15",
+      "13:16",
+      "13:16",
+      "13:17",
+      "13:18",
+      "13:18",
+      "13:19",
+      "13:19",
+      "13:20",
+      "13:21",
+      "13:21",
+      "13:22",
+      "13:22",
+      "13:23",
+      "13:23",
+      "13:24",
+      "13:25",
+      "13:26",
+      "13:29",
+      "13:30",
+      "13:31",
+      "13:31",
+      "13:32",
+      "13:32",
+      "13:33",
+      "13:33",
+      "13:34",
+      "13:35",
+      "13:36",
+      "13:40",
+      "13:41",
+      "13:42",
+      "13:44",
+      "13:45",
+      "13:45",
+      "13:46",
+      "13:47",
+      "13:50",
+      "13:51",
+      "13:52",
+      "13:54",
+      "13:55",
+      "13:56",
+      "13:57",
+      "13:58",
+      "14:00",
+      "14:01",
+      "14:01",
+      "14:02",
+      "14:02",
+      "14:03",
+      "14:03",
+      "14:04",
+      "14:04",
+      "14:05",
+      "14:05",
+      "14:06",
+      "14:06",
+      "14:07",
+      "14:07",
+      "14:08",
+      "14:08",
+      "14:09",
+      "14:09",
+      "14:10",
+      "14:10",
+      "14:11",
+      "14:11",
+      "14:12",
+      "14:12",
+      "14:13",
+      "14:13",
+      "14:14",
+      "14:14",
+      "14:15",
+      "14:15",
+      "14:16",
+      "14:16",
+      "14:17",
+      "14:20",
+      "14:21",
+      "14:30",
+      "14:48",
+      "14:50",
+      "15:00",
+      "15:01",
+      "15:11",
+      "15:12",
+      "15:13",
+      "15:14",
+      "15:15",
+      "15:16",
+      "15:16",
+      "15:17",
+      "15:17",
+      "15:18",
+      "15:18",
+      "15:19",
+      "15:19",
+      "15:20",
+      "15:20",
+      "15:21",
+      "15:21",
+      "15:22",
+      "15:22",
+      "15:23",
+      "15:23",
+      "15:24",
+      "15:24",
+      "15:25",
+      "15:25",
+      "15:26",
+      "15:26",
+      "15:27",
+      "15:27",
+      "15:28",
+      "15:30"
+    ],
+    "samples": [
+      {
+        "at": "09:50",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 7,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:02",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 7,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:15",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 6,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:20",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 6,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "10:40",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 7,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "11:11",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 7,
+        "cut_books": "weekly_thu",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "11:24",
+        "consecutive": 0,
+        "skipped": 10,
+        "collected": 7,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "11:26",
+        "consecutive": 1,
+        "skipped": 10,
+        "collected": 6,
+        "cut_books": "weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "11:30",
+        "consecutive": 3,
+        "skipped": 14,
+        "collected": 0,
+        "cut_books": "regular,weekly_mon",
+        "priority_violation": "아니오"
+      },
+      {
+        "at": "11:30",
+        "consecutive": 1,
+        "skipped": 16,
+        "collected": 0,
+        "cut_books": "regular,weekly_mon",
+        "priority_violation": "아니오"
+      }
+    ]
+  },
+  "catchups": {
+    "count": 0,
+    "minutes": []
+  },
+  "priority_retry": {
+    "cycles": 98,
+    "attempted": 224,
+    "recovered": 128,
+    "recovery_pct": 57.1
+  },
+  "ws_disconnect": {
+    "count": 0,
+    "by_hour": {},
+    "busiest_hour": null,
+    "busiest_hour_count": 0,
+    "first_at": null,
+    "last_at": null
+  },
+  "poller_phase": {
+    "계좌잔고": {
+      "mode_second": 30,
+      "top_seconds": {
+        "30": 21,
+        "35": 14,
+        "36": 13
+      },
+      "minutes_mod10": {
+        "4": 47,
+        "9": 47
+      },
+      "burst_count": 94
+    },
+    "기동": {
+      "mode_second": 28,
+      "top_seconds": {
+        "28": 1
+      },
+      "minutes_mod10": {
+        "0": 1
+      },
+      "burst_count": 1
+    },
+    "만기유동성": {
+      "mode_second": 31,
+      "top_seconds": {
+        "31": 18,
+        "36": 17,
+        "37": 9
+      },
+      "minutes_mod10": {
+        "1": 31,
+        "3": 29,
+        "5": 27
+      },
+      "burst_count": 87
+    },
+    "매크로": {
+      "mode_second": 30,
+      "top_seconds": {
+        "30": 27,
+        "33": 18,
+        "31": 14
+      },
+      "minutes_mod10": {
+        "2": 42,
+        "7": 43
+      },
+      "burst_count": 85
+    },
+    "옵션체인": {
+      "mode_second": 8,
+      "top_seconds": {
+        "8": 4,
+        "3": 3,
+        "29": 2
+      },
+      "minutes_mod10": {
+        "0": 2,
+        "1": 6,
+        "2": 1,
+        "3": 2,
+        "4": 3,
+        "5": 4,
+        "7": 4,
+        "8": 1
+      },
+      "burst_count": 23
+    },
+    "투자자수급": {
+      "mode_second": 52,
+      "top_seconds": {
+        "52": 2,
+        "53": 2,
+        "50": 1
+      },
+      "minutes_mod10": {
+        "0": 1,
+        "1": 2,
+        "3": 2,
+        "5": 1
+      },
+      "burst_count": 6
+    }
+  },
+  "log_volume": {
+    "total_bytes": 3412482,
+    "total_lines": 18080,
+    "httpx_bytes": 2005001,
+    "httpx_pct": 58.8,
+    "human_lines": 8448,
+    "traceback_lines": 553,
+    "httpx_lines": 9079,
+    "by_level": {
+      "INFO": 16514,
+      "WARNING": 964,
+      "ERROR": 49
+    }
+  },
+  "qualitative": {
+    "event_calendar_not_covered": 9,
+    "kis_error_response": 32,
+    "egw00201": 24,
+    "read_timeout": 1362,
+    "remote_protocol_error": 36,
+    "cycle_total_failure": 67,
+    "chain_cycle_empty": 49,
+    "gamma_flip_out_of_leg_range": 2
+  },
+  "qualitative_suppressed": {
+    "read_timeout": 1028
+  },
+  "process_starts": [
+    27028.203
+  ],
+  "parser_audit": {
+    "blind": {},
+    "loose_counts": {
+      "event_calendar_not_covered": 9,
+      "cycles": 494,
+      "kis_error_response": 32,
+      "rest_latency": 98,
+      "atm_rolls": 267,
+      "slow_calls": 4033,
+      "budget_exceeded": 166,
+      "backoff": 160,
+      "read_timeout": 341,
+      "remote_protocol_error": 36,
+      "timeout_abort": 204,
+      "chain_cycle_empty": 49,
+      "gamma_flip_out_of_leg_range": 2
+    }
+  },
+  "failures": {
+    "옵션 체인 폴링 실패": 228,
+    "옵션 체인 폴링 전체 실패": 67,
+    "옵션 체인 폴링 재시도도 실패": 49,
+    "만기 유동성 만기확인 조회 실패": 44,
+    "VIX 근월물 조회 실패": 28,
+    "VIX 차근월물 조회 실패": 21,
+    "USDCNH 선물 조회 실패": 21,
+    "매크로 스냅샷 폴링 전체 실패": 14,
+    "만기 유동성 폴링 실패": 10,
+    "ZN(10년 국채선물) 근월물 조회 실패": 9,
+    "ES(E-mini S&P500) 근월물 조회 실패": 9,
+    "계좌 잔고 폴링 사이클 실패": 5
+  },
+  "failures_by_cause": {
+    "ZN(10년 국채선물) 근월물 조회 실패": {
+      "kis_error": 8,
+      "read_timeout": 1
+    },
+    "ES(E-mini S&P500) 근월물 조회 실패": {
+      "kis_error": 9
+    },
+    "옵션 체인 폴링 실패": {
+      "read_timeout": 219,
+      "egw00201": 7,
+      "other": 2
+    },
+    "만기 유동성 폴링 실패": {
+      "egw00201": 10
+    },
+    "VIX 근월물 조회 실패": {
+      "read_timeout": 23,
+      "egw00201": 5
+    },
+    "VIX 차근월물 조회 실패": {
+      "read_timeout": 21
+    },
+    "USDCNH 선물 조회 실패": {
+      "read_timeout": 21
+    },
+    "만기 유동성 만기확인 조회 실패": {
+      "read_timeout": 42,
+      "egw00201": 2
+    },
+    "옵션 체인 폴링 전체 실패": {
+      "other": 67
+    },
+    "옵션 체인 폴링 재시도도 실패": {
+      "other": 49
+    },
+    "매크로 스냅샷 폴링 전체 실패": {
+      "other": 14
+    },
+    "계좌 잔고 폴링 사이클 실패": {
+      "other": 5
+    }
+  },
+  "overrun": {
+    "count": 0,
+    "max_seconds": 0.0,
+    "total_seconds": 0
+  },
+  "failure_budget_abort": {
+    "count": 0,
+    "skipped_legs_total": 0,
+    "priority_cut_minutes": null,
+    "priority_before_others_minutes": null,
+    "labelled": 0,
+    "minutes": []
+  },
+  "overrun_by_poller": {
+    "만기 유동성 폴링": {
+      "count": 3,
+      "max_seconds": 1.8,
+      "total_seconds": 3.5
+    }
+  },
+  "delta_baseline": {
+    "date": "2026-08-19",
+    "baseline_is_trading_day": 1,
+    "skipped_non_trading_days": 0,
+    "target_is_trading_day": 1,
+    "target_holiday_name": null,
+    "calendar_coverage_gap_days": 0,
+    "sidecar_found": 1
+  },
+  "levers": {
+    "levers": [
+      {
+        "key": "use_effective_member_count",
+        "위치": "strategy_params.yaml",
+        "value": false,
+        "default": false,
+        "on": false
+      },
+      {
+        "key": "reentry_cooldown_minutes",
+        "위치": "strategy_params.yaml · strategy_gates",
+        "value": 0,
+        "default": 0,
+        "on": false
+      },
+      {
+        "key": "SIGNAL_FUSION_PHASE_OFFSET_SECONDS",
+        "위치": "mahdi/main.py",
+        "value": 10.0,
+        "default": 10.0,
+        "on": false
+      },
+      {
+        "key": "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS",
+        "위치": "mahdi/main.py",
+        "value": {},
+        "default": {},
+        "on": false
+      },
+      {
+        "key": "OPTION_CHAIN_READ_TIMEOUT_SECONDS",
+        "위치": "mahdi/broker/rest_client.py",
+        "value": null,
+        "default": null,
+        "on": false
+      },
+      {
+        "key": "REGIME_RESTORE_SESSION_WINDOW",
+        "위치": "mahdi/engines/regime_pipeline.py",
+        "value": false,
+        "default": false,
+        "on": false
+      }
+    ],
+    "git_head": "843914e"
+  },
+  "watchdog": {
+    "checks": 57,
+    "restarts": 0,
+    "restart_failures": 0,
+    "alert_only": 0,
+    "degraded_checks": 8,
+    "missing_check_alerts": 0,
+    "stale_lock_sweeps": 1,
+    "max_silence_minutes": 10.2,
+    "silence_over_cadence_ratio": 1.02,
+    "max_silence_window": "12:30~12:40",
+    "first_at": "07:40:01",
+    "last_at": "15:40:02",
+    "silence_warn_minutes": 20.0
+  },
+  "crash": {
+    "starts": 1,
+    "crashes": 0,
+    "causes": {},
+    "events": [],
+    "unattributed": 3,
+    "marker_present": true
+  },
+  "db": {
+    "monthly_coverage": {
+      "expiry": "2026-09-10",
+      "expiry_source": "expiry_liquidity",
+      "minutes": 445,
+      "elapsed_minutes": 494,
+      "coverage_pct": 90.1,
+      "over_100": false
+    },
+    "tables": [
+      {
+        "table": "option_analysis_1m",
+        "rows": 6267,
+        "minutes": 445,
+        "note": "옵션체인 그릭스"
+      },
+      {
+        "table": "underlying_spot_1m",
+        "rows": 339,
+        "minutes": 339,
+        "note": "기초자산 스팟"
+      },
+      {
+        "table": "market_raw_1m",
+        "rows": 3987,
+        "minutes": 410,
+        "note": "WS 체결 1분봉"
+      },
+      {
+        "table": "investor_flow_1m",
+        "rows": 489,
+        "minutes": 489,
+        "note": "투자자 수급"
+      },
+      {
+        "table": "expiry_liquidity_1m",
+        "rows": 87,
+        "minutes": 87,
+        "note": "만기 유동성"
+      },
+      {
+        "table": "macro_snapshot_5m",
+        "rows": 85,
+        "minutes": 85,
+        "note": "매크로"
+      },
+      {
+        "table": "account_balance_snapshots",
+        "rows": 94,
+        "minutes": 94,
+        "note": "계좌 잔고"
+      },
+      {
+        "table": "signal_decisions",
+        "rows": 494,
+        "minutes": 494,
+        "note": "판단"
+      },
+      {
+        "table": "risk_snapshots",
+        "rows": 494,
+        "minutes": 494,
+        "note": "리스크 스냅샷"
+      },
+      {
+        "table": "regime_state",
+        "rows": 410,
+        "minutes": 410,
+        "note": "레짐"
+      },
+      {
+        "table": "feature_store",
+        "rows": 410,
+        "minutes": 410,
+        "note": "레짐 피처"
+      },
+      {
+        "table": "rate_limiter_status_history",
+        "rows": 494,
+        "minutes": 494,
+        "note": "레이트리밋 이력"
+      },
+      {
+        "table": "market_halt_event_history",
+        "rows": 0,
+        "minutes": 0,
+        "note": "CB 전이 이력"
+      },
+      {
+        "table": "decision_outcomes",
+        "rows": 300,
+        "minutes": 300,
+        "note": "판단 사후 평가"
+      },
+      {
+        "table": "execution_logs",
+        "rows": 0,
+        "minutes": 0,
+        "note": "주문 실행 이력(사람이 주문한 날만 자란다)"
+      }
+    ],
+    "chain_minute_coverage": {
+      "available": true,
+      "span_minutes": 494,
+      "minutes_with_rows": 445,
+      "zero_row_minutes": [
+        "11:30",
+        "12:34",
+        "12:40",
+        "12:41",
+        "13:01",
+        "13:02",
+        "13:03",
+        "13:06",
+        "13:11",
+        "13:12",
+        "13:14",
+        "13:15",
+        "13:16",
+        "13:18",
+        "13:19",
+        "13:21",
+        "13:22",
+        "13:23",
+        "13:31",
+        "13:32",
+        "13:33",
+        "14:01",
+        "14:02",
+        "14:03",
+        "14:04",
+        "14:05",
+        "14:06",
+        "14:07",
+        "14:08",
+        "14:09",
+        "14:10",
+        "14:11",
+        "14:12",
+        "14:13",
+        "14:14",
+        "14:15",
+        "14:16",
+        "15:16",
+        "15:17",
+        "15:18",
+        "15:19",
+        "15:20",
+        "15:21",
+        "15:22",
+        "15:23",
+        "15:24",
+        "15:25",
+        "15:26",
+        "15:27"
+      ],
+      "zero_row_count": 49,
+      "zero_row_longest_run": {
+        "length": 16,
+        "start": "14:01",
+        "end": "14:16"
+      },
+      "zero_row_run_alert_minutes": 20,
+      "over_design_minutes": [],
+      "over_design_count": 0,
+      "zero_row_by_cause": {
+        "collection_wiped": [
+          "11:30",
+          "12:34",
+          "12:40",
+          "12:41",
+          "13:01",
+          "13:02",
+          "13:03",
+          "13:06",
+          "13:11",
+          "13:12",
+          "13:14",
+          "13:15",
+          "13:16",
+          "13:18",
+          "13:19",
+          "13:21",
+          "13:22",
+          "13:23",
+          "13:31",
+          "13:32",
+          "13:33",
+          "14:01",
+          "14:02",
+          "14:03",
+          "14:04",
+          "14:05",
+          "14:06",
+          "14:07",
+          "14:08",
+          "14:09",
+          "14:10",
+          "14:11",
+          "14:12",
+          "14:13",
+          "14:14",
+          "14:15",
+          "14:16",
+          "15:16",
+          "15:17",
+          "15:18",
+          "15:19",
+          "15:20",
+          "15:21",
+          "15:22",
+          "15:23",
+          "15:24",
+          "15:25",
+          "15:26",
+          "15:27"
+        ],
+        "no_cycle": [],
+        "written_elsewhere": [],
+        "labelled": true
+      }
+    },
+    "monthly_leg_completeness": {
+      "available": true,
+      "expiry": "2026-09-10",
+      "minutes": 445,
+      "design_legs": 10,
+      "below_design_count": 172,
+      "below_design_pct": 38.7,
+      "below_flip_minimum_count": 69,
+      "legs_median": 10.0,
+      "legs_min": 1
+    },
+    "spot_source_divergence": {
+      "available": true,
+      "futures_symbol": "A01609",
+      "live_window_end": "15:20",
+      "minutes": 339,
+      "max_pct": 3.386,
+      "median_pct": 0.073,
+      "index_frozen_minutes": 2,
+      "index_frozen_max_run": 1
+    },
+    "book_coverage": [
+      {
+        "series": "regular",
+        "expiry": "2026-09-10",
+        "minutes": 445,
+        "coverage_pct": 100.0
+      },
+      {
+        "series": "weekly_mon",
+        "expiry": "2026-08-24",
+        "minutes": 160,
+        "coverage_pct": 36.0
+      },
+      {
+        "series": "weekly_thu",
+        "expiry": "2026-08-20",
+        "minutes": 174,
+        "coverage_pct": 39.1
+      }
+    ],
+    "book_gamma_map": [
+      {
+        "expiry": "2026-08-20",
+        "legs": 10,
+        "gex": 1490933131469.5305,
+        "gamma_flip": null,
+        "pin_strike": 1080.0,
+        "pin_concentration_pct": 46.4,
+        "expiry_today": true
+      },
+      {
+        "expiry": "2026-08-24",
+        "legs": 10,
+        "gex": 105611889366.81717,
+        "gamma_flip": null,
+        "pin_strike": 1082.5,
+        "pin_concentration_pct": 85.9,
+        "expiry_today": false
+      },
+      {
+        "expiry": "2026-09-10",
+        "legs": 10,
+        "gex": 1950552777.3839993,
+        "gamma_flip": null,
+        "pin_strike": 1075.0,
+        "pin_concentration_pct": 45.2,
+        "expiry_today": false
+      }
+    ],
+    "wide_oi_landscape": [
+      {
+        "expiry": "2026-08-20",
+        "strikes": 32,
+        "strike_min": 1007.5,
+        "strike_max": 1095.0,
+        "search_pct": 6.92,
+        "net_call_put_oi": 11617,
+        "call_heavy_strikes": 24,
+        "put_heavy_strikes": 8,
+        "wide_gamma_flip": null,
+        "flip_possible": false
+      },
+      {
+        "expiry": "2026-08-24",
+        "strikes": 30,
+        "strike_min": 1007.5,
+        "strike_max": 1092.5,
+        "search_pct": 6.92,
+        "net_call_put_oi": 4204,
+        "call_heavy_strikes": 9,
+        "put_heavy_strikes": 7,
+        "wide_gamma_flip": null,
+        "flip_possible": false
+      },
+      {
+        "expiry": "2026-09-10",
+        "strikes": 32,
+        "strike_min": 1007.5,
+        "strike_max": 1095.0,
+        "search_pct": 6.92,
+        "net_call_put_oi": -446,
+        "call_heavy_strikes": 11,
+        "put_heavy_strikes": 21,
+        "wide_gamma_flip": null,
+        "flip_possible": false
+      }
+    ],
+    "member_availability": {
+      "available": true,
+      "minutes": 494,
+      "members": [
+        {
+          "member": "regime_hmm",
+          "available_minutes": 419,
+          "available_pct": 84.8,
+          "top_unavailable_reason": "regime_state 없음",
+          "structural_minutes": 0,
+          "implemented": true
+        },
+        {
+          "member": "xgboost_tabular",
+          "available_minutes": 0,
+          "available_pct": 0.0,
+          "top_unavailable_reason": "미학습(Phase 3)",
+          "structural_minutes": 0,
+          "implemented": false
+        },
+        {
+          "member": "lstm_temporal",
+          "available_minutes": 0,
+          "available_pct": 0.0,
+          "top_unavailable_reason": "미학습(Phase 3)",
+          "structural_minutes": 0,
+          "implemented": false
+        },
+        {
+          "member": "options_flow",
+          "available_minutes": 366,
+          "available_pct": 74.1,
+          "top_unavailable_reason": "장전(스팟 미적재)",
+          "structural_minutes": 114,
+          "implemented": true
+        },
+        {
+          "member": "orderflow_ofi_vpin",
+          "available_minutes": 410,
+          "available_pct": 83.0,
+          "top_unavailable_reason": "ofi/queue_imbalance 없음",
+          "structural_minutes": 9,
+          "implemented": true
+        },
+        {
+          "member": "flow_position",
+          "available_minutes": 494,
+          "available_pct": 100.0,
+          "top_unavailable_reason": null,
+          "structural_minutes": 0,
+          "implemented": true
+        }
+      ],
+      "regime_hmm": {
+        "member": "regime_hmm",
+        "available_minutes": 419,
+        "available_pct": 84.8,
+        "top_unavailable_reason": "regime_state 없음",
+        "structural_minutes": 0,
+        "implemented": true
+      },
+      "xgboost_tabular": {
+        "member": "xgboost_tabular",
+        "available_minutes": 0,
+        "available_pct": 0.0,
+        "top_unavailable_reason": "미학습(Phase 3)",
+        "structural_minutes": 0,
+        "implemented": false
+      },
+      "lstm_temporal": {
+        "member": "lstm_temporal",
+        "available_minutes": 0,
+        "available_pct": 0.0,
+        "top_unavailable_reason": "미학습(Phase 3)",
+        "structural_minutes": 0,
+        "implemented": false
+      },
+      "options_flow": {
+        "member": "options_flow",
+        "available_minutes": 366,
+        "available_pct": 74.1,
+        "top_unavailable_reason": "장전(스팟 미적재)",
+        "structural_minutes": 114,
+        "implemented": true
+      },
+      "orderflow_ofi_vpin": {
+        "member": "orderflow_ofi_vpin",
+        "available_minutes": 410,
+        "available_pct": 83.0,
+        "top_unavailable_reason": "ofi/queue_imbalance 없음",
+        "structural_minutes": 9,
+        "implemented": true
+      },
+      "flow_position": {
+        "member": "flow_position",
+        "available_minutes": 494,
+        "available_pct": 100.0,
+        "top_unavailable_reason": null,
+        "structural_minutes": 0,
+        "implemented": true
+      }
+    },
+    "member_score_quality": {
+      "available": true,
+      "members": [
+        {
+          "member": "regime_hmm",
+          "scored_minutes": 419,
+          "mean": 0.0,
+          "positive": 0,
+          "negative": 0,
+          "zero": 419
+        },
+        {
+          "member": "options_flow",
+          "scored_minutes": 366,
+          "mean": -0.4754,
+          "positive": 91,
+          "negative": 265,
+          "zero": 10
+        },
+        {
+          "member": "orderflow_ofi_vpin",
+          "scored_minutes": 410,
+          "mean": -0.0854,
+          "positive": 186,
+          "negative": 221,
+          "zero": 3
+        },
+        {
+          "member": "flow_position",
+          "scored_minutes": 494,
+          "mean": 0.4595,
+          "positive": 323,
+          "negative": 96,
+          "zero": 75
+        }
+      ],
+      "pairs": [
+        {
+          "a": "flow_position",
+          "b": "options_flow",
+          "both_nonzero_minutes": 356,
+          "same_sign_minutes": 93,
+          "same_sign_pct": 26.1
+        },
+        {
+          "a": "flow_position",
+          "b": "orderflow_ofi_vpin",
+          "both_nonzero_minutes": 407,
+          "same_sign_minutes": 184,
+          "same_sign_pct": 45.2
+        },
+        {
+          "a": "options_flow",
+          "b": "orderflow_ofi_vpin",
+          "both_nonzero_minutes": 353,
+          "same_sign_minutes": 182,
+          "same_sign_pct": 51.6
+        }
+      ]
+    },
+    "strike_window_quality": {
+      "available": true,
+      "expiry": "2026-09-10",
+      "minutes": 339,
+      "atm_covered_pct": 82.9,
+      "atm_covered_pct_by_futures": 82.9,
+      "atm_covered_pct_by_index_same_minutes": 82.9,
+      "atm_source_gap_pt": 0.0,
+      "futures_cross_check_minutes": 339,
+      "window_covered_pct": 33.9,
+      "atm_offset_strikes_median": 1.0,
+      "atm_offset_strikes_max": 15.0,
+      "design_strikes": 5,
+      "snapshot_strikes_median": 5.0,
+      "snapshot_strikes_max": 10,
+      "width_jitter": 1.0,
+      "snapshot_window_minutes": 5
+    },
+    "signal_decisions": [
+      {
+        "decision": "ENTER",
+        "conviction": "STANDARD",
+        "reject_reason": null,
+        "count": 227
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "NO_TRADE",
+        "reject_reason": "meta_label:no_trade",
+        "count": 75
+      },
+      {
+        "decision": "ENTER",
+        "conviction": "SMALL_TEST",
+        "reject_reason": null,
+        "count": 60
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "STANDARD",
+        "reject_reason": null,
+        "count": 54
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "SMALL_TEST",
+        "reject_reason": "conflict_resolution:no_clear_consensus",
+        "count": 27
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "STANDARD",
+        "reject_reason": "entry_cutoff",
+        "count": 18
+      },
+      {
+        "decision": "ENTER",
+        "conviction": "HIGH_CONVICTION",
+        "reject_reason": null,
+        "count": 13
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "STANDARD",
+        "reject_reason": "strategy_palette:wait_only",
+        "count": 8
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "SMALL_TEST",
+        "reject_reason": null,
+        "count": 6
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "HIGH_CONVICTION",
+        "reject_reason": "entry_cutoff",
+        "count": 4
+      },
+      {
+        "decision": "REJECT",
+        "conviction": "HIGH_CONVICTION",
+        "reject_reason": null,
+        "count": 2
+      }
+    ],
+    "decisions": {
+      "total": 494,
+      "member_count": {
+        "available": true,
+        "available_mean": 3.42,
+        "effective_mean": 2.39,
+        "dead_axis_mean": 1.03,
+        "effective_min": 0,
+        "minutes_with_dead_axis": 494,
+        "dead_axis_by_member": {
+          "regime_hmm": 419,
+          "flow_position": 75,
+          "options_flow": 10,
+          "orderflow_ofi_vpin": 3
+        }
+      },
+      "decision": {
+        "ENTER": 300,
+        "REJECT": 194
+      },
+      "conviction": {
+        "HIGH_CONVICTION": 19,
+        "NO_TRADE": 75,
+        "SMALL_TEST": 93,
+        "STANDARD": 307
+      },
+      "reject_reason": {
+        "conflict_resolution:no_clear_consensus": 27,
+        "entry_cutoff": 22,
+        "meta_label:no_trade": 75,
+        "strategy_palette:wait_only": 8
+      },
+      "vrp": {
+        "non_null": 338,
+        "non_null_ratio": 0.684
+      },
+      "entry_strategies": {
+        "small_strangle_buy": 286,
+        "straddle_accumulate": 14
+      },
+      "distinct_entry_strategies": 2,
+      "entry_cutoff": {
+        "cutoff_time": "14:50",
+        "forced_flat_time": "15:10",
+        "blocked_count": 22,
+        "enter_after_cutoff": 0,
+        "enter_after_forced_flat": 0
+      },
+      "selected_instruments": {
+        "available": true,
+        "recorded_minutes": 494,
+        "enter_minutes": 300,
+        "enter_minutes_with_candidate": 22,
+        "enter_minutes_with_candidate_pct": 7.3,
+        "reason": {
+          "no_strike_match": 245,
+          "no_entry_strategy": 172,
+          "no_eligible_book": 52
+        },
+        "leg_count": 50,
+        "symbol_resolved_pct": 100.0,
+        "expiry_day_leg_count": 50,
+        "order_submitted_true_count": 0,
+        "strategy_attempts": {
+          "small_strangle_buy": 286,
+          "straddle_accumulate": 14
+        },
+        "strategy_rejected": {
+          "small_strangle_buy": 233
+        }
+      }
+    },
+    "signal_reach": {
+      "available": true,
+      "decisions": 494,
+      "member_count_max": 4,
+      "gamma_flip_count": 0,
+      "gamma_flip_pct": 0.0,
+      "chain_leg_median": 10.0,
+      "chain_leg_max": 10,
+      "chain_age_seconds_median": 70.064249,
+      "chain_age_seconds_max": 250.076465,
+      "chain_leg_over_design_minutes": 0,
+      "chain_leg_excess_max": 0,
+      "gex_input_missing_minutes": 23,
+      "gamma_flip_out_of_range_count": 0,
+      "chain_input_source": {
+        "available": true,
+        "counts": {
+          "none": 23,
+          "stale": 471
+        },
+        "stale_pct": 95.3
+      },
+      "decisions_after_open": 405,
+      "warnings": [
+        "감마플립 산출률 0.0% — 이 북에서는 0%가 정상일 수 있다(08-04 §2-3: 전 구간 단조). 판정은 아래 범위 밖 건수로 한다",
+        "체인 스냅샷 최고령 레그 4분 — 신선도 경계가 깨졌다",
+        "GEX 입력이 없던 분 23분 — 그 분의 판단은 감마 지형을 못 봤다. §4의 「0행 분 원인」에서 `수집 전멸`인지 확인할 것"
+      ],
+      "notes": []
+    },
+    "decision_outcomes": {
+      "available": true,
+      "entries": 300,
+      "horizons": {
+        "5m": {
+          "sample": 268,
+          "hits": 149,
+          "hit_pct": 55.6,
+          "abs_move_pct": 0.241
+        },
+        "15m": {
+          "sample": 258,
+          "hits": 134,
+          "hit_pct": 51.9,
+          "abs_move_pct": 0.425
+        },
+        "30m": {
+          "sample": 255,
+          "hits": 131,
+          "hit_pct": 51.4,
+          "abs_move_pct": 0.602
+        }
+      },
+      "control": {
+        "available": true,
+        "rejects": 194,
+        "horizons": {
+          "5m": {
+            "sample": 46,
+            "hits": 21,
+            "hit_pct": 45.7
+          },
+          "15m": {
+            "sample": 35,
+            "hits": 16,
+            "hit_pct": 45.7
+          },
+          "30m": {
+            "sample": 23,
+            "hits": 10,
+            "hit_pct": 43.5
+          }
+        },
+        "shared_hours": [
+          "09",
+          "11",
+          "12",
+          "13",
+          "14"
+        ],
+        "time_matched": {
+          "enter": {
+            "5m": {
+              "sample": 208,
+              "hits": 112,
+              "hit_pct": 53.8
+            },
+            "15m": {
+              "sample": 198,
+              "hits": 98,
+              "hit_pct": 49.5
+            },
+            "30m": {
+              "sample": 195,
+              "hits": 88,
+              "hit_pct": 45.1
+            }
+          },
+          "reject": {
+            "5m": {
+              "sample": 35,
+              "hits": 16,
+              "hit_pct": 45.7
+            },
+            "15m": {
+              "sample": 34,
+              "hits": 15,
+              "hit_pct": 44.1
+            },
+            "30m": {
+              "sample": 23,
+              "hits": 10,
+              "hit_pct": 43.5
+            }
+          }
+        }
+      },
+      "by_chain_input": {
+        "available": true,
+        "sources": {
+          "stale": {
+            "entries": 300,
+            "horizons": {
+              "5m": {
+                "sample": 268,
+                "hit_pct": 55.6,
+                "abs_move_pct": 0.241
+              },
+              "15m": {
+                "sample": 258,
+                "hit_pct": 51.9,
+                "abs_move_pct": 0.425
+              },
+              "30m": {
+                "sample": 255,
+                "hit_pct": 51.4,
+                "abs_move_pct": 0.602
+              }
+            }
+          }
+        }
+      }
+    },
+    "risk_gate_distinct": 269,
+    "regime": {
+      "visits": [
+        {
+          "regime": "2",
+          "today": 0,
+          "total": 9849,
+          "days": 26
+        },
+        {
+          "regime": "3",
+          "today": 381,
+          "total": 1167,
+          "days": 6
+        },
+        {
+          "regime": "5",
+          "today": 29,
+          "total": 1632,
+          "days": 7
+        }
+      ],
+      "today_total": 410,
+      "trend_minutes": 0,
+      "warmup_minutes": 29,
+      "warmup_runs": 1,
+      "warmup_restart_minutes": 0,
+      "warmup_unknown_minutes": 0
+    },
+    "regime_vs_futures_bars": {
+      "available": true,
+      "futures_symbol": "A01609",
+      "futures_bar_minutes": 410,
+      "regime_minutes": 410,
+      "gap": 0,
+      "minutes": []
+    },
+    "feature_store": {
+      "today": 410,
+      "total": 11070,
+      "hmm_threshold": 8000,
+      "hmm_progress_pct": 138.4,
+      "non_neutral_pct": {
+        "rv_ratio": 100.0,
+        "book_thinning": 99.3
+      },
+      "model": {
+        "trained_at": "2026-08-10T16:56:34",
+        "samples": 8223,
+        "sessions": 21,
+        "feature_version": "v1",
+        "iv_chg_source": "먼슬리 단독 재계산(이력 7832/8242행, 95.0%)",
+        "db_rows_modified": false
+      }
+    },
+    "macro": {
+      "vix_front": {
+        "non_null": 71,
+        "distinct": 1
+      },
+      "vix_next": {
+        "non_null": 78,
+        "distinct": 6
+      },
+      "vix_term_structure": {
+        "non_null": 67,
+        "distinct": 6
+      },
+      "usdcnh": {
+        "non_null": 78,
+        "distinct": 34
+      },
+      "es_front": {
+        "non_null": 85,
+        "distinct": 32
+      },
+      "zn_front": {
+        "non_null": 9,
+        "distinct": 5
+      },
+      "us10y_yield": {
+        "non_null": 2,
+        "distinct": 1
+      },
+      "usdkrw": {
+        "non_null": 2,
+        "distinct": 2
+      },
+      "move_index": {
+        "non_null": 2,
+        "distinct": 2
+      }
+    },
+    "market_halt": {
+      "updated_at": "15:40:34",
+      "last_message_at": null
+    },
+    "ws_status": {
+      "updated_at": "15:40:34",
+      "connected_since": "07:30:31",
+      "last_message_at": "15:35:00",
+      "reconnect_count_today": 0,
+      "market_op_subscribed_at": "07:30:32",
+      "atm_roll_count_today": 89,
+      "atm_roll_dropped_subs_today": 498
+    },
+    "remaining_processes": 0,
+    "rate_limiter": {
+      "rows": 494,
+      "overrun_rows": 0,
+      "max_multiplier": 2.25,
+      "mean_multiplier": 1.132
+    },
+    "positions": {
+      "available": true,
+      "rows": 0,
+      "snapshot_minutes": 0,
+      "symbols": 0,
+      "max_concurrent_symbols": 0,
+      "side_distribution": {},
+      "unknown_side_count_max": 0
+    },
+    "slack_alerts": {
+      "available": true,
+      "enabled": false,
+      "source": "slack_alert_settings"
+    }
+  }
+}

@@ -2118,3 +2118,54 @@ poll_expiry_liquidity/poll_macro_snapshot)가 공유하는 단일 `_RateLimiter`
       조건 둘을 **함께** 만족한 뒤: (a) 위 예약 3종이 새 이름으로 바뀌었고,
       (b) `docs/동작점검/`에 새로 생긴 `_점검_pre.md`가 **한 거래일도 없다**.
       **그 전에 지우면 매일 09:00에 거짓 경보가 울린다** — 이 경보가 원래 막으려던 그 실패다.
+
+### [MW0601] 2026-08-20 밤 실측 — **청소부가 아는 락은 `index.lock` 하나뿐이다**
+
+> 08-20 장후에 fix 5종을 커밋하다 막혀서 드러났다. **이 절은 fix가 아니라 관측 기록이다** —
+> 예측치는 구현 시점에 적는다.
+
+**실측 사실 넷.**
+
+1. **워치독은 장 마감 후에도 1분마다 정상 실행 중이다.** `.watchdog_last_check.json`이
+   22:27·22:31·22:34·22:37·22:53 모두 `{"action":"idle","detail":"감시 창 밖"}`.
+   `watchdog.log`에 15:40 이후 줄이 없는 것은 **창 밖에선 OK를 안 찍기 때문**이지 안 도는 게 아니다.
+   ⚠ 이 로그 침묵을 프로세스 부재로 읽으면 안 된다 — 이 세션이 한 번 그렇게 오독했다.
+2. **0바이트 `index.lock`이 13.4분(임계 10분)을 넘긴 채 워치독 4회를 지나쳤는데
+   `LOCK_SWEPT`이 안 찍혔다.** `sweep()`은 `main()` 첫 줄이라 게이트가 없으므로 **실행은 됐고
+   조용히 건너뛴 것**이다. 사유가 어디에도 안 남는다.
+3. **`INDEX_LOCK_RELPATH = ("index.lock",)` — 청소부가 아는 락은 하나뿐이다.**
+   그런데 실제로 남은 것은 셋이었다:
+   `.git/HEAD.lock`(22:23) · `.git/objects/maintenance.lock`(22:23) · `.git/worktrees/tree/HEAD.lock`(22:09).
+   **`HEAD.lock`은 이후 모든 커밋을 막는다.** `index.lock`보다 더 나쁜데 청소 대상이 아니다.
+4. 실패한 unlink가 `.git/objects/`에 `tmp_obj_*` **29개**를 남겼다(무해하나 `git gc` 전까지 누적).
+
+**후보 원인 둘 — 둘 다 흔적을 안 남긴다는 점이 같다.**
+
+| # | 원인 | 왜 조용한가 |
+|---|---|---|
+| 1 | `git_processes_running()`이 `False`가 아니었다 | `is_stale`은 *이 PC에 git.exe가 하나도 없을 것*을 요구한다. VS Code의 Git 통합은 저장소마다 장수하는 `git.exe cat-file --batch`를 띄운다 — **IDE가 켜져 있으면 청소가 구조적으로 거부된다.** 거부는 설계상 로그를 안 남긴다 |
+| 2 | `lock.unlink()` 실패 | `logger.warning`으로만 가는데 그 로거는 워치독 VBS 컨텍스트에서 **핸들러가 없다** |
+
+⚠ **1번은 미확정이다.** VS Code를 닫자 락이 사라졌지만 **`LOCK_SWEPT` 줄은 안 늘었다**(08:50 것 1건 그대로)
+— 즉 **워치독이 치운 것이 아니다.** 사람이 지웠을 가능성이 남아 있어 이 실험은 결론이 못 된다.
+**다음에 락이 생기면 VS Code를 닫은 상태로 10분을 그냥 두고 `LOCK_SWEPT`이 찍히는지 본다.**
+
+**뼈아픈 지점**: `mahdi/git_lock.py` docstring이 *"조용히 치우지 않는다 — 계명 12"* 라고 적었는데
+**치우는 것만 시끄럽고 못 치우는 것은 조용하다.** fix#9를 만든 계기가 16:20 락이었고,
+그 시각은 개발자의 IDE가 켜져 있을 시각이다.
+
+**fix 후보 (장후 세션에서 예측치와 함께 착수)**
+
+- [ ] **비행동에 사유를 남긴다.** `sweep()`이 `swept` 목록만 반환하지 말고
+      `skipped`(사유: `too_young` / `not_empty` / `git_running` / `git_unknown` / `unlink_failed`)를
+      함께 반환한다. 호출측이 `watchdog.log`에 찍고 `ops.watchdog_metrics`가 센다.
+      **하루 한 줄로 억제**한다 — 매분 찍으면 08-15~16 `ALERT_ONLY` 94·113줄의 재현이다.
+- [ ] **`INDEX_LOCK_RELPATH`를 넓힌다** — `HEAD.lock` · `objects/maintenance.lock` ·
+      `refs/heads/*.lock`. ⚠ **`refs/**.lock`은 신중히**: 진행 중인 push/fetch를 깨뜨릴 수 있다.
+      0바이트 + 나이 + git 프로세스 부재 세 조건은 그대로 요구한다.
+- [ ] **프로브를 저장소 단위로 좁힌다.** 지금은 *"이 PC에 git.exe가 있는가"*라 IDE 하나로
+      전면 거부된다. 최소한 `git_running=True`로 거부한 사실을 남겨 사람이 알 수 있게 한다.
+- [ ] **점검 세션이 저장소에 쓰지 않게 한다.** 오늘 락 넷이 전부 이 세션의 git 호출이 남긴 것이다.
+      `--no-optional-locks`는 읽기만 막고 **커밋은 못 막는다** — 커밋은 사람이 자기 터미널에서 하는 편이 낫다.
+
+**정리 명령(사람)**: `del .git\HEAD.lock .git\objects\maintenance.lock`, 이어서 `git gc --prune=now`.
