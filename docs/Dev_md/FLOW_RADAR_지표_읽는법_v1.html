@@ -1,0 +1,782 @@
+<title>Flow Radar 판독법</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+KR:wght@300;400;500;600&family=Noto+Serif+KR:wght@600;700&display=swap">
+
+<style>
+  /* ── 토큰: 밝은 화면(기본) ───────────────────────────────────────────── */
+  :root {
+    --ground:      #F5F7F9;
+    --surface:     #FFFFFF;
+    --surface-2:   #EBEFF4;
+    --ink:         #131A22;
+    --ink-2:       #3D4A59;
+    --muted:       #6B7888;
+    --rule:        #DBE1E8;
+    --rule-firm:   #BEC7D2;
+
+    /* 화면의 실제 계열색 — 장식이 아니라 차트와 같은 식별색이다 */
+    --ofi:         #0072B2;
+    --cvd:         #A34E80;
+    --abs:         #6E7B1F;
+    --good:        #00795A;
+    --warn:        #A96F00;
+    --crit:        #C04A00;
+
+    --ofi-wash:    #E3EEF6;
+    --cvd-wash:    #F3E7EE;
+    --abs-wash:    #EDEFE0;
+    --crit-wash:   #FAE9DF;
+
+    --code-bg:     #EAEEF3;
+    --code-ink:    #23303E;
+
+    --shadow: 0 1px 2px rgba(19, 26, 34, .05), 0 8px 24px -12px rgba(19, 26, 34, .18);
+  }
+
+  /* ── 토큰: 어두운 화면 (OS 설정, 명시적 light 선택이 이긴다) ────────── */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:    #0F141B;
+      --surface:   #161D26;
+      --surface-2: #1D2631;
+      --ink:       #E3E9F0;
+      --ink-2:     #B3BECB;
+      --muted:     #8593A3;
+      --rule:      #26303C;
+      --rule-firm: #3A4756;
+
+      --ofi:       #4FA6DC;
+      --cvd:       #D08AB4;
+      --abs:       #AEBE55;
+      --good:      #3FC49B;
+      --warn:      #E0A340;
+      --crit:      #F07A3C;
+
+      --ofi-wash:  #14293A;
+      --cvd-wash:  #331F2C;
+      --abs-wash:  #262B14;
+      --crit-wash: #3A2113;
+
+      --code-bg:   #1B242F;
+      --code-ink:  #C6D2DF;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -14px rgba(0, 0, 0, .7);
+    }
+  }
+
+  /* ── 토큰: 어두운 화면 (뷰어가 직접 고름) ────────────────────────────── */
+  :root[data-theme="dark"] {
+    --ground:    #0F141B;
+    --surface:   #161D26;
+    --surface-2: #1D2631;
+    --ink:       #E3E9F0;
+    --ink-2:     #B3BECB;
+    --muted:     #8593A3;
+    --rule:      #26303C;
+    --rule-firm: #3A4756;
+
+    --ofi:       #4FA6DC;
+    --cvd:       #D08AB4;
+    --abs:       #AEBE55;
+    --good:      #3FC49B;
+    --warn:      #E0A340;
+    --crit:      #F07A3C;
+
+    --ofi-wash:  #14293A;
+    --cvd-wash:  #331F2C;
+    --abs-wash:  #262B14;
+    --crit-wash: #3A2113;
+
+    --code-bg:   #1B242F;
+    --code-ink:  #C6D2DF;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -14px rgba(0, 0, 0, .7);
+  }
+
+  /* ── 바탕 ───────────────────────────────────────────────────────────── */
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans KR", system-ui, -apple-system, "Malgun Gothic", sans-serif;
+    font-size: 16px;
+    line-height: 1.75;
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 50rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3.25rem;
+  }
+
+  /* ── 타이포 ─────────────────────────────────────────────────────────── */
+  h1, h2, h3 {
+    font-family: "Noto Serif KR", Georgia, "Batang", serif;
+    font-weight: 600;
+    text-wrap: balance;
+    line-height: 1.35;
+    margin: 0;
+  }
+  h1 { font-size: 2.125rem; letter-spacing: -.015em; }
+  h2 { font-size: 1.5rem; letter-spacing: -.01em; }
+  h3 { font-size: 1.0625rem; font-family: "IBM Plex Sans KR", sans-serif; font-weight: 600; }
+
+  p { margin: 0; }
+  strong { font-weight: 600; color: var(--ink); }
+  em { font-style: normal; color: var(--muted); }
+
+  a { color: var(--ofi); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--ofi);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  code, .mono, .num {
+    font-family: "IBM Plex Mono", ui-monospace, "Consolas", monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  code {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: .1em .38em;
+    border-radius: 3px;
+    font-size: .875em;
+  }
+
+  .eyebrow {
+    font-size: .75rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+  }
+
+  /* ── 헤더 ───────────────────────────────────────────────────────────── */
+  .masthead { display: flex; flex-direction: column; gap: 1rem; }
+  .masthead .lede {
+    font-size: 1.125rem;
+    color: var(--ink-2);
+    max-width: 40ch;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem 1.25rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--rule);
+    font-size: .8125rem;
+    color: var(--muted);
+  }
+  .meta .mono { color: var(--ink-2); }
+
+  /* ── 절 ─────────────────────────────────────────────────────────────── */
+  section { display: flex; flex-direction: column; gap: 1.25rem; }
+  .sec-head { display: flex; flex-direction: column; gap: .35rem; }
+
+  /* ── 지표 요약 카드 ─────────────────────────────────────────────────── */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: 1rem;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--tone, var(--rule-firm));
+    border-radius: 4px;
+    padding: 1.15rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+    box-shadow: var(--shadow);
+  }
+  .card .name {
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 500;
+    font-size: 1rem;
+    color: var(--tone, var(--ink));
+    letter-spacing: .02em;
+  }
+  .card .layer { font-size: .75rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .card .what { font-size: .9375rem; color: var(--ink-2); line-height: 1.6; }
+  .card .alone {
+    font-size: .8125rem;
+    color: var(--muted);
+    border-top: 1px dashed var(--rule);
+    padding-top: .5rem;
+    margin-top: auto;
+  }
+
+  /* ── 화면 스택 도해 ─────────────────────────────────────────────────── */
+  .stack { display: flex; flex-direction: column; gap: 2px; }
+  .stack-row {
+    display: grid;
+    grid-template-columns: 8.5rem 1fr;
+    align-items: baseline;
+    gap: 1rem;
+    background: var(--surface);
+    border-left: 4px solid var(--tone, var(--rule-firm));
+    padding: .6rem .9rem;
+  }
+  .stack-row:first-child { border-radius: 4px 4px 0 0; }
+  .stack-row:last-child  { border-radius: 0 0 4px 4px; }
+  .stack-row .k {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .875rem;
+    font-weight: 500;
+    color: var(--tone, var(--ink));
+  }
+  .stack-row .v { font-size: .9375rem; color: var(--ink-2); }
+
+  /* ── 지표 본문 ──────────────────────────────────────────────────────── */
+  .indicator {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  .indicator > .bar { height: 4px; background: var(--tone); }
+  .indicator > .body {
+    padding: 1.6rem 1.5rem 1.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+  .indicator h2 { color: var(--tone); }
+  .indicator .sub { font-size: .875rem; color: var(--muted); margin-top: -.5rem; }
+
+  /* ── 표 ─────────────────────────────────────────────────────────────── */
+  .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 26rem;
+    font-size: .9375rem;
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .75rem;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+    line-height: 1.55;
+  }
+  th {
+    font-size: .75rem;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+    border-bottom: 1px solid var(--rule-firm);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td .mono { font-size: .875em; }
+
+  /* ── 상태 칩 ────────────────────────────────────────────────────────── */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    font-size: .8125rem;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .chip::before {
+    content: "";
+    width: .55rem; height: .55rem;
+    border-radius: 50%;
+    background: currentColor;
+    flex: none;
+  }
+  .chip.good { color: var(--good); }
+  .chip.warn { color: var(--warn); }
+  .chip.crit { color: var(--crit); }
+
+  /* ── 코드/도식 블록 ─────────────────────────────────────────────────── */
+  pre {
+    margin: 0;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: .95rem 1.1rem;
+    overflow-x: auto;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .8125rem;
+    line-height: 1.75;
+    color: var(--code-ink);
+  }
+
+  /* ── 반전 규칙 대비 블록 ────────────────────────────────────────────── */
+  .pair {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: 1rem;
+  }
+  .panel {
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 1.1rem 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: .55rem;
+    background: var(--surface);
+  }
+  .panel .cond {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .875rem;
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .panel .step { font-size: .875rem; color: var(--ink-2); padding-left: 1.1rem; position: relative; }
+  .panel .step::before { content: "→"; position: absolute; left: 0; color: var(--muted); }
+  .panel .verdict {
+    margin-top: .35rem;
+    padding-top: .6rem;
+    border-top: 1px solid var(--rule);
+    font-weight: 600;
+    font-size: .9375rem;
+  }
+  .panel.bear { background: var(--crit-wash); border-color: color-mix(in srgb, var(--crit) 30%, var(--rule)); }
+  .panel.bear .verdict { color: var(--crit); }
+  .panel.bull { background: var(--ofi-wash); border-color: color-mix(in srgb, var(--ofi) 30%, var(--rule)); }
+  .panel.bull .verdict { color: var(--ofi); }
+
+  /* ── 강조 노트 ──────────────────────────────────────────────────────── */
+  .note {
+    border-left: 3px solid var(--rule-firm);
+    padding: .15rem 0 .15rem 1.1rem;
+    color: var(--ink-2);
+    font-size: .9375rem;
+  }
+  .note.warn { border-left-color: var(--warn); }
+  .note.crit { border-left-color: var(--crit); }
+  .note b { color: var(--ink); }
+
+  /* ── 순서 목록 ──────────────────────────────────────────────────────── */
+  ol.steps { margin: 0; padding: 0; list-style: none; counter-reset: s; display: flex; flex-direction: column; gap: .1rem; }
+  ol.steps li {
+    counter-increment: s;
+    display: grid;
+    grid-template-columns: 1.9rem 1fr;
+    gap: .85rem;
+    align-items: baseline;
+    padding: .55rem 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: .9375rem;
+    color: var(--ink-2);
+  }
+  ol.steps li:last-child { border-bottom: none; }
+  ol.steps li::before {
+    content: counter(s);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .8125rem;
+    color: var(--muted);
+    border: 1px solid var(--rule-firm);
+    border-radius: 50%;
+    width: 1.6rem; height: 1.6rem;
+    display: grid; place-items: center;
+    align-self: start;
+  }
+
+  ul.plain { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: .5rem; color: var(--ink-2); font-size: .9375rem; }
+  ul.plain li::marker { color: var(--muted); }
+
+  /* ── 각주/맺음 ──────────────────────────────────────────────────────── */
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.5rem;
+    font-size: .8125rem;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+  }
+  footer .mono { color: var(--ink-2); }
+
+  @media (max-width: 34rem) {
+    .wrap { padding: 2.5rem 1.1rem 4rem; gap: 2.5rem; }
+    h1 { font-size: 1.75rem; }
+    .stack-row { grid-template-columns: 1fr; gap: .15rem; }
+    .indicator > .body { padding: 1.35rem 1.15rem 1.5rem; }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    a { transition: color .15s ease; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">마흐디 COCKPIT · 오더플로 계기판</p>
+    <h1>Flow Radar 판독법</h1>
+    <p class="lede">네 지표는 서로 다른 층위를 잰다. 혼자서는 어느 것도 방향을 확정하지 못하고, 어긋날 때 비로소 정보가 된다.</p>
+    <div class="meta">
+      <span>작성 <span class="mono">2026-08-21</span></span>
+      <span>대상 <span class="mono">Flow Radar — 옵션 / 선물</span></span>
+      <span>구현 <span class="mono">features/orderflow.py</span></span>
+    </div>
+  </header>
+
+  <!-- ── 요약 ───────────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>네 지표가 재는 것</h2>
+    </div>
+    <div class="cards">
+      <article class="card" style="--tone: var(--cvd)">
+        <span class="name">CVD</span>
+        <span class="layer">결과 · 체결됨</span>
+        <span class="what">공격적 매수에서 매도를 뺀 값의 누적. 누가 주도권을 쥐었나.</span>
+        <span class="alone">혼자 쓰면 — 방향은 있으나 세기의 기준이 없다</span>
+      </article>
+      <article class="card" style="--tone: var(--ofi)">
+        <span class="name">OFI</span>
+        <span class="layer">의도 · 체결 전</span>
+        <span class="what">최우선 호가 잔량의 변화. 호가창이 어느 쪽으로 기우나.</span>
+        <span class="alone">혼자 쓰면 — 실현될지 알 수 없다</span>
+      </article>
+      <article class="card" style="--tone: var(--warn)">
+        <span class="name">VPIN</span>
+        <span class="layer">위험 · 상태</span>
+        <span class="what">정보 거래자가 섞여 있을 확률. 지금 이 종목을 믿어도 되나.</span>
+        <span class="alone">혼자 쓰면 — 방향이 아예 없다</span>
+      </article>
+      <article class="card" style="--tone: var(--abs)">
+        <span class="name">Absorption</span>
+        <span class="layer">저항 · 벽</span>
+        <span class="what">대량 체결이 가격을 못 움직인 배수. 밀었는데 안 밀렸나.</span>
+        <span class="alone">혼자 쓰면 — 누가 받았는지 모른다</span>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── 화면 배치 ─────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>화면 배치가 곧 읽는 순서</h2>
+      <p class="note">옵션 Radar와 선물 Radar는 <b>x축이 완전히 같다.</b> 같은 세로선 위의 두 그림은 같은 시각이므로 위아래를 그대로 대조할 수 있다.</p>
+    </div>
+    <div class="stack">
+      <div class="stack-row" style="--tone: var(--cvd)"><span class="k">CVD</span><span class="v">결과 — 누가 얼마나 밀어붙였나 (누적)</span></div>
+      <div class="stack-row" style="--tone: var(--ofi)"><span class="k">OFI</span><span class="v">의도 — 호가창이 어느 쪽으로 기울고 있나 (봉마다)</span></div>
+      <div class="stack-row" style="--tone: var(--warn)"><span class="k">VPIN</span><span class="v">위험 — 지금 이 종목을 믿어도 되나</span></div>
+      <div class="stack-row" style="--tone: var(--abs)"><span class="k">Absorption</span><span class="v">저항 — 밀었는데 안 밀렸나</span></div>
+      <div class="stack-row" style="--tone: var(--rule-firm)"><span class="k">가격</span><span class="v">체결가 · Microprice — 실제로 어떻게 됐나</span></div>
+    </div>
+  </section>
+
+  <!-- ── 표기 규약 ─────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>먼저 알아야 할 표기 규약 셋</h2>
+      <p class="note crit">이 셋을 모르면 <b>없는 신호를 읽게 된다.</b></p>
+    </div>
+
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th style="width:11rem">화면에 보이는 것</th><th>실제 뜻</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>회색 음영</strong><br><span class="mono">「봉 없음 N분」</span></td>
+            <td>봉 간격이 <strong>5분 이상</strong> 벌어진 구간. 「시장이 조용했다」가 <strong>아니라</strong> 「우리가 그 종목을 안 보고 있었거나 체결이 없었다」는 뜻이다. 옵션은 ATM±2 창이 움직이면 구독에서 빠지므로 자주 생긴다. 선도 끊는다 — 직선으로 이으면 미관측이 정상으로 보인다.</td>
+          </tr>
+          <tr>
+            <td><strong>Absorption의 회색 점</strong><br><span class="mono">y = 0</span></td>
+            <td><strong>판정했고 흡수가 아니다.</strong> 관측은 했다는 표시다.</td>
+          </tr>
+          <tr>
+            <td><strong>Absorption의 빈칸</strong><br><span class="mono">「기준선 없음」</span></td>
+            <td><strong>판정 못 했다.</strong> 직전 봉이 5개도 안 쌓였다. 창 왼쪽 끝에 조금 있는 것은 정상이다.</td>
+          </tr>
+          <tr>
+            <td><strong>CVD의 세로 위치</strong></td>
+            <td>원점은 <strong>지금 보고 있는 창의 시작</strong>이다. 종목 전체 누적이 아니다. 창이 1분 밀리면 같은 시각의 값도 밀린다 — <strong>절대 높이가 아니라 기울기와 부호 전환</strong>을 읽는다.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ── CVD ───────────────────────────────────────────────────────── -->
+  <article class="indicator" style="--tone: var(--cvd)">
+    <div class="bar"></div>
+    <div class="body">
+      <h2>CVD — 실제로 체결된 방향</h2>
+      <p class="sub">Cumulative Volume Delta · 결과의 층위</p>
+
+      <p>공격적 매수 체결량에서 공격적 매도 체결량을 뺀 값의 <strong>누적</strong>이다.</p>
+      <pre>CVD = Σ (매수 체결량 − 매도 체결량)</pre>
+      <p>「공격적」이란 <strong>스프레드를 건너간 쪽(taker)</strong>을 말한다. 호가에 걸어두고 기다린 쪽(maker)이 아니라, 지금 당장 체결시키려고 상대 호가를 때린 쪽이다.</p>
+
+      <p class="note"><b>모든 체결에는 매수자와 매도자가 한 명씩 있다.</b> 그래서 「거래량」에는 애초에 방향이 없다. CVD가 방향을 갖는 이유는 <b>누가 먼저 움직였나</b>를 갈랐기 때문이다.</p>
+
+      <h3>읽는 법</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th style="width:12rem">모양</th><th>해석</th></tr></thead>
+          <tbody>
+            <tr><td>기울기 <span class="mono">+</span></td><td>매수 taker 우위 — 사려는 쪽이 급하다</td></tr>
+            <tr><td>기울기 <span class="mono">−</span></td><td>매도 taker 우위</td></tr>
+            <tr><td>수평</td><td>양쪽 균형. 거래는 있으나 주도권이 없다</td></tr>
+            <tr><td><strong>부호 전환</strong></td><td><strong>주도권 교체</strong> — 가장 중요한 순간</td></tr>
+            <tr><td>CVD ↑ 인데 가격이 안 오름</td><td><strong>Absorption 신호.</strong> 아래 「반전 규칙」으로</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="note warn"><b>2026-08-21 이전 봉은 편향돼 있다.</b> 그전에는 틱 룰로 추정했는데 동가(同價) 틱을 전부 매수로 넣는 결함이 있어 선물 매수비율이 59.3%로 부풀었다. 지금은 거래소 누적 분류값을 쓴다(<span class="mono">SHNU_CNTG_SMTN</span> / <span class="mono">SELN_CNTG_SMTN</span>의 차분, 실측 52.6%). 틱을 저장하지 않아 <b>과거는 재계산할 수 없다.</b></p>
+    </div>
+  </article>
+
+  <!-- ── OFI ───────────────────────────────────────────────────────── -->
+  <article class="indicator" style="--tone: var(--ofi)">
+    <div class="bar"></div>
+    <div class="body">
+      <h2>OFI — 호가창의 의도</h2>
+      <p class="sub">Order Flow Imbalance · Cont·Kukanov·Stoikov (2014) · 의도의 층위</p>
+
+      <p>최우선 매수/매도 호가의 <strong>잔량 변화</strong>를 1분 동안 합산한 값이다. 체결이 아니라 <strong>호가창</strong>을 본다.</p>
+      <pre>매수호가 잔량이 늘거나 호가가 올라감   →  +
+매도호가 잔량이 늘거나 호가가 내려감   →  −
+                        1분 동안 합산  →  OFI</pre>
+
+      <p><strong>왜 선행하는가</strong> — 호가를 거는 것은 체결보다 먼저다. 큰손이 매수벽을 쌓기 시작하면 아직 아무것도 체결되지 않았어도 OFI가 먼저 양수로 간다.</p>
+
+      <h3>읽는 법</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th style="width:12rem">모양</th><th>해석</th></tr></thead>
+          <tbody>
+            <tr><td>0 근처 좁은 진동</td><td>균형. 특별한 압력 없음</td></tr>
+            <tr><td>연속으로 같은 부호</td><td>한쪽으로 호가가 쌓이는 중 — <strong>방향 축적</strong></td></tr>
+            <tr><td>한 봉만 극단값</td><td>대형 호가의 등장 또는 취소. 다음 봉에서 되돌아오면 <strong>허수 가능성</strong></td></tr>
+            <tr><td>OFI <span class="mono">+</span> 인데 가격이 안 오름</td><td>의도는 있으나 실현 안 됨 → <strong>Absorption을 확인할 자리</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="note"><b>OFI는 취소도 잔량 변화로 잡는다.</b> 걸었다 빼는 호가가 OFI를 흔든다 — 한 봉짜리 극단값보다 <b>연속성</b>을 본다.</p>
+      <p class="note"><b>단위 감각</b>(08-21 실측) — 선물 <span class="mono">A01609</span>는 ±100, 옵션은 ±10 규모다. 절대값이 아니라 <b>그 종목의 평소 폭 대비</b>로 읽는다.</p>
+    </div>
+  </article>
+
+  <!-- ── VPIN ──────────────────────────────────────────────────────── -->
+  <article class="indicator" style="--tone: var(--warn)">
+    <div class="bar"></div>
+    <div class="body">
+      <h2>VPIN — 지금 이 종목을 믿어도 되나</h2>
+      <p class="sub">Easley·López de Prado·O'Hara (2012) · 위험의 층위</p>
+
+      <p>지금 체결되는 물량 중 <strong>정보를 가진 쪽이 섞여 있을 확률</strong>의 대용치다. 범위는 0~1.</p>
+      <p>시간이 아니라 <strong>거래량으로 자른다</strong> — 50계약이 쌓일 때마다 버킷 하나를 닫고 최근 50버킷을 본다. 한산할 때는 버킷이 천천히 차므로 <strong>값이 계단처럼 움직이는 것이 정상</strong>이다(특히 옵션).</p>
+
+      <p class="note"><b>왜 중요한가</b> — VPIN이 높다는 것은 <b>내가 모르는 것을 아는 사람이 지금 거래 중</b>이라는 뜻이다. 그 상황에서 「싸졌으니 산다」는 정확히 그 사람에게 물량을 주는 행위다.</p>
+
+      <h3>색이 곧 상태다</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th class="num" style="width:7rem">값</th><th style="width:8rem">상태</th><th>행동 지침</th></tr></thead>
+          <tbody>
+            <tr><td class="num">&lt; 0.40</td><td><span class="chip good">양호</span></td><td>평상</td></tr>
+            <tr><td class="num">0.40 – 0.70</td><td><span class="chip warn">경고</span></td><td>포지션 크기 축소 검토</td></tr>
+            <tr><td class="num">≥ 0.70</td><td><span class="chip crit">심각</span></td><td><strong>평균회귀 금지.</strong> 추세 추종 또는 회피</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="note crit"><b>VPIN은 방향을 말하지 않는다.</b> 0.9여도 위인지 아래인지 모른다. 방향은 CVD·OFI가 준다. VPIN이 하는 일은 <b>「그 방향 신호를 얼마나 크게 베팅해도 되나」</b>를 정하는 것이다.</p>
+    </div>
+  </article>
+
+  <!-- ── Absorption ────────────────────────────────────────────────── -->
+  <article class="indicator" style="--tone: var(--abs)">
+    <div class="bar"></div>
+    <div class="body">
+      <h2>Absorption — 밀었는데 안 밀렸다</h2>
+      <p class="sub">Kyle (1985) 프레임 · 저항의 층위</p>
+
+      <pre>Absorption = 이 봉의 거래량 ÷ 직전 20봉 평균 거래량
+             (단, 가격이 「정체」한 봉에서만. 아니면 0)</pre>
+
+      <p>보통은 많이 팔면 내리고 많이 사면 오른다. 그런데 평소의 3배 물량이 쏟아졌는데 가격이 제자리라면 <strong>반대편에서 누군가 그걸 전부 받아내고 있다</strong>는 뜻이다. Kyle의 λ(가격 충격 계수)가 비정상적으로 낮은 순간이고, 그 깊이를 만드는 건 대개 큰손이다.</p>
+
+      <h3>「가격 정체」의 판정 — 고정 상수가 아니다</h3>
+      <pre>정체 = 봉 범위(고가−저가) ≤ max( 2틱 , 직전 20봉 범위 중앙값 × 0.5 )</pre>
+      <ul class="plain">
+        <li><strong>순변화가 아니라 범위다.</strong> 시가=종가여도 봉 안에서 크게 왕복했으면 흡수가 아니다. 08-21 실측에서 순변화 기준으로 「정체」였던 선물 28봉이 <strong>28봉 전부</strong> 봉 안에서는 크게 움직이고 있었다.</li>
+        <li><strong>문턱이 종목 자신의 변동성에서 나온다.</strong> 고정 상수를 쓰면 한쪽에서 반드시 무의미해진다 — 고정 4틱 게이트의 통과율은 <span class="mono">선물 0.0% / 옵션 17.6%</span>였다. 선물 1분봉 범위는 중앙값이 52틱이라 애초에 몇 틱짜리 봉이 없다.</li>
+      </ul>
+
+      <h3>읽는 법</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th style="width:12rem">값</th><th>해석</th></tr></thead>
+          <tbody>
+            <tr><td>빈칸 + 「기준선 없음」</td><td>판정 못 함</td></tr>
+            <tr><td>회색 점 <span class="mono">(0)</span></td><td>판정했고 흡수 아님</td></tr>
+            <tr><td>1~2배 막대</td><td>평소보다 조금 많은 물량이 소화됨. 참고 수준</td></tr>
+            <tr><td><span class="chip crit">3배 이상</span></td><td><strong>흡수 의심.</strong> 반대편에 벽이 있다</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="note"><b>드문 것이 정상이다.</b> 조용한 봉은 대개 거래량도 적어 두 조건이 자연히 상충한다. 08-21 하루 동안 3배 이상은 선물·옵션 <b>모두 0건</b>이었다(최대 0.69 / 0.82).</p>
+      <p class="note crit"><b>이 지표는 방향을 말하지 않는다.</b> 「누군가 받아냈다」까지만 말한다. 받아낸 쪽이 매수자인지 매도자인지는 모른다 — 그래서 혼자 쓸 수 없다.</p>
+    </div>
+  </article>
+
+  <!-- ── 반전 규칙 ─────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <p class="eyebrow">여기서 인사이트가 나온다</p>
+      <h2>반전 규칙 — 흡수하는 쪽은 CVD의 반대편</h2>
+      <p class="note crit">직관에 반한다. 반드시 기억할 것: <b>CVD는 taker의 방향이고, 흡수하는 쪽은 그 반대편이다.</b></p>
+    </div>
+
+    <div class="pair">
+      <div class="panel bear">
+        <span class="cond">Absorption + CVD ↑</span>
+        <span class="step">매수 taker가 계속 때리는데 가격이 안 오른다</span>
+        <span class="step">매도 maker가 다 받아내는 중 = 분산(distribution)</span>
+        <span class="verdict">천장 단서 · 약세</span>
+      </div>
+      <div class="panel bull">
+        <span class="cond">Absorption + CVD ↓</span>
+        <span class="step">매도 taker가 계속 때리는데 가격이 안 빠진다</span>
+        <span class="step">매수 maker가 다 받아내는 중 = 축적(accumulation)</span>
+        <span class="verdict">바닥 단서 · 강세</span>
+      </div>
+    </div>
+
+    <p>화면에서 찾을 것은 <strong>CVD 기울기와 가격 방향이 어긋나는 순간</strong>이다.</p>
+
+    <h3>층위가 어긋날 때가 정보다</h3>
+    <pre>OFI(의도)  →  CVD(체결)  →  가격(결과)</pre>
+    <p>이 셋이 같은 방향이면 「정상적인 추세」다. 알려주는 게 별로 없다.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th style="width:14rem">어긋남</th><th>읽기</th></tr></thead>
+        <tbody>
+          <tr><td>의도는 있는데 체결이 없다<br><span class="mono">OFI + · CVD 평평</span></td><td>호가만 걸고 안 때린다. <strong>허수 또는 관망</strong></td></tr>
+          <tr><td>체결은 있는데 가격이 안 간다<br><span class="mono">CVD ↑ · 가격 →</span></td><td><strong>흡수.</strong> 벽이 있다</td></tr>
+          <tr><td>가격은 가는데 체결 뒷받침이 없다<br><span class="mono">가격 ↑ · CVD 평평</span></td><td>얇은 호가창에서의 이동. <strong>되돌림 위험</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>시나리오</h3>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th class="num">CVD</th><th class="num">OFI</th><th class="num">VPIN</th><th class="num">Absorp.</th><th class="num">가격</th><th>읽기</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">↑</td><td class="num">+</td><td class="num">낮음</td><td class="num">0</td><td class="num">↑</td><td><strong>정상 추세.</strong> 의도·체결·가격이 일치</td></tr>
+          <tr><td class="num">↑</td><td class="num">+</td><td class="num">낮음</td><td class="num">3배+</td><td class="num">→</td><td><strong>분산 의심.</strong> 사려는 힘을 벽이 먹고 있다. 추격 금지</td></tr>
+          <tr><td class="num">↓</td><td class="num">−</td><td class="num">낮음</td><td class="num">3배+</td><td class="num">→</td><td><strong>축적 의심.</strong> 팔리는데 안 빠진다. 반등 후보</td></tr>
+          <tr><td class="num">↑</td><td class="num">−</td><td class="num">—</td><td class="num">0</td><td class="num">↑</td><td><strong>불일치.</strong> 체결은 매수인데 호가는 매도 우위 → 지속성 의심</td></tr>
+          <tr><td class="num">—</td><td class="num">—</td><td class="num">≥0.7</td><td class="num">—</td><td class="num">—</td><td><strong>독성 구간.</strong> 방향 신호의 신뢰도를 낮춘다</td></tr>
+          <tr><td class="num">→</td><td class="num">0</td><td class="num">낮음</td><td class="num">0</td><td class="num">→</td><td>무신호. 대기</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>두 Radar를 함께 보는 법</h3>
+    <ul class="plain">
+      <li><strong>선물 CVD ↑ + 콜 옵션 CVD ↑</strong> — 방향에 대한 합의. 신뢰도 상승</li>
+      <li><strong>선물은 조용한데 옵션만 VPIN 급등</strong> — 그 행사가에 정보성 주문이 들어온 것일 수 있다</li>
+      <li><strong>선물 Absorption + 옵션 거래량 급증</strong> — 선물 벽이 옵션 헤지에서 나왔을 가능성</li>
+    </ul>
+  </section>
+
+  <!-- ── 판독 순서 ─────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>실전 판독 순서</h2>
+      <p class="note">매번 이 순서로 훑으면 빠뜨리지 않는다.</p>
+    </div>
+    <ol class="steps">
+      <li><strong>회색 음영부터 본다.</strong> 「봉 없음」이 있으면 그 구간의 모든 판단을 유보한다</li>
+      <li><strong>VPIN을 본다.</strong> 0.7 위면 이후 모든 방향 신호의 크기를 줄여 읽는다</li>
+      <li><strong>CVD 기울기와 부호 전환</strong>으로 주도권을 잡는다</li>
+      <li><strong>가격과 대조한다.</strong> CVD 방향과 가격 방향이 어긋나면 거기가 볼 자리다</li>
+      <li><strong>Absorption을 확인한다.</strong> 어긋남이 흡수 때문인지 — 3배 막대가 있나</li>
+      <li><strong>OFI로 지속성을 본다.</strong> 호가창이 같은 방향을 받쳐주나, 체결만 있었나</li>
+      <li><strong>다른 Radar의 같은 시각</strong>을 본다 (선물 ↔ 옵션)</li>
+    </ol>
+  </section>
+
+  <!-- ── 한계 ──────────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>믿지 말아야 할 것</h2>
+      <p class="note crit">이 목록을 모르고 읽으면 <b>없는 신호를 본다.</b></p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th style="width:13rem">한계</th><th>영향</th><th style="width:8rem">상태</th></tr></thead>
+        <tbody>
+          <tr><td><strong>08-21 이전 봉의 CVD</strong></td><td>매수 쪽으로 편향(선물 매수비율 59.3%)</td><td><span class="chip crit">영구</span></td></tr>
+          <tr><td><strong>마켓메이커 문제</strong></td><td>흡수의 주체가 방향관 없는 LP일 수 있다</td><td><span class="chip crit">미해결</span></td></tr>
+          <tr><td><strong>OFI는 취소를 구분 못 함</strong></td><td>허수 호가가 OFI를 흔든다</td><td><span class="chip warn">연속성으로 완화</span></td></tr>
+          <tr><td><strong>VPIN은 방향이 없다</strong></td><td>크기 조절용이지 진입 신호가 아니다</td><td><span class="chip good">설계상 의도</span></td></tr>
+          <tr><td><strong>Absorption 기준선</strong></td><td>직전 20봉 평균 — 스파이크 직후엔 둔감해진다</td><td><span class="chip good">설계상 대가</span></td></tr>
+          <tr><td><span class="mono">buy+sell</span> vs <span class="mono">volume</span></td><td>거래소 누적이 우리 합산 틱 거래량의 1.4~2.1배로 나온다</td><td><span class="chip warn">원인 조사 중</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>마켓메이커 문제 — 흡수 해석의 가장 큰 구멍</h3>
+    <p>흡수하는 maker가 <strong>방향관을 가진 주체일 때만</strong> 반전 규칙이 성립한다. 그런데 호가에 벽을 세우는 주체 중 상당수는 <strong>마켓메이커</strong>이고, MM은 방향관 없이 스프레드를 먹으려 <strong>양쪽에 동시에</strong> 호가를 건다. KOSPI200 옵션은 LP 제도가 있어 특히 그렇다.</p>
+    <p>구분하려면 <strong>흡수 이후</strong>를 봐야 한다.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th style="width:10rem">확인</th><th>MM이었다면</th><th>방향관 있는 주체였다면</th></tr></thead>
+        <tbody>
+          <tr><td>흡수 직후 가격</td><td>제자리 (단순 유동성 공급)</td><td>흡수한 쪽으로 밀림</td></tr>
+          <tr><td>옵션 OI 변화</td><td>거의 없음 (금방 되넘김)</td><td>증가 (신규 포지션)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ── 실측 ──────────────────────────────────────────────────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>2026-08-21 실제 화면으로 확인한 것</h2>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th style="width:10rem">관찰</th><th style="width:12rem">값</th><th>읽기</th></tr></thead>
+        <tbody>
+          <tr><td>선물 VPIN</td><td class="mono">0.47 – 0.56 평탄</td><td>양호 구간. 방향 신호를 정상 크기로</td></tr>
+          <tr><td>옵션 VPIN</td><td class="mono">0.50 – 0.65 계단형</td><td>정상 — 버킷이 천천히 찬다</td></tr>
+          <tr><td>선물 OFI</td><td class="mono">±100 진동, 부호 잦은 교체</td><td>강한 방향 축적 없음</td></tr>
+          <tr><td>Absorption</td><td class="mono">3배 이상 0건 (최대 0.69)</td><td>큰 벽 없음</td></tr>
+          <tr><td>선물 가격</td><td class="mono">1075 – 1095 왕복, 순변화 ≈ 0</td><td>방향 없는 하루</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>네 지표가 일관되게 「방향 없음」을 말했고 가격도 그랬다.</strong> 지표가 서로 맞는지 확인한 사례다.</p>
+    <p class="note warn">같은 날 오전, 옛 분류 규칙에서는 선물 CVD가 한 시간 동안 부호 전환 없이 곧게 올랐다. 가격은 방향이 없는데 CVD만 한 방향으로 가는 것은 <b>시장이 아니라 분류 규칙</b>이었다. <b>이런 모양을 보면 지표를 의심할 것</b> — 그것이 이 문서를 쓰게 만든 사건이다.</p>
+  </section>
+
+  <footer>
+    <p>구현 <span class="mono">mahdi/features/orderflow.py</span> (계산) · <span class="mono">mahdi/dashboard/panels/flow_radar_panel.py</span> (표시)</p>
+    <p>사양 <span class="mono">MAHDI_ULTIMATE_SYSTEM_v6.md</span> §8.2 지표 사전 · §10.1 Volume Spike · §17.3 패널</p>
+    <p>결정 근거 <span class="mono">dev_memory/DECISION_LOG.md</span> 2026-08-21 1~4차</p>
+    <p>원논문 — Cont·Kukanov·Stoikov (2014) OFI · Easley·López de Prado·O'Hara (2012) VPIN · Kyle (1985) 시장 깊이 · Stoikov (2018) Micro-Price · Lee·Ready (1991) 체결 분류</p>
+  </footer>
+
+</div>
