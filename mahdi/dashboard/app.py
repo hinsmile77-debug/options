@@ -22,6 +22,7 @@ from mahdi.dashboard.data_source import (
 from mahdi.dashboard.panels.account_panel import build_account_summary_cards
 from mahdi.dashboard.panels.decision_panel import build_decision_history_table, build_decision_summary_cards
 from mahdi.dashboard.panels.flow_radar_panel import (
+    build_absorption_chart,
     build_cvd_chart,
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
@@ -93,6 +94,17 @@ st.set_page_config(page_title="마흐디 COCKPIT v1", layout="wide")
 # `st.fragment(run_every=...)`로 감싸 자동 갱신을 조각 안에 가두고, 슬랙 토글은 조각 **밖**
 # 최상위에 두어 클릭 즉시 처리되게 했다(`time.sleep`/`st.rerun`은 제거).
 REFRESH_INTERVAL_SECONDS = 30
+
+
+# Absorption 캡션 — **문턱을 숫자로 적는다.** `absorption_score()`의 기본 문턱 0.05%는 가격
+# 수준에 비례하는 상대값이라 상품마다 뜻이 다르다(선물 ≈11틱 vs 옵션 프리미엄은 틱보다 작음).
+# 화면이 「가격 정체」라고만 쓰면 두 Radar가 같은 기준인 줄로 읽힌다.
+_ABSORPTION_CAPTION = (
+    "「가격 정체」 판정 문턱은 봉 내 변화율 0.05%입니다 — 가격 수준에 비례하는 상대값이라 "
+    "선물(≈1,080)에서는 약 11틱까지 정체로 보지만, 옵션 프리미엄(≈16)에서는 틱 크기보다 작아 "
+    "사실상 시가=종가인 봉만 통과합니다. 기준선은 직전 20봉 평균이고, 최소 5봉이 쌓이기 전 "
+    "구간은 0이 아니라 **판정 불가**로 표시됩니다."
+)
 
 
 @st.cache_resource
@@ -294,6 +306,13 @@ def render() -> None:
             width='stretch',
         )
         st.plotly_chart(
+            build_absorption_chart(
+                snapshot.option_timestamps, snapshot.option_absorption_series, x_range=flow_x_range
+            ),
+            width='stretch',
+        )
+        st.caption(_ABSORPTION_CAPTION)
+        st.plotly_chart(
             build_microprice_vs_price_chart(
                 snapshot.option_timestamps,
                 snapshot.option_price_series,
@@ -317,6 +336,11 @@ def render() -> None:
     st.plotly_chart(
         build_vpin_chart(snapshot.timestamps, snapshot.vpin_series, x_range=flow_x_range), width='stretch'
     )
+    st.plotly_chart(
+        build_absorption_chart(snapshot.timestamps, snapshot.absorption_series, x_range=flow_x_range),
+        width='stretch',
+    )
+    st.caption(_ABSORPTION_CAPTION)
     st.plotly_chart(
         build_microprice_vs_price_chart(
             snapshot.timestamps, snapshot.price_series, snapshot.microprice_series, x_range=flow_x_range

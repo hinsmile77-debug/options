@@ -24,6 +24,7 @@ from mahdi.engines.regime_pipeline import (
 )
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute_gamma_walls, signal_book_legs
+from mahdi.features.orderflow import absorption_score
 from mahdi.ops import db_metrics
 from mahdi import session
 
@@ -64,6 +65,16 @@ FLOW_RADAR_WINDOW_MINUTES = 60
 # 시간 창 안에서도 행 수 상한은 유지한다 — 1분봉이라 정상적으로는 60행을 넘을 수 없지만,
 # 재처리/중복 적재 등으로 창 안 행이 폭증하면 대시보드가 그것을 그리다 멈추면 안 된다.
 FLOW_RADAR_ROW_CAP = 240
+
+# Absorption 기준선(v6 §10.1 `spike = current_vol / avg_vol`)을 만드는 직전 봉 수.
+# 20봉(=20분)은 창 60분 안에서 "최근 정상 거래량"을 대표하면서도 한 번의 스파이크가 기준선을
+# 통째로 들어올리지 않는 길이다. 현재 봉은 **기준선에서 제외**한다 — 넣으면 자기 자신을 기준
+# 삼아 큰 봉일수록 점수가 눌린다.
+ABSORPTION_BASELINE_BARS = 20
+# 기준선으로 인정하는 최소 봉 수. 이보다 적으면 점수를 내지 않고 **None(기준선 없음)** 이다.
+# 2~3봉 평균을 기준선이라 부르면 창 초반이 상시 과대·과소 점수가 된다. 「모른다」를 0으로
+# 적으면 그것은 「흡수가 없었다」로 읽힌다 — 08-21 CVD에서 배운 것과 같은 실수다.
+ABSORPTION_MIN_BASELINE_BARS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +123,11 @@ class DashboardSnapshot:
     # 값이라 원점은 창의 첫 봉(0)이다. 종목 전체 누적이 아니므로 절대값이 아니라 기울기를 읽는다
     # (`flow_radar_panel.build_cvd_chart` docstring 참고).
     cvd_series: list[float]
+    # Absorption 배수(v6 §8.2 «대량 체결에도 가격 불변») — `features.orderflow.absorption_score()`.
+    # **`None`은 0이 아니다**: 기준선을 만들 직전 봉이 `ABSORPTION_MIN_BASELINE_BARS`에 못 미쳐
+    # 「아직 판정할 수 없다」는 뜻이고, 0.0은 「판정했고 흡수가 아니다」는 뜻이다. 화면은 둘을
+    # 다르게 그려야 한다.
+    absorption_series: list[float | None]
     vpin_series: list[float]
     price_series: list[float]
     microprice_series: list[float]
@@ -119,6 +135,7 @@ class DashboardSnapshot:
     option_timestamps: list[datetime]
     option_ofi_series: list[float]
     option_cvd_series: list[float]
+    option_absorption_series: list[float | None]
     option_vpin_series: list[float]
     option_price_series: list[float]
     option_microprice_series: list[float]
@@ -1401,6 +1418,39 @@ def _cumulative_volume_delta(rows: list) -> list[float]:
     return out
 
 
+def _absorption_series(rows: list) -> list[float | None]:
+    """
+    입력: Flow Radar 조회 결과 행(오름차순). `(timestamp, close, ofi, microprice, vpin,
+         buy_volume, sell_volume, open, volume)` — `_load_from_db`의 SELECT 순서와 묶여 있다.
+    계산: 봉마다 `absorption_score(거래량, 직전 봉들의 평균 거래량, 봉 내 가격변화율)`.
+         기준선은 **직전** 최대 `ABSORPTION_BASELINE_BARS`봉의 평균이고, 현재 봉은 뺀다.
+         가격변화율은 그 봉 안의 `(close - open) / open`이다.
+    해석: 값이 클수록 「대량 체결이 가격을 못 움직였다」 — v6 §10.1은 3배 이상을 흡수 의심으로
+         본다. `absorption_score()`가 가격이 문턱을 넘게 움직인 봉을 0으로 돌리므로, 0.0은
+         **판정했고 흡수가 아니다**라는 뜻이다.
+    실패 조건: 직전 봉이 `ABSORPTION_MIN_BASELINE_BARS`에 못 미치면 그 봉은 `None` —
+              **판정 불가이지 흡수 없음이 아니다.** 창 앞머리에서 매번 생긴다.
+              `open`이 0이거나 NULL이면(있어선 안 되지만) 역시 `None`으로 둔다.
+
+    ⚠ `absorption_score()`의 기본 `price_change_threshold=0.0005`는 **종목의 가격 수준에
+    비례하는 상대 문턱**이라 상품마다 뜻이 크게 달라진다. 08-21 실측: 선물(≈1,080)에서는
+    0.54포인트 ≈ 11틱까지 「가격 정체」로 보지만, 옵션 프리미엄(≈16)에서는 0.008로 **틱 크기
+    0.05보다 작다** — 즉 옵션에서 이 게이트는 사실상 «시가와 종가가 정확히 같은 봉»만 통과시킨다
+    (71봉 중 11봉). 화면 캡션이 문턱을 그대로 적어 이 사실이 숨지 않게 한다.
+    """
+    out: list[float | None] = []
+    volumes = [float(row[8]) if row[8] is not None else 0.0 for row in rows]
+    for i, row in enumerate(rows):
+        baseline = volumes[max(0, i - ABSORPTION_BASELINE_BARS):i]
+        open_px = float(row[7]) if row[7] is not None else 0.0
+        if len(baseline) < ABSORPTION_MIN_BASELINE_BARS or open_px <= 0:
+            out.append(None)
+            continue
+        price_change = (float(row[1]) - open_px) / open_px
+        out.append(absorption_score(volumes[i], sum(baseline) / len(baseline), price_change))
+    return out
+
+
 def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     try:
         with db.get_connection() as conn:
@@ -1458,7 +1508,8 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 futures_rows: list = []
                 if futures_flow_symbol is not None:
                     cur.execute(
-                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume FROM market_raw_1m "
+                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume, open, volume "
+                        "FROM market_raw_1m "
                         "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
                         (futures_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
@@ -1482,7 +1533,8 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 option_rows: list = []
                 if option_flow_symbol is not None:
                     cur.execute(
-                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume FROM market_raw_1m "
+                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume, open, volume "
+                        "FROM market_raw_1m "
                         "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
                         (option_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
@@ -1548,6 +1600,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         timestamps=[row[0] for row in futures_rows],
         ofi_series=[float(row[2]) for row in futures_rows],
         cvd_series=_cumulative_volume_delta(futures_rows),
+        absorption_series=_absorption_series(futures_rows),
         vpin_series=[float(row[4]) if row[4] is not None else 0.0 for row in futures_rows],
         price_series=[float(row[1]) for row in futures_rows],
         microprice_series=[float(row[3]) for row in futures_rows],
@@ -1555,6 +1608,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         option_timestamps=[row[0] for row in option_rows],
         option_ofi_series=[float(row[2]) for row in option_rows],
         option_cvd_series=_cumulative_volume_delta(option_rows),
+        option_absorption_series=_absorption_series(option_rows),
         option_vpin_series=[float(row[4]) if row[4] is not None else 0.0 for row in option_rows],
         option_price_series=[float(row[1]) for row in option_rows],
         option_microprice_series=[float(row[3]) for row in option_rows],
@@ -1579,6 +1633,15 @@ def _synthetic_macro_snapshot(rng: np.random.Generator) -> dict:
     }
 
 
+def _synthetic_absorption(rng: np.random.Generator, n: int) -> list[float | None]:
+    """합성 Absorption 계열 — 앞머리는 기준선 없음(None), 이후는 대부분 0에 가끔 스파이크."""
+    out: list[float | None] = [None] * min(ABSORPTION_MIN_BASELINE_BARS, n)
+    for _ in range(n - len(out)):
+        # 3/4은 가격이 움직여 게이트에서 0, 나머지가 실제 배수를 갖는다.
+        out.append(0.0 if rng.random() < 0.75 else float(abs(rng.normal(1.6, 1.2))))
+    return out
+
+
 def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
     rng = np.random.default_rng(seed)
     now = datetime.now()  # DB에 안 쓰이는 순수 합성 더미 시각이라 db.local_now() 정책 대상 아님
@@ -1590,6 +1653,9 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
     # CVD는 봉별 체결 델타의 누적이므로 합성도 누적으로 만든다 — 라이브와 모양(단조에 가까운
     # 표류 + 간헐적 부호 전환)이 달라지면 합성 화면으로 판독 연습이 안 된다.
     cvd_series = rng.normal(20, 400, n).cumsum()
+    # Absorption은 대부분의 봉에서 0이고 가끔 튄다 — 합성도 그 모양이어야 화면 판독 연습이 된다.
+    # 앞머리 `ABSORPTION_MIN_BASELINE_BARS`봉은 라이브와 똑같이 **기준선 없음(None)** 으로 둔다.
+    absorption_series = _synthetic_absorption(rng, n)
     vpin_series = np.clip(0.3 + rng.normal(0, 0.15, n).cumsum() * 0.02, 0.05, 0.95)
     microprice_series = spot + rng.normal(0, 0.05, n)
 
@@ -1597,6 +1663,7 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
     option_price = 50.0 + np.cumsum(rng.normal(0, 0.2, n))
     option_ofi_series = rng.normal(0, 50, n).cumsum() * 0.05
     option_cvd_series = rng.normal(2, 40, n).cumsum()
+    option_absorption_series = _synthetic_absorption(rng, n)
     option_vpin_series = np.clip(0.3 + rng.normal(0, 0.15, n).cumsum() * 0.02, 0.05, 0.95)
     option_microprice_series = option_price + rng.normal(0, 0.05, n)
 
@@ -1632,6 +1699,7 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         timestamps=timestamps,
         ofi_series=list(ofi_series),
         cvd_series=list(cvd_series),
+        absorption_series=absorption_series,
         vpin_series=list(vpin_series),
         price_series=list(spot),
         microprice_series=list(microprice_series),
@@ -1639,6 +1707,7 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         option_timestamps=timestamps,
         option_ofi_series=list(option_ofi_series),
         option_cvd_series=list(option_cvd_series),
+        option_absorption_series=option_absorption_series,
         option_vpin_series=list(option_vpin_series),
         option_price_series=list(option_price),
         option_microprice_series=list(option_microprice_series),

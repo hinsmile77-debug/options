@@ -1,4 +1,4 @@
-"""Flow Radar 패널 — CVD, OFI 스파크라인, VPIN 독성 게이지, Microprice vs 체결가 (v6 §8, §17 COCKPIT).
+"""Flow Radar 패널 — CVD, OFI, VPIN 독성 게이지, Absorption, Microprice vs 체결가 (v6 §8, §17 COCKPIT).
 
 VPIN 마커 색은 카테고리가 아니라 상태(status)를 나타내므로 예약된 상태 팔레트를 쓴다
 (양호/경고/심각 — 시리즈 정체성 색과 절대 혼용하지 않는다).
@@ -32,6 +32,15 @@ _VPIN_WARNING_THRESHOLD = 0.4
 # 쓰면 안 된다(상태색은 예약색). 이 값은 눈대중이 아니라 팔레트 검증기를 돌려 고른 것 —
 # #0072B2와 protan ΔE 8.5 / 정상시 ΔE 20.1, 흰 배경 대비 3:1 이상을 모두 통과한다.
 _CVD_COLOR = "#A34E80"
+
+# Absorption 막대색. OFI(#0072B2)·CVD(#A34E80)와 함께 검증기를 통과한 값이다(3색 동시 검사:
+# 최악 인접쌍 protan ΔE 8.5 / 정상시 20.1, 대비 3:1 전부 통과). 문턱을 넘은 막대만 VPIN과
+# **같은 심각색**을 쓴다 — 상태색은 예약색이고, 「임계 초과」라는 같은 뜻으로만 빌린다.
+_ABSORPTION_COLOR = "#6E7B1F"
+# v6 §10.1 «spike = current_vol / avg_vol, 3배 이상 + 가격 정체 = Absorption 의심».
+_ABSORPTION_SUSPECT_THRESHOLD = 3.0
+# 판정 불가(기준선 없음) 구간은 "봉 없음"과 **같은 회색**(`_GAP_BAND_COLOR`)으로 칠한다.
+# 둘 다 값의 부재가 아니라 **판단의 부재**를 뜻하고, 화면에서 같은 뜻이면 같은 표시여야 한다.
 
 # 파생 거래시간은 09:00~15:45로 고정(v6 §16.1) — 전일 장마감부터 익일 개장까지, 그리고 주말은
 # 항상 거래가 없으므로 x축에서 건너뛴다. 그래야 실제 체결이 뜸한 옵션 종목도 시간축이 빈 공백에
@@ -188,6 +197,123 @@ def build_cvd_chart(
     _add_gap_bands(fig, timestamps)
     fig.update_layout(
         yaxis_title="CVD(창 시작=0)", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=180
+    )
+    _apply_trading_hours_rangebreaks(fig)
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
+    return fig
+
+
+def _no_baseline_spans(
+    timestamps: list[datetime], absorption_series: list[float | None]
+) -> list[tuple[datetime, datetime]]:
+    """
+    입력: 봉 시각과 그에 정렬된 Absorption 계열(`None` = 기준선 없음).
+    계산: `None`이 이어지는 구간의 (시작, 끝) 목록.
+    해석: 창 앞머리에서 «아직 기준선을 못 만들었다»가 대부분이지만, 중간에 생길 수도 있다
+         (예: `open`이 비정상인 봉). 어디든 **판정하지 않은 구간**이므로 똑같이 칠한다.
+    실패 조건: 없음 — 해당 없으면 빈 목록.
+    """
+    spans: list[tuple[datetime, datetime]] = []
+    start: datetime | None = None
+    for ts, value in zip(timestamps, absorption_series):
+        if value is None:
+            if start is None:
+                start = ts
+            end = ts
+        elif start is not None:
+            spans.append((start, end))
+            start = None
+    if start is not None:
+        spans.append((start, end))
+    return spans
+
+
+def build_absorption_chart(
+    timestamps: list[datetime],
+    absorption_series: list[float | None],
+    x_range: tuple[datetime, datetime] | None = None,
+    price_change_threshold: float = 0.0005,
+) -> go.Figure:
+    """Absorption(흡수) 배수 — 「대량 체결에도 가격이 안 움직였는가」(v6 §8.2·§10.1).
+
+    **선이 아니라 막대다.** 이 값은 이어지는 수준이 아니라 봉마다 독립인 사건 크기이고,
+    대부분의 봉에서 0이다(가격이 문턱을 넘게 움직이면 `absorption_score()`가 0을 돌린다).
+    선으로 그리면 0이 이어진 구간이 「관측 중이고 값이 0」이 아니라 평탄한 신호처럼 보인다.
+
+    **0과 「모름」을 다르게 그린다.** 높이 0인 막대는 안 보이므로 그것만으로는 «판정했고 흡수가
+    아니다»와 «판정 못 했다»가 구분되지 않는다 — 이 저장소가 08-05(미관측을 정상으로 표시)와
+    08-21(모르는 것을 매수로 분류)에서 두 번 겪은 실수다. 그래서
+
+        판정했고 0      ->  y=0 자리에 작은 점 (관측했다는 표시)
+        기준선 없음     ->  점도 막대도 없고, 회색 음영 + "기준선 없음" 라벨
+
+    **문턱선은 값이 아무리 작아도 항상 화면에 있다.** y축 상한을 최소 `3.5`로 고정하기 때문이다.
+    자동 범위에 맡기면 최대값이 1.4인 날에 3배 선이 화면 밖으로 나가고, 그러면 «임계에 얼마나
+    가까운가»를 읽을 수 없다.
+
+    ⚠ `price_change_threshold`(기본 0.0005)는 **가격 수준에 비례하는 상대 문턱**이라 상품마다
+    뜻이 다르다 — 선물(≈1,080)에서는 ≈11틱까지 「정체」로 보지만 옵션 프리미엄(≈16)에서는
+    틱 크기보다도 작아 사실상 «시가=종가»인 봉만 통과한다. 그래서 캡션에 문턱을 숫자로 적는다.
+    """
+    observed_x = [ts for ts, v in zip(timestamps, absorption_series) if v is not None]
+    observed_y = [v for v in absorption_series if v is not None]
+    colors = [
+        _VPIN_CRITICAL if v >= _ABSORPTION_SUSPECT_THRESHOLD else _ABSORPTION_COLOR for v in observed_y
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=observed_x,
+            y=observed_y,
+            name="흡수 배수",
+            marker=dict(color=colors),
+            hovertemplate="%{x|%H:%M}: 평균 대비 %{y:.2f}배<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=observed_x,
+            y=[0] * len(observed_x),
+            mode="markers",
+            name="판정함(흡수 아님)",
+            marker=dict(color="#8A8A8A", size=3),
+            hoverinfo="skip",
+        )
+    )
+    fig.add_hline(
+        y=_ABSORPTION_SUSPECT_THRESHOLD,
+        line_dash="dash",
+        line_color=_VPIN_CRITICAL,
+        annotation_text=f"흡수 의심({_ABSORPTION_SUSPECT_THRESHOLD:.0f}배)",
+        # 기본값(top right)은 화면 오른쪽 끝에 결손 음영이 걸린 날 "봉 없음 N분" 라벨과 겹친다
+        # (08-21 렌더에서 실제로 뭉개졌다). 선 아래로 내려 같은 높이를 다투지 않게 한다.
+        annotation_position="bottom right",
+    )
+    for start, end in _no_baseline_spans(timestamps, absorption_series):
+        fig.add_vrect(
+            x0=start,
+            x1=end,
+            fillcolor=_GAP_BAND_COLOR,
+            opacity=0.18,
+            line_width=0,
+            layer="below",
+            annotation_text="기준선 없음",
+            # "봉 없음"은 top left에 붙는다. 두 음영이 겹치는 자리(창 앞머리에 결손이 있는
+            # 옵션 계열에서 실제로 생긴다 — 08-21 렌더에서 두 라벨이 한 줄로 뭉개졌다)에서
+            # 서로 덮지 않도록 이쪽만 아래로 내린다.
+            annotation_position="bottom left",
+            annotation_font_size=10,
+        )
+    _add_gap_bands(fig, timestamps)
+    top = max(_ABSORPTION_SUSPECT_THRESHOLD + 0.5, max(observed_y, default=0.0) * 1.15)
+    fig.update_layout(
+        yaxis=dict(title="Absorption(배)", range=[0, top]),
+        legend=dict(orientation="h", y=1.15),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=200,
+        bargap=0.15,
     )
     _apply_trading_hours_rangebreaks(fig)
     if x_range is not None:

@@ -48,6 +48,9 @@ def test_synthetic_snapshot_is_flagged_not_live_and_internally_consistent():
     assert snap.is_live is False
     assert len(snap.timestamps) == len(snap.ofi_series) == len(snap.vpin_series) == len(snap.price_series)
     assert len(snap.cvd_series) == len(snap.timestamps)
+    assert len(snap.absorption_series) == len(snap.timestamps)
+    # 앞머리는 기준선이 없어 판정 불가 — 0으로 채우면 「흡수 없음」으로 읽힌다.
+    assert snap.absorption_series[0] is None
     assert len(snap.option_cvd_series) == len(snap.option_timestamps)
     assert all(0.0 <= v <= 1.0 for v in snap.vpin_series)
     assert abs(sum(snap.regime_prob.values()) - 1.0) < 1e-9
@@ -333,9 +336,9 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62, 310.0, 180.0)],
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62, 310.0, 180.0, 1271.0, 490.0)],
         "option_symbol": [("B01607B38",)],
-        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55, 25.0, 40.0)],
+        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55, 25.0, 40.0, 40.6, 65.0)],
     }
 
     @contextmanager
@@ -371,9 +374,9 @@ def test_load_snapshot_accumulates_cvd_within_the_window(monkeypatch):
         "futures_symbol_value": "A01609",
         # 조회는 timestamp DESC이므로 fake도 최신순으로 돌려준다(_load_from_db가 뒤집는다).
         "futures_rows": [
-            (bars[2], 1080.0, 5.0, 1080.1, 0.5, 40.0, 10.0),
-            (bars[1], 1079.0, -3.0, 1079.1, 0.5, 20.0, 90.0),
-            (bars[0], 1078.0, 8.0, 1078.1, 0.5, 100.0, 60.0),
+            (bars[2], 1080.0, 5.0, 1080.1, 0.5, 40.0, 10.0, 1079.8, 50.0),
+            (bars[1], 1079.0, -3.0, 1079.1, 0.5, 20.0, 90.0, 1079.5, 110.0),
+            (bars[0], 1078.0, 8.0, 1078.1, 0.5, 100.0, 60.0, 1078.2, 160.0),
         ],
     }
 
@@ -399,8 +402,8 @@ def test_load_snapshot_holds_cvd_flat_across_bars_with_null_volume_delta(monkeyp
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
         "futures_rows": [
-            (ts, 1080.0, 5.0, 1080.1, 0.5, None, None),
-            (ts - timedelta(minutes=1), 1079.0, 8.0, 1079.1, 0.5, 100.0, 25.0),
+            (ts, 1080.0, 5.0, 1080.1, 0.5, None, None, 1080.0, 0.0),
+            (ts - timedelta(minutes=1), 1079.0, 8.0, 1079.1, 0.5, 100.0, 25.0, 1079.0, 125.0),
         ],
     }
 
@@ -429,9 +432,9 @@ def test_load_snapshot_bounds_both_flow_series_by_the_same_time_window(monkeypat
         "spot": [(1042.85, ts)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5, 100.0, 90.0)],
+        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5, 100.0, 90.0, 1046.2, 190.0)],
         "option_symbol": [("B09F9WA21",)],
-        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47, 8.0, 5.0)],
+        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47, 8.0, 5.0, 19.5, 13.0)],
     }
     conn = _FakeConnection(responses)
 
@@ -497,7 +500,7 @@ def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None, None, None)],
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None, None, None, 1271.0, 490.0)],
     }
 
     @contextmanager
@@ -2091,3 +2094,67 @@ def test_entry_cutoff_badge_says_not_yet_instead_of_inventing_a_number(monkeypat
     check = _entry_cutoff_check(object(), datetime(2026, 8, 6, 10, 0))
     assert check.status == "info"
     assert "집계 전" in check.detail
+
+
+def test_absorption_needs_a_baseline_before_it_judges(monkeypatch):
+    """기준선(직전 최소 5봉)이 없는 앞머리는 **0이 아니라 None**이다.
+
+    0으로 채우면 「판정했고 흡수가 아니다」로 읽힌다 — 08-21 CVD에서 「모르는 것을 매수로
+    적으면 없는 매수 우위가 그려진다」와 같은 형태의 실수다.
+    """
+    ts = datetime(2026, 8, 21, 10, 30)
+    n = 8
+    bars = [ts - timedelta(minutes=n - 1 - i) for i in range(n)]
+    # 앞 7봉은 거래량 100·가격 정체, 마지막 봉만 거래량 400(4배)에 역시 정체 → 흡수 의심.
+    rows = []
+    for i, bar_ts in enumerate(bars):
+        vol = 400.0 if i == n - 1 else 100.0
+        rows.append((bar_ts, 1080.0, 5.0, 1080.1, 0.5, vol / 2, vol / 2, 1080.0, vol))
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": list(reversed(rows)),  # 조회는 DESC
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    assert snap.absorption_series[:5] == [None] * 5, "직전 5봉이 안 쌓이면 판정하지 않는다"
+    assert snap.absorption_series[5] == pytest.approx(1.0)  # 평균과 같은 거래량
+    assert snap.absorption_series[-1] == pytest.approx(4.0)  # 평균 대비 4배 + 가격 정체
+
+
+def test_absorption_is_zero_when_the_price_actually_moved(monkeypatch):
+    # 대량 체결이어도 가격이 문턱을 넘게 움직였으면 흡수가 아니다 — None(모름)이 아니라 0(판정함).
+    ts = datetime(2026, 8, 21, 10, 30)
+    n = 8
+    bars = [ts - timedelta(minutes=n - 1 - i) for i in range(n)]
+    rows = []
+    for i, bar_ts in enumerate(bars):
+        vol = 400.0 if i == n - 1 else 100.0
+        close = 1090.0 if i == n - 1 else 1080.0  # 마지막 봉만 크게 상승
+        rows.append((bar_ts, close, 5.0, close, 0.5, vol / 2, vol / 2, 1080.0, vol))
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": list(reversed(rows)),
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    assert snap.absorption_series[-1] == 0.0

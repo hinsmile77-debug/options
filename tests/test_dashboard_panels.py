@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 
 from mahdi.dashboard.panels.flow_radar_panel import (
+    build_absorption_chart,
     build_cvd_chart,
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
@@ -373,3 +374,64 @@ def test_cvd_chart_breaks_and_shades_missing_bar_gaps_like_its_siblings():
 def test_cvd_chart_shows_marker_for_single_point_series():
     fig = build_cvd_chart([datetime(2026, 8, 21, 12, 23)], [0.0])
     assert "markers" in fig.data[0].mode
+
+
+# ===== 2026-08-21: Absorption을 패널에 올린다(v6 §17.3의 네 항목 중 마지막) =====
+
+
+def test_absorption_chart_marks_suspect_bars_with_the_status_color():
+    timestamps = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(3)]
+
+    fig = build_absorption_chart(timestamps, [0.0, 1.2, 3.4])
+
+    colors = list(fig.data[0].marker.color)
+    assert colors[:2] == ["#6E7B1F", "#6E7B1F"]
+    assert colors[2] == "#D55E00", "3배를 넘은 봉만 심각색 — 임계 초과라는 같은 뜻으로만 빌린다"
+
+
+def test_absorption_chart_distinguishes_judged_zero_from_no_baseline():
+    """0(판정했고 흡수 아님)과 None(기준선 없어 판정 못 함)은 **다르게 그려야 한다.**
+
+    높이 0인 막대는 안 보이므로 막대만으로는 둘이 구분되지 않는다 — 08-05(미관측을 정상으로
+    표시)·08-21(모르는 것을 매수로 분류)에서 두 번 겪은 실수의 같은 형태다.
+    """
+    timestamps = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(4)]
+
+    fig = build_absorption_chart(timestamps, [None, None, 0.0, 2.0])
+
+    # 판정한 봉만 막대·점을 갖는다.
+    assert list(fig.data[0].x) == timestamps[2:]
+    assert list(fig.data[1].x) == timestamps[2:]  # y=0 관측 점
+    assert list(fig.data[1].y) == [0, 0]
+    # 판정 못 한 앞머리는 음영 + 라벨로 명시된다.
+    bands = [s for s in fig.layout.shapes if s.type == "rect"]
+    assert len(bands) == 1
+    assert (bands[0].x0, bands[0].x1) == (timestamps[0], timestamps[1])
+    assert any("기준선 없음" in (a.text or "") for a in fig.layout.annotations)
+
+
+def test_absorption_threshold_line_stays_visible_on_a_quiet_day():
+    # 값이 전부 작아도 3배 선이 화면 밖으로 나가면 「임계에 얼마나 가까운가」를 못 읽는다.
+    timestamps = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(3)]
+
+    fig = build_absorption_chart(timestamps, [0.0, 0.3, 0.9])
+
+    assert fig.layout.yaxis.range[1] >= 3.0
+
+
+def test_absorption_chart_is_bars_not_a_line():
+    # 봉마다 독립인 사건 크기다 — 선으로 이으면 0이 이어진 구간이 평탄한 신호처럼 보인다.
+    timestamps = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(2)]
+
+    fig = build_absorption_chart(timestamps, [0.0, 1.0])
+
+    assert fig.data[0].type == "bar"
+
+
+def test_absorption_chart_is_safe_when_nothing_can_be_judged_yet():
+    timestamps = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(3)]
+
+    fig = build_absorption_chart(timestamps, [None, None, None])
+
+    assert list(fig.data[0].y) == []
+    assert fig.layout.yaxis.range[1] >= 3.0
