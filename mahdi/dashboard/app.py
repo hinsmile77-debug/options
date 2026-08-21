@@ -22,9 +22,11 @@ from mahdi.dashboard.data_source import (
 from mahdi.dashboard.panels.account_panel import build_account_summary_cards
 from mahdi.dashboard.panels.decision_panel import build_decision_history_table, build_decision_summary_cards
 from mahdi.dashboard.panels.flow_radar_panel import (
+    build_cvd_chart,
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
     build_vpin_chart,
+    shared_x_range,
 )
 from mahdi.dashboard.panels.expiry_liquidity_panel import build_expiry_liquidity_table
 from mahdi.dashboard.panels.gamma_map_panel import build_gamma_profile_chart
@@ -273,19 +275,22 @@ def render() -> None:
     else:
         st.caption("아직 만기 유동성 폴링 데이터가 없습니다.")
 
-    # 선물 시계열 범위를 옵션 차트에도 강제 적용 — 옵션은 거래가 뜸해 데이터가 1~2점뿐일 때가
-    # 많은데, 그러면 Plotly가 그 점 주위로만 확대해 x축이 마이크로초 단위로 깨진다(2026-07-06 발견).
-    futures_x_range = (snapshot.timestamps[0], snapshot.timestamps[-1]) if len(snapshot.timestamps) >= 2 else None
+    # 두 Flow Radar가 같은 x축을 쓰게 한다 — 근거는 `shared_x_range` docstring.
+    flow_x_range = shared_x_range(snapshot.timestamps, snapshot.option_timestamps)
 
     st.subheader("Flow Radar — 옵션(가장 활발한 종목)")
     if snapshot.option_flow_symbol is not None:
         st.caption(f"종목: {snapshot.option_flow_symbol}")
         st.plotly_chart(
-            build_ofi_sparkline(snapshot.option_timestamps, snapshot.option_ofi_series, x_range=futures_x_range),
+            build_cvd_chart(snapshot.option_timestamps, snapshot.option_cvd_series, x_range=flow_x_range),
             width='stretch',
         )
         st.plotly_chart(
-            build_vpin_chart(snapshot.option_timestamps, snapshot.option_vpin_series, x_range=futures_x_range),
+            build_ofi_sparkline(snapshot.option_timestamps, snapshot.option_ofi_series, x_range=flow_x_range),
+            width='stretch',
+        )
+        st.plotly_chart(
+            build_vpin_chart(snapshot.option_timestamps, snapshot.option_vpin_series, x_range=flow_x_range),
             width='stretch',
         )
         st.plotly_chart(
@@ -293,7 +298,7 @@ def render() -> None:
                 snapshot.option_timestamps,
                 snapshot.option_price_series,
                 snapshot.option_microprice_series,
-                x_range=futures_x_range,
+                x_range=flow_x_range,
             ),
             width='stretch',
         )
@@ -303,10 +308,19 @@ def render() -> None:
     st.subheader("Flow Radar — 선물(기초자산)")
     if snapshot.futures_flow_symbol is not None:
         st.caption(f"종목: {snapshot.futures_flow_symbol}")
-    st.plotly_chart(build_ofi_sparkline(snapshot.timestamps, snapshot.ofi_series), width='stretch')
-    st.plotly_chart(build_vpin_chart(snapshot.timestamps, snapshot.vpin_series), width='stretch')
     st.plotly_chart(
-        build_microprice_vs_price_chart(snapshot.timestamps, snapshot.price_series, snapshot.microprice_series),
+        build_cvd_chart(snapshot.timestamps, snapshot.cvd_series, x_range=flow_x_range), width='stretch'
+    )
+    st.plotly_chart(
+        build_ofi_sparkline(snapshot.timestamps, snapshot.ofi_series, x_range=flow_x_range), width='stretch'
+    )
+    st.plotly_chart(
+        build_vpin_chart(snapshot.timestamps, snapshot.vpin_series, x_range=flow_x_range), width='stretch'
+    )
+    st.plotly_chart(
+        build_microprice_vs_price_chart(
+            snapshot.timestamps, snapshot.price_series, snapshot.microprice_series, x_range=flow_x_range
+        ),
         width='stretch',
     )
 

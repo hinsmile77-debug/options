@@ -1,9 +1,11 @@
 from datetime import date, datetime, timedelta
 
 from mahdi.dashboard.panels.flow_radar_panel import (
+    build_cvd_chart,
     build_microprice_vs_price_chart,
     build_ofi_sparkline,
     build_vpin_chart,
+    shared_x_range,
 )
 from mahdi.dashboard.panels.gamma_map_panel import build_gamma_profile_chart
 from mahdi.dashboard.panels.position_panel import build_position_flow_chart
@@ -299,3 +301,75 @@ def test_gamma_profile_chart_labels_a_single_wall_by_name_not_rank():
         [1045.0], [10.0], spot=1045.0, gamma_flip=None, gamma_walls=[1045.0], expiry=date(2026, 8, 13)
     )
     assert any((a.text or "") == "감마월" for a in fig.layout.annotations)
+
+
+# ===== 2026-08-21 사용자 요청: 두 Flow Radar의 시간축 일치 + CVD 추가 =====
+
+
+def test_shared_x_range_spans_both_series_not_just_the_futures_window():
+    # 선물 창만 강제하면 그 밖의 옵션 봉이 보이지도 않은 채 잘려 나간다 — 합집합이어야 한다.
+    futures = [datetime(2026, 8, 21, 9, 20), datetime(2026, 8, 21, 10, 15)]
+    option = [datetime(2026, 8, 21, 9, 12), datetime(2026, 8, 21, 10, 30)]
+
+    assert shared_x_range(futures, option) == (datetime(2026, 8, 21, 9, 12), datetime(2026, 8, 21, 10, 30))
+
+
+def test_shared_x_range_is_none_when_there_is_nothing_to_align():
+    assert shared_x_range([], []) is None
+    # 점이 하나뿐이면 폭 0짜리 범위가 되어 Plotly가 축을 못 그린다 — 자동 범위에 맡긴다.
+    assert shared_x_range([datetime(2026, 8, 21, 9, 20)], []) is None
+
+
+def test_both_flow_radars_get_the_identical_x_axis_range():
+    """회귀: 종전에는 옵션 차트에만 x_range를 넘기고 선물 차트는 자동 범위였다.
+
+    Plotly의 자동 여백은 계열의 값 분포에 따라 달라지므로 같은 09:30이 두 그림에서 서로 다른
+    가로 위치에 찍혔고, 위아래 대조가 불가능했다.
+    """
+    futures_ts = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(3)]
+    option_ts = [datetime(2026, 8, 21, 9, 21)]
+    x_range = shared_x_range(futures_ts, option_ts)
+
+    figures = [
+        build_cvd_chart(futures_ts, [1.0, 2.0, 3.0], x_range=x_range),
+        build_ofi_sparkline(futures_ts, [1.0, 2.0, 3.0], x_range=x_range),
+        build_vpin_chart(futures_ts, [0.1, 0.2, 0.3], x_range=x_range),
+        build_microprice_vs_price_chart(futures_ts, [1.0, 2.0, 3.0], [1.1, 2.1, 3.1], x_range=x_range),
+        build_cvd_chart(option_ts, [5.0], x_range=x_range),
+        build_ofi_sparkline(option_ts, [5.0], x_range=x_range),
+        build_vpin_chart(option_ts, [0.5], x_range=x_range),
+        build_microprice_vs_price_chart(option_ts, [5.0], [5.1], x_range=x_range),
+    ]
+
+    ranges = {tuple(fig.layout.xaxis.range) for fig in figures}
+    assert len(ranges) == 1, "여덟 차트의 x축 범위가 하나로 같아야 위아래를 눈으로 대조할 수 있다"
+    assert ranges.pop() == (futures_ts[0], futures_ts[-1])
+
+
+def test_cvd_is_its_own_chart_never_a_second_axis_on_ofi():
+    # OFI는 0 근처 진동, CVD는 누적 — 이중 y축으로 겹치면 두 선의 교차점이 축 스케일이 만든
+    # 우연일 뿐인데 "신호"처럼 읽힌다. 두 계열은 x축만 공유하는 별도 그림이어야 한다.
+    timestamps = [datetime(2026, 8, 21, 9, 20) + timedelta(minutes=i) for i in range(3)]
+
+    ofi_fig = build_ofi_sparkline(timestamps, [1.0, -2.0, 3.0])
+    cvd_fig = build_cvd_chart(timestamps, [100.0, 80.0, 260.0])
+
+    assert len(ofi_fig.data) == 1
+    assert "yaxis2" not in ofi_fig.layout.to_plotly_json()  # 이중 축을 만들지 않는다
+    assert len(cvd_fig.data) == 1
+    assert list(cvd_fig.data[0].y) == [100.0, 80.0, 260.0]
+
+
+def test_cvd_chart_breaks_and_shades_missing_bar_gaps_like_its_siblings():
+    # CVD도 미관측 구간을 직선으로 이으면 "누적이 멈춰 있었다"는 거짓 사실을 그린다.
+    timestamps, _ = _gapped_series(gap_minutes=35)
+
+    fig = build_cvd_chart(timestamps, [100.0, 220.0, 180.0, 240.0])
+
+    assert list(fig.data[0].y) == [100.0, 220.0, None, 180.0, 240.0]
+    assert len([s for s in fig.layout.shapes if s.type == "rect"]) == 1
+
+
+def test_cvd_chart_shows_marker_for_single_point_series():
+    fig = build_cvd_chart([datetime(2026, 8, 21, 12, 23)], [0.0])
+    assert "markers" in fig.data[0].mode

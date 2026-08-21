@@ -108,12 +108,17 @@ class DashboardSnapshot:
     futures_flow_symbol: str | None
     timestamps: list[datetime]
     ofi_series: list[float]
+    # CVD(누적 체결 델타) — `market_raw_1m.buy_volume - sell_volume`을 **조회 창 안에서만** 누적한
+    # 값이라 원점은 창의 첫 봉(0)이다. 종목 전체 누적이 아니므로 절대값이 아니라 기울기를 읽는다
+    # (`flow_radar_panel.build_cvd_chart` docstring 참고).
+    cvd_series: list[float]
     vpin_series: list[float]
     price_series: list[float]
     microprice_series: list[float]
     option_flow_symbol: str | None
     option_timestamps: list[datetime]
     option_ofi_series: list[float]
+    option_cvd_series: list[float]
     option_vpin_series: list[float]
     option_price_series: list[float]
     option_microprice_series: list[float]
@@ -1375,6 +1380,27 @@ def _gamma_wall_strikes(legs: list, spot: float) -> list[float]:
     return [walls[0][0]]
 
 
+def _cumulative_volume_delta(rows: list) -> list[float]:
+    """
+    입력: Flow Radar 조회 결과 행(오름차순). 각 행은 `(timestamp, close, ofi, microprice, vpin,
+         buy_volume, sell_volume)` — `_load_from_db`의 SELECT 순서와 묶여 있다.
+    계산: `buy_volume - sell_volume`의 **창 안 누적합**. 첫 봉 직전을 0으로 두므로 반환 계열의
+         원점은 조회 창의 시작이다.
+    해석: 종목의 장중 전체 누적이 아니다 — 창이 1분 밀릴 때마다 같은 시각의 값도 함께 밀린다.
+         읽어야 할 것은 절대 높이가 아니라 기울기와 부호 전환이다.
+    실패 조건: 없음. buy/sell이 NULL인 봉(수집기가 델타를 못 채운 경우)은 그 봉의 기여를 0으로
+              보고 **직전 값을 유지**한다 — 0으로 리셋하면 없는 매도 압력을 그리게 된다.
+    """
+    out: list[float] = []
+    running = 0.0
+    for row in rows:
+        buy = float(row[5]) if row[5] is not None else 0.0
+        sell = float(row[6]) if row[6] is not None else 0.0
+        running += buy - sell
+        out.append(running)
+    return out
+
+
 def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     try:
         with db.get_connection() as conn:
@@ -1432,7 +1458,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 futures_rows: list = []
                 if futures_flow_symbol is not None:
                     cur.execute(
-                        "SELECT timestamp, close, ofi, microprice, vpin FROM market_raw_1m "
+                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume FROM market_raw_1m "
                         "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
                         (futures_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
@@ -1456,7 +1482,7 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 option_rows: list = []
                 if option_flow_symbol is not None:
                     cur.execute(
-                        "SELECT timestamp, close, ofi, microprice, vpin FROM market_raw_1m "
+                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume FROM market_raw_1m "
                         "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
                         (option_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
@@ -1521,12 +1547,14 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         futures_flow_symbol=futures_flow_symbol,
         timestamps=[row[0] for row in futures_rows],
         ofi_series=[float(row[2]) for row in futures_rows],
+        cvd_series=_cumulative_volume_delta(futures_rows),
         vpin_series=[float(row[4]) if row[4] is not None else 0.0 for row in futures_rows],
         price_series=[float(row[1]) for row in futures_rows],
         microprice_series=[float(row[3]) for row in futures_rows],
         option_flow_symbol=option_flow_symbol,
         option_timestamps=[row[0] for row in option_rows],
         option_ofi_series=[float(row[2]) for row in option_rows],
+        option_cvd_series=_cumulative_volume_delta(option_rows),
         option_vpin_series=[float(row[4]) if row[4] is not None else 0.0 for row in option_rows],
         option_price_series=[float(row[1]) for row in option_rows],
         option_microprice_series=[float(row[3]) for row in option_rows],
@@ -1559,12 +1587,16 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
 
     spot = 350.0 + np.cumsum(rng.normal(0, 0.15, n))
     ofi_series = rng.normal(0, 300, n).cumsum() * 0.05
+    # CVD는 봉별 체결 델타의 누적이므로 합성도 누적으로 만든다 — 라이브와 모양(단조에 가까운
+    # 표류 + 간헐적 부호 전환)이 달라지면 합성 화면으로 판독 연습이 안 된다.
+    cvd_series = rng.normal(20, 400, n).cumsum()
     vpin_series = np.clip(0.3 + rng.normal(0, 0.15, n).cumsum() * 0.02, 0.05, 0.95)
     microprice_series = spot + rng.normal(0, 0.05, n)
 
     # 옵션 계열은 선물과 스케일이 다르다(체결가가 지수 포인트가 아니라 옵션 프리미엄) — 별도로 합성.
     option_price = 50.0 + np.cumsum(rng.normal(0, 0.2, n))
     option_ofi_series = rng.normal(0, 50, n).cumsum() * 0.05
+    option_cvd_series = rng.normal(2, 40, n).cumsum()
     option_vpin_series = np.clip(0.3 + rng.normal(0, 0.15, n).cumsum() * 0.02, 0.05, 0.95)
     option_microprice_series = option_price + rng.normal(0, 0.05, n)
 
@@ -1599,12 +1631,14 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         futures_flow_symbol=None,
         timestamps=timestamps,
         ofi_series=list(ofi_series),
+        cvd_series=list(cvd_series),
         vpin_series=list(vpin_series),
         price_series=list(spot),
         microprice_series=list(microprice_series),
         option_flow_symbol="SYNTH_OPT",
         option_timestamps=timestamps,
         option_ofi_series=list(option_ofi_series),
+        option_cvd_series=list(option_cvd_series),
         option_vpin_series=list(option_vpin_series),
         option_price_series=list(option_price),
         option_microprice_series=list(option_microprice_series),

@@ -25,6 +25,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "kaleido>=1.3.0",
     "pytest>=8.3",
 ]
 

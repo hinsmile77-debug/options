@@ -99,6 +99,25 @@ class VolumeBucketAggregator:
         return None
 
 
+def _midpoint_direction(tick: Tick) -> int:
+    """
+    입력: 비교할 직전 체결이 아직 없는 틱(세션 최초 1건).
+    계산: 호가 중간값보다 비싸게 체결됐으면 매수(+1), 싸게면 매도(-1).
+    해석: Lee-Ready(1991)가 tick test를 쓸 수 없을 때 쓰는 quote test와 같은 판정이다.
+    실패 조건: 중간값과 정확히 같거나 호가가 비정상(bid >= ask)이면 **0(모름)**. 이때 상위
+              호출자는 그 틱을 매수·매도 어느 쪽으로도 세지 않는다 — 모르는 것을 한쪽으로
+              적는 것이 편향의 시작이다.
+    """
+    if not (tick.bid_px < tick.ask_px):
+        return 0
+    mid = (tick.bid_px + tick.ask_px) / 2
+    if tick.price > mid:
+        return 1
+    if tick.price < mid:
+        return -1
+    return 0
+
+
 class MinuteBarAggregator:
     """symbol 1개에 대해 틱을 누적하고, 분이 바뀌면 완성된 1분봉을 flush한다."""
 
@@ -107,6 +126,11 @@ class MinuteBarAggregator:
     def __init__(self) -> None:
         self._current_minute: datetime | None = None
         self._ticks: list[Tick] = []
+        # 틱 룰의 기준은 **봉 경계를 넘어 이월된다**(2026-08-21). 봉마다 baseline을 새로 잡으면
+        # 그 봉의 첫 틱은 자기 자신과 비교돼 언제나 매수가 된다 — 그것이 CVD를 직선으로 만든
+        # 편향의 절반이었다(`_classify_volumes` docstring).
+        self._prev_price: float | None = None
+        self._prev_direction: int = 0  # +1 매수 · -1 매도 · 0 아직 모름
 
     def add_tick(self, tick: Tick) -> MinuteBar | None:
         """
@@ -139,6 +163,46 @@ class MinuteBarAggregator:
         self._ticks = []
         return completed
 
+    def _classify_volumes(self) -> tuple[float, float]:
+        """
+        입력: 이 봉에 쌓인 틱들(`self._ticks`)과 **직전 봉에서 이월된** 기준 체결가·직전 분류.
+        계산: 틱 룰(Lee-Ready 1991의 tick test). 직전 체결보다 **오르면 매수, 내리면 매도,
+             같으면 직전 분류를 승계**한다(zero-uptick / zero-downtick). 봉의 첫 틱도 직전
+             봉의 마지막 체결과 비교한다 — 기준은 봉 경계에서 끊기지 않는다.
+        해석: 반환값은 (매수 체결량, 매도 체결량)이고 **둘의 합이 `volume`보다 작을 수 있다.**
+             가를 근거가 없는 틱을 어느 쪽으로도 세지 않기 때문이다(아래 실패 조건).
+        실패 조건: 기준이 아직 없는 **세션 최초 틱**은 호가 중간값으로 가른다. 중간값과 정확히
+                  같거나 호가가 비정상(bid >= ask)이면 **어느 쪽으로도 세지 않는다.**
+
+        2026-08-21 — 종전 규칙은 `if p >= prev_price: buy else: sell`이었고 baseline이 그 봉
+        자신의 첫 체결가였다. 결함이 둘 겹쳐 있었다: **동가 틱이 전부 매수**로 갔고(`>=`),
+        **봉의 첫 틱도 자기 자신과 비교돼 항상 매수**였다. 이웃 틱이 같은 가격인 경우가 많은
+        선물에서 편향이 가장 컸다 — 08-21 09:00~10:38 A01609 실측 매수 12,975 / 매도 8,773
+        (매수 59.7%)이고, COCKPIT의 CVD가 가격이 제자리인 한 시간 동안 부호 전환 없이 85 ->
+        2,454까지 곧게 올랐다. **모르는 것을 매수로 적으면 없는 매수 우위가 그려진다.**
+        """
+        buy_volume = 0.0
+        sell_volume = 0.0
+        for tick in self._ticks:
+            if self._prev_price is None:
+                direction = _midpoint_direction(tick)
+            elif tick.price > self._prev_price:
+                direction = 1
+            elif tick.price < self._prev_price:
+                direction = -1
+            else:
+                direction = self._prev_direction
+
+            if direction > 0:
+                buy_volume += tick.volume
+            elif direction < 0:
+                sell_volume += tick.volume
+
+            self._prev_price = tick.price
+            if direction != 0:
+                self._prev_direction = direction
+        return buy_volume, sell_volume
+
     def _build_bar(self) -> MinuteBar | None:
         if not self._ticks or self._current_minute is None:
             return None
@@ -154,15 +218,7 @@ class MinuteBarAggregator:
         micro = microprice(last.bid_px, last.bid_qty, last.ask_px, last.ask_qty)
         spread = last.ask_px - last.bid_px
 
-        buy_volume = 0.0
-        sell_volume = 0.0
-        prev_price = prices[0]
-        for p, v in zip(prices, volumes):
-            if p >= prev_price:
-                buy_volume += v
-            else:
-                sell_volume += v
-            prev_price = p
+        buy_volume, sell_volume = self._classify_volumes()
 
         quality_flag = 0 if len(self._ticks) >= self.MIN_TICKS_FOR_NORMAL_QUALITY else 1
 

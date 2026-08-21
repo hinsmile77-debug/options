@@ -47,6 +47,8 @@ def test_synthetic_snapshot_is_flagged_not_live_and_internally_consistent():
 
     assert snap.is_live is False
     assert len(snap.timestamps) == len(snap.ofi_series) == len(snap.vpin_series) == len(snap.price_series)
+    assert len(snap.cvd_series) == len(snap.timestamps)
+    assert len(snap.option_cvd_series) == len(snap.option_timestamps)
     assert all(0.0 <= v <= 1.0 for v in snap.vpin_series)
     assert abs(sum(snap.regime_prob.values()) - 1.0) < 1e-9
     assert snap.regime in RegimeLabel
@@ -331,9 +333,9 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62)],
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62, 310.0, 180.0)],
         "option_symbol": [("B01607B38",)],
-        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55)],
+        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55, 25.0, 40.0)],
     }
 
     @contextmanager
@@ -353,6 +355,64 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
     assert snap.option_ofi_series == [12.0]
     assert snap.option_microprice_series == [40.7]
     assert snap.option_vpin_series == [0.55]  # 2026-07-06: 옵션도 VPIN이 실제로 계산됨
+    assert snap.cvd_series == [130.0]  # 310 매수 − 180 매도
+    assert snap.option_cvd_series == [-15.0]  # 25 매수 − 40 매도
+
+
+def test_load_snapshot_accumulates_cvd_within_the_window(monkeypatch):
+    # 2026-08-21 신규: CVD는 봉별 델타가 아니라 **창 안 누적합**이다. 원점은 창의 첫 봉(0)이고
+    # 종목 전체 누적이 아니므로, 화면은 절대 높이가 아니라 기울기를 읽게 된다.
+    ts = datetime(2026, 8, 21, 10, 15)
+    bars = [ts - timedelta(minutes=2), ts - timedelta(minutes=1), ts]
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        # 조회는 timestamp DESC이므로 fake도 최신순으로 돌려준다(_load_from_db가 뒤집는다).
+        "futures_rows": [
+            (bars[2], 1080.0, 5.0, 1080.1, 0.5, 40.0, 10.0),
+            (bars[1], 1079.0, -3.0, 1079.1, 0.5, 20.0, 90.0),
+            (bars[0], 1078.0, 8.0, 1078.1, 0.5, 100.0, 60.0),
+        ],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    # +40, -70, +30 → 누적 40, -30, 0 (부호가 뒤집히는 구간이 그대로 보여야 한다)
+    assert snap.cvd_series == [40.0, -30.0, 0.0]
+
+
+def test_load_snapshot_holds_cvd_flat_across_bars_with_null_volume_delta(monkeypatch):
+    # buy/sell이 NULL인 봉(수집기가 델타를 못 채운 경우)에 0으로 리셋하면 **없던 매도 압력**을
+    # 그리게 된다 — 기여를 0으로 보고 직전 누적값을 유지해야 한다.
+    ts = datetime(2026, 8, 21, 10, 15)
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": [
+            (ts, 1080.0, 5.0, 1080.1, 0.5, None, None),
+            (ts - timedelta(minutes=1), 1079.0, 8.0, 1079.1, 0.5, 100.0, 25.0),
+        ],
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    assert snap.cvd_series == [75.0, 75.0]
 
 
 def test_load_snapshot_bounds_both_flow_series_by_the_same_time_window(monkeypatch):
@@ -369,9 +429,9 @@ def test_load_snapshot_bounds_both_flow_series_by_the_same_time_window(monkeypat
         "spot": [(1042.85, ts)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5)],
+        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5, 100.0, 90.0)],
         "option_symbol": [("B09F9WA21",)],
-        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47)],
+        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47, 8.0, 5.0)],
     }
     conn = _FakeConnection(responses)
 
@@ -437,7 +497,7 @@ def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None)],
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None, None, None)],
     }
 
     @contextmanager

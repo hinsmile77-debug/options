@@ -330,6 +330,7 @@ def detect_regime(features_1m, features_15m) -> RegimeState:
 | **OFI** | 최우선 호가 잔량 변화 기반 주문흐름 불균형 | 단기 가격변화와 선형 관계 — 방향 선행 신호 |
 | **VPIN** | 정보거래 확률 | >0.7 정보거래자 활성 → 회귀 전략 금지, 추세/회피 |
 | Microprice | 잔량 가중 중심가격 | 다음 틱 방향의 단기 선행가격 |
+| CVD | 공격적 매수−매도 체결량의 누적(틱 룰 분류) | 기울기가 방향, 부호 전환이 주도권 교체. 화면 계열의 원점은 **조회 창의 시작**이라 절대 높이는 창에 종속된다 |
 | Queue Imbalance | 최우선 호가잔량 비대칭 | 체결 압력 방향 |
 | Absorption | 대량 체결에도 가격 불변 | 반전 or 지속의 핵심 단서 |
 | Aggressive Sweeps | 여러 호가 훑는 공격 체결 | 스마트머니 흔적 |
@@ -938,7 +939,7 @@ flowchart TD
 | Risk Budget | 잔여 일중 손실 버퍼, Greeks 사용률 | 1분 | 버퍼 30% 미만 시 황색 |
 | Gamma Map | GEX 프로파일 + Flip/Wall + Vanna/Charm 상태 | 1분 | Flip 접근 시 경고 |
 | Volume Profile | POC/VAH/VAL/LVN + VWAP·AVWAP | 1분 | 구조 붕괴 시 Structure Stop 연동 표시 |
-| Flow Radar | OFI 스파크라인, VPIN, Microprice, Absorption | 1분(틱 집계) | 독성 급등 시 진입 게이트 차단 표시 |
+| Flow Radar | CVD, OFI 스파크라인, VPIN, Microprice, Absorption | 1분(틱 집계) | 독성 급등 시 진입 게이트 차단 표시 |
 | 수급 Intel | 주체별 순매수 + 추정 손익 상태 + Trap 스캔 | 1분 | Trap 감지 시 역발상 카드 |
 | Positions | **EV(belief) 바 + 가장 가까운 청산 트리거와의 거리** | 실시간 | 원클릭 [50%축소] [전량청산] |
 | Action Feed | 행동이 필요한 항목만 (정보성 로그 분리) | 실시간 | 각 항목에 승인/무시 버튼 |

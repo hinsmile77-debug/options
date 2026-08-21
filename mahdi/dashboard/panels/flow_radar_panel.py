@@ -1,4 +1,4 @@
-"""Flow Radar 패널 — OFI 스파크라인, VPIN 독성 게이지, Microprice vs 체결가 (v6 §8, §17 COCKPIT).
+"""Flow Radar 패널 — CVD, OFI 스파크라인, VPIN 독성 게이지, Microprice vs 체결가 (v6 §8, §17 COCKPIT).
 
 VPIN 마커 색은 카테고리가 아니라 상태(status)를 나타내므로 예약된 상태 팔레트를 쓴다
 (양호/경고/심각 — 시리즈 정체성 색과 절대 혼용하지 않는다).
@@ -27,6 +27,11 @@ _VPIN_WARNING = "#E69F00"
 _VPIN_CRITICAL = "#D55E00"
 _VPIN_CRISIS_THRESHOLD = 0.7
 _VPIN_WARNING_THRESHOLD = 0.4
+
+# CVD 계열색. OFI의 #0072B2와 **다른 정체성**이어야 하고, VPIN 상태 팔레트(녹/주/홍)를 빌려
+# 쓰면 안 된다(상태색은 예약색). 이 값은 눈대중이 아니라 팔레트 검증기를 돌려 고른 것 —
+# #0072B2와 protan ΔE 8.5 / 정상시 ΔE 20.1, 흰 배경 대비 3:1 이상을 모두 통과한다.
+_CVD_COLOR = "#A34E80"
 
 # 파생 거래시간은 09:00~15:45로 고정(v6 §16.1) — 전일 장마감부터 익일 개장까지, 그리고 주말은
 # 항상 거래가 없으므로 x축에서 건너뛴다. 그래야 실제 체결이 뜸한 옵션 종목도 시간축이 빈 공백에
@@ -117,6 +122,77 @@ def _add_gap_bands(fig: go.Figure, timestamps: list[datetime]) -> None:
             annotation_position="top left",
             annotation_font_size=10,
         )
+
+
+def shared_x_range(*timestamp_series: list[datetime]) -> tuple[datetime, datetime] | None:
+    """
+    입력: 같은 x축을 쓰게 할 봉 시각 계열들(선물 계열, 옵션 계열 …).
+    계산: 모든 계열 **합집합**의 최소~최대 시각. 점이 사실상 하나뿐이면(폭 0) None.
+    해석: Flow Radar 두 벌(옵션·선물)의 여덟 차트가 전부 같은 가로 좌표를 쓰게 하는 값이다.
+         2026-08-21 사용자 지적 — 종전에는 옵션 차트에만 선물 창을 `x_range`로 강제하고 선물
+         차트는 아무것도 안 넘겼다. Plotly의 자동 여백은 계열의 값 분포에 따라 달라지므로 같은
+         09:30이 두 그림에서 서로 다른 가로 위치에 찍혔고, 위아래를 눈으로 대조할 수 없었다.
+         선물 범위가 아니라 **합집합**인 이유: 선물 창만 강제하면 그 밖에 있는 옵션 봉이
+         보이지도 않은 채 잘려 나간다(2026-08-05 P2-9에서 창 밖 점이 y축만 잡아늘였던 것과
+         같은 종류의 "안 보이는데 영향은 주는" 상태).
+    실패 조건: 없음 — 범위를 못 정하면 None을 돌려 Plotly 자동 범위에 맡긴다. 그때는 애초에
+              그릴 점이 0~1개뿐이라 맞출 축 자체가 없다.
+    """
+    all_timestamps = [ts for series in timestamp_series for ts in series]
+    if not all_timestamps:
+        return None
+    low, high = min(all_timestamps), max(all_timestamps)
+    return (low, high) if low < high else None
+
+
+def build_cvd_chart(
+    timestamps: list[datetime], cvd_series: list[float], x_range: tuple[datetime, datetime] | None = None
+) -> go.Figure:
+    """CVD(누적 체결 델타) — 창 시작 이후 `매수체결량 − 매도체결량`의 누적합.
+
+    OFI와 **같은 그림에 겹치지 않는다.** OFI는 봉마다 0 근처를 오가는 진동값이고 CVD는 단조에
+    가깝게 누적되는 값이라 스케일이 두 자릿수 이상 벌어진다 — 이중 y축으로 겹치면 두 선의
+    교차점이 축 스케일이 만든 우연이 되어 아무 뜻도 없는 "신호"처럼 읽힌다. 두 계열은 x축만
+    공유하는 별도 차트로 위아래에 둔다.
+
+    값의 원점은 **화면 창의 시작**이다(종목 전체 누적이 아니다) — 창이 밀리면 같은 시각의 CVD
+    절대값도 달라지므로, 읽을 것은 절대 높이가 아니라 **기울기와 부호 전환**이다.
+
+    ⚠ **2026-08-21 이전에 수집된 봉은 매수 쪽으로 편향돼 있다.** 이 차트가 만든 결함이 아니라
+    **드러낸** 결함이다 — 종전 `collector.MinuteBarAggregator`의 분류가 `p >= prev_price`라
+    동가 틱이 전부 매수로 갔고, baseline이 그 봉 자신의 첫 체결가라 첫 틱도 항상 매수였다.
+    가격이 제자리인 한 시간 동안 이 차트가 부호 전환 없이 85 -> 2,454까지 곧게 올라 발견됐다
+    (08-21 09:38~10:38 A01609 실측, 그 창의 매수비율 59.7%).
+
+    **분류는 고쳤다**(`_classify_volumes` — 동가 틱은 직전 분류 승계, baseline은 봉 경계를 넘어
+    이월). 그러나 **틱을 저장하지 않으므로 과거 봉은 재계산할 수 없다.** 즉 이 차트는
+
+        수정 배포 이후 수집된 봉  ->  신뢰 가능
+        그 이전에 수집된 봉        ->  매수 편향 잔존(영구)
+
+    이다. 창(`FLOW_RADAR_WINDOW_MINUTES`)이 그 경계를 가로지르는 동안에는 계단이 하나 생긴다 —
+    시장이 만든 것이 아니다.
+    """
+    x, (y,) = _break_on_gaps(timestamps, cvd_series)
+    fig = go.Figure(
+        go.Scatter(
+            x=x,
+            y=y,
+            mode="lines+markers",
+            line=dict(color=_CVD_COLOR, width=2),
+            marker=dict(color=_CVD_COLOR, size=5),
+            hovertemplate="%{x|%H:%M}: CVD %{y:+,.0f}<extra></extra>",
+        )
+    )
+    fig.add_hline(y=0, line_color="#8A8A8A", line_width=1)
+    _add_gap_bands(fig, timestamps)
+    fig.update_layout(
+        yaxis_title="CVD(창 시작=0)", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=180
+    )
+    _apply_trading_hours_rangebreaks(fig)
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
+    return fig
 
 
 def build_ofi_sparkline(
