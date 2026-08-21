@@ -24,7 +24,8 @@ from mahdi.engines.regime_pipeline import (
 )
 from mahdi.execution.account_tracker import BalanceSnapshot, build_account_state
 from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute_gamma_walls, signal_book_legs
-from mahdi.features.orderflow import absorption_score
+from mahdi.execution.entry import tick_size_for_price
+from mahdi.features.orderflow import absorption_score, flat_range_limit
 from mahdi.ops import db_metrics
 from mahdi import session
 
@@ -1421,33 +1422,41 @@ def _cumulative_volume_delta(rows: list) -> list[float]:
 def _absorption_series(rows: list) -> list[float | None]:
     """
     입력: Flow Radar 조회 결과 행(오름차순). `(timestamp, close, ofi, microprice, vpin,
-         buy_volume, sell_volume, open, volume)` — `_load_from_db`의 SELECT 순서와 묶여 있다.
-    계산: 봉마다 `absorption_score(거래량, 직전 봉들의 평균 거래량, 봉 내 가격변화율)`.
-         기준선은 **직전** 최대 `ABSORPTION_BASELINE_BARS`봉의 평균이고, 현재 봉은 뺀다.
-         가격변화율은 그 봉 안의 `(close - open) / open`이다.
+         buy_volume, sell_volume, open, volume, high, low)` — `_load_from_db`의 SELECT 순서와
+         묶여 있다.
+    계산: 봉마다 `absorption_score(거래량, 직전 봉들의 평균 거래량, 봉 범위, 정체 상한)`.
+         **거래량 기준선도 가격 정체 상한도 직전 `ABSORPTION_BASELINE_BARS`봉에서 나온다**
+         (현재 봉은 양쪽 모두에서 제외 — 자기 자신을 기준 삼으면 큰 봉일수록 점수가 눌린다).
+         정체 상한은 `flat_range_limit(직전 범위들, 그 봉 가격의 호가단위)`.
     해석: 값이 클수록 「대량 체결이 가격을 못 움직였다」 — v6 §10.1은 3배 이상을 흡수 의심으로
-         본다. `absorption_score()`가 가격이 문턱을 넘게 움직인 봉을 0으로 돌리므로, 0.0은
-         **판정했고 흡수가 아니다**라는 뜻이다.
+         본다. 가격이 상한을 넘게 움직인 봉은 0.0이고, 그것은 **판정했고 흡수가 아니다**라는
+         뜻이다.
     실패 조건: 직전 봉이 `ABSORPTION_MIN_BASELINE_BARS`에 못 미치면 그 봉은 `None` —
               **판정 불가이지 흡수 없음이 아니다.** 창 앞머리에서 매번 생긴다.
-              `open`이 0이거나 NULL이면(있어선 안 되지만) 역시 `None`으로 둔다.
+              `high`/`low`가 NULL이면(있어선 안 되지만) 역시 `None`으로 둔다.
 
-    ⚠ `absorption_score()`의 기본 `price_change_threshold=0.0005`는 **종목의 가격 수준에
-    비례하는 상대 문턱**이라 상품마다 뜻이 크게 달라진다. 08-21 실측: 선물(≈1,080)에서는
-    0.54포인트 ≈ 11틱까지 「가격 정체」로 보지만, 옵션 프리미엄(≈16)에서는 0.008로 **틱 크기
-    0.05보다 작다** — 즉 옵션에서 이 게이트는 사실상 «시가와 종가가 정확히 같은 봉»만 통과시킨다
-    (71봉 중 11봉). 화면 캡션이 문턱을 그대로 적어 이 사실이 숨지 않게 한다.
+    문턱을 왜 「그 종목 최근 변동성의 절반」으로 잡는지, 왜 순변화가 아니라 범위인지는
+    `features.orderflow.flat_range_limit` / `absorption_score` docstring에 실측과 함께 있다.
     """
     out: list[float | None] = []
     volumes = [float(row[8]) if row[8] is not None else 0.0 for row in rows]
+    ranges: list[float | None] = [
+        float(row[9]) - float(row[10]) if row[9] is not None and row[10] is not None else None
+        for row in rows
+    ]
     for i, row in enumerate(rows):
-        baseline = volumes[max(0, i - ABSORPTION_BASELINE_BARS):i]
-        open_px = float(row[7]) if row[7] is not None else 0.0
-        if len(baseline) < ABSORPTION_MIN_BASELINE_BARS or open_px <= 0:
+        window = slice(max(0, i - ABSORPTION_BASELINE_BARS), i)
+        baseline_ranges = [r for r in ranges[window] if r is not None]
+        if len(baseline_ranges) < ABSORPTION_MIN_BASELINE_BARS or ranges[i] is None:
             out.append(None)
             continue
-        price_change = (float(row[1]) - open_px) / open_px
-        out.append(absorption_score(volumes[i], sum(baseline) / len(baseline), price_change))
+        limit = flat_range_limit(baseline_ranges, tick_size_for_price(float(row[1])))
+        baseline_volumes = volumes[window]
+        out.append(
+            absorption_score(
+                volumes[i], sum(baseline_volumes) / len(baseline_volumes), ranges[i], limit
+            )
+        )
     return out
 
 
@@ -1508,8 +1517,8 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 futures_rows: list = []
                 if futures_flow_symbol is not None:
                     cur.execute(
-                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume, open, volume "
-                        "FROM market_raw_1m "
+                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume, "
+                        "open, volume, high, low FROM market_raw_1m "
                         "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
                         (futures_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )
@@ -1533,8 +1542,8 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
                 option_rows: list = []
                 if option_flow_symbol is not None:
                     cur.execute(
-                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume, open, volume "
-                        "FROM market_raw_1m "
+                        "SELECT timestamp, close, ofi, microprice, vpin, buy_volume, sell_volume, "
+                        "open, volume, high, low FROM market_raw_1m "
                         "WHERE symbol=%s AND timestamp >= %s ORDER BY timestamp DESC LIMIT %s",
                         (option_flow_symbol, flow_cutoff, FLOW_RADAR_ROW_CAP),
                     )

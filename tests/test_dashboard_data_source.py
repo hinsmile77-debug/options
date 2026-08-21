@@ -336,9 +336,9 @@ def test_load_snapshot_splits_futures_and_option_flow_series(monkeypatch):
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62, 310.0, 180.0, 1271.0, 490.0)],
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, 0.62, 310.0, 180.0, 1271.0, 490.0, 1271.6, 1270.8)],
         "option_symbol": [("B01607B38",)],
-        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55, 25.0, 40.0, 40.6, 65.0)],
+        "option_rows": [(ts, 40.65, 12.0, 40.7, 0.55, 25.0, 40.0, 40.6, 65.0, 40.8, 40.5)],
     }
 
     @contextmanager
@@ -374,9 +374,9 @@ def test_load_snapshot_accumulates_cvd_within_the_window(monkeypatch):
         "futures_symbol_value": "A01609",
         # 조회는 timestamp DESC이므로 fake도 최신순으로 돌려준다(_load_from_db가 뒤집는다).
         "futures_rows": [
-            (bars[2], 1080.0, 5.0, 1080.1, 0.5, 40.0, 10.0, 1079.8, 50.0),
-            (bars[1], 1079.0, -3.0, 1079.1, 0.5, 20.0, 90.0, 1079.5, 110.0),
-            (bars[0], 1078.0, 8.0, 1078.1, 0.5, 100.0, 60.0, 1078.2, 160.0),
+            (bars[2], 1080.0, 5.0, 1080.1, 0.5, 40.0, 10.0, 1079.8, 50.0, 1080.2, 1079.7),
+            (bars[1], 1079.0, -3.0, 1079.1, 0.5, 20.0, 90.0, 1079.5, 110.0, 1079.6, 1078.9),
+            (bars[0], 1078.0, 8.0, 1078.1, 0.5, 100.0, 60.0, 1078.2, 160.0, 1078.4, 1077.9),
         ],
     }
 
@@ -402,8 +402,8 @@ def test_load_snapshot_holds_cvd_flat_across_bars_with_null_volume_delta(monkeyp
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
         "futures_rows": [
-            (ts, 1080.0, 5.0, 1080.1, 0.5, None, None, 1080.0, 0.0),
-            (ts - timedelta(minutes=1), 1079.0, 8.0, 1079.1, 0.5, 100.0, 25.0, 1079.0, 125.0),
+            (ts, 1080.0, 5.0, 1080.1, 0.5, None, None, 1080.0, 0.0, 1080.0, 1080.0),
+            (ts - timedelta(minutes=1), 1079.0, 8.0, 1079.1, 0.5, 100.0, 25.0, 1079.0, 125.0, 1079.2, 1078.9),
         ],
     }
 
@@ -432,9 +432,9 @@ def test_load_snapshot_bounds_both_flow_series_by_the_same_time_window(monkeypat
         "spot": [(1042.85, ts)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5, 100.0, 90.0, 1046.2, 190.0)],
+        "futures_rows": [(ts, 1046.3, 5.0, 1046.2, 0.5, 100.0, 90.0, 1046.2, 190.0, 1046.5, 1046.0)],
         "option_symbol": [("B09F9WA21",)],
-        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47, 8.0, 5.0, 19.5, 13.0)],
+        "option_rows": [(ts, 19.5, 2.0, 19.45, 0.47, 8.0, 5.0, 19.5, 13.0, 19.6, 19.4)],
     }
     conn = _FakeConnection(responses)
 
@@ -500,7 +500,7 @@ def test_load_snapshot_defaults_vpin_to_zero_when_null(monkeypatch):
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
         "futures_symbol": [("A01609",)],
         "futures_symbol_value": "A01609",
-        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None, None, None, 1271.0, 490.0)],
+        "futures_rows": [(ts, 1271.15, 92.0, 1270.89, None, None, None, 1271.0, 490.0, 1271.6, 1270.8)],
     }
 
     @contextmanager
@@ -2105,11 +2105,13 @@ def test_absorption_needs_a_baseline_before_it_judges(monkeypatch):
     ts = datetime(2026, 8, 21, 10, 30)
     n = 8
     bars = [ts - timedelta(minutes=n - 1 - i) for i in range(n)]
-    # 앞 7봉은 거래량 100·가격 정체, 마지막 봉만 거래량 400(4배)에 역시 정체 → 흡수 의심.
+    # 앞 7봉은 거래량 100·범위 1.0포인트, 마지막 봉만 거래량 400(4배)에 범위 0.2포인트(조용).
     rows = []
     for i, bar_ts in enumerate(bars):
         vol = 400.0 if i == n - 1 else 100.0
-        rows.append((bar_ts, 1080.0, 5.0, 1080.1, 0.5, vol / 2, vol / 2, 1080.0, vol))
+        half = 0.1 if i == n - 1 else 0.5
+        rows.append((bar_ts, 1080.0, 5.0, 1080.1, 0.5, vol / 2, vol / 2, 1080.0, vol,
+                     1080.0 + half, 1080.0 - half))
     responses = {
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
@@ -2127,20 +2129,26 @@ def test_absorption_needs_a_baseline_before_it_judges(monkeypatch):
     snap = load_snapshot()
 
     assert snap.absorption_series[:5] == [None] * 5, "직전 5봉이 안 쌓이면 판정하지 않는다"
-    assert snap.absorption_series[5] == pytest.approx(1.0)  # 평균과 같은 거래량
-    assert snap.absorption_series[-1] == pytest.approx(4.0)  # 평균 대비 4배 + 가격 정체
+    # 마지막 봉: 범위 0.2 <= 정체 상한(중앙값 1.0 x 0.5 = 0.5), 거래량 400 / 평균 100 = 4배
+    assert snap.absorption_series[-1] == pytest.approx(4.0)
 
 
-def test_absorption_is_zero_when_the_price_actually_moved(monkeypatch):
-    # 대량 체결이어도 가격이 문턱을 넘게 움직였으면 흡수가 아니다 — None(모름)이 아니라 0(판정함).
+def test_absorption_is_zero_when_the_bar_swung_inside_itself(monkeypatch):
+    """봉 안에서 크게 왕복한 봉은 **시가=종가여도 흡수가 아니다.**
+
+    2026-08-21 회귀 — 종전에는 `(종가-시가)/시가`로만 판정해 A01609의 「정체」 28봉이 28봉
+    전부 봉 안에서는 문턱보다 크게 움직이고 있었다. 왕복은 λ가 낮았다는 뜻이 아니다.
+    """
     ts = datetime(2026, 8, 21, 10, 30)
     n = 8
     bars = [ts - timedelta(minutes=n - 1 - i) for i in range(n)]
     rows = []
     for i, bar_ts in enumerate(bars):
         vol = 400.0 if i == n - 1 else 100.0
-        close = 1090.0 if i == n - 1 else 1080.0  # 마지막 봉만 크게 상승
-        rows.append((bar_ts, close, 5.0, close, 0.5, vol / 2, vol / 2, 1080.0, vol))
+        # 마지막 봉은 시가=종가지만 범위는 앞 봉들의 3배로 벌어졌다.
+        half = 1.5 if i == n - 1 else 0.5
+        rows.append((bar_ts, 1080.0, 5.0, 1080.1, 0.5, vol / 2, vol / 2, 1080.0, vol,
+                     1080.0 + half, 1080.0 - half))
     responses = {
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
@@ -2157,4 +2165,40 @@ def test_absorption_is_zero_when_the_price_actually_moved(monkeypatch):
 
     snap = load_snapshot()
 
+    assert snap.absorption_series[-1] == 0.0
+
+
+def test_absorption_threshold_scales_to_the_instruments_own_volatility(monkeypatch):
+    """같은 「범위 0.2포인트」라도 조용한 종목에서는 정체가 아니다 — 문턱이 종목에서 나온다.
+
+    고정 상수(0.05% 또는 N틱)로는 선물과 옵션 중 한쪽이 반드시 상시 참/상시 거짓이 된다
+    (근거는 `flat_range_limit` docstring의 08-21 실측 표).
+    """
+    ts = datetime(2026, 8, 21, 10, 30)
+    n = 8
+    bars = [ts - timedelta(minutes=n - 1 - i) for i in range(n)]
+    rows = []
+    for i, bar_ts in enumerate(bars):
+        vol = 400.0 if i == n - 1 else 100.0
+        # 앞 봉들이 범위 0.1로 아주 조용하다 -> 정체 상한 0.05. 마지막 봉 0.2는 「시끄러운」 봉이다.
+        half = 0.1 if i == n - 1 else 0.05
+        rows.append((bar_ts, 1080.0, 5.0, 1080.1, 0.5, vol / 2, vol / 2, 1080.0, vol,
+                     1080.0 + half, 1080.0 - half))
+    responses = {
+        **_BASE_RESPONSES,
+        "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        "futures_symbol": [("A01609",)],
+        "futures_symbol_value": "A01609",
+        "futures_rows": list(reversed(rows)),
+    }
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+
+    snap = load_snapshot()
+
+    # 범위 0.2 > 상한 max(2틱=0.1, 중앙값 0.1 x 0.5=0.05) = 0.1 -> 흡수 아님
     assert snap.absorption_series[-1] == 0.0

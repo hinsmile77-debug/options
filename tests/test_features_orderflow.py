@@ -5,6 +5,7 @@ import pytest
 from mahdi.features.orderflow import (
     BookSnapshot,
     absorption_score,
+    flat_range_limit,
     calculate_ofi,
     calculate_vpin,
     microprice,
@@ -84,12 +85,40 @@ def test_vpin_no_buckets_is_zero():
 
 
 def test_absorption_score_flags_high_volume_flat_price():
-    assert absorption_score(traded_volume=300, avg_volume=100, price_change=0.0001) == pytest.approx(3.0)
+    # 범위 0.2가 정체 상한 0.5 이내 → 거래량 배수 그대로.
+    assert absorption_score(traded_volume=300, avg_volume=100, price_range=0.2, flat_limit=0.5) == pytest.approx(3.0)
 
 
 def test_absorption_score_zero_when_price_moves_too_much():
-    assert absorption_score(traded_volume=300, avg_volume=100, price_change=0.01) == 0.0
+    assert absorption_score(traded_volume=300, avg_volume=100, price_range=1.2, flat_limit=0.5) == 0.0
 
 
 def test_absorption_score_zero_when_no_baseline():
-    assert absorption_score(traded_volume=300, avg_volume=0, price_change=0.0) == 0.0
+    assert absorption_score(traded_volume=300, avg_volume=0, price_range=0.0, flat_limit=0.5) == 0.0
+
+
+def test_absorption_gate_uses_the_full_bar_range_not_the_net_change():
+    """2026-08-21 회귀 — 봉 안에서 왕복한 봉을 「정체」로 세면 안 된다.
+
+    A01609 실측에서 종전 규칙이 정체로 판정한 28봉이 **28봉 전부** 봉 안에서는 문턱보다 크게
+    움직이고 있었다(예: 시가=종가 1072.60인데 고가 1073.35 / 저가 1070.85). 왕복은 가격 충격
+    계수 λ가 낮았다는 뜻이 아니다.
+    """
+    # 시가와 종가가 같아 순변화는 0이지만, 봉 범위는 상한의 5배다.
+    assert absorption_score(traded_volume=300, avg_volume=100, price_range=2.5, flat_limit=0.5) == 0.0
+
+
+def test_flat_range_limit_scales_with_the_instruments_own_recent_ranges():
+    # 문턱은 종목 자신의 최근 변동성에서 나온다 — 고정 상수는 두 상품 중 한쪽에서 무의미해진다.
+    busy = flat_range_limit([2.0, 2.6, 3.0, 2.4, 2.6], tick_size=0.05)
+    quiet = flat_range_limit([0.2, 0.3, 0.25, 0.2, 0.3], tick_size=0.05)
+
+    assert busy == pytest.approx(1.3)   # 중앙값 2.6 x 0.5
+    assert quiet == pytest.approx(0.125)  # 중앙값 0.25 x 0.5
+    assert busy > quiet
+
+
+def test_flat_range_limit_never_falls_below_the_tick_floor():
+    """시장이 죽어 중앙값이 0이어도 문턱이 0이 되면 어떤 봉도 통과 못 한다 — 2틱이 하한이다."""
+    assert flat_range_limit([0.0, 0.0, 0.0], tick_size=0.05) == pytest.approx(0.1)
+    assert flat_range_limit([], tick_size=0.01) == pytest.approx(0.02)

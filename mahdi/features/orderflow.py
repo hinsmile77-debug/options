@@ -7,7 +7,7 @@ v6 §8.2). 입력 시그니처를 그대로 유지하면 상위 레이어(Fusion
 from __future__ import annotations
 
 from dataclasses import dataclass
-from statistics import NormalDist
+from statistics import NormalDist, median
 from typing import Sequence
 
 _NORMAL = NormalDist()
@@ -117,20 +117,82 @@ def calculate_vpin(bucket_returns: Sequence[float], bucket_volumes: Sequence[flo
     return total_imbalance / total_volume
 
 
+# 「가격이 안 움직였다」의 기준을 만드는 두 값(2026-08-21 실측으로 정함, 아래 `flat_range_limit`).
+FLAT_RANGE_RELATIVE_FACTOR = 0.5
+FLAT_RANGE_MIN_TICKS = 2
+
+
+def flat_range_limit(
+    recent_ranges: Sequence[float],
+    tick_size: float,
+    *,
+    relative_factor: float = FLAT_RANGE_RELATIVE_FACTOR,
+    min_ticks: int = FLAT_RANGE_MIN_TICKS,
+) -> float:
+    """
+    입력: 최근 봉들의 가격 범위(고가−저가) 목록, 그 종목의 호가단위.
+    계산: `max(min_ticks × tick_size, 최근 범위 중앙값 × relative_factor)`.
+    해석: 「이 종목 기준으로 유난히 안 움직인 봉」의 상한이다. `absorption_score()`가 이 값
+         이하인 봉만 흡수 후보로 본다.
+    실패 조건: 없음 — `recent_ranges`가 비면 틱 하한만 남는다.
+
+    **왜 고정 문턱이 아니라 상대 문턱인가**(2026-08-21, 실측으로 확정):
+
+    종전 기준은 `|종가−시가| / 시가 ≤ 0.0005`였다. 가격 수준에 비례하는 상대값이라 상품마다
+    뜻이 갈렸다 — 선물(≈1,080)에서는 ≈11틱까지 「정체」였고 옵션 프리미엄(≈16)에서는 틱 크기
+    보다도 작아 사실상 «시가=종가»인 봉만 통과했다. 그래서 **틱 단위 고정 문턱**을 시험했는데,
+    그것도 답이 아니었다. 08-21 하루치 실측:
+
+        선물 1분봉 범위(고가−저가)  중앙값 52틱 · 10분위 32틱 · 「≤8틱」인 봉 145개 중 0개
+        옵션 1분봉 범위             중앙값  9틱 · 14%가 0틱
+
+        고정 4틱 게이트   ->  선물 통과율 0.0% · 옵션 17.6%   (선물에서 지표가 죽는다)
+        상대 0.5 게이트   ->  선물 통과율 4.8% · 옵션 23.5%
+
+    **두 상품은 틱 단위 변동성 자체가 두 자릿수로 다르다.** 어떤 고정 상수도 한쪽에서는 상시
+    참이고 다른 쪽에서는 상시 거짓이 된다. 거래량을 이미 「평균 대비 배수」로 재고 있듯 가격도
+    **그 종목 자신의 최근 변동성 대비**로 재야 두 Radar가 같은 뜻이 된다.
+
+    틱 하한을 함께 두는 이유: 시장이 죽은 구간에서는 중앙값이 0에 수렴해 어떤 봉도 통과하지
+    못한다. 「2틱도 안 움직였다」는 그 자체로 정체다. 다만 그런 구간은 거래량도 적어 흡수
+    배수가 안 나오므로, 이 하한이 오탐을 만들지는 않는다.
+    """
+    floor = min_ticks * tick_size
+    if not recent_ranges:
+        return floor
+    return max(floor, median(recent_ranges) * relative_factor)
+
+
 def absorption_score(
     traded_volume: float,
     avg_volume: float,
-    price_change: float,
-    price_change_threshold: float = 0.0005,
+    price_range: float,
+    flat_limit: float,
 ) -> float:
     """
     대량 체결에도 가격이 거의 움직이지 않는 흡수(Absorption) 정도.
 
-    입력: 해당 구간 체결량, 평균 체결량(기준선), 가격 변화율.
-    계산: traded_volume / avg_volume — 단, |price_change| > threshold면 흡수로 보지 않고 0 반환.
-    해석: 값이 클수록(예: 3배 이상) 대량 매물이 가격 변동 없이 소화됨 → 반전 또는 지속의 핵심 단서.
-    실패 조건: avg_volume이 0이면 0.0 (기준선 부재).
+    입력: 해당 봉의 체결량, 평균 체결량(기준선), 그 봉의 **가격 범위(고가−저가)**,
+         정체로 인정할 범위 상한(`flat_range_limit()`).
+    계산: `traded_volume / avg_volume` — 단, `price_range > flat_limit`이면 0 반환.
+    해석: 값이 클수록(예: 3배 이상) 대량 매물이 가격 변동 없이 소화됨 → 반전 또는 지속의
+         핵심 단서(v6 §8.2, Kyle 1985 프레임 — 가격 충격 계수 λ가 낮은 순간).
+         **0.0은 「판정했고 흡수가 아니다」이지 「모른다」가 아니다.**
+    실패 조건: `avg_volume`이 0 이하면 0.0(기준선 부재). 호출측이 기준선 유무를 먼저 가려야
+              「모른다」와 구분된다 — 화면은 그것을 `None`으로 따로 표시한다.
+
+    **순변화가 아니라 범위를 보는 이유**(2026-08-21, 실측으로 발견):
+
+    종전에는 `(종가−시가)/시가`로 「가격이 안 움직였다」를 판정했다. 그러면 봉 안에서 크게
+    튀었다가 제자리로 돌아온 봉이 «완전 정체»로 판정된다. 08-21 A01609 실측에서
+    **정체 판정된 28봉이 28봉 전부** 봉 안에서는 문턱보다 크게 움직였다:
+
+        시가 1072.60  종가 1072.60 (변화 0.000%)  <- 「완전 정체」
+        고가 1073.35  저가 1070.85 (폭 0.233%)    <- 실제로는 문턱의 4.7배를 왕복
+
+    왕복한 봉은 흡수가 아니다. 가격이 밀렸다가 되돌아온 것이고, 그 사이 λ는 전혀 낮지 않았다.
+    범위를 쓰면 순변화는 자동으로 포함된다 — `|종가−시가| ≤ 고가−저가`이기 때문이다.
     """
-    if avg_volume <= 0 or abs(price_change) > price_change_threshold:
+    if avg_volume <= 0 or price_range > flat_limit:
         return 0.0
     return traded_volume / avg_volume

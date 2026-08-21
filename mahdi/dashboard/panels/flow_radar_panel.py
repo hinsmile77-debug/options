@@ -252,9 +252,9 @@ def build_absorption_chart(
     자동 범위에 맡기면 최대값이 1.4인 날에 3배 선이 화면 밖으로 나가고, 그러면 «임계에 얼마나
     가까운가»를 읽을 수 없다.
 
-    ⚠ `price_change_threshold`(기본 0.0005)는 **가격 수준에 비례하는 상대 문턱**이라 상품마다
-    뜻이 다르다 — 선물(≈1,080)에서는 ≈11틱까지 「정체」로 보지만 옵션 프리미엄(≈16)에서는
-    틱 크기보다도 작아 사실상 «시가=종가»인 봉만 통과한다. 그래서 캡션에 문턱을 숫자로 적는다.
+    **「가격 정체」의 문턱은 종목마다 다른 값이다.** 봉 범위가 직전 20봉 범위 중앙값의 절반
+    이하(최소 2틱)일 때만 흡수 후보로 본다 — 고정 상수는 두 상품 중 한쪽에서 반드시 무의미해진다
+    (`features.orderflow.flat_range_limit` docstring의 실측 표). 화면 캡션이 이 기준을 적는다.
     """
     observed_x = [ts for ts, v in zip(timestamps, absorption_series) if v is not None]
     observed_y = [v for v in absorption_series if v is not None]
@@ -269,7 +269,7 @@ def build_absorption_chart(
             y=observed_y,
             name="흡수 배수",
             marker=dict(color=colors),
-            hovertemplate="%{x|%H:%M}: 평균 대비 %{y:.2f}배<extra></extra>",
+            hovertemplate="%{x|%H:%M}: 거래량 평균 대비 %{y:.2f}배<extra></extra>",
         )
     )
     fig.add_trace(
