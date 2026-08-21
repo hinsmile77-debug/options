@@ -1477,6 +1477,7 @@ async def run_observation_loop(
         bar = aggregator.add_tick(tick)
         if bar is None:
             return
+        _log_volume_source(tick_symbol, bar.volume_source)
 
         with db.get_connection() as conn:
             db.insert_market_raw_1m(
@@ -1660,6 +1661,50 @@ async def run_observation_loop_forever(
 
 # H0IOCNT0(지수옵션 실시간체결가) 응답 필드 인덱스 — "^" 구분, 0-based.
 # 출처: docs/efriend/한국투자증권_오픈API_전체문서 시트 "지수옵션  실시간체결가"(API ID 실시간-014).
+# 종목별로 "지금 어느 분류를 쓰고 있는가"를 한 번씩만 알린다. 매 봉 찍으면 로그가 묻히고,
+# 아예 안 찍으면 **추정으로 떨어진 사실이 어디에도 안 남는다** — 08-19에 워치독이 청소를 조용히
+# 건너뛰던 것과 같은 형태의 침묵이다.
+_volume_source_seen: dict[str, str] = {}
+
+
+def _log_volume_source(symbol: str, source: str) -> None:
+    """
+    입력: 종목코드와 그 봉의 매수/매도 분류 출처("exchange" | "tick_rule").
+    계산: 종목별로 **출처가 바뀔 때만** 로그를 남긴다(최초 1회 포함).
+    해석: `tick_rule`이 뜨면 거래소 누적 필드를 못 읽었거나 자기검증에 걸린 것이다 — 그때의
+         CVD는 추정이고, 2026-08-21 오전에 고친 그 편향 계열의 값이 다시 섞인다는 뜻이다.
+    실패 조건: 없음.
+    """
+    if _volume_source_seen.get(symbol) == source:
+        return
+    _volume_source_seen[symbol] = source
+    if source == "exchange":
+        logger.info("체결 분류: %s — 거래소 누적값 사용", symbol)
+    else:
+        logger.warning(
+            "체결 분류: %s — **틱 룰 추정으로 폴백**(거래소 누적 필드 없음 또는 자기검증 실패). "
+            "이 구간의 CVD는 추정치다.",
+            symbol,
+        )
+
+
+def _optional_float(fields: list[str], index: int) -> float | None:
+    """
+    입력: "^"로 나눈 프레임 필드들과 읽을 인덱스.
+    계산: 그 자리를 float으로 읽는다.
+    해석: **없으면 없는 대로 None**이다. 이 자리의 값들(거래소 누적 체결량)은 있으면 더 정확한
+         분류를 주지만 없다고 틱을 버릴 이유는 없다 — 그래서 `_MIN_FIELDS`를 올리지 않는다.
+         올리면 짧은 프레임의 틱이 통째로 사라지고, 그것은 얻는 것보다 잃는 게 크다.
+    실패 조건: 인덱스 초과·빈 문자열·숫자 아님 → None.
+    """
+    if index >= len(fields):
+        return None
+    try:
+        return float(fields[index])
+    except ValueError:
+        return None
+
+
 _IDX_MKSC_SHRN_ISCD = 0  # 유가증권 단축종목코드 — ATM±N 구독은 종목이 여러 개라 필수로 읽어야 함
 _IDX_BSOP_HOUR = 1  # 영업시간 HHMMSS
 _IDX_OPTN_PRPR = 2  # 옵션 현재가
@@ -1669,6 +1714,11 @@ _IDX_OPTN_BIDP1 = 42  # 옵션 매수호가1
 _IDX_ASKP_RSQN1 = 43  # 매도호가 잔량1
 _IDX_BIDP_RSQN1 = 44  # 매수호가 잔량1
 _MIN_FIELDS = _IDX_BIDP_RSQN1 + 1
+# 2026-08-21 — 거래소가 이미 갈라 보내주는 누적 체결량. **틱 룰 추정을 대체한다**
+# (`collector.MinuteBarAggregator._exchange_classified_volumes`).
+_IDX_ACML_VOL = 10  # 누적 거래량
+_IDX_SELN_CNTG_SMTN = 48  # 총 매도 수량(누적)
+_IDX_SHNU_CNTG_SMTN = 49  # 총 매수 수량(누적)
 
 
 def _parse_tick(raw: str, today: date | None = None) -> tuple[str, Tick] | None:
@@ -1702,6 +1752,9 @@ def _parse_tick(raw: str, today: date | None = None) -> tuple[str, Tick] | None:
             bid_qty=float(fields[_IDX_BIDP_RSQN1]),
             ask_px=float(fields[_IDX_OPTN_ASKP1]),
             ask_qty=float(fields[_IDX_ASKP_RSQN1]),
+            cum_volume=_optional_float(fields, _IDX_ACML_VOL),
+            cum_buy_volume=_optional_float(fields, _IDX_SHNU_CNTG_SMTN),
+            cum_sell_volume=_optional_float(fields, _IDX_SELN_CNTG_SMTN),
         )
         return symbol, tick
     except (ValueError, IndexError):
@@ -1720,6 +1773,10 @@ _FUT_IDX_BIDP1 = 35  # 선물 매수호가1
 _FUT_IDX_ASKP_RSQN1 = 36  # 매도호가 잔량1
 _FUT_IDX_BIDP_RSQN1 = 37  # 매수호가 잔량1
 _FUT_MIN_FIELDS = _FUT_IDX_BIDP_RSQN1 + 1
+# 옵션과 같은 이유로 읽는 누적 체결량 — 인덱스만 다르다(선물 프레임은 50필드).
+_FUT_IDX_ACML_VOL = 10  # 누적 거래량
+_FUT_IDX_SELN_CNTG_SMTN = 41  # 총 매도 수량(누적)
+_FUT_IDX_SHNU_CNTG_SMTN = 42  # 총 매수 수량(누적)
 
 
 def _parse_futures_tick(raw: str, today: date | None = None) -> tuple[str, Tick] | None:
@@ -1746,6 +1803,9 @@ def _parse_futures_tick(raw: str, today: date | None = None) -> tuple[str, Tick]
             bid_qty=float(fields[_FUT_IDX_BIDP_RSQN1]),
             ask_px=float(fields[_FUT_IDX_ASKP1]),
             ask_qty=float(fields[_FUT_IDX_ASKP_RSQN1]),
+            cum_volume=_optional_float(fields, _FUT_IDX_ACML_VOL),
+            cum_buy_volume=_optional_float(fields, _FUT_IDX_SHNU_CNTG_SMTN),
+            cum_sell_volume=_optional_float(fields, _FUT_IDX_SELN_CNTG_SMTN),
         )
         return symbol, tick
     except (ValueError, IndexError):

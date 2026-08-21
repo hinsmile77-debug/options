@@ -48,12 +48,15 @@ from mahdi.main import (
     run_observation_loop_forever,
 )
 
-_NUM_FIELDS = 45  # _MIN_FIELDS in mahdi.main (index 0..44)
+# 2026-08-21 — 공식 문서(docs/efriend, 시트 「지수옵션 실시간체결가」)의 Response Body는
+# idx 0..57로 **58필드**다. 종전 45는 우리가 그때까지 읽던 범위였을 뿐 프레임의 실제 폭이
+# 아니었다 — 누적 체결량(48/49)을 읽기 시작하며 실제 폭으로 맞춘다.
+_NUM_FIELDS = 58  # 공식 문서 실측(index 0..57)
 # 2026-07-31: 매크로 항목별 갱신 주기(ZN 1시간 / MOVE·일봉 6시간)와 무관하게 "매 사이클 전부
 # 조회"로 고정하고 싶은 테스트용 — 스트릭/알림처럼 주기와 별개인 동작을 검증할 때 쓴다.
 _MACRO_ITEMS_EVERY_CYCLE = {item: 0.0 for item in mahdi_main.MACRO_ITEM_REFRESH_SECONDS}
 _FALLBACK_PRICE = 99.9  # yfinance 폴백 스텁이 돌려줄 값(실제 값과 구분되는 임의 숫자)
-_FUT_NUM_FIELDS = 40  # _FUT_MIN_FIELDS(38) in mahdi.main
+_FUT_NUM_FIELDS = 50  # 공식 문서 시트 「지수선물 실시간체결가」 실측(index 0..49)
 
 
 class _FakeRegimeStateMachine:
@@ -6909,3 +6912,55 @@ def test_the_label_fires_when_the_deadline_ends_inside_the_monthly(monkeypatch, 
     cut = [r for r in caplog.records if "수집 예산" in r.getMessage()]
     assert len(cut) == 1
     assert "데드라인이먼슬리에서끝남=예" in cut[0].getMessage()
+
+
+# ===== 2026-08-21: 거래소 누적 체결량 필드를 읽는다 =====
+#
+# KIS 파생 실시간 체결에는 틱 단위 체결구분이 없지만 누적 매수/매도 수량은 있다.
+# 출처: docs/efriend 공식 문서 시트 "지수선물 실시간체결가"(idx 41/42) ·
+# "지수옵션 실시간체결가"(idx 48/49). 우리가 이미 쓰던 인덱스 6개가 그 문서와 전부 일치한다.
+
+
+def test_parse_tick_reads_exchange_cumulative_volumes():
+    fields = ["0"] * _NUM_FIELDS
+    fields[0], fields[1], fields[2], fields[9] = "201S03C325", "093015", "16.25", "7"
+    fields[10] = "1500"   # ACML_VOL
+    fields[41], fields[42], fields[43], fields[44] = "16.30", "16.20", "40", "55"
+    fields[48], fields[49] = "700", "800"  # SELN_CNTG_SMTN / SHNU_CNTG_SMTN
+
+    _, tick = _parse_tick("^".join(fields), today=date(2026, 8, 21))
+
+    assert tick.cum_volume == 1500
+    assert tick.cum_buy_volume == 800
+    assert tick.cum_sell_volume == 700
+
+
+def test_parse_futures_tick_reads_exchange_cumulative_volumes():
+    fields = ["0"] * _FUT_NUM_FIELDS
+    fields[0], fields[1], fields[5], fields[9] = "101S03", "093015", "1080.5", "12"
+    fields[10] = "21000"  # ACML_VOL
+    fields[34], fields[35], fields[36], fields[37] = "1080.55", "1080.45", "30", "25"
+    fields[41], fields[42] = "9000", "12000"  # SELN_CNTG_SMTN / SHNU_CNTG_SMTN
+
+    _, tick = _parse_futures_tick("^".join(fields), today=date(2026, 8, 21))
+
+    assert tick.cum_volume == 21000
+    assert tick.cum_buy_volume == 12000
+    assert tick.cum_sell_volume == 9000
+
+
+def test_short_frames_still_produce_a_tick_without_cumulative_fields():
+    """누적 필드가 없다고 틱을 버리지 않는다 — `_MIN_FIELDS`를 올리면 그렇게 된다.
+
+    있으면 더 정확한 분류를 주지만, 없다고 체결 자체를 잃는 것은 얻는 것보다 손해다.
+    그때는 틱 룰 추정으로 떨어지고 그 사실이 로그에 남는다.
+    """
+    fields = ["0"] * 45  # 누적 매수/매도(48/49)에 못 미치는 길이
+    fields[0], fields[1], fields[2], fields[9] = "201S03C325", "093015", "16.25", "7"
+    fields[41], fields[42], fields[43], fields[44] = "16.30", "16.20", "40", "55"
+
+    parsed = _parse_tick("^".join(fields), today=date(2026, 8, 21))
+
+    assert parsed is not None
+    assert parsed[1].cum_buy_volume is None
+    assert parsed[1].cum_sell_volume is None

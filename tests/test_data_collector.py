@@ -179,3 +179,90 @@ def test_volume_bucket_ignores_non_positive_volume_ticks():
 def test_volume_bucket_invalid_size_raises():
     with pytest.raises(ValueError):
         VolumeBucketAggregator(bucket_size=0)
+
+
+# ===== 2026-08-21: 거래소 분류가 틱 룰 추정을 대체한다 =====
+#
+# KIS 실시간 체결 프레임에는 틱 단위 체결구분(공격자 플래그)이 없지만 **누적 매수/매도 수량**이
+# 있다(H0IFCNT0 idx 41/42, H0IOCNT0 idx 48/49). 봉의 매수량 = 그 누적값의 차분이고, 그것은
+# 추정이 아니라 거래소 판정이다.
+
+
+def _cum_tick(second: int, price: float, volume: float, cum, minute: int = 5) -> Tick:
+    """cum = (누적거래량, 누적매수, 누적매도). None을 주면 누적 필드가 없는 프레임을 흉내 낸다."""
+    cv, cb, cs = cum if cum is not None else (None, None, None)
+    return Tick(
+        timestamp=datetime(2026, 8, 21, 9, minute, second),
+        price=price, volume=volume,
+        bid_px=price - 0.05, bid_qty=100, ask_px=price + 0.05, ask_qty=100,
+        cum_volume=cv, cum_buy_volume=cb, cum_sell_volume=cs,
+    )
+
+
+def test_exchange_cumulative_volumes_replace_the_tick_rule():
+    agg = MinuteBarAggregator()
+    agg.add_tick(_cum_tick(0, 100.0, 10, (1000, 600, 400), minute=5))   # 기준선
+    agg.add_tick(_cum_tick(0, 100.0, 90, (1090, 670, 420), minute=6))   # 6분봉
+
+    agg.add_tick(_cum_tick(0, 100.0, 10, (1100, 675, 425), minute=7))   # 6분봉 마감
+    bar = agg.flush_final()  # 7분봉
+
+    # 6분봉의 Δ: 거래량 90 = 매수 70 + 매도 20. 가격이 전혀 안 움직였으므로 틱 룰이었다면 0/0이다.
+    assert bar.volume_source == "exchange"
+
+
+def test_exchange_delta_is_taken_across_the_bar_boundary():
+    agg = MinuteBarAggregator()
+    agg.add_tick(_cum_tick(0, 100.0, 10, (1000, 600, 400), minute=5))
+    completed = agg.add_tick(_cum_tick(0, 100.0, 100, (1100, 670, 430), minute=6))
+
+    assert completed is not None  # 5분봉
+    bar6 = agg.flush_final()
+
+    assert bar6.buy_volume == pytest.approx(70)   # 670 - 600
+    assert bar6.sell_volume == pytest.approx(30)  # 430 - 400
+    assert bar6.volume_source == "exchange"
+
+
+def test_falls_back_to_the_tick_rule_when_the_frame_has_no_cumulative_fields():
+    # 짧은 프레임·리플레이·과거 픽스처 — 누적 필드가 없다고 틱을 버리지 않는다.
+    agg = MinuteBarAggregator()
+    agg.add_tick(_cum_tick(0, 100.0, 10, None, minute=5))
+    agg.add_tick(_cum_tick(0, 99.0, 10, None, minute=6))
+
+    bar = agg.flush_final()
+
+    assert bar.volume_source == "tick_rule"
+    assert bar.sell_volume == pytest.approx(10)  # 하락 틱
+
+
+def test_self_check_rejects_cumulative_fields_that_do_not_add_up():
+    """`Δ매수 + Δ매도`가 `Δ누적거래량`과 크게 어긋나면 **우리가 잘못 읽은 것**이다.
+
+    두 누적량은 같은 프레임에서 오므로 원리상 합이 맞아야 한다. 필드 인덱스가 틀리면 시각이나
+    가격 같은 엉뚱한 숫자가 들어와 자릿수가 통째로 달라진다 — 그때 조용히 그 값을 쓰면
+    2026-08-21 오전에 CVD를 직선으로 만든 사고가 재연된다. 티가 나게 추정으로 되돌아간다.
+    """
+    agg = MinuteBarAggregator()
+    agg.add_tick(_cum_tick(0, 100.0, 10, (1000, 600, 400), minute=5))
+    # 거래량은 100 늘었는데 매수/매도 합은 9밖에 안 는다 → 못 믿는다.
+    agg.add_tick(_cum_tick(0, 99.0, 100, (1100, 604, 405), minute=6))
+
+    bar = agg.flush_final()
+
+    assert bar.volume_source == "tick_rule"
+
+
+def test_a_session_reset_does_not_produce_negative_volumes():
+    # 장이 바뀌면 누적이 0부터 다시 센다 — 차분이 음수가 되므로 그 봉만 추정으로 가고
+    # 기준선은 새 값으로 갱신돼야 한다(안 그러면 다음 봉이 통째로 부풀어 오른다).
+    agg = MinuteBarAggregator()
+    agg.add_tick(_cum_tick(0, 100.0, 10, (9000, 5000, 4000), minute=5))
+    agg.add_tick(_cum_tick(0, 100.0, 10, (50, 30, 20), minute=6))       # 리셋
+    reset_bar = agg.add_tick(_cum_tick(0, 100.0, 10, (150, 80, 70), minute=7))
+
+    assert reset_bar is not None and reset_bar.volume_source == "tick_rule"
+    bar7 = agg.flush_final()
+    assert bar7.buy_volume == pytest.approx(50)   # 80 - 30, 새 기준선에서 정상 재개
+    assert bar7.sell_volume == pytest.approx(50)  # 70 - 20
+    assert bar7.volume_source == "exchange"

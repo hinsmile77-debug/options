@@ -21,6 +21,13 @@ class Tick:
     bid_qty: float
     ask_px: float
     ask_qty: float
+    # 2026-08-21 — **거래소가 분류한 누적 체결량**(H0IFCNT0 idx 41/42, H0IOCNT0 idx 48/49의
+    # SELN_CNTG_SMTN / SHNU_CNTG_SMTN, 그리고 ACML_VOL). 봉의 매수량은 이 누적값의 차분이다 —
+    # 틱 룰 추정이 아니라 거래소 판정이다. 프레임이 짧거나 파싱이 안 되면 None이고, 그때만
+    # 틱 룰로 떨어진다(`MinuteBarAggregator._classify_volumes`).
+    cum_volume: float | None = None
+    cum_buy_volume: float | None = None
+    cum_sell_volume: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +45,10 @@ class MinuteBar:
     buy_volume: float
     sell_volume: float
     quality_flag: int
+    # 매수/매도를 무엇으로 갈랐는지. "exchange"면 거래소 누적값의 차분, "tick_rule"이면 추정이다.
+    # DB에는 안 실린다(마이그레이션 없음) — 상위 레이어가 폴백 발생을 **로그로 알리기 위한** 값이다.
+    # 분류가 조용히 바뀌면 CVD가 통째로 다른 것을 그린다(2026-08-21 오전 사고).
+    volume_source: str = "tick_rule"
 
 
 def _floor_to_minute(ts: datetime) -> datetime:
@@ -122,6 +133,12 @@ class MinuteBarAggregator:
     """symbol 1개에 대해 틱을 누적하고, 분이 바뀌면 완성된 1분봉을 flush한다."""
 
     MIN_TICKS_FOR_NORMAL_QUALITY = 3
+    # 거래소 누적값을 믿을지 가르는 허용 오차. `Δ매수 + Δ매도`는 `Δ누적거래량`과 같아야 한다 —
+    # 둘 다 **같은 프레임의 누적 필드**라서 원리상 어긋날 수 없다. 이 가드가 겨누는 것은 시장의
+    # 미세한 불일치가 아니라 **필드 인덱스가 틀린 경우**다(그러면 시각이나 가격 같은 엉뚱한
+    # 숫자가 들어와 자릿수가 통째로 다르다). 그래서 느슨해도 된다. 협의대량처럼 누적거래량에만
+    # 잡히는 물량이 있어 완전 일치를 요구하면 상시 오경보가 된다.
+    EXCHANGE_VOLUME_TOLERANCE = 0.2
 
     def __init__(self) -> None:
         self._current_minute: datetime | None = None
@@ -131,6 +148,11 @@ class MinuteBarAggregator:
         # 편향의 절반이었다(`_classify_volumes` docstring).
         self._prev_price: float | None = None
         self._prev_direction: int = 0  # +1 매수 · -1 매도 · 0 아직 모름
+        # 거래소 누적 체결량의 기준선. 틱 룰 baseline과 같은 이유로 **봉 경계를 넘어 이월된다** —
+        # 봉 안에서만 차분하면 그 봉의 첫 틱 이전 물량을 통째로 잃는다.
+        self._prev_cum_volume: float | None = None
+        self._prev_cum_buy: float | None = None
+        self._prev_cum_sell: float | None = None
 
     def add_tick(self, tick: Tick) -> MinuteBar | None:
         """
@@ -162,6 +184,51 @@ class MinuteBarAggregator:
         completed = self._build_bar()
         self._ticks = []
         return completed
+
+    def _exchange_classified_volumes(self) -> tuple[float, float] | None:
+        """
+        입력: 이 봉의 틱들과 **직전 봉에서 이월된** 거래소 누적값(`_prev_cum_*`).
+        계산: 봉 마지막 틱의 누적값 − 직전 기준선. 세 누적 필드(거래량·매수·매도)를 함께 본다.
+        해석: 성공하면 (매수, 매도)이고 이것은 **추정이 아니라 거래소 분류**다.
+        실패 조건 — 아래 어느 하나라도 걸리면 `None`을 돌려 호출측이 틱 룰로 떨어지게 한다:
+             ① 누적 필드가 없다(짧은 프레임·리플레이·테스트 픽스처)
+             ② 기준선이 아직 없다(세션 첫 봉) 또는 누적값이 줄었다(장 넘어가며 리셋)
+             ③ `Δ매수 + Δ매도`가 `Δ누적거래량`과 `EXCHANGE_VOLUME_TOLERANCE`를 넘게 어긋난다
+
+        ③이 이 함수의 핵심이다. **필드 인덱스가 틀리면 조용히 이상한 숫자를 쓰게 되는데**,
+        그것이 2026-08-21 오전에 CVD를 한 시간짜리 직선으로 만든 사고의 형태였다. 두 누적량은
+        같은 프레임에서 오므로 원리상 합이 맞아야 하고, 안 맞으면 우리가 잘못 읽은 것이다.
+        틀리면 **티가 나고 추정으로 되돌아간다.**
+        """
+        last = self._ticks[-1]
+        if last.cum_volume is None or last.cum_buy_volume is None or last.cum_sell_volume is None:
+            return None
+        if self._prev_cum_volume is None or self._prev_cum_buy is None or self._prev_cum_sell is None:
+            return None
+
+        d_volume = last.cum_volume - self._prev_cum_volume
+        d_buy = last.cum_buy_volume - self._prev_cum_buy
+        d_sell = last.cum_sell_volume - self._prev_cum_sell
+        if d_volume < 0 or d_buy < 0 or d_sell < 0:
+            return None  # 누적이 줄었다 = 세션이 바뀌었다. 이 봉은 추정으로 가고 기준선만 새로 잡는다.
+        if d_volume > 0 and abs((d_buy + d_sell) - d_volume) > self.EXCHANGE_VOLUME_TOLERANCE * d_volume:
+            return None
+        return d_buy, d_sell
+
+    def _carry_cumulative_baseline(self) -> None:
+        """봉 마지막 틱의 거래소 누적값을 다음 봉의 기준선으로 넘긴다.
+
+        판정에 실패했을 때도(리셋·인덱스 불일치) **반드시 갱신한다** — 안 그러면 낡은 기준선으로
+        다음 봉이 통째로 부풀어 오른다. 「이번 봉은 추정으로 갔다」와 「다음 봉의 기준선이
+        틀렸다」는 별개의 문제이고, 후자를 만들면 안 된다.
+        """
+        last = self._ticks[-1]
+        if last.cum_volume is not None:
+            self._prev_cum_volume = last.cum_volume
+        if last.cum_buy_volume is not None:
+            self._prev_cum_buy = last.cum_buy_volume
+        if last.cum_sell_volume is not None:
+            self._prev_cum_sell = last.cum_sell_volume
 
     def _classify_volumes(self) -> tuple[float, float]:
         """
@@ -218,7 +285,14 @@ class MinuteBarAggregator:
         micro = microprice(last.bid_px, last.bid_qty, last.ask_px, last.ask_qty)
         spread = last.ask_px - last.bid_px
 
-        buy_volume, sell_volume = self._classify_volumes()
+        # 거래소 분류가 먼저다 — 틱 룰은 그것이 없거나 못 믿을 때만 쓰는 **추정**이다.
+        # `_classify_volumes()`는 어느 쪽을 쓰든 반드시 호출한다: 틱 룰 상태(직전 가격·방향)를
+        # 계속 굴려야 폴백이 필요해진 순간에 baseline이 이미 준비돼 있다.
+        estimated = self._classify_volumes()
+        exchange = self._exchange_classified_volumes()
+        buy_volume, sell_volume = exchange if exchange is not None else estimated
+        volume_source = "exchange" if exchange is not None else "tick_rule"
+        self._carry_cumulative_baseline()
 
         quality_flag = 0 if len(self._ticks) >= self.MIN_TICKS_FOR_NORMAL_QUALITY else 1
 
@@ -236,4 +310,5 @@ class MinuteBarAggregator:
             buy_volume=buy_volume,
             sell_volume=sell_volume,
             quality_flag=quality_flag,
+            volume_source=volume_source,
         )
