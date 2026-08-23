@@ -116,7 +116,10 @@ class ExecutionEngine:
         self,
         position: PositionState,
         market: MarketStructureState,
-        belief: BeliefState,
+        # 2026-08-23 (실행 배선 ④) — **None이 정상값이다.** EV 입력(`trade_history`)이
+        # 없는 동안 레이어 4는 평가되지 않는다(근거는 `exit_stack` 쪽 주석). 지어낸
+        # 중립값을 넣으면 그 숫자가 그대로 청산 주문이 된다.
+        belief: BeliefState | None,
         account_state: AccountState,
         market_conditions: MarketConditions,
         mode: HybridMode,

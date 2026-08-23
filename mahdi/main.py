@@ -57,7 +57,9 @@ from mahdi.execution.account_tracker import (
 )
 from mahdi.execution.engine import EntryRequest, ExecutionEngine
 from mahdi.execution.entry import EntryContext
-from mahdi.execution.hybrid_mode import HybridMode, effective_mode, mode_from_params
+from mahdi.execution.exit_stack import MarketStructureState, PositionState
+from mahdi.execution import forced_flat
+from mahdi.execution.hybrid_mode import GateAction, HybridMode, effective_mode, mode_from_params
 from mahdi.execution import order_manager, position_ledger
 from mahdi.features.options_intel import (
     OptionLeg,
@@ -4658,6 +4660,260 @@ async def poll_account_balance_cycle(
         await asyncio.sleep(delay)
 
 
+# ===== 2026-08-23 (실행 배선 ④·⑤) — 매 1분 청산 재평가 + 15:10 강제청산 =====
+#
+# v6 §13.4는 *"진입 후에도 **매 1분마다** 기대값을 다시 계산한다"*고 적었고, §13.3의 여섯
+# 레이어 중 마지막(15:10 Forced Flat)은 *"항상 자동, 해제 불가"*다. 이 루프가 그 둘이다 —
+# 강제청산을 별도 루프로 두지 않는 이유는 그것이 **같은 스택의 레이어 6**이기 때문이다.
+# 별도로 만들면 15:10이 두 곳에 적히고, `session.py`가 시각 상수를 하나로 모은 의미가 사라진다.
+#
+# ## 오늘 이 루프가 **못 하는** 것 — 지어내지 않는다
+#
+#   · 레이어 4(Belief Decay): EV 입력(`trade_history`)이 0행이라 **평가하지 않는다.**
+#     중립값으로 채우면 EV가 0이 되고 그것이 악화 1건으로 세어져, 다른 플래그 하나만 붙어도
+#     지어낸 숫자가 부분청산 주문이 된다(`exit_stack._warn_belief_unavailable` 주석).
+#   · 레이어 2(Structure): VWAP/POC/감마벽을 **보유 옵션 단위로** 계산하는 곳이 아직 없다.
+#     `None`이면 `check_structure_stop()`이 그 레벨을 건너뛴다 — 없는 것을 없다고 둔다.
+#   · 레이어 3(Flow): 외국인 수급 반전·OFI 역행은 **기초자산 축**의 신호이고, 그것을 보유
+#     옵션의 방향으로 옮기는 규칙이 스펙에 없다(콜 보유와 풋 보유가 반대다). 넘기지 않는다.
+#
+# 즉 오늘 실제로 도는 것은 **레이어 1(하드스톱·레짐손절) · 5(타임스톱) · 6(강제청산)** 셋이다.
+# 그 셋이 «포지션을 닫을 줄 안다»의 최소 집합이고, 나머지는 재료가 생기는 날 켠다.
+# 무엇이 꺼져 있는지는 매 사이클 기록에 남는다 — 「걸리지 않았다」와 「평가하지 않았다」는
+# 다른 사건이다(규약 C).
+EXIT_STACK_POLL_INTERVAL_SECONDS = 60.0
+EXIT_STACK_PHASE_OFFSET_SECONDS = 25.0
+
+# 이 루프가 오늘 평가하지 **않는** 레이어 — 기록에 그대로 실린다.
+EXIT_LAYERS_UNEVALUATED = ("belief_decay_stop", "structure_stop", "flow_stop")
+
+LOG_EXIT_TRIGGERED = "청산 판정: %s %s %d계약 · 레이어=%s · %s · 진입 %.2f → 현재 %.2f (%.1f%%)"
+LOG_EXIT_PRICE_MISSING = (
+    "청산 평가에 현재가가 없다: %s — 가격 의존 레이어(하드스톱)를 건너뛴다. "
+    "타임스톱·15:10 강제청산은 그대로 걸린다"
+)
+LOG_FORCED_FLAT_VERIFY = "15:10 강제청산 자기검증: 대상 %d건 · 미확인 %d건%s"
+
+
+def _chain_price_by_symbol(conn, master: IndexDerivativesMaster | None, underlying: str) -> dict:
+    """
+    입력: DB 커넥션, 종목 마스터, 기초자산 라벨.
+    계산: 최신 체인 스냅샷의 각 행을 단축상품번호로 옮겨 `{symbol: price}`를 만든다.
+    해석: **브로커 잔고의 `current_price`를 안 쓰는 이유가 여기 있다.** 그 필드(`idx_clpr`)는
+         마이그레이션 030이 *"옵션 보유 시 이 값이 옵션 가격인지 기초자산 지수인지 실측으로
+         확인할 것(이름은 «지수»종가다)"*라고 적어 둔 **미실측 값**이다. 프리미엄(≈22)이
+         와야 할 자리에 지수(≈1090)가 오면 하드스톱은 즉시 걸리거나 영원히 안 걸린다.
+         `option_analysis_1m.price`는 우리가 수집한 값이고 필드명이 08-18에 실측 확정됐다.
+    실패 조건: 마스터가 없거나 조회가 실패하면 빈 dict — 가격 없는 상태로 떨어지고, 그
+              사실이 사이클 기록에 남는다(가격을 지어내지 않는다).
+    """
+    if master is None:
+        return {}
+    try:
+        rows = db.latest_option_chain(conn, underlying)
+    except Exception:
+        logger.warning("청산 평가용 체인 스냅샷 조회 실패 — 이번 사이클은 가격 없이 평가", exc_info=True)
+        return {}
+    prices: dict[str, float] = {}
+    for row in rows:
+        price = row.get("price")
+        if price is None:
+            continue
+        for series in ("regular", "weekly_mon", "weekly_thu"):
+            symbol = master.option_symbol(
+                row["option_type"], float(row["strike"]), underlying=underlying, series=series
+            )
+            if symbol:
+                prices.setdefault(symbol, float(price))
+    return prices
+
+
+def _exit_market_state(now: datetime) -> MarketStructureState:
+    """레이어 6만 채우고 나머지는 비운다 — 없는 것을 없다고 둔다(모듈 주석의 세 항목)."""
+    return MarketStructureState(is_forced_flat_time=session.is_forced_flat_time(now))
+
+
+async def poll_exit_stack(
+    rest_client: KISRestClient,
+    execution_engine: ExecutionEngine,
+    master: IndexDerivativesMaster | None = None,
+    underlying: str = UNDERLYING,
+    interval_seconds: float = EXIT_STACK_POLL_INTERVAL_SECONDS,
+    phase_offset_seconds: float = EXIT_STACK_PHASE_OFFSET_SECONDS,
+    max_cycles: int | None = None,
+) -> None:
+    """
+    입력: REST 클라이언트, 실행 파사드, 종목 마스터, 기초자산, 주기·위상, (테스트용) 사이클 상한.
+    계산: 매 분 열린 원장 행마다 `ExecutionEngine.evaluate_exit()`를 돌리고, HOLD가 아니면
+         반대 방향 주문을 낸다. 15:10 이후에는 레이어 6이 무조건 걸리므로 전량 시장가다.
+    해석: **모드와 무관하게 자동인 레이어가 있다**(v6 §13.1 불변 규칙: 수동 모드는 공격의
+         자유이지 방어의 자유가 아니다). `gate_exit()`가 `hard_stop`/`circuit_breaker`/
+         `forced_flat_15_10`을 `AUTO_SUBMIT`으로 강제하므로, ADVISORY 설정에서도 **이 셋은
+         실제로 주문을 낸다.** 진입과 다른 점이 이것이다 — 진입은 설정이 막지만 방어는 안 막는다.
+    실패 조건: 포지션 단위로 격리한다. 한 종목의 청산 실패가 나머지 포지션의 평가를 막으면
+              안 되고, 이 루프의 죽음이 관측 루프를 죽여서도 안 된다.
+    """
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
+
+    next_tick: float | None = None
+    cycles = 0
+    forced_flat_done = False
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        poll_time = db.local_now()
+        try:
+            with db.get_connection() as conn:
+                entries = position_ledger.load_open_entries(conn)
+                if entries:
+                    prices = _chain_price_by_symbol(conn, master, underlying)
+                    submitted = [
+                        _evaluate_and_exit_one(conn, rest_client, execution_engine, e, prices, poll_time)
+                        for e in entries
+                    ]
+                    # ⑤ 15:10 자기검증 — 그 시각을 지났고 아직 안 했으면 한 번.
+                    if session.is_forced_flat_time(poll_time) and not forced_flat_done:
+                        _verify_forced_flat(conn, [o for o in submitted if o is not None], poll_time)
+                        forced_flat_done = True
+                elif session.is_forced_flat_time(poll_time) and not forced_flat_done:
+                    logger.info(LOG_FORCED_FLAT_VERIFY, 0, 0, " — 청산할 포지션이 없었다")
+                    forced_flat_done = True
+        except Exception:
+            logger.warning("청산 평가 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
+
+        loop_now = asyncio.get_running_loop().time()
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
+        if overrun_seconds > 0:
+            logger.warning(
+                "청산 평가 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
+            )
+        if max_cycles is not None and cycles >= max_cycles:
+            return
+        await asyncio.sleep(delay)
+
+
+def _evaluate_and_exit_one(
+    conn,
+    rest_client: KISRestClient,
+    execution_engine: ExecutionEngine,
+    entry,
+    prices: dict,
+    now: datetime,
+):
+    """포지션 하나의 청산 평가 + 필요 시 주문. **실패를 삼킨다**(한 종목이 나머지를 막으면 안 된다)."""
+    try:
+        current_price = prices.get(entry.symbol)
+        if current_price is None:
+            logger.warning(LOG_EXIT_PRICE_MISSING, entry.symbol)
+
+        session_start = session.session_start_of(now)
+        position = PositionState(
+            symbol=entry.symbol,
+            side=entry.side,
+            entry_price=entry.entry_price,
+            # 가격이 없으면 진입가를 넣는다 — 손익 0%가 되어 **하드스톱이 안 걸린다.**
+            # 「모르면 안 건다」이고, 그 사실은 위 경고 줄이 말한다. 0.0을 넣으면 매수
+            # 포지션이 −100%로 보여 즉시 전량 청산이 나간다(지어낸 값이 주문이 되는 형태).
+            current_price=current_price if current_price is not None else entry.entry_price,
+            entry_time_minutes=max((entry.opened_at - session_start).total_seconds() / 60.0, 0.0),
+            now_minutes=max((now - session_start).total_seconds() / 60.0, 0.0),
+            regime=entry.exit_rules_key or "",
+        )
+        decision, gate = execution_engine.evaluate_exit(
+            position,
+            _exit_market_state(now),
+            # 레이어 4는 평가하지 않는다 — 모듈 주석 참고.
+            None,
+            AccountState(daily_pnl_pct=0.0, weekly_pnl_pct=0.0, drawdown_pct=0.0,
+                         same_direction_positions=0),
+            MarketConditions(),
+            # 2026-08-23 — **설정된 모드를 따른다.** 진입과 달리 여기엔 `_ORDER_PATH_WIRED`
+            # 클램프를 걸지 않는다: `gate_exit()`가 하드스톱·서킷브레이커·15:10을 모드와
+            # 무관하게 `AUTO_SUBMIT`으로 강제하므로(v6 §13.1), ADVISORY에서도 그 셋은 나간다.
+            # 나머지 레이어(구조·플로우·타임스톱)는 ADVISORY에서 판정만 남고 주문은 안 낸다 —
+            # 그것이 「수동 모드는 공격의 자유이지 방어의 자유가 아니다」의 정확한 뜻이다.
+            mode_from_params(get_strategy_params()),
+        )
+    except Exception:
+        logger.warning("포지션 %s 청산 평가 실패 — 다음 사이클에 다시 본다", entry.symbol, exc_info=True)
+        return None
+
+    if decision.action == "HOLD":
+        return None
+
+    pnl_pct = (
+        0.0 if not entry.entry_price
+        else ((position.current_price - entry.entry_price) / entry.entry_price
+              * (1 if entry.side.upper() == "BUY" else -1) * 100)
+    )
+    logger.info(
+        LOG_EXIT_TRIGGERED, entry.symbol, entry.side, int(entry.qty),
+        decision.triggered_layer.value if decision.triggered_layer else "circuit_breaker",
+        decision.reason or "", entry.entry_price, position.current_price, pnl_pct,
+    )
+    if gate.action != GateAction.AUTO_SUBMIT:
+        # ADVISORY/CONFIRM에서 방어가 아닌 레이어는 주문을 안 낸다 — 판정만 남는다.
+        return None
+    return _submit_exit_order(conn, rest_client, entry, decision, now)
+
+
+def _submit_exit_order(conn, rest_client: KISRestClient, entry, decision, now: datetime):
+    """반대 방향 **시장가** 청산 주문. 청산은 체결 확실성이 지정가보다 중요하다(v6 §13.3)."""
+    qty = int(entry.qty)
+    if qty <= 0:
+        return None
+    opposite = "SELL" if entry.side.upper() == "BUY" else "BUY"
+    layer = decision.triggered_layer.value if decision.triggered_layer else "circuit_breaker"
+    order = Order(
+        order_id=f"exit_{layer}_{entry.symbol}_{now:%H%M%S}",
+        symbol=entry.symbol, side=opposite, order_type="MARKET",
+        intended_px=0.0, qty=qty, timestamp=now,
+    )
+    try:
+        result = order_manager.submit(order, rest_client, extract_order_no=extract_order_no)
+    except Exception:
+        logger.error(
+            "청산 주문 제출 실패 — **포지션이 남는다**: %s %s %d계약(레이어 %s). 사람이 확인할 것",
+            entry.symbol, opposite, qty, layer, exc_info=True,
+        )
+        return None
+    try:
+        db.insert_execution_log(conn, order_to_execution_log_row(result.order))
+    except Exception:
+        logger.error(
+            "청산 주문은 나갔는데 execution_logs 적재에 실패했다(브로커번호 %s) — "
+            "체결 확인 루프가 못 본다. 사람이 확인할 것", result.order.order_id, exc_info=True,
+        )
+    return result.order
+
+
+def _verify_forced_flat(conn, orders: list, now: datetime) -> None:
+    """
+    입력: 이번 사이클에 낸 청산 주문들, 검증 시각.
+    계산: `forced_flat.verify_forced_flat()`으로 **전부 체결됐는지** 자기검증한다.
+    해석: [[DECISION_LOG]] 2026-07-21이 *"종료 시퀀스 자기검증 없이는 배포 금지"*로 적은
+         조항이다. 「청산 주문을 보냈다」는 완성이 아니다 — 보낸 것이 체결됐고 잔여 미종결이
+         없는지 스스로 확인해야 한다.
+    해석(왜 여기서 곧바로 체결이 안 잡히나): 방금 낸 시장가 주문은 이 순간 PENDING이다.
+         `all_flat=False`가 정상이고, 실제 확인은 `poll_open_orders()`가 다음 사이클에 한다.
+         그래서 이 줄은 **경보가 아니라 기록**이다 — 15:45 종료 배치와 다음 날 장전 점검이
+         `db.orders.open`으로 최종 판정한다.
+    실패 조건: 없다 — 검증 실패가 예외를 던지면 그것이 오히려 종료 시퀀스를 망친다.
+    """
+    result = forced_flat.verify_forced_flat(orders, now)
+    unconfirmed = len(result.unconfirmed_order_ids)
+    logger.info(
+        LOG_FORCED_FLAT_VERIFY, len(orders), unconfirmed,
+        "" if result.all_flat else " — 방금 낸 주문은 아직 PENDING이다(체결 확인 루프가 이어받는다)",
+    )
+    if unconfirmed:
+        logger.warning(
+            "15:10 강제청산 미확인 %d건 — 장 마감까지 체결되지 않으면 **포지션이 밤을 넘는다.** "
+            "주문번호: %s", unconfirmed, ", ".join(result.unconfirmed_order_ids),
+        )
+
 # ===== 2026-08-23 (실행 배선 ③) — 체결 확인 루프 =====
 #
 # 제출은 판단 사이클(`poll_signal_fusion_cycle`)이 하고, **확인은 이 루프가 한다.** 둘을 가르는
@@ -5092,6 +5348,12 @@ async def main() -> None:
             # 2026-08-23 (실행 배선 ③) — 체결 확인(REST 축). 미종결 목록은 DB에서 읽으므로
             # 재기동을 견딘다. 주문이 0건이면 매 사이클 빈 목록이라 아무 일도 안 한다.
             poll_open_orders(rest_client),
+            # 2026-08-23 (실행 배선 ④·⑤) — 매 1분 청산 재평가 + 15:10 강제청산.
+            # **방어는 모드와 무관하게 자동이다**(v6 §13.1) — ADVISORY 설정에서도 하드스톱·
+            # 강제청산은 실제로 주문을 낸다. 열린 포지션이 0이면 아무 일도 안 한다.
+            # `ExecutionEngine`은 상태가 없는 파사드라 판단 사이클과 따로 하나 더 만든다 —
+            # 공유하면 두 코루틴이 같은 객체를 잡고 수명이 얽힌다.
+            poll_exit_stack(rest_client, ExecutionEngine(), master=master),
             # 2026-07-31 §4 우선순위 4 / 2026-08-01 §5-4 — 안전장치 생존 신호는 감시 대상과
             # 독립한 타이머에서 낸다(CB 감지 / WS 연결).
             poll_market_halt_heartbeat(market_halt_monitor),

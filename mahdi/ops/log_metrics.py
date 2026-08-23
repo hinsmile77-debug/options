@@ -356,6 +356,17 @@ _QUALITATIVE_MARKERS = {
     "order_submitted": "주문 제출",
     "order_blocked": "주문 미제출",
     "order_state_changed": "주문 상태 전이",
+    # ===== 2026-08-23 (실행 배선 ④·⑤) — 청산 =====
+    #
+    # **`exit_price_missing`이 이 묶음에서 가장 중요하다.** 현재가를 모르면 하드스톱이 안
+    # 걸리는데, 그 사실이 안 세어지면 「하드스톱이 한 번도 안 걸렸다」를 「손실이 없었다」로
+    # 읽게 된다. 「안 걸렸다」와 「평가하지 못했다」는 다른 사건이다(규약 C).
+    #
+    # 포맷 원본: `mahdi.main.LOG_EXIT_TRIGGERED` / `LOG_EXIT_PRICE_MISSING` /
+    #            `LOG_FORCED_FLAT_VERIFY`
+    "exit_triggered": "청산 판정",
+    "exit_price_missing": "청산 평가에 현재가가 없다",
+    "forced_flat_verified": "15:10 강제청산 자기검증",
 }
 
 # ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
@@ -383,6 +394,9 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 2026-08-23 (실행 배선 ③) — 08-24 예측이 「제출 0 · 미제출 N」이라 **0이 인쇄돼야
     # 검정된다**(`2026-08-23-wiring3-code-is-wired-but-config-still-blocks`).
     "order_submitted", "order_blocked", "order_state_changed",
+    # 2026-08-23 (실행 배선 ④·⑤) — 포지션이 0이면 셋 다 0이어야 한다. **0이 인쇄돼야
+    # 검정된다**(`2026-08-23-wiring45-defence-runs-even-in-advisory`).
+    "exit_triggered", "exit_price_missing", "forced_flat_verified",
 )
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #

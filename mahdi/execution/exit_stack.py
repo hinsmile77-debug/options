@@ -255,17 +255,52 @@ def check_time_stop(position: PositionState, exit_rules_cfg: dict) -> bool:
     return (position.now_minutes - position.entry_time_minutes) >= params.time_stop
 
 
+# ===== 2026-08-23 (실행 배선 ④) — 레이어 4의 입력이 없으면 **평가하지 않는다** =====
+#
+# §13.4의 EV 공식은 `P(win)`·`AvgWin`·`AvgLoss`를 요구하고, 그 셋은 `trade_history`에서 온다.
+# 그 표는 오늘 0행이다(08-23에 쓰기 함수가 처음 생겼다). 즉 **우리는 그 값을 모른다.**
+#
+# ## 왜 중립값으로 채우면 안 되는가
+#
+# `win_probability=0.5, avg_win=avg_loss`를 넣으면 EV가 정확히 0이 되고, `reevaluate_position()`
+# 은 `ev <= 0`을 **악화 1건으로 센다.** 거기에 레짐 악화 같은 플래그가 하나만 더 붙으면 2건이
+# 되어 **부분청산(50%)이 나간다** — 지어낸 숫자가 실제 청산 주문이 되는 것이다.
+#
+# 반대로 EV가 크게 양수가 되도록 채우면 레이어 4가 영원히 안 걸린다. 그것도 거짓이지만
+# 방향이 다르다: 없는 신호를 만들어내는 대신 **없는 신호를 없다고 두는 것**이다.
+#
+# ## 그래서 세 번째 선택 — 평가하지 않고, 그 사실을 남긴다
+#
+# `belief=None`이면 레이어 4를 건너뛰고 키당 1회 경고를 남긴다. `resolve_exit_params()`가
+# 미정의 레짐에 대해 하는 것과 **정확히 같은 처리**다: 조용한 False가 아니라 시끄러운 경고.
+# 나머지 다섯 레이어(하드스톱·구조·플로우·타임스톱·강제청산)는 그대로 돈다.
+_warned_belief_unavailable = False
+
+
+def _warn_belief_unavailable() -> None:
+    global _warned_belief_unavailable
+    if _warned_belief_unavailable:
+        return
+    _warned_belief_unavailable = True
+    logger.warning(
+        "청산 레이어 4(Belief Decay)를 평가하지 않는다 — EV 입력(P(win)/AvgWin/AvgLoss)이 "
+        "없다. `trade_history`가 쌓이기 전까지 이 레이어는 꺼져 있고, 그동안 확신도 붕괴에 "
+        "의한 청산은 일어나지 않는다. 나머지 다섯 레이어는 정상 동작한다."
+    )
+
+
 def evaluate_exit_stack(
     position: PositionState,
     market: MarketStructureState,
-    belief: BeliefState,
+    belief: BeliefState | None,
     exit_rules_cfg: dict,
     hard_stop_pct: float = -0.02,
 ) -> ExitDecision:
     """
     입력: 포지션/시장구조/확신 상태 + 레짐별 exit_rules 설정.
     계산: 레이어 6(Forced Flat, 해제 불가) -> 1(Hard Stop) -> 2(Structure Stop) ->
-         3(Flow Stop) -> 4(Belief Decay, reevaluate_position 위임) -> 5(Time Stop) 순서로
+         3(Flow Stop) -> 4(Belief Decay, **`belief=None`이면 건너뛴다** — 위 주석) ->
+         5(Time Stop) 순서로
          점검해 가장 먼저 트리거된 레이어를 반환한다(§13.3 표 순서, 단 Forced Flat은 항상
          자동·해제 불가라 최우선 점검).
     해석: action="HOLD"면 어떤 레이어도 트리거되지 않은 것.
@@ -285,9 +320,14 @@ def evaluate_exit_stack(
     if check_flow_stop(market):
         return ExitDecision(triggered_layer=ExitLayer.FLOW_STOP, action="FULL_EXIT", reason="수급/주문흐름 역행")
 
-    belief_decision = reevaluate_position(belief)
-    if belief_decision.action != "HOLD":
-        return belief_decision
+    # 2026-08-23 — `belief`가 None이면 레이어 4는 **평가되지 않는다**(위 주석). 지어낸
+    # 중립값으로 EV를 계산하면 그 숫자가 그대로 청산 주문이 된다.
+    if belief is None:
+        _warn_belief_unavailable()
+    else:
+        belief_decision = reevaluate_position(belief)
+        if belief_decision.action != "HOLD":
+            return belief_decision
 
     if check_time_stop(position, exit_rules_cfg):
         return ExitDecision(triggered_layer=ExitLayer.TIME_STOP, action="FULL_EXIT", reason="레짐별 time_stop 도달")
