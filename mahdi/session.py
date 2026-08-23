@@ -34,7 +34,7 @@
 
 from __future__ import annotations
 
-from datetime import time as dtime
+from datetime import datetime, time as dtime
 
 # 정규장 연속거래 구간 (v6 §16.1).
 TRADING_DAY_START = dtime(9, 0)
@@ -173,6 +173,22 @@ def is_equity_spot_live(now) -> bool:
     """
     moment = now.time() if hasattr(now, "time") else now
     return TRADING_DAY_START <= moment < EQUITY_CONTINUOUS_TRADING_END
+
+
+def session_start_of(now: datetime) -> datetime:
+    """
+    입력: 그날 안의 아무 시각(datetime — **time은 안 받는다**).
+    계산: 같은 날짜의 `TRADING_DAY_START`(09:00)를 datetime으로 돌려준다.
+    해석: 「그 어떤 당일 포지션보다도 앞선 시각」이 필요한 곳에 쓴다. 지금 그 소비자는
+         `position_ledger.reconcile()`의 `opened_at_floor`다 — 기동 후 첫 잔고 조회에서 고아
+         포지션을 만나면 직전 조회가 없어 하한을 여기서 가져온다(모듈 docstring 참고).
+    해석(이 모듈의 정체성): `session.py`는 **시각만 보는 모듈**이고([[DECISION_LOG]]
+         2026-08-16), 이 함수도 그 규율 안에 있다 — 날짜는 인자에서 그대로 받아 쓸 뿐
+         달력을 묻지 않는다. 휴장일 판정은 여전히 `market_calendar`의 일이다.
+    실패 조건: `now`가 date 속성이 없으면 AttributeError — time을 넘기면 날짜를 지어내야
+              하고, 그것은 이 함수가 절대 하면 안 되는 일이다.
+    """
+    return datetime.combine(now.date(), TRADING_DAY_START)
 
 
 def is_preopen(now) -> bool:

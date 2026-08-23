@@ -316,6 +316,21 @@ _QUALITATIVE_MARKERS = {
     "member_axis_return": "판단 축 복귀",
     # 포맷 원본: `mahdi.engines.regime_pipeline.LOG_REGIME_WARMUP_END`
     "regime_warmup_end": "레짐 warmup 종료",
+    # ===== 2026-08-23 (실행 배선 ①) — 포지션 생애주기 =====
+    #
+    # 이 넷이 「포지션이 언제 생겨 언제 사라졌는가」의 로그 축이다. 정본은 DB
+    # (`db.ledger`)이고 이쪽은 **장중에 볼 수 있는 사본**이다 — warmup 종료 줄과 같은 관계다.
+    #
+    # `position_held`가 **없는 것이 의도**다: 유지는 사건이 아니고, 매 사이클 찍으면 그 줄들이
+    # 진짜 사건을 덮는다(08-21 §1-11의 DEGRADED 14줄이 정확히 그 형태였다).
+    #
+    # 포맷 원본: `mahdi.execution.position_ledger.LOG_POSITION_OPENED` 외 3종
+    "position_opened": "포지션 개시",
+    "position_closed": "포지션 종료",
+    "position_qty_changed": "포지션 수량 변경",
+    # ⚠ 이 줄은 WARNING이다 — 브로커에는 있는데 원장에 없는 포지션이다. 0이 아닌 날은
+    #   사람이 직접 냈거나 원장 기록이 실패한 것이고, 둘 다 사람이 봐야 한다.
+    "orphan_position": "원장에 없는 포지션 발견",
 }
 
 # ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
@@ -332,6 +347,10 @@ _QUALITATIVE_MARKERS = {
 # (`hypotheses.measurable_on()`이 그것을 이미 강제한다).
 _QUALITATIVE_ALWAYS_PRESENT = (
     "expiry_burst_done", "member_axis_exit", "member_axis_return", "regime_warmup_end",
+    # 2026-08-23 (실행 배선 ①) — 08-24 예측이 「전부 0」이라 **0이 인쇄돼야 검정된다.**
+    # 키가 없으면 그 가설이 「경로 없음」으로 떨어지고, 포지션이 없었던 하루가 배선 실패로
+    # 읽힌다(`2026-08-23-wiring1-ledger-runs-silent-until-a-position-exists`).
+    "position_opened", "position_closed", "position_qty_changed", "orphan_position",
 )
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #

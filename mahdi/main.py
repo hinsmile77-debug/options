@@ -56,6 +56,7 @@ from mahdi.execution.account_tracker import (
 from mahdi.execution.engine import EntryRequest, ExecutionEngine
 from mahdi.execution.entry import EntryContext
 from mahdi.execution.hybrid_mode import HybridMode, effective_mode, mode_from_params
+from mahdi.execution import position_ledger
 from mahdi.features.options_intel import (
     OptionLeg,
     atm_straddle_vrp,
@@ -4109,6 +4110,23 @@ def _shadow_execution_outcome(
         market_conditions=MarketConditions(),
         now=now,
         market_halted=market_halted,
+        # ===== 2026-08-23 (실행 배선 ①) — 이 인자가 채울 값이 없어 비어 있었다 =====
+        #
+        # `docs/동작흐름과상태` §2가 «배선 선행 조건»으로 든 것이 정확히 이 값이다: *"포지션
+        # 생애주기 추적이 없어 `has_open_position_same_direction`을 채울 곳이 없다."* 이제
+        # 브로커 잔고에서 나온 실측값이 있다(`account_tracker.same_direction_positions()` —
+        # 방향 판정 실패분은 후보 방향으로 세어진다, 모르면 안전한 쪽).
+        #
+        # ⚠ **그렇다고 이 게이트가 지금 무언가를 막지는 않는다.** `forbid_averaging_down()`은
+        # `has_open and not is_new_signal`일 때만 참인데, 이 루프에 도달하는 모든 ENTER는
+        # Signal Fusion의 그 사이클 재평가에서 나온 것이라 `is_new_signal`이 항상 True다.
+        # 즉 이 게이트는 **구조적으로 비활성**이고, 그것을 아는 채로 값을 채운다 — 값을
+        # 안 채우면 「막을 수 있었는데 몰랐다」와 「막을 것이 없었다」가 구분되지 않는다.
+        #
+        # 같은 방향 누적을 실제로 막는 것은 둘이다: `limits.max_same_direction_positions`(3,
+        # 이미 살아 있다)와 `strategy_gates.reentry_cooldown_minutes`(**아직 0 — 실주문
+        # 배선 전에 켜라고 그 설정 주석이 지시한다**). ③ 전에 그것을 켜는 것이 남은 일이다.
+        has_open_position_same_direction=account_state.same_direction_positions > 0,
     )
     outcome = execution_engine.evaluate_entry(request, mode)
     return {
@@ -4518,6 +4536,15 @@ async def poll_account_balance_cycle(
     await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
 
     next_tick: float | None = None
+    # 2026-08-23 (실행 배선 ①) — 대사에서 **진입 시각의 하한**으로 쓸 직전 조회 시각.
+    #
+    # 고아 포지션(브로커에는 있는데 원장에 없다)의 진입 시각을 모를 때, 「직전 조회에는 없었다」
+    # 가 곧 「그 이후에 열렸다」이다. 하한을 쓰면 보유 시간이 과대평가되고 타임스톱이 더 일찍
+    # 걸린다 — 안전한 쪽으로만 틀린다(`position_ledger` 모듈 docstring).
+    #
+    # `None`인 동안(기동 후 첫 사이클)은 세션 시작을 하한으로 쓴다. 그보다 앞선 시각을 지어낼
+    # 근거가 없고, 세션 시작은 어떤 당일 포지션보다도 앞선다.
+    previous_balance_poll_at: datetime | None = None
     while True:
         poll_time = _grid_poll_minute(db.local_now())
         try:
@@ -4533,6 +4560,27 @@ async def poll_account_balance_cycle(
                 # `unknown_side_count`(잔고 표)와 `side_distribution`(포지션 표)이 서로 다른
                 # 사이클을 가리켜 §16-1이 「두 축이 갈렸다」를 오탐한다.
                 db.insert_position_snapshots(conn, position_rows(snapshot))
+                # 2026-08-23 (실행 배선 ①) — **브로커 대사.** 같은 응답으로 원장을 맞춘다.
+                #
+                # 같은 사이클·같은 커넥션·같은 `poll_time`을 쓰는 이유는 바로 위 주석과 같다:
+                # 세 표(잔고·포지션 스냅샷·원장)가 다른 시각을 가리키면 사후에 어느 것이 그
+                # 사이클의 사실인지 못 가린다.
+                #
+                # **주문이 하나도 안 나가는 지금도 이것을 켠다.** 포지션이 0이면 대사는 매번
+                # 빈 결과를 내고 아무 줄도 안 남긴다 — 대가가 없다. 대신 ②~⑤가 붙기 전에
+                # 이 경로가 며칠 돌아 「사람이 HTS로 낸 포지션을 우리가 어떻게 보는가」를
+                # 실측할 수 있다. 워치독(08-06 생성, 08-11까지 미가동)의 반대를 하는 것이다:
+                # 소비자가 생기기 전에 도는 것이 아니라, **주문이 나가기 전에 관측을 먼저 켠다.**
+                reconcile_result = position_ledger.reconcile(
+                    position_ledger.load_open_entries(conn),
+                    [position_ledger.from_position_record(p) for p in snapshot.positions],
+                    poll_time,
+                    opened_at_floor=previous_balance_poll_at
+                    or session.session_start_of(poll_time),
+                )
+                position_ledger.log_reconcile(reconcile_result, poll_time)
+                position_ledger.apply_reconcile(conn, reconcile_result)
+            previous_balance_poll_at = poll_time
         except Exception:
             logger.warning("계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
 

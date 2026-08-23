@@ -154,6 +154,12 @@ def collect(
         ("positions", positions),
         # 2026-08-16 (Block D) — 경보 토글. DB에 있어 레버 표(§0)가 모르는 값이다.
         ("slack_alerts", slack_alerts),
+        # 2026-08-23 (실행 배선 ①) — 포지션 원장. 마이그레이션 034.
+        #
+        # `positions`(030)와 겹치지 않는다: 저쪽은 「브로커가 말한 것」의 시간축 미러이고
+        # 이쪽은 「우리가 아는 것」의 원장이다. **두 절이 갈리면 그 자체가 사건이다** —
+        # 브로커에 있는데 원장에 없으면 고아이고, 원장에 있는데 브로커에 없으면 대사 누락이다.
+        ("ledger", ledger),
     ):
         try:
             out[key] = fn(conn, target)
@@ -210,6 +216,60 @@ def slack_alerts(conn: ConnectionLike, _target: date) -> dict:
         # 아무도 토글한 적 없으면 env 기본값으로 폴백한다(`db.is_slack_alerts_enabled()`와 같은 규칙).
         return {"available": True, "enabled": None, "source": "미설정(env 기본값 폴백)"}
     return {"available": True, "enabled": bool(row[0]), "source": "slack_alert_settings"}
+
+
+def ledger(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 그날 연/닫은 포지션 수, 지금 열려 있는 수, 그중 **진입 시각을 모르는** 수,
+         출처별(order/orphan) 분포, 그날 `trade_history`에 완결된 트레이드 수와
+         그중 순손익을 아직 모르는 수.
+    해석: 2026-08-23 실행 배선 ①. 답해야 하는 질문 넷:
+           (a) 원장이 돌긴 했는가 — `opened`/`closed`/`open_now`가 전부 0이면 포지션이 없었던
+               것이지 대사가 죽은 것이 아니다(대사는 포지션이 0이면 조용하다, 그것이 설계다).
+           (b) **진입 시각을 아는가** — `unknown_entry_time > 0`이면 그만큼의 포지션은
+               타임스톱이 **하한 위에서** 돈다. 「걸렸다」와 「걸릴 수 있었는데 시각을 몰랐다」는
+               다른 사건이다(규약 C).
+           (c) 고아가 있는가 — `origin.orphan > 0`이면 사람이 직접 냈거나 원장 기록이 실패했다.
+               `observation_loop.log`의 `원장에 없는 포지션 발견` 줄이 그 종목을 갖고 있다.
+           (d) 손익을 아는가 — `trades_without_net_pnl`이 곧 **메타라벨 학습이 못 쓰는 행 수**다
+               (`db.get_trade_history()`가 `net_pnl IS NULL`을 거른다). 이 값이 `trades`와 같으면
+               학습 재료는 여전히 0행이고, 그것은 결함이 아니라 비용 산식이 아직 없다는 뜻이다.
+         **임계를 걸지 않는다** — 정상 분포를 모른다(첫 포지션이 아직 없다). 08-16 `positions`가
+         같은 이유로 임계 없이 들어간 것과 같다.
+    실패 조건: 테이블이 비어 있으면 0을 낸다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FILTER (WHERE opened_at::date = %s), "
+            "       count(*) FILTER (WHERE closed_at::date = %s), "
+            "       count(*) FILTER (WHERE closed_at IS NULL), "
+            "       count(*) FILTER (WHERE closed_at IS NULL AND NOT opened_at_exact) "
+            "FROM position_ledger",
+            (target, target),
+        )
+        opened, closed, open_now, unknown = cur.fetchone() or (0, 0, 0, 0)
+        cur.execute(
+            "SELECT origin, count(*) FROM position_ledger WHERE closed_at IS NULL "
+            "GROUP BY origin ORDER BY origin",
+        )
+        origin_distribution = {str(origin): int(count) for origin, count in cur.fetchall()}
+        cur.execute(
+            "SELECT count(*), count(*) FILTER (WHERE net_pnl IS NULL) "
+            "FROM trade_history WHERE exit_time::date=%s",
+            (target,),
+        )
+        trades, trades_without_net = cur.fetchone() or (0, 0)
+    return {
+        "opened": int(opened or 0),
+        "closed": int(closed or 0),
+        "open_now": int(open_now or 0),
+        "unknown_entry_time": int(unknown or 0),
+        "origin": origin_distribution,
+        "trades": int(trades or 0),
+        # 이 값이 `trades`와 같으면 학습 재료는 0행이다 — 결함이 아니라 비용 산식 부재다.
+        "trades_without_net_pnl": int(trades_without_net or 0),
+    }
 
 
 def positions(conn: ConnectionLike, target: date) -> dict:

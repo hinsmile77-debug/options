@@ -231,6 +231,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
         lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
         lines += _section("16-1. 보유 포지션 — 브로커가 무엇을 들고 있다고 말했는가",
                           lambda: _render_positions(db_metrics))
+        lines += _section("16-2. 포지션 원장 — 우리는 왜 들고 있다고 아는가",
+                          lambda: _render_ledger(db_metrics))
     lines += _section("17. 교차 점검 — 지표끼리 모순되는가",
                       lambda: _render_crosschecks(metrics, db_metrics))
     return "\n".join(lines).rstrip() + "\n"
@@ -2108,6 +2110,68 @@ def _render_db_misc(db: dict) -> list[str]:
         "",
     ]
     out += _render_spot_divergence(db)
+    return out
+
+
+def _render_ledger(db: dict) -> list[str]:
+    """2026-08-23 (실행 배선 ①) — 포지션 원장(마이그레이션 034 `position_ledger`).
+
+    **§16-1과 나란히 읽는 절이다.** 저쪽은 브로커가 말한 것이고 이쪽은 우리가 아는 것이다 —
+    브로커는 「무엇을」을 알고 원장은 「언제·왜」를 안다. 두 절이 갈리면 그 자체가 사건이다.
+
+    임계를 걸지 않는다 — 첫 포지션이 아직 없어 정상 분포를 모른다(§16-1이 같은 이유로
+    임계 없이 들어갔다).
+    """
+    led = db.get("ledger")
+    if not led:
+        return ["> 원장 집계 불가 — `db.ledger` 절이 없다(집계가 실패했거나 배선 전이다).", ""]
+
+    opened, closed = led.get("opened", 0), led.get("closed", 0)
+    open_now, unknown = led.get("open_now", 0), led.get("unknown_entry_time", 0)
+    trades, no_net = led.get("trades", 0), led.get("trades_without_net_pnl", 0)
+
+    if not any((opened, closed, open_now, trades)):
+        return [
+            "- **그날 원장 사건이 없다** — 연 것도 닫은 것도 없고 지금 열려 있는 것도 없다.",
+            "",
+            "> **주문 경로가 배선되기 전에는 이것이 정상이다.** 대사는 매 잔고 조회마다 돌지만 "
+            "포지션이 0이면 아무 줄도 남기지 않는다(설계). 이 절이 0이 아닌 날은 둘 중 "
+            "하나다: 사람이 HTS로 직접 거래했거나, 주문 경로가 배선됐거나.",
+            "",
+        ]
+
+    origin = led.get("origin") or {}
+    out = [
+        f"- 그날 **연 {opened}건 / 닫은 {closed}건**, 지금 열려 있는 **{open_now}건**",
+        f"- 출처: {', '.join(f'`{k}` {v}' for k, v in sorted(origin.items())) or '—'}",
+        f"- 완결 트레이드 **{trades}건**(`trade_history`)",
+        "",
+    ]
+
+    if unknown:
+        out += [
+            f"> ⚠ **진입 시각을 모르는 포지션 {unknown}건.** 그만큼은 타임스톱이 **하한 위에서** "
+            "돈다 — 보유 시간이 과대평가되므로 타임스톱은 더 일찍 걸린다(안전 방향이지만 "
+            "실측이 아니다). 「걸렸다」와 「걸릴 수 있었는데 시각을 몰랐다」는 다른 사건이다.",
+            "> 원인은 `observation_loop.log`의 `원장에 없는 포지션 발견` 줄에 있다.",
+            "",
+        ]
+
+    if trades and no_net == trades:
+        out += [
+            f"> **완결 {trades}건 전부 순손익 미상**(`net_pnl IS NULL`)이라 메타라벨 학습이 "
+            "쓸 수 있는 행은 여전히 **0행**이다. 결함이 아니다 — 수수료·슬리피지 산식이 아직 "
+            "없어서 0으로 채우지 않은 것이다(0으로 채우면 그 표로 학습한 모델이 무비용 거래를 "
+            "배운다). ②(체결통보)가 붙는 날 채운다.",
+            "",
+        ]
+    elif no_net:
+        out += [
+            f"> 완결 {trades}건 중 **{no_net}건이 순손익 미상** — 나머지 {trades - no_net}건만 "
+            "학습에 잡힌다.",
+            "",
+        ]
+
     return out
 
 

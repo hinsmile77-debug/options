@@ -1,5 +1,6 @@
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import psycopg
 import pytest
@@ -1530,3 +1531,118 @@ def test_execution_logs_on_converts_decimals_to_float():
     assert isinstance(row["intended_px"], float)
     assert row["filled_px"] is None
     assert row["state"] == "PENDING"
+
+
+# ===== 2026-08-23 (실행 배선 ①) — 포지션 원장 =====
+
+
+def _ledger_values(**over):
+    """`_POSITION_LEDGER_COLUMNS` 순서에 맞춘 한 행. psycopg가 돌려주는 형태를 흉내낸다."""
+    row = {
+        "symbol": "B09FAWA37",
+        "opened_at": datetime(2026, 8, 24, 9, 58, 12, tzinfo=timezone.utc),
+        "side": "BUY",
+        "qty": Decimal("2.0000"),
+        "entry_price": Decimal("22.0500"),
+        "opened_at_exact": True,
+        "origin": "order",
+        "strategy_id": "vol_expansion_long",
+        "entry_order_id": "0000007047",
+        "regime_entry": 4,
+        "exit_rules_key": "VOL_EXPANSION",
+        "confidence_entry": Decimal("0.7123"),
+        "last_seen_at": datetime(2026, 8, 24, 10, 0, tzinfo=timezone.utc),
+        "closed_at": None,
+        "exit_price": None,
+        "exit_reason": None,
+    }
+    row.update(over)
+    return tuple(row[c] for c in db._POSITION_LEDGER_COLUMNS)
+
+
+def test_open_position_ledger_converts_decimals_to_float():
+    """07-28 8차와 같은 함정 — Decimal이 float와 섞이면 TypeError가 난다."""
+    conn = FakeReadConnection([_ledger_values()])
+
+    row = db.open_position_ledger(conn)[0]
+
+    assert isinstance(row["qty"], float) and row["qty"] == 2.0
+    assert isinstance(row["entry_price"], float) and row["entry_price"] == 22.05
+    assert isinstance(row["confidence_entry"], float) and row["confidence_entry"] == 0.7123
+
+
+def test_open_position_ledger_strips_tzinfo_from_timestamps():
+    """**라이브 왕복이 잡은 버그다**(2026-08-23).
+
+    naive KST를 써 놓고 TIMESTAMPTZ에서 읽으면 tz-aware로 돌아온다. 떼지 않으면
+    `position_ledger.LedgerEntry.held_minutes()`가 naive `local_now()`와 빼다가 TypeError를
+    내고, 그 자리는 하필 **재기동 직후의 청산 루프**다 — 그때는 이미 포지션을 들고 있다.
+    벽시계 숫자는 이미 같은 좌표계이므로 tzinfo만 뗀다(`local_now()` docstring).
+    """
+    conn = FakeReadConnection([_ledger_values(closed_at=None)])
+
+    row = db.open_position_ledger(conn)[0]
+
+    assert row["opened_at"] == datetime(2026, 8, 24, 9, 58, 12)
+    assert row["opened_at"].tzinfo is None
+    assert row["last_seen_at"].tzinfo is None
+    # 이 뺄셈이 이 테스트의 요점이다 — 예외가 나면 안 된다.
+    assert (datetime(2026, 8, 24, 10, 30) - row["opened_at"]).total_seconds() > 0
+
+
+def test_open_position_ledger_tolerates_null_timestamps():
+    conn = FakeReadConnection([_ledger_values(last_seen_at=None)])
+
+    assert db.open_position_ledger(conn)[0]["last_seen_at"] is None
+
+
+def test_upsert_position_ledger_never_writes_the_closing_columns():
+    """닫는 것은 `close_position_ledger()`의 몫 — 대사 버그 하나가 닫힌 행을 되살리면 안 된다."""
+    conn = FakeConnection()
+
+    db.upsert_position_ledger(conn, {"symbol": "A", "opened_at": datetime(2026, 8, 24, 9, 0), "side": "BUY"})
+
+    query = conn.store["query"]
+    assert "closed_at" not in query
+    assert "exit_price" not in query
+    assert "exit_reason" not in query
+    assert "ON CONFLICT (symbol, opened_at)" in query
+
+
+class _RowcountCursor(FakeCursor):
+    """`UPDATE ... RETURNING` 없이 영향 행 수를 보는 경로라 `rowcount`가 필요하다."""
+
+    def __init__(self, store: dict, rowcount: int):
+        super().__init__(store)
+        self.rowcount = rowcount
+
+
+class _RowcountConnection(FakeConnection):
+    def __init__(self, rowcount: int):
+        super().__init__()
+        self._rowcount = rowcount
+
+    def cursor(self) -> _RowcountCursor:
+        return _RowcountCursor(self.store, self._rowcount)
+
+
+def test_close_position_ledger_only_touches_rows_that_are_still_open():
+    conn = _RowcountConnection(rowcount=1)
+
+    closed = db.close_position_ledger(
+        conn, "A", datetime(2026, 8, 24, 9, 0), datetime(2026, 8, 24, 10, 0), 25.5, "TIME"
+    )
+
+    assert closed is True
+    assert "closed_at IS NULL" in conn.store["query"], (
+        "이 조건이 없으면 같은 종료를 두 번 보고할 때 손익이 두 번 세어진다"
+    )
+
+
+def test_close_position_ledger_reports_false_when_the_row_was_already_closed():
+    """이 False가 `apply_reconcile()`에서 `trade_history` 이중 적재를 막는다."""
+    conn = _RowcountConnection(rowcount=0)
+
+    assert db.close_position_ledger(
+        conn, "A", datetime(2026, 8, 24, 9, 0), datetime(2026, 8, 24, 10, 0), 25.5, "TIME"
+    ) is False

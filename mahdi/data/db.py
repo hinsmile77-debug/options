@@ -1966,3 +1966,177 @@ def daily_trade_counts_by_strategy(conn: ConnectionLike, day: date) -> dict[str,
         )
         rows = cur.fetchall()
     return {strategy_id: int(count) for strategy_id, count in rows if strategy_id is not None}
+
+
+# ===== 2026-08-23 (실행 배선 ①) — 포지션 원장 =====
+#
+# 마이그레이션 034. 030 `position_snapshots`와 겹치지 않는다 — 저쪽은 「브로커가 말한 것」의
+# 시간축 미러이고, 이쪽은 「우리가 아는 것」의 원장이다(포지션 하나당 한 행). 자세한 근거는
+# 034 헤더와 `mahdi/execution/position_ledger.py` 모듈 docstring.
+_POSITION_LEDGER_COLUMNS = (
+    "symbol", "opened_at", "side", "qty", "entry_price", "opened_at_exact", "origin",
+    "strategy_id", "entry_order_id", "regime_entry", "exit_rules_key", "confidence_entry",
+    "last_seen_at", "closed_at", "exit_price", "exit_reason",
+)
+
+# 열린 행을 읽을 때 float으로 되돌릴 DECIMAL 컬럼 — 07-28 8차의 `Decimal`/`float` 혼합 버그와
+# 같은 함정이다(psycopg가 DECIMAL을 Decimal로 돌려주고, 그것이 float와 섞이면 TypeError).
+_POSITION_LEDGER_DECIMAL_COLUMNS = ("qty", "entry_price", "confidence_entry", "exit_price")
+
+# ===== 2026-08-23 — 읽을 때 tzinfo를 뗀다. **라이브 왕복이 이것을 잡았다.** =====
+#
+# 우리는 naive KST 벽시계를 쓰고(`local_now()` docstring) TIMESTAMPTZ 컬럼은 그것을 "+00"으로
+# 라벨링해 저장한다. 그런데 **읽을 때는 psycopg가 tz-aware로 돌려준다** — 즉 왕복 한 번에
+# naive가 aware가 되고, 그것을 `local_now()`(naive)와 빼면
+#
+#     TypeError: can't subtract offset-naive and offset-aware datetimes
+#
+# 가 난다. 벽시계 숫자는 이미 같은 좌표계이므로 **tzinfo만 떼면 맞다**(317·506·534·1569행이
+# 같은 처리를 한다 — 이 저장소의 기존 규약이다).
+#
+# **이 버그가 왜 위험했나**: 단위 테스트로는 절대 안 드러난다(스텁이 naive를 그대로 돌려준다).
+# 그리고 터지는 자리가 하필 **재기동 직후의 청산 루프**다 — `load_open_entries()`로 원장을
+# 복원한 뒤 `held_minutes()`를 부르는 첫 순간이고, 그때는 이미 포지션을 들고 있다. 07-28 8차가
+# *"새 DB 조회 함수는 최소 1회 라이브 왕복"*을 규약으로 만든 이유가 정확히 이것이다.
+_POSITION_LEDGER_TIMESTAMP_COLUMNS = ("opened_at", "last_seen_at", "closed_at")
+
+# `upsert_position_ledger()`가 쓰는 컬럼 — **종료 3종을 뺀 나머지 전부**다. 목록을 여기서
+# 파생시키는 이유: 컬럼이 늘 때 한쪽만 고쳐 두 목록이 갈리면, 새 컬럼이 조용히 안 써진다.
+_POSITION_LEDGER_OPEN_COLUMNS = tuple(
+    c for c in _POSITION_LEDGER_COLUMNS if c not in ("closed_at", "exit_price", "exit_reason")
+)
+
+
+def upsert_position_ledger(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: `position_ledger.ledger_row()`가 만든 dict(열려 있는 포지션 한 행).
+    계산: INSERT ... ON CONFLICT (symbol, opened_at) DO UPDATE — 대사가 매 사이클 같은 행을
+         다시 쓰므로 멱등이어야 한다(수량·평균단가·`last_seen_at`이 갱신된다).
+    해석: **`closed_at`을 안 건드린다.** 이 함수는 열려 있는 행만 다루고, 닫는 것은
+         `close_position_ledger()`의 몫이다 — 한 함수가 둘 다 하면 대사 버그 하나가 닫힌
+         행을 되살릴 수 있다.
+    실패 조건: 같은 종목의 열린 행이 이미 다른 `opened_at`으로 있으면 **부분 유니크 인덱스가
+              거부한다**(마이그레이션 034). 조용히 이중 계상되는 것보다 적재가 실패하고 그
+              실패가 로그에 남는 쪽이 낫다 — 예외는 호출측으로 전파된다.
+    """
+    payload = {k: row.get(k) for k in _POSITION_LEDGER_OPEN_COLUMNS}
+    _upsert(conn, "position_ledger", _POSITION_LEDGER_OPEN_COLUMNS, ("symbol", "opened_at"), payload)
+
+
+def close_position_ledger(
+    conn: ConnectionLike,
+    symbol: str,
+    opened_at: datetime,
+    closed_at: datetime,
+    exit_price: float | None,
+    exit_reason: str,
+) -> bool:
+    """
+    입력: 닫을 행의 키(종목·개시시각), 종료 시각·청산가·사유.
+    계산: `closed_at IS NULL`인 행만 UPDATE한다.
+    반환: 실제로 닫힌 행이 있으면 True.
+    해석: **이미 닫힌 행은 다시 안 닫는다**(WHERE 절의 `closed_at IS NULL`). 대사가 같은
+         종료를 두 번 보고하면 두 번째는 False가 되고, 호출측은 그것으로 `trade_history`
+         이중 적재를 막는다 — 손익이 두 번 세어지는 것이 이 표에서 가장 나쁜 실패다.
+    실패 조건: 없다 — 행이 없으면 False.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE position_ledger SET closed_at=%s, exit_price=%s, exit_reason=%s "
+            "WHERE symbol=%s AND opened_at=%s AND closed_at IS NULL",
+            (closed_at, exit_price, exit_reason, symbol, opened_at),
+        )
+        closed = cur.rowcount > 0
+    conn.commit()
+    return closed
+
+
+def open_position_ledger(conn: ConnectionLike) -> list[dict]:
+    """
+    입력: DB 커넥션.
+    계산: `closed_at IS NULL`인 행 전부를 개시 시각 순으로 돌려준다.
+    해석: **재시작 복원의 우리 쪽 절반이다**(L12/R12 — 브로커 재조회가 나머지 절반). 프로세스가
+         죽었다 살아나면 「무엇을 들고 있나」는 브로커에게 묻고, 「언제·왜 들어갔나」는 이
+         함수가 답한다. 이것이 없으면 재기동 한 번에 모든 포지션이 고아가 되고 타임스톱이
+         전부 하한 위에서 돈다.
+    실패 조건: 없다 — 열린 포지션이 없으면 빈 목록.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(_POSITION_LEDGER_COLUMNS)} FROM position_ledger "
+            "WHERE closed_at IS NULL ORDER BY opened_at",
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for values in rows:
+        record = dict(zip(_POSITION_LEDGER_COLUMNS, values))
+        for col in _POSITION_LEDGER_DECIMAL_COLUMNS:
+            if record.get(col) is not None:
+                record[col] = float(record[col])
+        for col in _POSITION_LEDGER_TIMESTAMP_COLUMNS:
+            stamp = record.get(col)
+            if stamp is not None and stamp.tzinfo is not None:
+                record[col] = stamp.replace(tzinfo=None)
+        out.append(record)
+    return out
+
+
+_TRADE_HISTORY_COLUMNS = (
+    "strategy_id", "symbol", "entry_time", "exit_time", "entry_price", "exit_price", "qty",
+    "gross_pnl", "commission", "slippage", "net_pnl", "regime_entry", "confidence_entry",
+    "exit_reason", "setup_fingerprint",
+)
+
+
+def insert_trade_history(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: `position_ledger.trade_history_row()`가 만든 dict — 왕복이 완결된 트레이드 하나.
+    계산: 단순 INSERT. `trade_id`는 DB가 `gen_random_uuid()`로 채운다.
+    해석: **이 저장소에서 `trade_history`에 쓰는 첫 함수다.** 07-11부터 스키마만 있고 쓰는
+         곳이 없어 `get_trade_history()`·`daily_trade_counts_by_strategy()`가 항상 빈 값을
+         돌려줬고, 그 0행이 메타라벨 학습(§11.2)·자기강화 학습(§14)·Champion-Challenger
+         (§14.4)를 전부 막고 있었다.
+    해석(멱등): **멱등하지 않다 — 일부러 그렇다.** 같은 트레이드를 두 번 넣을 자연키가 없고
+         (같은 종목을 같은 분에 두 번 여닫을 수 있다), 억지로 키를 만들면 그 키가 틀린 날
+         진짜 트레이드가 사라진다. 이중 적재는 대신 **호출측**이 막는다 —
+         `close_position_ledger()`가 True를 돌려준 경우에만 이 함수를 부른다.
+    실패 조건: 예외는 호출측으로 전파된다(R7) — 손익 기록의 실패를 조용히 삼키면 그날의
+              성과가 영구히 틀린다.
+    """
+    values = [row.get(c) for c in _TRADE_HISTORY_COLUMNS]
+    placeholders = ", ".join(["%s"] * len(_TRADE_HISTORY_COLUMNS))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO trade_history ({', '.join(_TRADE_HISTORY_COLUMNS)}) "
+            f"VALUES ({placeholders})",
+            values,
+        )
+    conn.commit()
+
+
+def position_ledger_counts(conn: ConnectionLike, day: date) -> dict:
+    """
+    입력: DB 커넥션, 집계할 날짜.
+    계산: 그날 연 건수 · 그날 닫은 건수 · 지금 열려 있는 건수 · 그중 진입 시각을 모르는 건수.
+    해석: 마지막 값이 0이 아니면 그만큼의 포지션은 **타임스톱이 하한 위에서 돈다.** 리포트가
+         그 사실을 인쇄해야 한다 — 「걸렸다」와 「걸릴 수 있었는데 시각을 몰랐다」는 다른
+         사건이다(규약 C).
+    실패 조건: 없다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FILTER (WHERE opened_at::date = %s), "
+            "       count(*) FILTER (WHERE closed_at::date = %s), "
+            "       count(*) FILTER (WHERE closed_at IS NULL), "
+            "       count(*) FILTER (WHERE closed_at IS NULL AND NOT opened_at_exact) "
+            "FROM position_ledger",
+            (day, day),
+        )
+        row = cur.fetchone()
+    opened, closed, still_open, unknown = (row or (0, 0, 0, 0))
+    return {
+        "opened": int(opened or 0),
+        "closed": int(closed or 0),
+        "open_now": int(still_open or 0),
+        "unknown_entry_time": int(unknown or 0),
+    }

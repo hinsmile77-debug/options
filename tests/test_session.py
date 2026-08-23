@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from datetime import datetime, time as dtime
 
+import pytest
+
 from mahdi import session
 
 
@@ -142,3 +144,16 @@ def test_equity_spot_window_leaves_the_entry_cutoff_untouched():
     """이 구간은 전부 진입 컷오프(14:50) 이후다 — 신규 진입에는 1비트도 영향이 없다."""
     assert session.NEW_ENTRY_CUTOFF < session.EQUITY_CONTINUOUS_TRADING_END
     assert session.is_after_entry_cutoff(session.EQUITY_CONTINUOUS_TRADING_END) is True
+
+
+# ===== 2026-08-23 (실행 배선 ①) — 세션 시작 datetime =====
+
+
+def test_session_start_of_returns_nine_am_on_the_same_date():
+    assert session.session_start_of(datetime(2026, 8, 24, 14, 37, 12)) == datetime(2026, 8, 24, 9, 0)
+
+
+def test_session_start_of_refuses_a_bare_time():
+    """time을 받으면 날짜를 지어내야 하고, 그것은 이 모듈이 절대 하면 안 되는 일이다."""
+    with pytest.raises(AttributeError):
+        session.session_start_of(dtime(14, 37))
