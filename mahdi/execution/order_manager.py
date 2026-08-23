@@ -12,7 +12,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from datetime import datetime
+
 from mahdi.broker.order_state_machine import Order, OrderState, OrderStateMachine
+from mahdi.execution.hybrid_mode import GateAction
 
 logger = logging.getLogger(__name__)
 
@@ -100,3 +103,105 @@ def confirm_fill(order: Order, broker: BrokerClient) -> Order:
         return order
     machine = OrderStateMachine(order)
     return machine.transition(new_state, filled_px=status.get("filled_px"), filled_qty=status.get("filled_qty"))
+
+
+# ===== 2026-08-23 (실행 배선 ③) — 주문이 나가기 위해 **전부** 참이어야 하는 것들 =====
+#
+# 이 함수가 이 증분의 안전장치다. 종전까지 「주문을 내면 안 되는 이유」는 여러 파일의 **주석**에
+# 흩어져 있었고, 주석은 실행되지 않는다. 여기서 값으로 만든다.
+#
+# ## 왜 CONFIRM이 제출하지 않는가 — 승인 채널이 없다
+#
+# `gate_entry()`는 CONFIRM에서 `PENDING_CONFIRMATION`(60초 타임아웃)을 낸다. v6 §13.1은 그것을
+# *"대시보드 원클릭 승인 후 실행"*으로 정의했는데, **그 대시보드 버튼이 없다.** 승인 채널이
+# 없는 상태에서 CONFIRM을 제출로 취급하면 그것은 FULL_AUTO이고, 사람이 「승인 모드」라고 믿는
+# 동안 자동매매가 도는 것이 된다 — 이 저장소가 가장 경계하는 형태의 거짓(설정과 사실의 분리)이다.
+# 그래서 **AUTO_SUBMIT만 제출한다.**
+#
+# ## 왜 재진입 쿨다운이 전제인가 — 저장소 자신이 그렇게 적었다
+#
+# `strategy_params.yaml`의 `reentry_cooldown_minutes` 주석: *"켤 조건 … **실주문 배선 전에**
+# 켜고, 그 전에 며칠치 ENTER 빈도 분포를 본다."* 그 값이 아직 0이다.
+#
+# 08-11 실측이 그 이유를 말한다: ENTER **281건/494분(56.9%)**, 09:03~09:19 **16분 연속**.
+# ADVISORY라 무해했지만 실주문이었다면 16분 연속 진입이다. 그리고 08-23에 켠 레버 F가
+# HIGH_CONVICTION을 **늘리는** 방향이다 — 즉 그 빈도는 더 올라간다.
+#
+# 여기서 쿨다운을 대신 켜지 않는 이유: 그것은 판단 출력을 움직이는 결정이고, 레버 F와 같은
+# 날 켜면 **귀속이 안 갈린다**(08-23에 레버 E를 09-01로 미룬 것과 같은 이유). 대신 **켜지지
+# 않은 동안 주문을 막는다** — 사람이 값을 정하는 것이 이 항목의 해소이고, 그 전까지는
+# 배선이 완성돼도 주문이 안 나간다.
+BLOCKER_MODE_NOT_AUTO = "mode_not_auto_submit"
+BLOCKER_REENTRY_COOLDOWN_OFF = "reentry_cooldown_not_configured"
+BLOCKER_NO_ENTRY_PLAN = "no_entry_plan"
+BLOCKER_NO_LIMIT_PRICE = "limit_price_missing"
+BLOCKER_SYMBOL_UNRESOLVED = "symbol_unresolved"
+BLOCKER_QTY_NOT_POSITIVE = "qty_not_positive"
+
+
+def submission_blockers(
+    *,
+    gate_action,
+    entry_plan,
+    symbol_resolved: bool,
+    qty: int,
+    reentry_cooldown_minutes: float,
+) -> list[str]:
+    """
+    입력: 하이브리드 게이트 판정, 만들어진 `EntryPlan`(없으면 None), 종목코드를 실제로
+         찾았는지, 승인 계약수, 설정된 재진입 쿨다운(분).
+    계산: 주문을 막는 사유를 **전부** 모은다 — 첫 번째에서 멈추지 않는다.
+    반환: 빈 목록이면 제출해도 된다.
+    해석: **전부 모으는 것이 요점이다.** 하나만 돌려주면 그것을 고친 뒤에야 다음이 보이고,
+         「고쳤는데 여전히 안 나간다」가 반복된다. 이 목록이 그대로
+         `signal_decisions.risk_gate_state`에 실려 리포트가 인쇄한다.
+    실패 조건: 없다.
+
+    ⚠ **이 함수는 리스크 게이트가 아니다.** 한도·서킷브레이커·14:50 컷오프는 이미
+      `RiskEngine.evaluate_entry()`가 봤고(§12 독립 거부권), 여기 오는 것은 그것을 통과한
+      후보다. 이 함수가 보는 것은 **「실행 경로가 준비됐는가」** 하나다. 둘을 섞으면 어느
+      층이 거부했는지 사후에 못 가린다.
+    """
+    blockers: list[str] = []
+    if gate_action != GateAction.AUTO_SUBMIT:
+        blockers.append(BLOCKER_MODE_NOT_AUTO)
+    if not reentry_cooldown_minutes or reentry_cooldown_minutes <= 0:
+        blockers.append(BLOCKER_REENTRY_COOLDOWN_OFF)
+    if entry_plan is None:
+        blockers.append(BLOCKER_NO_ENTRY_PLAN)
+    elif entry_plan.order_type == "LIMIT" and not entry_plan.limit_price:
+        # 0.0을 지정가로 보내면 거래소가 거부한다 — 그런데 그 거부는 「주문 API가 안 된다」로
+        # 오귀속되기 쉽다(`entry.DEFAULT_TICK_SIZE` 주석의 08-18 사례와 같은 함정).
+        blockers.append(BLOCKER_NO_LIMIT_PRICE)
+    if not symbol_resolved:
+        # 행사가 라벨(`C1090.0`)로는 주문을 못 낸다 — 단축상품번호가 있어야 한다.
+        blockers.append(BLOCKER_SYMBOL_UNRESOLVED)
+    if qty <= 0:
+        blockers.append(BLOCKER_QTY_NOT_POSITIVE)
+    return blockers
+
+
+def build_order(plan, order_id: str, now: datetime) -> Order:
+    """
+    입력: 승인된 `EntryPlan`, 로컬 주문 식별자, 주문 시각.
+    계산: PENDING 상태의 `Order`를 만든다. 시장가면 `intended_px`에 0.0이 아니라
+         `limit_price`(없으면 0.0)를 넣는다 — 시장가 주문의 의도 가격은 기록용이다.
+    해석: `order_id`는 **로컬 식별자**다. 제출 응답의 KIS 주문번호(`ODNO`)로 갈아끼우는 것은
+         `submit()`의 `extract_order_no`가 한다 — 안 갈아끼우면 체결 조회가 존재하지 않는
+         번호를 묻고 **영원히 PENDING**을 돌려받는다(`submit()` docstring의 08-16 발견).
+    실패 조건: 없다.
+    """
+    return Order(
+        order_id=order_id,
+        symbol=plan.symbol,
+        side=plan.side,
+        order_type=plan.order_type,
+        intended_px=float(plan.limit_price or 0.0),
+        qty=int(plan.qty),
+        timestamp=now,
+    )
+
+
+def order_dvsn_cd(plan) -> str:
+    """`EntryPlan.order_type` → KIS 주문구분코드. 01=지정가 / 02=시장가(`rest_client` 참고)."""
+    return "02" if plan.order_type == "MARKET" else "01"

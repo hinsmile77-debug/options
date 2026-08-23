@@ -3850,8 +3850,16 @@ def test_a_minute_without_a_premium_says_so_instead_of_pricing_at_zero(monkeypat
     assert shadow["entry_plan_blocked_by"] == "option_price_missing_this_minute"
 
 
-def test_a_configured_auto_mode_is_still_recorded_as_advisory_while_unwired(monkeypatch):
-    """설정을 FULL_AUTO로 올려도 주문 경로가 없으면 기록은 실제(ADVISORY)를 말해야 한다."""
+def test_a_configured_auto_mode_is_no_longer_clamped_now_that_the_path_is_wired(monkeypatch):
+    """2026-08-23 (실행 배선 ③) — **이 테스트의 뜻이 뒤집혔다. 일부러 그렇다.**
+
+    08-17~08-22에는 `_ORDER_PATH_WIRED=False`라 `effective_mode()`가 FULL_AUTO를 ADVISORY로
+    낮췄고, 이 테스트는 *"기록이 실제를 말한다"*를 지켰다. 이제 호출부가 생겨 그 클램프가
+    풀린다 — 설정이 곧 실행 모드다.
+
+    **보호가 사라진 것이 아니라 옮겨 갔다.** 아래 두 테스트가 그 자리를 대신 지킨다:
+    모드가 FULL_AUTO여도 `submission_blockers()`가 비지 않으면 주문은 안 나간다.
+    """
     from mahdi.config.settings import get_strategy_params
 
     monkeypatch.setattr(
@@ -3859,9 +3867,46 @@ def test_a_configured_auto_mode_is_still_recorded_as_advisory_while_unwired(monk
         lambda: {**get_strategy_params(), "hybrid_mode": {"default": "FULL_AUTO"}},
     )
     risk_gate_state, exec_mode = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
-    assert exec_mode == "ADVISORY"
+
+    assert exec_mode == "FULL_AUTO"
     assert risk_gate_state["execution_engine"]["configured_mode"] == "FULL_AUTO"
-    assert risk_gate_state["execution_engine"]["mode"] == "ADVISORY"
+    assert risk_gate_state["execution_engine"]["mode"] == "FULL_AUTO"
+
+
+def test_advisory_mode_never_submits_even_though_the_path_is_wired(monkeypatch):
+    """기본 설정(ADVISORY)에서는 주문이 나가지 않는다 — 배선 전과 겉보기 동작이 같다."""
+    risk_gate_state, _ = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
+    shadow = risk_gate_state["execution_engine"]
+
+    assert shadow["order_submitted"] is False
+    assert "mode_not_auto_submit" in shadow["submission_blockers"]
+
+
+def test_full_auto_is_still_blocked_while_the_reentry_cooldown_is_off(monkeypatch):
+    """`reentry_cooldown_minutes: 0`이면 FULL_AUTO여도 주문이 안 나간다.
+
+    `strategy_params.yaml`의 그 주석이 *"실주문 배선 **전에** 켠다"*고 지시했다. 켜는 것은
+    판단 출력을 움직이는 결정이라 사람의 몫이고, 그 전까지 **코드가 막는다** — 주석은
+    실행되지 않지만 이 전제는 실행된다.
+    """
+    from mahdi.config.settings import get_strategy_params
+
+    monkeypatch.setattr(
+        "mahdi.main.get_strategy_params",
+        lambda: {
+            **get_strategy_params(),
+            "hybrid_mode": {"default": "FULL_AUTO"},
+            "strategy_gates": {
+                **(get_strategy_params().get("strategy_gates") or {}),
+                "reentry_cooldown_minutes": 0,
+            },
+        },
+    )
+    risk_gate_state, _ = _run_fusion_cycle_capturing_risk_gate(monkeypatch)
+    shadow = risk_gate_state["execution_engine"]
+
+    assert shadow["order_submitted"] is False
+    assert "reentry_cooldown_not_configured" in shadow["submission_blockers"]
 
 
 def test_poll_signal_fusion_cycle_continues_after_cycle_failure(monkeypatch):

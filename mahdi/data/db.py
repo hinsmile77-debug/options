@@ -2198,3 +2198,73 @@ def order_notice_counts(conn: ConnectionLike, day: date, expected_field_count: i
         "field_count_mismatched": int(mismatched or 0),
         "field_count_distribution": distribution,
     }
+
+
+# ===== 2026-08-23 (실행 배선 ③) — 미종결 주문 =====
+#
+# 체결 확인 루프가 **재기동을 견디려면** 미종결 주문 목록이 프로세스 밖에 있어야 한다.
+# 메모리에 두면 워치독이 되살린 순간 「우리가 낸 주문」을 잊고, 그 주문은 체결되든 말든
+# 아무도 안 본다 — 원장을 DB에 둔 것과 정확히 같은 이유다(L12/R12: 프로세스는 무상태).
+#
+# `execution_logs`가 이미 그 표다(PK가 order_id, state가 PENDING/PARTIAL/…). 새 표를 만들지
+# 않고, 컬럼 목록도 위 `_EXECUTION_LOG_COLUMNS`를 그대로 쓴다(두 번 선언하면 갈린다).
+_OPEN_ORDER_STATES = ("PENDING", "PARTIAL")
+
+
+def open_orders(conn: ConnectionLike, day: date | None = None) -> list[dict]:
+    """
+    입력: DB 커넥션, (선택) 그날로 한정할 날짜.
+    계산: `state`가 PENDING/PARTIAL인 주문을 시각 순으로 돌려준다.
+    해석: **날짜를 거는 이유**: KIS 체결내역 조회(`inquire_ccnl`)가 «그날 주문»만 본다.
+         전날 미종결로 남은 행을 오늘 조회하면 영원히 「없다 → PENDING」을 돌려받고
+         (`get_order_fill_status()`의 문서화된 동작), 그 행은 매 사이클 헛조회를 만든다.
+         날짜를 안 주면 전부 돌려주므로, 장마감 정리 배치가 그것을 쓴다.
+    실패 조건: 없다 — 미종결 주문이 없으면 빈 목록.
+    """
+    query = (
+        f"SELECT {', '.join(_EXECUTION_LOG_COLUMNS)} FROM execution_logs "
+        f"WHERE state = ANY(%s)"
+    )
+    params: list = [list(_OPEN_ORDER_STATES)]
+    if day is not None:
+        query += " AND timestamp::date = %s"
+        params.append(day)
+    query += " ORDER BY timestamp"
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for values in rows:
+        record = dict(zip(_EXECUTION_LOG_COLUMNS, values))
+        for col in ("intended_px", "filled_px", "slippage_ticks"):
+            if record.get(col) is not None:
+                record[col] = float(record[col])
+        if record.get("timestamp") is not None and record["timestamp"].tzinfo is not None:
+            # 왕복하면 tz-aware로 돌아온다 — 08-23에 원장에서 같은 것에 물렸다.
+            record["timestamp"] = record["timestamp"].replace(tzinfo=None)
+        out.append(record)
+    return out
+
+
+def execution_log_counts(conn: ConnectionLike, day: date) -> dict:
+    """
+    입력: DB 커넥션, 집계할 날짜.
+    계산: 그날 주문 수를 상태별로 세고, 미종결 수를 따로 낸다.
+    해석: **`submitted`가 0이 아닌 첫 날이 이 저장소의 실주문 개시일이다.** 08-18 왕복
+         3건은 격리된 스크립트가 낸 것이라 여기 안 잡힌다(그 스크립트는 자기 행을
+         `execution_logs`에 남기지만 날짜가 08-18이다).
+    실패 조건: 없다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT state, count(*) FROM execution_logs WHERE timestamp::date=%s GROUP BY state",
+            (day,),
+        )
+        by_state = {str(state): int(count) for state, count in cur.fetchall() if state}
+    return {
+        "submitted": sum(by_state.values()),
+        "by_state": by_state,
+        "open": sum(by_state.get(s, 0) for s in _OPEN_ORDER_STATES),
+        "filled": by_state.get("FILLED", 0),
+        "rejected": by_state.get("REJECTED", 0),
+    }

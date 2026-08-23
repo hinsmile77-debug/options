@@ -25,7 +25,8 @@ import httpx
 import websockets
 
 from mahdi.broker import tr_codes
-from mahdi.broker.rest_client import KISRestClient
+from mahdi.broker.order_state_machine import Order, OrderState, order_to_execution_log_row
+from mahdi.broker.rest_client import KISRestClient, extract_order_no
 from mahdi.broker.token_daemon import TokenDaemon
 from mahdi.broker import order_notice
 from mahdi.broker.ws_client import ApprovalKeyIssuer, KISWebSocketClient, Subscription, WSConnection
@@ -57,7 +58,7 @@ from mahdi.execution.account_tracker import (
 from mahdi.execution.engine import EntryRequest, ExecutionEngine
 from mahdi.execution.entry import EntryContext
 from mahdi.execution.hybrid_mode import HybridMode, effective_mode, mode_from_params
-from mahdi.execution import position_ledger
+from mahdi.execution import order_manager, position_ledger
 from mahdi.features.options_intel import (
     OptionLeg,
     atm_straddle_vrp,
@@ -4030,17 +4031,30 @@ def _record_risk_snapshot(
 # 없었다」, `REASON_*`는 「돌렸는데 못 골랐다」 — 셋은 서로 다른 사건이다.
 _SELECTION_NO_ENTRY_STRATEGY = "no_entry_strategy"
 
-# ===== 2026-08-17 — 주문 제출 경로는 아직 배선돼 있지 않다 =====
+# ===== 2026-08-17 → 2026-08-23 — 주문 제출 경로가 **배선됐다** =====
 #
 # 이 상수 하나가 «설정»과 «사실»을 가른다. `strategy_params.yaml`을 CONFIRM/FULL_AUTO로 바꿔도
 # 이 값이 False인 동안 실행 모드는 ADVISORY로 낮춰지고(`effective_mode()`), `signal_decisions.
-# exec_mode`에는 **실제로 일어난 것**이 기록된다. 설정값은 `risk_gate_state.execution_engine.
-# configured_mode`에 따로 남으므로 둘이 갈렸다는 사실 자체가 관측 가능하다.
+# exec_mode`에는 **실제로 일어난 것**이 기록된다.
 #
-# **이 값을 True로 바꾸는 것만으로는 주문이 나가지 않는다** — `order_manager.submit()` 호출부를
-# 이 파일에 실제로 넣는 것이 그 작업이고, 그때 이 상수도 함께 바꾼다. 지금 이것을 True로 두면
-# 기록만 거짓이 되고 체결은 여전히 0건이다.
-_ORDER_PATH_WIRED = False
+# 08-17 원문은 이렇게 적었다: *"이 값을 True로 바꾸는 것만으로는 주문이 나가지 않는다 —
+# `order_manager.submit()` 호출부를 이 파일에 실제로 넣는 것이 그 작업이고, **그때 이 상수도
+# 함께 바꾼다.**"* 08-23에 그 호출부가 생겼다(`_submit_entry_order()`). 그래서 함께 바꾼다.
+#
+# ## ⚠ 그래도 오늘 주문은 나가지 않는다 — 잠금이 **셋** 남아 있다
+#
+# 이 값이 True가 됐다고 자동매매가 켜진 것이 아니다. 제출까지 가려면 전부 참이어야 한다:
+#
+#   1. `hybrid_mode.default`가 **FULL_AUTO** — 지금은 `ADVISORY`다(설정 파일).
+#      CONFIRM은 제출하지 않는다. v6 §13.1이 그것을 «대시보드 원클릭 승인 후 실행»으로
+#      정의했는데 **그 버튼이 없기 때문**이다(`order_manager.submission_blockers()` 주석).
+#   2. `strategy_gates.reentry_cooldown_minutes > 0` — 지금은 **0**이다. 그 설정의 주석이
+#      *"실주문 배선 전에 켜라"*고 지시했고, 켜는 것은 판단 출력을 움직이는 결정이라
+#      사람의 몫으로 남긴다. 그동안 코드가 주문을 막는다.
+#   3. 종목코드·지정가·수량이 실제로 있어야 한다.
+#
+# **1과 2는 사람이 파일을 고쳐야 풀린다.** 코드 배선만으로는 안 풀린다는 것이 이 설계의 요점이다.
+_ORDER_PATH_WIRED = True
 
 # 2026-08-18 — 마이그레이션 032로 `option_analysis_1m.price`가 생겨 이 제약이 **풀렸다.**
 # 종전에는 가격 컬럼 자체가 없어 `EntryContext.reference_price`를 채울 수 없었고, 그것이
@@ -4056,6 +4070,9 @@ def _shadow_execution_outcome(
     execution_engine: ExecutionEngine,
     selection_record: dict,
     *,
+    conn=None,
+    rest_client: KISRestClient | None = None,
+    reentry_cooldown_minutes: float = 0.0,
     sizing_input: PositionSizingInput,
     account_state: AccountState,
     strategy_id: str,
@@ -4130,7 +4147,7 @@ def _shadow_execution_outcome(
         has_open_position_same_direction=account_state.same_direction_positions > 0,
     )
     outcome = execution_engine.evaluate_entry(request, mode)
-    return {
+    record = {
         "evaluated": True,
         "approved": outcome.approved,
         "approved_size": outcome.approved_size,
@@ -4147,12 +4164,42 @@ def _shadow_execution_outcome(
         "reference_price": reference_price,
         # 가격이 있는 분에는 None — 즉 이 키가 채워져 있으면 그 분은 지정가를 못 만든다.
         "entry_plan_blocked_by": None if reference_price is not None else _ENTRY_PLAN_BLOCKED_NO_PRICE,
-        # **주문은 나가지 않았다.** 이 파일에 `order_manager.submit()` 호출부가 없다.
-        "order_submitted": False,
         "mode": mode.value,
-        # 설정과 실제가 갈렸는지 여기서 보인다 — 둘이 다르면 주문 경로가 아직 없다는 뜻이다.
+        # 설정과 실제가 갈렸는지 여기서 보인다.
         "configured_mode": configured_mode.value,
     }
+
+    # ===== 2026-08-23 (실행 배선 ③) — 여기서부터 실제 주문이다 =====
+    #
+    # 08-17부터 이 자리에는 `"order_submitted": False` 한 줄이 상수로 박혀 있었다. 이제 값이
+    # 아니라 **결과**다. 다만 `submission_blockers()`가 전부 통과해야 제출되고, 오늘 그중 둘은
+    # 사람이 설정 파일을 고쳐야 풀린다(`_ORDER_PATH_WIRED` 위 주석).
+    #
+    # `conn`/`rest_client`가 없으면(테스트·백테스트 경로) 제출하지 않는다. 다만 **막힌 사유는
+    # 그래도 전부 계산한다** — 「클라이언트가 없다」 하나가 나머지 사유를 가리면, 라이브에서
+    # 그것을 채웠을 때 무엇이 더 막고 있는지 그제야 하나씩 드러난다.
+    blockers = order_manager.submission_blockers(
+        gate_action=outcome.gate_decision.action if outcome.gate_decision else None,
+        entry_plan=outcome.entry_plan,
+        symbol_resolved=bool(record.get("symbol_resolved")),
+        qty=int(record.get("qty") or 0),
+        reentry_cooldown_minutes=reentry_cooldown_minutes,
+    )
+    if conn is None or rest_client is None:
+        record["order_submitted"] = False
+        record["submission_blockers"] = [*blockers, "order_path_not_available"]
+        return record
+
+    record.update(
+        _submit_entry_order(
+            conn, rest_client, record,
+            entry_plan=outcome.entry_plan,
+            gate_action=outcome.gate_decision.action if outcome.gate_decision else None,
+            now=now,
+            reentry_cooldown_minutes=reentry_cooldown_minutes,
+        )
+    )
+    return record
 
 
 def _build_symbol_resolver(conn, master: IndexDerivativesMaster | None, underlying: str):
@@ -4201,6 +4248,10 @@ async def poll_signal_fusion_cycle(
     phase_offset_seconds: float = 0.0,
     futures_symbol: str | None = None,
     master: IndexDerivativesMaster | None = None,
+    # 2026-08-23 (실행 배선 ③) — 주문 제출에 쓴다. **None이면 제출 경로가 통째로 꺼진다**
+    # (`_shadow_execution_outcome`이 종전과 같이 기록만 한다) — 기존 테스트를 안 깨는 쪽이고,
+    # 라이브는 `main()`이 반드시 채운다.
+    rest_client: KISRestClient | None = None,
 ) -> None:
     """
     입력: 다른 폴러가 매 선물봉마다 갱신하는 RegimeStateMachine(최신 레짐은 last_state로 읽음 —
@@ -4467,6 +4518,16 @@ async def poll_signal_fusion_cycle(
                         risk_gate_state["execution_engine"] = _shadow_execution_outcome(
                             execution_engine,
                             selection_record,
+                            # 2026-08-23 (실행 배선 ③) — 이 둘이 넘어가면서 이 호출은
+                            # 더 이상 「그림자」가 아니다. 다만 제출 전제(모드·쿨다운·
+                            # 종목코드·지정가)가 전부 참일 때만 실제로 나간다.
+                            conn=conn,
+                            rest_client=rest_client,
+                            reentry_cooldown_minutes=float(
+                                (get_strategy_params().get("strategy_gates") or {}).get(
+                                    "reentry_cooldown_minutes"
+                                ) or 0.0
+                            ),
                             sizing_input=sizing_input,
                             account_state=account_state,
                             strategy_id=entry_candidates[0],
@@ -4596,6 +4657,163 @@ async def poll_account_balance_cycle(
             )
         await asyncio.sleep(delay)
 
+
+# ===== 2026-08-23 (실행 배선 ③) — 체결 확인 루프 =====
+#
+# 제출은 판단 사이클(`poll_signal_fusion_cycle`)이 하고, **확인은 이 루프가 한다.** 둘을 가르는
+# 이유: 제출은 신호가 있을 때만 일어나는 사건이고 확인은 미종결 주문이 있는 한 계속돼야 하는
+# 상태다. 같은 코루틴에 두면 신호가 끊긴 분에 확인도 함께 멈춘다.
+#
+# **미종결 목록을 DB에서 읽는다**(`db.open_orders()`) — 메모리에 두면 워치독이 되살린 순간
+# 우리가 낸 주문을 잊는다. 08-21에 장중 재기동이 실제로 있었다.
+ORDER_FILL_POLL_INTERVAL_SECONDS = 20.0
+ORDER_FILL_PHASE_OFFSET_SECONDS = 7.0
+
+LOG_ORDER_SUBMITTED = "주문 제출: %s %s %s %d계약 @%s · 로컬id=%s → 브로커번호=%s · rt_cd=%s"
+LOG_ORDER_BLOCKED = "주문 미제출 — 실행 경로 전제 미충족: %s (종목=%s 수량=%d 모드=%s)"
+LOG_ORDER_STATE_CHANGED = "주문 상태 전이: %s %s → %s (체결 %d/%d @%s)"
+
+
+async def poll_open_orders(
+    rest_client: KISRestClient,
+    interval_seconds: float = ORDER_FILL_POLL_INTERVAL_SECONDS,
+    phase_offset_seconds: float = ORDER_FILL_PHASE_OFFSET_SECONDS,
+    max_cycles: int | None = None,
+) -> None:
+    """
+    입력: REST 클라이언트, 폴링 주기·위상, (테스트용) 최대 사이클 수.
+    계산: `execution_logs`의 미종결(PENDING/PARTIAL) 주문을 **그날 것만** 골라
+         `order_manager.confirm_fill()`로 REST 재확인하고, 상태가 바뀐 것만 다시 적재한다.
+    해석: v6 §13.2 「체결통보-REST 이중 확인」의 **REST 축**이다. 통보(②)가 빠른 축이고 이쪽이
+         느리지만 확실한 축이다 — 통보가 안 붙어 있어도(지금이 그렇다: `KIS_HTS_ID` 미설정)
+         이 루프만으로 체결이 확인된다.
+    해석(오늘 것만 보는 이유): `inquire_ccnl`은 그날 주문만 조회한다. 전날 미종결 행을 오늘
+         물으면 「없다 → PENDING」을 영원히 돌려받고 매 사이클 헛조회가 된다.
+    실패 조건: 사이클 단위로 격리한다 — 한 주문의 조회 실패가 나머지 주문의 확인을 막으면
+              안 되고, 이 루프의 죽음이 관측 루프를 죽여서도 안 된다(다른 폴러와 같은 원칙).
+    """
+    await _sleep_until_first_wall_tick(interval_seconds, phase_offset_seconds)
+
+    next_tick: float | None = None
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        poll_time = db.local_now()
+        try:
+            with db.get_connection() as conn:
+                pending = db.open_orders(conn, poll_time.date())
+                for row in pending:
+                    _confirm_one_order(conn, rest_client, row)
+        except Exception:
+            logger.warning("체결 확인 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
+
+        loop_now = asyncio.get_running_loop().time()
+        next_tick, delay, overrun_seconds = _advance_fixed_tick(
+            next_tick, interval_seconds, loop_now, phase_offset_seconds
+        )
+        if overrun_seconds > 0:
+            logger.warning(
+                "체결 확인 사이클이 주기(%.0f초)를 초과해 스케줄이 %.1f초 밀렸습니다 — 다음 틱까지 %.1f초 대기",
+                interval_seconds, overrun_seconds, delay,
+            )
+        if max_cycles is not None and cycles >= max_cycles:
+            return
+        await asyncio.sleep(delay)
+
+
+def _confirm_one_order(conn, rest_client: KISRestClient, row: dict) -> None:
+    """주문 하나의 REST 재확인 — **실패를 여기서 삼킨다**(한 건이 나머지를 막으면 안 된다)."""
+    order = Order(
+        order_id=row["order_id"],
+        symbol=row["symbol"],
+        side=row["side"],
+        order_type=row["order_type"],
+        intended_px=row["intended_px"] or 0.0,
+        qty=int(row["qty"] or 0),
+        timestamp=row["timestamp"],
+        state=OrderState(row["state"]),
+        filled_px=row.get("filled_px"),
+        filled_qty=0,
+    )
+    previous = order.state
+    try:
+        updated = order_manager.confirm_fill(order, rest_client)
+    except Exception:
+        logger.warning("주문 %s 체결 확인 실패 — 다음 사이클에 다시 본다", row["order_id"], exc_info=True)
+        return
+    if updated.state == previous:
+        return  # 아직 안 바뀌었다 — 매 사이클 같은 행을 다시 쓰지 않는다.
+    logger.info(
+        LOG_ORDER_STATE_CHANGED,
+        updated.order_id, previous.value, updated.state.value,
+        updated.filled_qty, updated.qty, updated.filled_px,
+    )
+    db.insert_execution_log(conn, order_to_execution_log_row(updated))
+
+
+def _submit_entry_order(
+    conn,
+    rest_client: KISRestClient,
+    outcome_record: dict,
+    *,
+    entry_plan,
+    gate_action,
+    now: datetime,
+    reentry_cooldown_minutes: float,
+) -> dict:
+    """
+    입력: DB 커넥션, REST 클라이언트, 그림자 기록 dict(여기에 결과를 덧붙인다), 주문 계획,
+         게이트 판정, 판단 시각, 설정된 재진입 쿨다운.
+    계산: `order_manager.submission_blockers()`가 빈 목록일 때만 실제로 제출한다. 제출하면
+         응답에서 KIS 주문번호를 뽑아 `order.order_id`를 갈아끼우고 `execution_logs`에 남긴다.
+    반환: `outcome_record`에 덧붙일 dict(`order_submitted` / `blockers` / `order_id` / `rt_cd`).
+    해석: **막힌 이유를 전부 값으로 남긴다.** 「왜 주문이 안 나갔나」를 로그를 뒤져 추론하게
+         두지 않는다 — 그 목록이 `signal_decisions.risk_gate_state`에 실리고 리포트가 인쇄한다.
+    실패 조건: 제출 자체가 예외를 던지면 **삼키지 않고 기록한 뒤 다시 던지지 않는다** —
+              판단 사이클이 주문 하나 때문에 죽으면 그 분의 관측이 통째로 사라진다. 대신
+              `submit_error`로 남기고, 그 값이 0이 아닌 날은 사람이 봐야 한다.
+    """
+    blockers = order_manager.submission_blockers(
+        gate_action=gate_action,
+        entry_plan=entry_plan,
+        symbol_resolved=bool(outcome_record.get("symbol_resolved")),
+        qty=int(outcome_record.get("qty") or 0),
+        reentry_cooldown_minutes=reentry_cooldown_minutes,
+    )
+    if blockers:
+        logger.info(
+            LOG_ORDER_BLOCKED, ",".join(blockers), outcome_record.get("symbol"),
+            int(outcome_record.get("qty") or 0), outcome_record.get("mode"),
+        )
+        return {"order_submitted": False, "submission_blockers": blockers}
+
+    order = order_manager.build_order(entry_plan, f"mahdi_{now:%Y%m%d_%H%M%S}_{entry_plan.symbol}", now)
+    try:
+        result = order_manager.submit(order, rest_client, extract_order_no=extract_order_no)
+    except Exception as exc:
+        logger.warning("주문 제출 실패 — 이 분의 진입은 없다: %s", exc, exc_info=True)
+        return {"order_submitted": False, "submission_blockers": [], "submit_error": str(exc)}
+
+    rt_cd = str(result.broker_response.get("rt_cd", ""))
+    logger.info(
+        LOG_ORDER_SUBMITTED, result.order.symbol, result.order.side, result.order.order_type,
+        result.order.qty, result.order.intended_px, order.order_id, result.order.order_id, rt_cd,
+    )
+    try:
+        db.insert_execution_log(conn, order_to_execution_log_row(result.order))
+    except Exception:
+        # 적재 실패가 주문을 되돌리지는 못한다 — 주문은 이미 나갔다. 그 사실을 크게 남긴다.
+        logger.error(
+            "주문은 나갔는데 execution_logs 적재에 실패했다 — 이 주문은 체결 확인 루프가 "
+            "못 본다(브로커번호 %s). 사람이 확인할 것", result.order.order_id, exc_info=True,
+        )
+    return {
+        "order_submitted": result.order.state is not OrderState.REJECTED,
+        "submission_blockers": [],
+        "order_id": result.order.order_id,
+        "order_state": result.order.state.value,
+        "rt_cd": rt_cd,
+    }
 
 # ===== 2026-08-23 (실행 배선 ②) — 체결통보 스트림 =====
 #
@@ -4862,6 +5080,8 @@ async def main() -> None:
                 # 2026-08-17 §11.5 — 고른 (만기, 행사가, 콜풋)을 단축상품번호로 옮기려면
                 # 종목 마스터가 필요하다. 없으면 후보의 `symbol`만 비고 선택 자체는 돈다.
                 master=master,
+                # 2026-08-23 (실행 배선 ③) — 이것이 있어야 주문이 나갈 수 있다(전제 통과 시).
+                rest_client=rest_client,
             ),
             poll_account_balance_cycle(
                 rest_client, phase_offset_seconds=ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS
@@ -4869,6 +5089,9 @@ async def main() -> None:
             # 2026-08-23 (실행 배선 ②) — 체결통보 전용 WS. 시세와 **별개 연결**이다.
             # KIS_HTS_ID가 비어 있으면 경고 한 줄 남기고 즉시 끝난다(관측 루프는 정상 기동).
             poll_order_notice_stream(kis_settings, approval_key),
+            # 2026-08-23 (실행 배선 ③) — 체결 확인(REST 축). 미종결 목록은 DB에서 읽으므로
+            # 재기동을 견딘다. 주문이 0건이면 매 사이클 빈 목록이라 아무 일도 안 한다.
+            poll_open_orders(rest_client),
             # 2026-07-31 §4 우선순위 4 / 2026-08-01 §5-4 — 안전장치 생존 신호는 감시 대상과
             # 독립한 타이머에서 낸다(CB 감지 / WS 연결).
             poll_market_halt_heartbeat(market_halt_monitor),

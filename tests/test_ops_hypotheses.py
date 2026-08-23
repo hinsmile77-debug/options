@@ -254,6 +254,8 @@ _DB_METRIC_ROOTS = {
     # 2026-08-23 (실행 배선 ②) — 체결통보(마이그레이션 035). 첫 통보가 `_NOTICE_FIELDS`를
     # 실측으로 확정한다 — `field_count_distribution`이 그 판정이다.
     "order_notices",
+    # 2026-08-23 (실행 배선 ③) — 실제로 나간 주문(execution_logs).
+    "orders",
 }
 
 

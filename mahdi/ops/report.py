@@ -235,6 +235,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                           lambda: _render_ledger(db_metrics))
         lines += _section("16-3. 체결통보 — 우리 주문이 체결됐다는 사실을 실시간으로 아는가",
                           lambda: _render_order_notices(db_metrics, metrics))
+        lines += _section("16-4. 주문 — 나갔는가, 막혔는가, 무엇이 막았는가",
+                          lambda: _render_orders(db_metrics, metrics))
     lines += _section("17. 교차 점검 — 지표끼리 모순되는가",
                       lambda: _render_crosschecks(metrics, db_metrics))
     return "\n".join(lines).rstrip() + "\n"
@@ -2112,6 +2114,70 @@ def _render_db_misc(db: dict) -> list[str]:
         "",
     ]
     out += _render_spot_divergence(db)
+    return out
+
+
+def _render_orders(db: dict, log: dict) -> list[str]:
+    """2026-08-23 (실행 배선 ③) — 실제로 나간 주문(`execution_logs`).
+
+    **DB 축과 로그 축을 함께 읽는다.** 주문 0건이 「진입 신호가 없었다」인지 「막혔다」인지는
+    `execution_logs`만 봐서는 못 가린다 — 둘 다 0행이다. 로그의 `주문 미제출` 줄이 그
+    구분이고, 사유가 그 줄 안에 있다.
+    """
+    orders = db.get("orders")
+    qualitative = (log or {}).get("qualitative") or {}
+    blocked = qualitative.get("order_blocked", 0)
+
+    if not orders:
+        return ["> 주문 집계 불가 — `db.orders` 절이 없다.", ""]
+
+    submitted = orders.get("submitted", 0)
+    if submitted == 0:
+        out = ["- **그날 나간 주문이 0건이다.**", ""]
+        if blocked:
+            out += [
+                f"> 진입 판단은 있었고 **{blocked}번 막혔다.** 사유는 `observation_loop.log`의 "
+                "`주문 미제출` 줄과 `signal_decisions.risk_gate_state.execution_engine."
+                "submission_blockers`에 있다.",
+                "> 오늘 기대되는 사유는 둘이다 — `mode_not_auto_submit`(설정이 ADVISORY) · "
+                "`reentry_cooldown_not_configured`(쿨다운 0). **둘 다 사람이 설정 파일을 "
+                "고쳐야 풀린다.** 코드 배선만으로는 안 풀리는 것이 이 설계의 요점이다.",
+                "",
+            ]
+        else:
+            out += [
+                "> **막힌 줄도 없다** — 그날 ENTER 판단 자체가 없었다는 뜻이다. "
+                "「막혔다」와 「막을 것이 없었다」는 다른 사건이다(규약 C).",
+                "",
+            ]
+        return out
+
+    by_state = orders.get("by_state") or {}
+    out = [
+        f"- 주문 **{submitted}건** · 체결 **{orders.get('filled', 0)}건** · "
+        f"거부 **{orders.get('rejected', 0)}건** · 미종결 **{orders.get('open', 0)}건**",
+        f"- 상태 분포: {', '.join(f'`{k}` {v}' for k, v in sorted(by_state.items())) or '—'}",
+        "",
+        "> ⚠ **이 저장소에서 주문이 나간 날이다.** 설정 둘(`hybrid_mode` · "
+        "`reentry_cooldown_minutes`)이 실제로 바뀌었는지 확인할 것 — 안 바뀌었는데 이 값이 "
+        "0이 아니면 `submission_blockers()`가 뚫린 것이고 그것은 P0다.",
+        "",
+    ]
+
+    if orders.get("rejected"):
+        out += [
+            f"> 거부 {orders['rejected']}건 — KIS가 우리 요청을 안 받았다. 사유(`rt_cd`/`msg1`)는 "
+            "`observation_loop.log`의 제출 줄에 있다. 08-18 왕복에서는 선물 두 건이 "
+            "「지정가는 상/하한가 벗어남」·「주문가능금액을 초과합니다」로 거부당했다.",
+            "",
+        ]
+    if orders.get("open"):
+        out += [
+            f"> ⚠ **미종결 {orders['open']}건이 남았다.** 체결 확인 루프가 따라잡지 못한 "
+            "주문이고, 그 주문은 15:10 강제청산이 못 본다. 다음 거래일 개장 전에 브로커에서 "
+            "직접 확인할 것 — `inquire_ccnl`은 **그날 주문만** 조회한다.",
+            "",
+        ]
     return out
 
 

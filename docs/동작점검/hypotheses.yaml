@@ -4930,3 +4930,48 @@
     22가 아니면 `_NOTICE_FIELDS`가 틀린 것이고, 그 상태에서 파싱 컬럼을 믿으면 체결수량
     자리에서 체결단가를 읽는다. 그때는 `plaintext`로 복원한다.
   상태: pending
+
+- id: "2026-08-23-wiring3-code-is-wired-but-config-still-blocks"
+  구현일: 2026-08-23
+  검증예정일: 2026-08-24
+  가설: |
+    주문 제출 경로가 코드로는 배선됐는데 **주문은 한 건도 안 나간다.** 막는 것은 코드가 아니라
+    **사람이 고쳐야 할 설정 둘**이고, 그 사실이 사유별로 기록에 남는다.
+
+    ENTER가 나온 분마다 `signal_decisions.risk_gate_state.execution_engine.
+    submission_blockers`에 `mode_not_auto_submit`과 `reentry_cooldown_not_configured`가
+    **둘 다** 들어 있다.
+  대가: |
+    그날 나간 주문이 **0건**이다(`db.orders.submitted == 0`).
+
+    이것이 이 증분의 유일한 위험이다. `_ORDER_PATH_WIRED`를 True로 바꾸면서
+    `effective_mode()`의 ADVISORY 클램프가 풀렸다 — 08-17부터 그 클램프가 «설정을 올려도
+    주문은 안 나간다»를 보장하고 있었고, 이제 그 보장이 `submission_blockers()`로 옮겨 갔다.
+    **보장이 옮겨 가는 순간이 가장 위험한 순간이다.** 0이 아니면 그 이전이 되고, 그날은
+    설정을 안 고쳤는데 주문이 나간 날이다.
+  근거: |
+    실행 배선 ③. 08-17에 `_ORDER_PATH_WIRED` 주석이 *"호출부를 이 파일에 실제로 넣는 것이 그
+    작업이고, **그때 이 상수도 함께 바꾼다**"*라고 적었고, 08-23에 그 호출부가 생겼다.
+
+    그런데 `strategy_params.yaml`의 `reentry_cooldown_minutes` 주석은 *"**실주문 배선 전에**
+    켠다"*고 지시했고 그 값은 아직 0이다. 쿨다운을 대신 켜지 않는 이유는 그것이 판단 출력을
+    움직이는 결정이고 08-23에 켠 레버 F와 같은 날이면 귀속이 안 갈리기 때문이다(레버 E를
+    09-01로 미룬 것과 같은 이유). 대신 **코드가 막는다** — 주석은 실행되지 않지만 전제는
+    실행된다.
+
+    08-11 실측이 그 전제의 근거다: ENTER 281건/494분(56.9%), 09:03~09:19 **16분 연속.**
+    ADVISORY라 무해했지만 실주문이었다면 16분 연속 진입이고, 레버 F는 그 빈도를 올린다.
+  예측:
+    - metric: db.orders.submitted
+      expect: "== 0"
+      역할: 주장
+    - metric: db.orders.rejected
+      expect: "== 0"
+      역할: 대가
+  주의: |
+    ⚠ **이 예측이 참인 것이 목표가 아니다.** 이것은 「배선이 안전하게 들어갔다」의 확인이고,
+    설정 둘을 고치는 날 이 가설은 `superseded`로 닫고 「주문이 나가고 체결이 잡히는가」로
+    다시 적는다.
+    ⚠ ENTER가 하루 종일 0건이면 `submission_blockers`도 안 남는다 — 그날은 이 가설이
+    `inconclusive`다(막을 것이 없었던 날을 「막았다」로 세면 안 된다, 규약 C).
+  상태: pending

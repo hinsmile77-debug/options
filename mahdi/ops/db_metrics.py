@@ -167,6 +167,9 @@ def collect(
         # **`field_count_distribution`이 이 절의 본체다** — 위치 기반 파싱이 밀렸는지를
         # 그 분포 하나가 답한다(문서가 말한 22가 아니면 파싱 컬럼을 믿으면 안 된다).
         ("order_notices", order_notices),
+        # 2026-08-23 (실행 배선 ③) — 실제로 나간 주문. **`submitted`가 0이 아닌 첫 날이
+        # 이 저장소의 실주문 개시일이다**(08-18 왕복 3건은 격리 스크립트가 낸 것이고 날짜가 다르다).
+        ("orders", orders),
     ):
         try:
             out[key] = fn(conn, target)
@@ -223,6 +226,26 @@ def slack_alerts(conn: ConnectionLike, _target: date) -> dict:
         # 아무도 토글한 적 없으면 env 기본값으로 폴백한다(`db.is_slack_alerts_enabled()`와 같은 규칙).
         return {"available": True, "enabled": None, "source": "미설정(env 기본값 폴백)"}
     return {"available": True, "enabled": bool(row[0]), "source": "slack_alert_settings"}
+
+
+def orders(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 그날 `execution_logs`의 주문 수를 상태별로 센다.
+    해석: 2026-08-23 실행 배선 ③. 답해야 하는 질문 셋:
+           (a) 주문이 나갔는가 — `submitted`가 0이 아닌 첫 날이 실주문 개시일이다.
+               **오늘도 0이어야 한다**: 제출 전제 둘(`hybrid_mode: FULL_AUTO` ·
+               `reentry_cooldown_minutes > 0`)이 사람이 설정 파일을 고쳐야 풀린다.
+               0이 아닌데 그 둘을 안 고쳤으면 `submission_blockers()`가 뚫린 것이다.
+           (b) 거부당했는가 — `rejected`가 0이 아니면 KIS가 우리 요청을 안 받았다.
+               08-18 왕복에서 선물 두 건이 「지정가는 상/하한가 벗어남」·「주문가능금액 초과」로
+               거부당했다. 사유는 `observation_loop.log`의 제출 줄(`rt_cd`)에 있다.
+           (c) 미종결로 남았는가 — `open`이 장 마감 후에도 0이 아니면 **체결 확인 루프가
+               따라잡지 못한 주문**이고, 그 주문은 15:10 강제청산(⑤)이 못 본다.
+         **임계를 걸지 않는다** — 실주문이 한 건도 없어 정상 분포를 모른다.
+    실패 조건: 없다.
+    """
+    return db.execution_log_counts(conn, target)
 
 
 def order_notices(conn: ConnectionLike, target: date) -> dict:
@@ -1486,9 +1509,11 @@ def _selected_instruments(conn: ConnectionLike, target: date) -> dict:
          남겼는가»를 잰다. "더 좋은 행사가를 골랐는가"는 여기서 재지 않는다(체결 0건인 동안
          정의상 관측 불가이고, 재려 들면 선택기가 아니라 우리의 상상을 재게 된다).
 
-         `expiry_day_leg_count`와 `order_submitted_true_count`는 **불변식이라 건수로 낸다**
-         — 규약 F는 *비례하는* 값에 대한 규칙이고, 0이어야 하는 값은 비율로 만들면 1건이
-         0.2%로 묻힌다(`gex_input_missing_minutes`가 같은 이유로 건수다).
+         `expiry_day_leg_count`와 `order_submitted_true_count`는 **건수로 낸다** — 규약 F는
+         *비례하는* 값에 대한 규칙이고, 0이어야 하는 값은 비율로 만들면 1건이 0.2%로 묻힌다
+         (`gex_input_missing_minutes`가 같은 이유로 건수다).
+         ⚠ 2026-08-23 — 후자는 **더 이상 불변식이 아니다.** 주문 경로가 배선돼(실행 배선 ③)
+         0이 아닌 것이 정상일 수 있는 날이 온다. 자세한 근거는 그 키 위 주석.
 
          `symbol_resolved_pct`에는 **임계를 두지 않는다.** 정상 분포를 모른다(규약 G) —
          마스터의 만기 표기가 `YYYYMM`/`YYMMW#`이라 달력상 만기일과 대조할 수 없어, 북이
@@ -1588,7 +1613,18 @@ def _selected_instruments(conn: ConnectionLike, target: date) -> dict:
         "symbol_resolved_pct": round(resolved / legs * 100, 1) if legs else None,
         # **불변식 — 0이 아니면 코드가 깨진 것이다**(0DTE 제외가 뚫렸다).
         "expiry_day_leg_count": expiry_day_legs,
-        # **불변식 — main.py에 order_manager.submit() 호출부가 없으므로 나올 수 없어야 한다.**
+        # ===== 2026-08-23 (실행 배선 ③) — **이 값의 뜻이 바뀌었다** =====
+        #
+        # 08-17~08-22: *"main.py에 `order_manager.submit()` 호출부가 없으므로 **나올 수 없다**"*
+        #              — 즉 0이 아니면 코드가 깨진 것이었다(불변식).
+        # 08-23부터:   호출부가 생겼다. 이 값은 이제 **그날 실제로 나간 주문 수**이고,
+        #              0이 아닌 것이 정상일 수 있는 날이 온다.
+        #
+        # 다만 오늘도 0이어야 한다 — 제출 전제 둘(`hybrid_mode: FULL_AUTO` ·
+        # `reentry_cooldown_minutes > 0`)이 **사람이 설정 파일을 고쳐야** 풀리기 때문이다.
+        # 그 둘을 안 고쳤는데 이 값이 0이 아니면 `submission_blockers()`가 뚫린 것이다.
+        # 무엇이 막았는지는 `signal_decisions.risk_gate_state.execution_engine.
+        # submission_blockers`에 사유별로 남는다.
         "order_submitted_true_count": int(submitted_row[0]) if submitted_row else 0,
         # 2026-08-19 — 전략별 **시도**와 **실패**. 근거는 위 주석.
         # 캠페인이 이 둘을 분모·분자로 쓰면 팔레트 구성이 약분된다.

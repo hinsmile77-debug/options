@@ -346,6 +346,16 @@ _QUALITATIVE_MARKERS = {
     #   가장 위험한 상태다.
     "order_notice_not_configured": "체결통보를 구독하지 않는다",
     "order_notice_stream_down": "체결통보 스트림 끊김",
+    # ===== 2026-08-23 (실행 배선 ③) — 주문 =====
+    #
+    # `db.orders`(건수)와 나란히 읽는다. **DB가 답 못 하는 것을 이쪽이 답한다:** 주문 0건이
+    # 「진입 신호가 없었다」인지 「막혔다」인지는 `execution_logs`만 봐서는 못 가린다(둘 다
+    # 0행이다). `order_blocked` 줄이 그 구분이고, 사유가 그 줄 안에 있다.
+    #
+    # 포맷 원본: `mahdi.main.LOG_ORDER_SUBMITTED` / `LOG_ORDER_BLOCKED` / `LOG_ORDER_STATE_CHANGED`
+    "order_submitted": "주문 제출",
+    "order_blocked": "주문 미제출",
+    "order_state_changed": "주문 상태 전이",
 }
 
 # ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
@@ -370,6 +380,9 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 인쇄돼야 검정된다**(`2026-08-23-wiring2-notice-stream-says-why-it-is-silent`).
     "order_notice_subscribed", "order_notice_received",
     "order_notice_not_configured", "order_notice_stream_down",
+    # 2026-08-23 (실행 배선 ③) — 08-24 예측이 「제출 0 · 미제출 N」이라 **0이 인쇄돼야
+    # 검정된다**(`2026-08-23-wiring3-code-is-wired-but-config-still-blocks`).
+    "order_submitted", "order_blocked", "order_state_changed",
 )
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
