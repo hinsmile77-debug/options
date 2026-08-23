@@ -2140,3 +2140,61 @@ def position_ledger_counts(conn: ConnectionLike, day: date) -> dict:
         "open_now": int(still_open or 0),
         "unknown_entry_time": int(unknown or 0),
     }
+
+
+# ===== 2026-08-23 (실행 배선 ②) — 체결통보 원문 =====
+#
+# 마이그레이션 035. **`plaintext`가 이 표의 본체다** — 나머지 컬럼은 위치 기반 파싱 결과라
+# 미실측 상태에서 통째로 밀렸을 수 있고, 첫 통보가 오는 날 이 원문 한 줄이 `_NOTICE_FIELDS`를
+# 확정할 유일한 근거다(035 헤더 참고).
+_ORDER_NOTICE_COLUMNS = (
+    "received_at", "seq", "tr_id", "symbol", "order_no", "sell_buy_code",
+    "filled_qty", "filled_price", "filled_time", "rejected_flag", "filled_flag",
+    "accepted_flag", "field_count", "plaintext",
+)
+
+
+def insert_order_notice(conn: ConnectionLike, row: dict) -> None:
+    """
+    입력: `order_notice.notice_row()`가 만든 dict.
+    계산: INSERT ... ON CONFLICT (received_at, seq) DO UPDATE — 재처리에도 멱등.
+    해석: 키에 **파싱된 값을 하나도 안 쓴다.** 주문번호를 키로 삼고 싶어지지만 그것이야말로
+         이 표가 검증하려는 대상이다 — 파싱이 밀리면 키가 쓰레기가 되고, 그러면 원문조차
+         제자리에 안 들어간다.
+    실패 조건: 예외는 호출측으로 전파된다. 다만 **호출측(스트림 콜백)은 그것을 잡아 로그만
+              남긴다** — 적재 실패가 수신 루프를 끊으면 그 뒤의 체결을 전부 놓친다.
+    """
+    _upsert(conn, "order_notices", _ORDER_NOTICE_COLUMNS, ("received_at", "seq"), row)
+
+
+def order_notice_counts(conn: ConnectionLike, day: date, expected_field_count: int) -> dict:
+    """
+    입력: DB 커넥션, 집계할 날짜, 문서가 말하는 필드 수.
+    계산: 그날 받은 통보 수와, 그중 **필드 수가 문서와 다른** 건수, 그리고 실제로 관측된
+         필드 수 분포.
+    해석: `field_count_distribution`이 이 절의 핵심이다. 문서가 말한 22개가 아닌 값이 보이면
+         `_NOTICE_FIELDS`가 틀린 것이고, 그 상태에서 파싱 컬럼을 믿으면 **체결수량 자리에서
+         체결단가를 읽는다.** 값이 그럴듯해서 조용히 통과하는 종류의 오류다.
+    해석(상수 소유권): `expected_field_count`를 인자로 받는 이유는 규약 A다 — 그 수를 아는
+         것은 `order_notice._NOTICE_FIELDS`이고, 데이터 층이 브로커 층의 사실을 복사해
+         들고 있으면 둘이 갈리는 날 이 지표가 조용히 거짓말을 한다.
+    실패 조건: 없다 — 행이 없으면 0.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*), count(*) FILTER (WHERE field_count <> %s) "
+            "FROM order_notices WHERE received_at::date=%s",
+            (expected_field_count, day),
+        )
+        total, mismatched = cur.fetchone() or (0, 0)
+        cur.execute(
+            "SELECT field_count, count(*) FROM order_notices WHERE received_at::date=%s "
+            "GROUP BY field_count ORDER BY field_count",
+            (day,),
+        )
+        distribution = {int(n): int(c) for n, c in cur.fetchall() if n is not None}
+    return {
+        "notices": int(total or 0),
+        "field_count_mismatched": int(mismatched or 0),
+        "field_count_distribution": distribution,
+    }

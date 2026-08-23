@@ -4890,3 +4890,43 @@
     「지켰다」로 세면 안 된다(규약 C). 검증은 첫 포지션이 생긴 날로 이월한다.
     ⚠ 이 예측은 **재기동 전에 열린 포지션이 있었을 때만** 의미가 있다.
   상태: pending
+
+- id: "2026-08-23-wiring2-notice-stream-says-why-it-is-silent"
+  구현일: 2026-08-23
+  검증예정일: 2026-08-24
+  가설: |
+    체결통보 스트림이 **왜 조용한지를 로그가 말한다.** `KIS_HTS_ID`가 비어 있는 동안에는
+    「구독하지 않는다」 경고가 **기동당 정확히 한 번** 나오고, 그 뒤로는 조용하다.
+  대가: |
+    그 경고가 **하루 5건을 넘지 않는다**(기동 1회당 1건 + 재기동 여유).
+
+    이것이 이 fix의 진짜 위험이다: 미설정 상태에서 재연결 루프가 돌면 같은 경고를 매초
+    찍는다. 08-15 `ALERT_ONLY` 94줄과 08-21 DEGRADED 14줄이 같은 형태였고, 그 줄들이
+    정작 봐야 할 사건을 덮었다. 그래서 미설정은 **재연결 루프에 들어가기 전에** 끝낸다.
+  근거: |
+    실행 배선 ②. `mahdi/broker/order_notice.py`는 08-16에 만들어졌지만 **호출부가 0건**이었다 —
+    즉 저장소는 자기 주문이 체결됐다는 사실을 실시간으로 알 방법이 없었다. 이 증분이 그
+    연결(시세와 별개의 두 번째 WS)을 붙인다.
+
+    다만 `KIS_HTS_ID`가 `.env`에 없다. 그 값은 사람이 넣어야 하고, 08-24에는 비어 있을
+    것이다. 그러면 **통보 0건**인데 그 0이 「체결이 없었다」인지 「안 붙었다」인지 DB만
+    봐서는 못 가린다(둘 다 0행이다). 08-03에 H0UNMKO0 수신 0건을 두고 같은 질문에 답 못
+    했던 것이 `SubscriptionAck`을 만든 이유다 — 같은 실수를 반복하지 않는다.
+  예측:
+    - metric: qualitative.order_notice_not_configured
+      expect: ">= 1"
+      역할: 주장
+    - metric: qualitative.order_notice_not_configured
+      expect: "<= 5"
+      역할: 대가
+    - metric: db.order_notices.notices
+      expect: "== 0"
+      역할: 참고
+  주의: |
+    ⚠ **`KIS_HTS_ID`를 채우면 이 예측이 뒤집힌다** — 그때는 `not_configured`가 0이고
+    `order_notice_subscribed`가 1 이상이어야 한다. 이 가설은 `superseded`로 닫고
+    「구독이 성립하는가」로 다시 적는다.
+    ⚠ 첫 통보가 오는 날 봐야 할 것은 `db.order_notices.field_count_distribution`이다 —
+    22가 아니면 `_NOTICE_FIELDS`가 틀린 것이고, 그 상태에서 파싱 컬럼을 믿으면 체결수량
+    자리에서 체결단가를 읽는다. 그때는 `plaintext`로 복원한다.
+  상태: pending

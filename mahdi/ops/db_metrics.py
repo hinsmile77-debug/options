@@ -12,6 +12,9 @@ import logging
 from datetime import date
 
 from mahdi import session
+# 규약 A — 「문서가 말하는 필드 수」를 아는 것은 브로커 층이다.
+# 이 값을 여기 복사해 두면 둘이 갈리는 날 `order_notices` 절이 조용히 거짓말을 한다.
+from mahdi.broker.order_notice import _NOTICE_FIELDS
 from mahdi.data import db
 from mahdi.data.db import ConnectionLike
 from mahdi.features.options_intel import (
@@ -160,6 +163,10 @@ def collect(
         # 이쪽은 「우리가 아는 것」의 원장이다. **두 절이 갈리면 그 자체가 사건이다** —
         # 브로커에 있는데 원장에 없으면 고아이고, 원장에 있는데 브로커에 없으면 대사 누락이다.
         ("ledger", ledger),
+        # 2026-08-23 (실행 배선 ②) — 체결통보. 마이그레이션 035.
+        # **`field_count_distribution`이 이 절의 본체다** — 위치 기반 파싱이 밀렸는지를
+        # 그 분포 하나가 답한다(문서가 말한 22가 아니면 파싱 컬럼을 믿으면 안 된다).
+        ("order_notices", order_notices),
     ):
         try:
             out[key] = fn(conn, target)
@@ -216,6 +223,25 @@ def slack_alerts(conn: ConnectionLike, _target: date) -> dict:
         # 아무도 토글한 적 없으면 env 기본값으로 폴백한다(`db.is_slack_alerts_enabled()`와 같은 규칙).
         return {"available": True, "enabled": None, "source": "미설정(env 기본값 폴백)"}
     return {"available": True, "enabled": bool(row[0]), "source": "slack_alert_settings"}
+
+
+def order_notices(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: `db.order_notice_counts()`를 그대로 낸다 — 그날 받은 통보 수, 필드 수가 문서와
+         다른 건수, 실제 필드 수 분포.
+    해석: 2026-08-23 실행 배선 ②. **첫 통보가 오는 날 가장 먼저 볼 절이다.**
+           (a) `notices == 0`이면 통보가 없었던 것이지 스트림이 죽은 것이 아니다 —
+               그 구분은 로그 축(`qualitative.order_notice_subscribed`)이 한다.
+           (b) `field_count_mismatched > 0`이면 **`_NOTICE_FIELDS`가 틀렸다.** 위치 기반
+               파싱이라 하나가 밀리면 그 뒤가 전부 밀리고, 값은 형식이 그럴듯해 조용히
+               통과한다. 그때 같은 행의 파싱 컬럼을 믿으면 안 되고, `plaintext`로 복원한다.
+           (c) 분포가 22 하나로 모이면 문서가 맞았다는 뜻이고, 그것이 R8 실측 확정의 근거다
+               (`docs/dev_memory/KIS_RAW_FIELD_RANGES.md`에 적을 대상).
+         **임계를 걸지 않는다** — 통보를 한 번도 받아본 적이 없어 정상 분포를 모른다.
+    실패 조건: 없다 — 행이 없으면 0.
+    """
+    return db.order_notice_counts(conn, target, len(_NOTICE_FIELDS))
 
 
 def ledger(conn: ConnectionLike, target: date) -> dict:

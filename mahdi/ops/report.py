@@ -233,6 +233,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                           lambda: _render_positions(db_metrics))
         lines += _section("16-2. 포지션 원장 — 우리는 왜 들고 있다고 아는가",
                           lambda: _render_ledger(db_metrics))
+        lines += _section("16-3. 체결통보 — 우리 주문이 체결됐다는 사실을 실시간으로 아는가",
+                          lambda: _render_order_notices(db_metrics, metrics))
     lines += _section("17. 교차 점검 — 지표끼리 모순되는가",
                       lambda: _render_crosschecks(metrics, db_metrics))
     return "\n".join(lines).rstrip() + "\n"
@@ -2110,6 +2112,76 @@ def _render_db_misc(db: dict) -> list[str]:
         "",
     ]
     out += _render_spot_divergence(db)
+    return out
+
+
+def _render_order_notices(db: dict, log: dict) -> list[str]:
+    """2026-08-23 (실행 배선 ②) — 체결통보(마이그레이션 035 `order_notices`).
+
+    **DB 축과 로그 축을 함께 읽는 절이다.** 통보 0건이 「체결이 없었다」인지 「스트림이 안
+    붙었다」인지는 DB만 봐서는 못 가린다 — 둘 다 0행이다. 로그의 구독 성립 줄이 그 구분이다.
+    """
+    notices = db.get("order_notices")
+    qualitative = (log or {}).get("qualitative") or {}
+    subscribed = qualitative.get("order_notice_subscribed", 0)
+    not_configured = qualitative.get("order_notice_not_configured", 0)
+    stream_down = qualitative.get("order_notice_stream_down", 0)
+
+    if not notices:
+        return ["> 체결통보 집계 불가 — `db.order_notices` 절이 없다.", ""]
+
+    total = notices.get("notices", 0)
+    mismatched = notices.get("field_count_mismatched", 0)
+    distribution = notices.get("field_count_distribution") or {}
+
+    if not_configured and total == 0:
+        return [
+            "- **체결통보를 구독하지 않았다** — `KIS_HTS_ID`가 비어 있다.",
+            "",
+            "> **주문이 나가도 실시간 체결 알림이 없다.** 체결 확인은 REST 조회"
+            "(`get_order_fill_status`)로만 이뤄지고, v6 §13.2의 「체결통보-REST 이중 확인」은 "
+            "절반만 성립한다. `.env`에 `KIS_HTS_ID`를 넣고 재기동하면 켜진다.",
+            f"> 경고 {not_configured}건(기동당 1건이 정상 — 재연결 루프에 들어가기 전에 끝낸다).",
+            "",
+        ]
+
+    out = [
+        f"- 통보 **{total}건** · 구독 성립 **{subscribed}회** · 스트림 끊김 **{stream_down}회**",
+        f"- 필드 수 분포: {', '.join(f'`{k}개` {v}건' for k, v in sorted(distribution.items())) or '—'}",
+        "",
+    ]
+
+    if total == 0:
+        out += [
+            "> 통보 0건. **구독 성립 횟수가 이 0의 뜻을 가른다** — 성립했는데 0건이면 그날 "
+            "체결이 없었던 것이고, 성립 0회면 스트림이 안 붙은 것이다.",
+            "",
+        ]
+    elif mismatched:
+        out += [
+            f"> ⚠ **필드 수가 문서와 다른 통보 {mismatched}건.** `_NOTICE_FIELDS`(22개)가 "
+            "틀렸다는 뜻이고, 위치 기반 파싱이라 **하나가 밀리면 그 뒤가 전부 밀린다** — "
+            "체결수량 자리에서 체결단가를 읽는 식이고 값이 그럴듯해 조용히 통과한다.",
+            "> **그 행의 파싱 컬럼을 믿지 말 것.** `order_notices.plaintext`가 원문이고, "
+            "그것으로 순서를 다시 정한 뒤 `docs/dev_memory/KIS_RAW_FIELD_RANGES.md`에 적는다(R8).",
+            "",
+        ]
+    else:
+        out += [
+            "> 필드 수가 전부 문서와 일치한다 — **`_NOTICE_FIELDS`가 실측으로 확인됐다.** "
+            "이 저장소가 체결통보를 받아본 것은 이번이 처음이고, 그 사실을 R8 범위표에 "
+            "적을 것(`docs/dev_memory/KIS_RAW_FIELD_RANGES.md`).",
+            "",
+        ]
+
+    if stream_down:
+        out += [
+            f"> 스트림이 {stream_down}회 끊겼다. 체결통보가 끊겨도 REST 조회가 체결을 "
+            "확인하므로(이중 확인의 다른 축) 즉시 위험하지는 않다 — 다만 끊긴 동안의 통보는 "
+            "**받지 못한 것이지 지연된 것이 아니다.**",
+            "",
+        ]
+
     return out
 
 

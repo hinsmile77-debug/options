@@ -27,6 +27,7 @@ import websockets
 from mahdi.broker import tr_codes
 from mahdi.broker.rest_client import KISRestClient
 from mahdi.broker.token_daemon import TokenDaemon
+from mahdi.broker import order_notice
 from mahdi.broker.ws_client import ApprovalKeyIssuer, KISWebSocketClient, Subscription, WSConnection
 from mahdi.config.settings import (
     PROJECT_ROOT,
@@ -4596,6 +4597,102 @@ async def poll_account_balance_cycle(
         await asyncio.sleep(delay)
 
 
+# ===== 2026-08-23 (실행 배선 ②) — 체결통보 스트림 =====
+#
+# 시세 소켓과 **별개의 두 번째 WS 연결**이다(도메인·TR·암호화가 전부 다르다 —
+# `broker/order_notice.py` 헤더의 네 항목). 그래서 `run_observation_loop_forever`에 얹지 않고
+# 독립 태스크로 둔다: 체결통보가 끊겨도 시세 수집은 계속돼야 하고, 그 반대도 마찬가지다.
+#
+# ## 재연결 대기가 시세 쪽과 다른 이유
+#
+# 시세는 끊기면 **데이터가 안 쌓인다** — 급하다. 체결통보는 끊겨도 REST 조회
+# (`get_order_fill_status`)가 체결을 확인한다(v6 §13.2의 「이중 확인」에서 이쪽은 빠른 축이지
+# 유일한 축이 아니다). 그래서 폭주 재연결로 레이트리밋을 먹는 쪽이 더 나쁘다 — 08-12 밤에
+# 실제로 그 대가를 치렀다(재연결 폭주). 지수적으로 늘리고 상한을 둔다.
+ORDER_NOTICE_RECONNECT_DELAYS = (2.0, 5.0, 15.0, 30.0, 60.0)
+
+LOG_ORDER_NOTICE_STREAM_DOWN = "체결통보 스트림 끊김 — %s. %.0f초 뒤 재연결한다(누적 %d회)"
+
+
+async def poll_order_notice_stream(
+    kis_settings,
+    approval_key: str,
+    *,
+    connect=None,
+    state: order_notice.OrderNoticeStreamState | None = None,
+    max_sessions: int | None = None,
+) -> None:
+    """
+    입력: KIS 설정, WS 접속키, (테스트 주입용) 연결 팩토리·상태 객체·최대 세션 수.
+    계산: 체결통보 도메인에 붙어 구독하고, 받은 통보를 `order_notices`에 원문째로 적재한다.
+         끊기면 지수 백오프로 다시 붙는다.
+    해석: **HTS ID가 없으면 한 번 경고하고 조용히 끝낸다.** 재연결로 같은 경고를 무한히
+         찍지 않는다 — 설정이 없는 것은 네트워크 문제가 아니라 사람이 채워야 할 값이고,
+         매분 같은 줄을 찍으면 그 줄이 다른 사건을 덮는다(08-21 §1-11).
+    실패 조건: 이 코루틴은 예외를 밖으로 내지 않는다. 체결통보의 죽음이 시세 수집·판단·원장을
+              같이 죽이면 안 된다 — 대신 끊김 자체를 로그와 `state`에 남기고, 리포트가 그것을
+              인쇄한다.
+    """
+    stream_state = state if state is not None else order_notice.OrderNoticeStreamState()
+    if order_notice.subscription_tr_key(kis_settings) is None:
+        logger.warning(order_notice.LOG_NOTICE_NOT_CONFIGURED)
+        return
+
+    tr_id = order_notice.order_notice_tr_id(kis_settings)
+    domain = order_notice.order_notice_ws_domain(kis_settings)
+    connector = connect or websockets.connect
+    sessions = 0
+    failures = 0
+    # 같은 수신 시각에 두 건이 오면 PK가 부딪친다. 마이크로초 해상도라 사실상 안 겹치지만,
+    # 겹치는 날 **두 번째 통보가 첫 번째를 덮어쓴다** — 체결 한 건이 소리 없이 사라지는 형태다.
+    last_stamp: datetime | None = None
+    stamp_seq = 0
+
+    async def _persist(notice, received_at: datetime | None) -> None:
+        """적재 실패가 수신 루프를 끊으면 그 뒤의 체결을 전부 놓친다 — 그래서 여기서 삼킨다."""
+        nonlocal last_stamp, stamp_seq
+        stamp = received_at or db.local_now()
+        stamp_seq = stamp_seq + 1 if stamp == last_stamp else 0
+        last_stamp = stamp
+        seq = stamp_seq
+        try:
+            with db.get_connection() as conn:
+                db.insert_order_notice(
+                    conn, order_notice.notice_row(notice, stamp, seq, tr_id)
+                )
+        except Exception:
+            logger.warning(
+                "체결통보 적재 실패 — 수신은 계속한다. 원문은 이 로그에 남는다: %r",
+                notice.raw, exc_info=True,
+            )
+
+    while max_sessions is None or sessions < max_sessions:
+        sessions += 1
+        try:
+            async with connector(domain) as raw_ws:
+                stream = order_notice.OrderNoticeStream(
+                    kis_settings, approval_key, _WebsocketsAdapter(raw_ws),
+                    on_notice=_persist, state=stream_state,
+                )
+                failures = 0
+                await stream.run_once()
+        except Exception as exc:
+            stream_state.last_error = f"{type(exc).__name__}: {exc}"
+        # 세션이 끝났다 — 정상 종료든 예외든 붙어 있지 않다는 사실은 같다.
+        stream_state.subscribed = False
+        stream_state.cipher_ready = False
+        delay = ORDER_NOTICE_RECONNECT_DELAYS[
+            min(failures, len(ORDER_NOTICE_RECONNECT_DELAYS) - 1)
+        ]
+        failures += 1
+        logger.warning(
+            LOG_ORDER_NOTICE_STREAM_DOWN, stream_state.last_error or "정상 종료", delay, failures
+        )
+        if max_sessions is not None and sessions >= max_sessions:
+            return
+        await asyncio.sleep(delay)
+
+
 def _configure_logging() -> None:
     """
     계산: 콘솔(stdout)과 로테이션 파일(logs/observation_loop.log) 양쪽에 동시에 로깅한다.
@@ -4769,6 +4866,9 @@ async def main() -> None:
             poll_account_balance_cycle(
                 rest_client, phase_offset_seconds=ACCOUNT_BALANCE_PHASE_OFFSET_SECONDS
             ),
+            # 2026-08-23 (실행 배선 ②) — 체결통보 전용 WS. 시세와 **별개 연결**이다.
+            # KIS_HTS_ID가 비어 있으면 경고 한 줄 남기고 즉시 끝난다(관측 루프는 정상 기동).
+            poll_order_notice_stream(kis_settings, approval_key),
             # 2026-07-31 §4 우선순위 4 / 2026-08-01 §5-4 — 안전장치 생존 신호는 감시 대상과
             # 독립한 타이머에서 낸다(CB 감지 / WS 연결).
             poll_market_halt_heartbeat(market_halt_monitor),

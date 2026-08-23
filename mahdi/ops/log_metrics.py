@@ -331,6 +331,21 @@ _QUALITATIVE_MARKERS = {
     # ⚠ 이 줄은 WARNING이다 — 브로커에는 있는데 원장에 없는 포지션이다. 0이 아닌 날은
     #   사람이 직접 냈거나 원장 기록이 실패한 것이고, 둘 다 사람이 봐야 한다.
     "orphan_position": "원장에 없는 포지션 발견",
+    # ===== 2026-08-23 (실행 배선 ②) — 체결통보 =====
+    #
+    # `db.order_notices`(건수·필드 수)와 나란히 읽는다. **DB가 답 못 하는 것을 이쪽이 답한다:**
+    # 통보 0건이 「체결이 없었다」인지 「스트림이 안 붙었다」인지는 DB만 봐서는 못 가린다
+    # (둘 다 0행이다). 구독 성립 줄이 그 구분이다 — 08-03에 H0UNMKO0 수신 0건을 두고 같은
+    # 질문에 답 못 했던 것이 `SubscriptionAck`을 만든 이유다.
+    #
+    # 포맷 원본: `mahdi.broker.order_notice.LOG_NOTICE_SUBSCRIBED` 외
+    "order_notice_subscribed": "체결통보 구독 성립",
+    "order_notice_received": "체결통보 수신",
+    # ⚠ 아래 둘은 WARNING이다. `not_configured`는 사람이 .env를 채워야 하는 상태이고,
+    #   `stream_down`은 붙어 있지 않은 상태다 — 주문이 나가는데 알림이 없는 것이 이 시스템에서
+    #   가장 위험한 상태다.
+    "order_notice_not_configured": "체결통보를 구독하지 않는다",
+    "order_notice_stream_down": "체결통보 스트림 끊김",
 }
 
 # ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
@@ -351,6 +366,10 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 키가 없으면 그 가설이 「경로 없음」으로 떨어지고, 포지션이 없었던 하루가 배선 실패로
     # 읽힌다(`2026-08-23-wiring1-ledger-runs-silent-until-a-position-exists`).
     "position_opened", "position_closed", "position_qty_changed", "orphan_position",
+    # 2026-08-23 (실행 배선 ②) — 08-24 예측이 「구독 0 · 수신 0 · 미설정 1」이라 **0이
+    # 인쇄돼야 검정된다**(`2026-08-23-wiring2-notice-stream-says-why-it-is-silent`).
+    "order_notice_subscribed", "order_notice_received",
+    "order_notice_not_configured", "order_notice_stream_down",
 )
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
