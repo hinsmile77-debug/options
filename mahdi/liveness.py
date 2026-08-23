@@ -190,13 +190,35 @@ INGEST_STALE_MINUTES = 10
 #
 # 09:00 이전: 장전에도 사이클은 돌지만(08-14 장전 62분 연속 관측) 기동 직후에는 마스터 파일
 #            다운로드·토큰·WS 구독 32건이 앞에 있어 적재가 비는 분이 정상적으로 존재한다.
-# 15:15 이후: 15:20 정규장 마감과 15:45 종료 배치 사이는 폴링이 자연스럽게 잦아드는 구간이다.
+# 15:30 이후: 15:30 단일가 종료와 15:45 종료 배치 사이는 폴링이 자연스럽게 잦아드는 구간이다.
 #            여기에 임계를 걸면 **매일** 오경보가 난다 — 규약 D의 "오경보 비용이 미탐지 비용보다
 #            훨씬 싸지 않다"가 그대로 적용된다. 무시되기 시작한 배지는 없는 배지와 같다.
 #
 # 08-14의 84분은 14:00에 시작했으므로 이 창으로 잡힌다(14:10에 첫 `degraded`).
+#
+# ===== 2026-08-23(08-21 §1-13 / §4 Fix#1) — 끝을 15:15에서 **15:30**으로 넓혔다 =====
+#
+# ## 무엇이 안 보였나
+#
+# 08-21의 당일 최장 빈손은 **26분(15:05~15:30)** 이고 임계 20분을 그날 처음 넘겼다.
+# 그런데 종전 창(15:15)에서는 **그 절반을 아무도 안 보고 있었다** — 15:20:01과 15:30:02의
+# 판정이 `OK — 정상`으로 인쇄됐고, 그때 프로그램은 26분째 빈손이었다.
+#
+# ## 왜 15:30인가 — 08-20 지시(15:20)로는 부족하다
+#
+# 08-20 §4 Fix#1은 `session.CLOSING_AUCTION_START`를 쓰라고 적었는데 그 값은 **15:35**
+# (파생시장 종가 단일가)이고, 그 지시를 「현물 마감 15:20」으로 옮겨 적은 판본도 있었다.
+# **둘 다 틀렸다**: 15:35는 너무 넓어 매일 오경보를 부르고, 15:20은 08-21 구멍의 **10분을
+# 그대로 남긴다.** 답은 **유가증권시장 장 마감 동시호가의 끝**이고 그 값이 15:30이다
+# (`session.EQUITY_CLOSING_AUCTION_END` — 시작 15:20과 한자리에 두었다).
+#
+# ## 대가는 숫자로 걸었다
+#
+# 창을 넓히면 그 15분에서 오경보가 늘 수 있다. `hypotheses.yaml`의
+# `2026-08-21-fix1-ingest-watch-covers-closing-auction`이 대가를 **DEGRADED 하루 24건 이하**
+# (08-21 실측 16건의 1.5배)로 못박아 뒀다 — 넘으면 넓힌 것이 손해다.
 INGEST_WATCH_START = dtime(9, 0)
-INGEST_WATCH_END = dtime(15, 15)
+INGEST_WATCH_END = session.EQUITY_CLOSING_AUCTION_END
 
 ACTION_OK = "ok"
 ACTION_IDLE = "idle"  # 감시 창 밖이거나 판정을 보류할 이유가 있다 — 아무것도 하지 않는다
@@ -629,6 +651,23 @@ def decide(
                 detail=f"{no_ingest}(마지막 박동 {age:.0f}초 전 — 프로세스는 살아 있다)",
                 should_alert=_alert_due(state, now),
             )
+        # ===== 2026-08-23(08-21 §1-13 / §4 Fix#1) — 창 밖의 「정상」은 **모른다**는 뜻이다 =====
+        #
+        # 적재 감시창 밖에서는 `ingest_minutes_recent`가 무엇이든 `_no_ingest_detail()`이 None을
+        # 낸다. 즉 이 자리의 판정은 **박동만 보고 한 말**인데, 종전 문구 「정상」은 적재까지
+        # 괜찮다는 인상을 준다. 08-21 15:20·15:30이 정확히 그랬다 — 그 두 분에 프로그램은
+        # 26분째 빈손이었고 화면은 초록이었다.
+        #
+        # **`ACTION_IDLE`로 바꾸지 않는다.** `scripts/watchdog_observation_loop.py`가 IDLE을
+        # 「기록 안 함」으로 처리하므로, 바꾸면 그 구간이 로그에서 통째로 사라진다 —
+        # 「모른다」를 「없다」로 바꾸는 것은 지금보다 나쁘다. 바꾸는 것은 **문구뿐**이다.
+        #
+        # 창 **안**에서 적재가 정상이면 종전 문구를 그대로 쓴다(회귀 없음).
+        if not in_ingest_window(now):
+            return WatchdogDecision(
+                ACTION_OK,
+                detail=f"박동 정상 · 적재 감시 창 밖(적재 상태 모름) — 마지막 박동 {age:.0f}초 전",
+            )
         return WatchdogDecision(ACTION_OK, detail=f"정상 — 마지막 박동 {age:.0f}초 전")
 
     restarts = _restarts_today(state, now)
@@ -701,3 +740,114 @@ def next_state(state: dict | None, now: datetime, decision: WatchdogDecision) ->
     if decision.should_alert:
         last_alert = now.isoformat()
     return {"date": today, "restarts": restarts, "last_alert_at": last_alert}
+
+
+# ===== 2026-08-23 (08-21 §1-11 · §1-13 / §4 Fix#1·#4) — DEGRADED **사건**의 시작과 끝 =====
+#
+# ## 무엇이 없었나
+#
+# 08-21에 워치독은 24분 동안 「수집이 멈췄다」를 **14번 외쳤고**, 회복하자 그냥 `OK — 정상`으로
+# 돌아갔다. 로그에는 **사건의 시작도 끝도 없다** — 같은 문구 14줄이 있을 뿐이다. 그래서
+#
+#   · 「몇 분째인가」를 사람이 줄을 세어 구해야 했고(13:39~14:02),
+#   · 사후에 사건 수를 세려면 비-OK **16행을 손으로 묶어야** 했다(세 구간: 13:39~14:02 · 14:44 · 15:14).
+#
+# 필요한 것은 알림 채널이 아니라 **로그에 남는 두 문장**이다: 진행 중인 줄의 「연속 N분째」와
+# 끝나는 자리의 종료 줄. ⛔ Slack은 제안하지 않는다(`NEXT_TODO.md` 2026-08-01 보류 확정).
+#
+# ## 왜 상태를 따로 든는가 — `.watchdog_state.json`에 못 얹는다
+#
+# 워치독은 1분마다 **새 프로세스**로 뜨므로(작업 스케줄러) 직전 판정을 기억하려면 파일이
+# 필요하다. 그런데 `next_state()`는 **매번 새 dict를 만들어 세 키만 남긴다** — 거기 얹은 값은
+# 조용히 사라지고, 그러면 이 카운터가 영원히 1에서 멈춘다. 08-19의 `_MISSING_CHECK_STATE`가
+# 별도 파일이 된 것과 **정확히 같은 이유**이고, 그 주석이 이 함정을 이미 적어 뒀다.
+#
+# ## 무기록 구간을 회복으로 읽지 않는다
+#
+# 워치독 자신이 멈춘 사이(08-12에 5시간 31분 있었다) 적재가 회복됐는지 우리는 **모른다**.
+# 마지막 기록에서 이 값보다 오래 떨어져 있으면 「회복」이라고 말하지 않고, 몇 분을 못 봤는지를
+# 적어 닫는다 — 규약 C(「없었다」와 「셀 수 없었다」는 다르다)를 종료 줄에도 적용한다.
+DEGRADED_EPISODE_GAP_MINUTES = 5.0
+
+_DEGRADED_EPISODE_FILENAME = ".watchdog_degraded_episode.json"
+
+
+def degraded_episode_path(log_dir: Path) -> Path:
+    return log_dir / _DEGRADED_EPISODE_FILENAME
+
+
+def _live_episode(state: dict | None, now: datetime) -> dict | None:
+    """반환: **이어서 셀 수 있는** 에피소드. 날짜가 다르거나 기록이 끊겼으면 None."""
+    if not state or state.get("date") != now.date().isoformat():
+        return None
+    try:
+        last = datetime.fromisoformat(str(state["last_at"]))
+        minutes = int(state["minutes"])
+        since = datetime.fromisoformat(str(state["since"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if minutes < 1 or now < last:
+        return None
+    return {"since": since, "last_at": last, "minutes": minutes}
+
+
+def track_degraded_episode(
+    state: dict | None, now: datetime, action: str,
+) -> tuple[dict | None, str | None, str | None]:
+    """
+    입력: 직전 에피소드 상태(파일에서 읽은 dict, 없으면 None), 현재 시각, 이번 판정의 `action`.
+    계산: DEGRADED가 이어지는 동안 분을 세고, 다른 판정으로 넘어가는 **그 한 번**에 종료 문구를 만든다.
+    반환: `(다음 상태, 진행 중 문구, 종료 문구)`.
+         - 다음 상태가 `None`이면 호출측은 파일을 지운다(에피소드가 닫혔다).
+         - 진행 중 문구는 DEGRADED 판정 detail 뒤에 붙는다(`연속 3분째(13:39부터)`).
+         - 종료 문구는 **한 번만** 나온다 — 이미 닫힌 뒤의 OK에는 `None`이다.
+    해석: 순수 함수다(파일도 시계도 안 건드린다) — 그래야 `tests/test_liveness.py`가
+         「14분 이어지고 15분째에 한 줄」을 시각 시퀀스로 검사할 수 있다.
+    실패 조건: 없다. 상태가 깨져 있으면 새 에피소드로 시작한다(못 읽은 과거를 지어내지 않는다).
+    """
+    live = _live_episode(state, now)
+    stale = live is not None and (now - live["last_at"]) > timedelta(
+        minutes=DEGRADED_EPISODE_GAP_MINUTES
+    )
+
+    if action == ACTION_DEGRADED:
+        if live is None or stale:
+            nxt = {
+                "date": now.date().isoformat(),
+                "since": now.isoformat(timespec="seconds"),
+                "last_at": now.isoformat(timespec="seconds"),
+                "minutes": 1,
+            }
+        else:
+            nxt = {
+                "date": now.date().isoformat(),
+                "since": live["since"].isoformat(timespec="seconds"),
+                "last_at": now.isoformat(timespec="seconds"),
+                "minutes": live["minutes"] + 1,
+            }
+        note = f"연속 {nxt['minutes']}분째({live['since'] if live and not stale else now:%H:%M}부터)"
+        # 무기록 뒤에 다시 DEGRADED면 **이어 세지 않고 새로 센다.** 그 사이를 못 봤기 때문이다.
+        if stale:
+            gap = int((now - live["last_at"]).total_seconds() // 60)
+            return nxt, f"{note} · 직전 에피소드({live['since']:%H:%M}~{live['last_at']:%H:%M}, "\
+                        f"{live['minutes']}분)와 사이에 **{gap}분 무기록**", None
+        return nxt, note, None
+
+    if live is None:
+        return None, None, None
+
+    span = f"{live['since']:%H:%M}~{live['last_at']:%H:%M}"
+    if stale:
+        gap = int((now - live["last_at"]).total_seconds() // 60)
+        return None, None, (
+            f"적재 정지 {live['minutes']}분 지속({span}) — 그 뒤 **{gap}분 무기록**이라 "
+            "언제 회복했는지 모른다(회복이 아니라 관측이 끊긴 것이다)"
+        )
+    if action == ACTION_OK:
+        return None, None, f"적재 정지 {live['minutes']}분 지속 후 회복({span})"
+    # 회복이 아니다 — 박동 이상·의도적 정지·감시 창 종료 중 하나로 사건이 끝났다.
+    # **「회복」이라고 쓰지 않는 것이 요점이다**: 적재가 돌아온 것이 아니라 관측이 바뀐 것이다.
+    return None, None, (
+        f"적재 정지 {live['minutes']}분 지속({span}) — 회복이 아니라 판정이 "
+        f"`{action.upper()}`로 바뀌며 끝났다"
+    )

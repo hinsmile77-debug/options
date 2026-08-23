@@ -47,6 +47,29 @@ _IV_WINDOW_MINUTES = 30
 _SPREAD_WINDOW_MINUTES = 30
 _MIN_WARMUP_BARS = 30  # 이 정도 봉이 쌓이기 전에는 모델이 있어도 predict() 대신 warmup_fallback 유지(burn-in)
 
+# ===== 2026-08-23 (08-21 §1-12 / §4 Fix#5) — warmup이 **언제 끝났는지**를 로그로 묻는다 =====
+#
+# ## 08-21에 답을 못 얻었다
+#
+# 아래 `레짐 전이` 줄은 **상태가 바뀔 때만** 찍힌다. warmup이 끝나도 레짐 라벨이 같으면 줄이
+# 없다. 그래서 그날 12:19 재기동의 warmup 종료 시각을 **로그로는 상한 74분까지만** 좁혔고,
+# 정답 **29분**은 15:46 지표(`db.regime.warmup_restart_minutes`)에서야 나왔다.
+#
+# ## 왜 그 값이 중요한가
+#
+# 「재기동 1회 = 레짐 warmup 29분」은 **장중 재기동 결정의 유일한 손익 재료**다(08-19·08-21
+# 두 날 모두 29분). 그런데 그 판단이 필요한 시각은 재기동을 고민하는 **그 순간**(08-21이면
+# 12:19)이고, 그때 이 값은 어디에도 없다. 다음 날 지표에 있는 숫자는 그날의 결정을 못 돕는다.
+#
+# ## 정본은 DB다
+#
+# 이 줄은 로그 축이고 정본은 `db.regime`이다. 두 축이 갈리면 DB가 맞다 —
+# 08-21 §1-12가 그 판정을 이미 냈다(로그로 좁힌 상한 74분은 참이었지만 느슨했다).
+# 대가는 「재기동 1회당 1건」이고 가설 `2026-08-21-fix9-warmup-end-is-logged`가 상한을 5로 뒀다.
+LOG_REGIME_WARMUP_END = (
+    "레짐 warmup 종료: 기동 %s 이후 %.0f분 · 예측창 %d봉 · 임계 %d봉 · 모델=predict"
+)
+
 # 2026-08-10 — `RegimeEngine.predict()`에 넘기는 **세션 누적 창**의 길이.
 #
 # `_ROLLING_WINDOW_MINUTES`와 값이 같지만 **독립 상수로 선언한다**: 저쪽은 Hurst/ADX가 수렴하는
@@ -353,6 +376,11 @@ class RegimeStateMachine:
         # 주석 참고). 이 클래스는 **세션당 1개**(클래스 docstring 계약)라 세션 경계 초기화는
         # 프로세스 재기동이 담당한다 — 여기에 별도 리셋 훅을 두지 않는다.
         self._predict_window: deque[list[float]] = deque(maxlen=_PREDICT_WINDOW_MINUTES)
+        # 2026-08-23 Fix#5 — 이 프로세스가 뜬 시각. warmup이 **몇 분 걸렸는지**를 그 분에
+        # 말하려면 기준점이 있어야 하고, 이 클래스는 세션당 1개(클래스 docstring 계약)이므로
+        # 생성 시각이 곧 기동 시각이다. 상세 근거는 `LOG_REGIME_WARMUP_END` 위 주석.
+        self._started_at = db.local_now()
+        self._was_using_model = False
         try:
             self.engine: RegimeEngine | None = RegimeEngine.load(model_path)
         except FileNotFoundError:
@@ -445,6 +473,13 @@ class RegimeStateMachine:
             prior_regime = latest_prior_close_regime(conn)
             state = warmup_fallback(prior_regime, macro_score=macro_score, gap_zscore=self._gap_zscore)
 
+        # 2026-08-23 (08-21 §1-12 / §4 Fix#5) — **warmup이 끝난 그 분에 한 줄.**
+        # 아래 「레짐 전이」 줄보다 **앞**이다: 두 줄이 같은 분에 나오면 원인(warmup 종료)이
+        # 결과(레짐이 바뀜)보다 먼저 읽혀야 한다.
+        if use_model and not self._was_using_model:
+            self._log_warmup_end(timestamp)
+        self._was_using_model = use_model
+
         if self._last_regime != state.regime:
             # 2026-08-10 — 모델/폴백 표기는 **실제로 탄 분기**(`use_model`)에서 가져온다. 종전에는
             # 조건식을 여기서 한 번 더 적었는데, 분기 조건이 늘면(예측 창 비어 있음) 그 복제가
@@ -460,6 +495,21 @@ class RegimeStateMachine:
 
         self.last_state = state
         return state
+
+    def _log_warmup_end(self, timestamp: datetime) -> None:
+        """
+        입력: 이번 봉의 타임스탬프.
+        계산: 기동 이후 몇 분 만에 `warmup_fallback` → `predict`로 넘어갔는지를 한 줄로 남긴다.
+        해석: 상세 근거는 `LOG_REGIME_WARMUP_END` 위 주석. 정본은 여전히 DB
+             (`db.regime.warmup_restart_minutes`)이고 이 줄은 **장중에 볼 수 있는 사본**이다 —
+             두 축이 갈리면 DB가 맞다(08-21 §1-12가 그 판정을 이미 냈다).
+        실패 조건: 없다 — 로깅 실패가 판단을 막지 않는다.
+        """
+        minutes = max((timestamp - self._started_at).total_seconds() / 60.0, 0.0)
+        logger.info(
+            LOG_REGIME_WARMUP_END,
+            self._started_at, minutes, len(self._predict_window), _MIN_WARMUP_BARS,
+        )
 
     def _log_neutral_escapes(self, named_features: dict[str, float]) -> None:
         """

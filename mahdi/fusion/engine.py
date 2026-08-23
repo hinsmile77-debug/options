@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from mahdi.config.settings import get_strategy_params
 from mahdi.engines.regime import RegimeLabel
@@ -87,6 +88,11 @@ class SignalFusionEngine:
         self._params = strategy_params if strategy_params is not None else get_strategy_params()
         # 직전 사이클의 "판단 형태" — 바뀔 때만 로그를 낸다(위 logger 주석 참고).
         self._last_shape: tuple | None = None
+        # 2026-08-23 Fix#3 — 축 하나하나의 **최근 상태 전환 시각**. 상세 근거는
+        # `LOG_MEMBER_AXIS_EXIT` 위 주석. 값이 없는 멤버는 아직 한 번도 안 바뀐 것이다.
+        self._member_since: dict[str, datetime] = {}
+        self._last_available: tuple[str, ...] | None = None
+        self._last_effective: int = 0
 
     def evaluate(
         self,
@@ -97,6 +103,9 @@ class SignalFusionEngine:
         # 2026-08-11 고도화 D — 전략별 **직전 진입 이후 경과 분**. 기본값 None은 "기록 없음"이라
         # 쿨다운이 켜져 있어도 아무것도 안 막는다(레버 OFF와 같은 결과) — 백테스트·테스트 경로 보호.
         last_entry_minutes_ago: dict[str, float] | None = None,
+        # 2026-08-23 Fix#3 — 사건 줄에 찍을 **이번 사이클의 시각**. `None`이면 벽시계를 쓴다
+        # (백테스트·단위 테스트 경로 보호 — 로그 문구에만 쓰이고 판단에는 안 들어간다).
+        now: datetime | None = None,
     ) -> FusionDecision:
         """
         입력: SignalInputs(원재료), MetaLabelContext(슬리피지/감마레짐/이벤트근접/자기강화
@@ -196,6 +205,7 @@ class SignalFusionEngine:
             reject_reasons=reject_reasons,
             member_scores=member_scores,
         )
+        self._log_member_transitions(decision, member_scores, now)
         self._log_shape_transition(decision, member_scores)
         return decision
 
@@ -234,3 +244,92 @@ class SignalFusionEngine:
             list(decision.allowed_strategies) or "없음",
             "" if previous is None else f" (직전 가용멤버 {list(previous[0])})",
         )
+
+    def _log_member_transitions(
+        self, decision: FusionDecision, member_scores: MemberScores, now: datetime | None,
+    ) -> None:
+        """
+        입력: 이번 사이클의 판단, 멤버 점수, (선택) 이번 사이클 시각.
+        계산: 가용 멤버 **집합**이 직전 사이클과 달라진 축마다 사건 줄 하나. 그 축이 직전
+             상태를 얼마나 유지했는지도 함께 적는다.
+        해석: 상세 근거는 `LOG_MEMBER_AXIS_EXIT` 위 주석. 첫 사이클은 **아무것도 안 찍는다** —
+             기동 직후의 「전부 새로 편입」은 사건이 아니라 시작이고, 그것을 사건으로 세면
+             매일 아침 여섯 줄이 상한을 갉아먹는다.
+        실패 조건: 없다 — 로깅 실패는 판단에 영향을 주지 않는다.
+        """
+        moment = now if now is not None else datetime.now()
+        available = tuple(
+            name for name in MEMBER_FIELDS if getattr(member_scores, name) is not None
+        )
+        previous, self._last_available = self._last_available, available
+        previous_effective, self._last_effective = self._last_effective, decision.effective_member_count
+        if previous is None:
+            # 기동 직후 — 지금 살아 있는 축의 「편입 시각」만 세워 두고 조용히 넘어간다.
+            for name in available:
+                self._member_since[name] = moment
+            return
+        if previous == available:
+            return
+
+        for name in previous:
+            if name not in available:
+                self._emit_axis_event(
+                    LOG_MEMBER_AXIS_EXIT, name, previous, available,
+                    previous_effective, decision.effective_member_count, moment, "편입", "유지",
+                )
+        for name in available:
+            if name not in previous:
+                self._emit_axis_event(
+                    LOG_MEMBER_AXIS_RETURN, name, previous, available,
+                    previous_effective, decision.effective_member_count, moment, "이탈", "부재",
+                )
+
+    def _emit_axis_event(
+        self, template: str, name: str, previous: tuple[str, ...], available: tuple[str, ...],
+        previous_effective: int, effective: int, moment: datetime, since_label: str, span_label: str,
+    ) -> None:
+        """한 축의 전환 한 줄. **직전 상태를 언제부터 유지했는지**가 이 줄의 절반이다.
+
+        「빠졌다」만으로는 그것이 42분 만의 첫 이탈인지 1분 만의 되돌이인지 알 수 없고,
+        그 둘은 조치가 다르다(전자는 사건, 후자는 채터링이다 — 08-04 ATM 롤링 왕복 70회가
+        같은 형태였고 그때도 「몇 번」이 아니라 「얼마 만에」가 답이었다).
+        """
+        began = self._member_since.get(name)
+        self._member_since[name] = moment
+        if began is None:
+            span = f"직전 {since_label} 시각 모름"
+        else:
+            minutes = max((moment - began).total_seconds() / 60.0, 0.0)
+            span = f"직전 {since_label} {began:%H:%M:%S} · {minutes:.0f}분 {span_label}"
+        logger.info(
+            template, name, len(previous), len(available), previous_effective, effective, span,
+        )
+
+
+# ===== 2026-08-23 (08-21 §1-10 / §4 Fix#3) — 축이 **빠진 그 분**에 한 줄 =====
+#
+# ## 사흘째 이월된 fix이고, 08-21에 여섯 번 눈으로 찾았다
+#
+# 그날 `options_flow`가 여섯 번 빠졌다(10:47 · 12:04 · 13:05 · 13:34 · 13:49 · 15:09) —
+# **어제 2회에서 세 배**로 늘었는데 여섯 번 다 사람이 로그를 겹쳐 세어 찾았다. 사흘 연속이다.
+#
+# ## 값은 이미 있었다. 없던 것은 **차이를 말하는 문장**이다
+#
+# 위 `_log_shape_transition`은 「지금 형태가 무엇인가」를 찍는다 — `가용멤버 [...](4/6, 비영 3)`.
+# 축이 하나 빠진 것을 알려면 **직전 줄과 나란히 놓고 목록을 비교해야** 한다. 그 비교를 사람이
+# 하는 한, 축은 조용히 죽고 그 사실은 장후에나 드러난다(08-19 §3-5가 정확히 그 하루였다).
+#
+# ## 두 줄은 서로를 대체하지 않는다
+#
+# 형태 전이 줄은 **상태**이고 이 줄은 **사건**이다. 전자를 없애면 「지금 무엇이 살아 있나」를
+# 못 묻고, 후자가 없으면 「언제 무엇이 죽었나」를 못 묻는다. 08-19 Fix#6이 형태 줄에 「비영」을
+# 실은 것과 같은 계열의 보강이고, 그때와 같이 **파서는 두 문구를 각자 센다**
+# (`log_metrics._QUALITATIVE_MARKERS`).
+#
+# ## 볼륨
+#
+# 전이가 있는 분에만, **바뀐 축마다 한 줄**이다. 08-21 실측이면 이탈 6 + 복귀 5 = **11줄**이고,
+# 가설이 상한을 하루 20건으로 못박아 뒀다(`2026-08-21-fix7-member-exit-is-an-event`).
+# 매분 찍으면 08-15 `ALERT_ONLY` 94줄의 재현이다 — 그래서 전이에만 반응한다.
+LOG_MEMBER_AXIS_EXIT = "판단 축 이탈: %s (가용 %d→%d, 비영 %d→%d) · %s"
+LOG_MEMBER_AXIS_RETURN = "판단 축 복귀: %s (가용 %d→%d, 비영 %d→%d) · %s"

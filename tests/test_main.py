@@ -6201,6 +6201,85 @@ def test_collect_option_chain_cycle_visits_the_monthly_book_first():
     assert books[0][1] == "regular", "books[0]은 먼슬리여야 한다 — 이 전제가 깨지면 예산 절단이 주입력을 자른다"
 
 
+# ===== 2026-08-23 (08-21 §1-9 / §4 Fix#2) — 먼슬리 **핵심 6레그**가 맨 앞이다 =====
+#
+# 08-21에 먼슬리 절대 커버리지가 90.1% → 76.1%로 떨어졌고, 「컷당한북에 `regular` 포함」이
+# 31건이었다. 북 사이 순서는 옳았는데(위 테스트가 지킨다) **북 안**이 행사가 오름차순이라
+# ATM이 10레그 중 5~6번째였다 — 컷이 4번째에서 걸리면 먼 외가를 받고 ATM을 잃는다.
+
+
+class _FakeManagerWithAtm(_FakeManagerManyStrikes):
+    """`RollingSubscriptionManager.current_atm`을 가진 더블 — 창 중심이 정렬 중앙과 다를 수 있다."""
+
+    def __init__(self, strikes, atm):
+        super().__init__(strikes)
+        self._atm = atm
+
+    @property
+    def current_atm(self):
+        return self._atm
+
+
+def test_core_first_strikes_puts_the_atm_and_its_neighbours_up_front():
+    """ATM → ATM-1 → ATM+1 → 나머지 오름차순. 동률은 낮은 행사가부터(재현 가능해야 한다)."""
+    from mahdi.main import _core_first_strikes
+
+    strikes = frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})
+    assert _core_first_strikes(strikes, 1000.0) == [1000.0, 997.5, 1002.5, 995.0, 1005.0]
+
+
+def test_core_first_strikes_uses_the_window_centre_not_the_sorted_middle():
+    """상장 안 된 칸이 빠져 창이 비대칭이면 **정렬 중앙은 ATM이 아니다.**
+
+    `current_atm`을 쓰는 이유가 이것이고, `RollingSubscriptionManager._current_atm` 주석이
+    같은 함정을 적어 뒀다. 여기서 정렬 중앙(1002.5)을 쓰면 ATM(997.5)이 뒤로 밀린다.
+    """
+    from mahdi.main import _core_first_strikes
+
+    strikes = frozenset({997.5, 1000.0, 1002.5, 1005.0, 1007.5})
+    assert _core_first_strikes(strikes, 997.5)[0] == 997.5
+
+
+def test_core_first_strikes_falls_back_to_the_sorted_middle_when_the_atm_is_unknown():
+    """구독 초기에는 `current_atm`이 None이다 — 그때 죽지 않고 종전과 같은 중심을 쓴다."""
+    from mahdi.main import _core_first_strikes
+
+    assert _core_first_strikes(frozenset({1000.0, 1002.5, 1005.0}), None)[0] == 1002.5
+    assert _core_first_strikes(frozenset(), None) == []
+
+
+def test_a_budget_cut_can_no_longer_take_the_monthly_atm(monkeypatch):
+    """**이 fix의 전부.** 예산이 4레그에서 끊겨도 ATM 콜/풋은 이미 들어와 있어야 한다.
+
+    종전 순서(행사가 오름차순)라면 4레그는 995.0 C/P와 997.5 C/P였고 **ATM(1000.0)은
+    한 레그도 안 들어온다** — 08-21에 실제로 그 형태로 먼슬리가 얇아졌다.
+    """
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientCountingQuotes(clock, 1.0, _OPTION_QUOTE_FIXTURE)
+    books = [(
+        _FakeManagerWithAtm(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0}), 1000.0),
+        "regular",
+    )]
+
+    rows, _spot, _any, missing = _run(
+        _collect_option_chain_cycle(
+            rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 21, 13, 0),
+            WarningThrottle(60.0), deadline=clock[0] + 4.0,   # 4레그만 들어간다
+        )
+    )
+
+    assert len(rows) == 4
+    collected = {(row["strike"], row["option_type"]) for row in rows}
+    assert (1000.0, "C") in collected and (1000.0, "P") in collected
+    # 잘린 쪽은 **가장 먼 외가**여야 한다.
+    assert (995.0, "C") not in collected and (1005.0, "C") not in collected
+    # 잘린 먼슬리 레그는 여전히 재시도 목록에 남는다(회계가 완전해야 한다).
+    assert (995.0, "C") in missing
+
+
 def test_option_chain_cycle_that_collects_nothing_is_louder_than_a_truncation(monkeypatch, caplog):
     """08-05 14:31 회귀 — `rows=0`은 "조금 잘렸다"와 **같은 줄로 보고되면 안 된다.**
 

@@ -106,9 +106,99 @@ def test_report_names_the_cause_next_to_the_restart_count():
 
 
 def test_report_shouts_when_a_death_left_no_reason():
-    """08-19 10:32가 그 형태였다 — 예외 없이 사라지고 3분 뒤 워치독이 되살렸다."""
-    out = report.render({"date": "2026-08-19"}, crash=crash_metrics.parse(_REAL_CRASH, _TARGET))
+    """08-19 10:32가 그 형태였다 — 예외 없이 사라지고 3분 뒤 워치독이 되살렸다.
+
+    2026-08-23 Fix#7 — 「사유 없이 끝난 기동」은 이제 **종료 표식을 다 빼고 남은 것**이다.
+    그래서 이 테스트도 그날의 종료 회계(장마감 자동 종료 1회 · 수동 정지 0회)를 함께 준다.
+    그것이 없으면 리포트는 「모른다」라고 말한다(아래 테스트).
+    """
+    out = report.render({"date": "2026-08-19"}, crash=_with_shutdowns(_REAL_CRASH, clean=1))
     assert "사유 없이 끝난 기동 1건" in out
+
+
+# ===== 2026-08-23 (08-21 §1-17 / §4 Fix#7) — 의도적 정지는 죽음이 아니다 =====
+#
+# 08-21 12:18에 사람이 `stop_mahdi_manual.bat`으로 내렸고, 그 정지가 지표에서 「사유 없이
+# 끝난 기동 1건」으로 잡혔다. 표식은 둘이나 있었고(`.intentional_stop` · 기동 로그의 문구)
+# 워치독은 그것을 정확히 읽었다(재기동 시도 0회) — **지표만 몰랐다.**
+
+_STARTUP_LOG_0821 = [
+    "[2026-08-21  7:30:00.90] ===== Mahdi 장전 기동 시작 ===== ",
+    "[2026-08-21 12:18:25.50] ===== Mahdi 수동 정지 시작 (사람이 일부러 내림) ===== ",
+    "[2026-08-21 12:18:26.57] ===== Mahdi 수동 정지 완료 (DB/Redis는 계속 실행) ===== ",
+    "[2026-08-21 12:18:53.81] ===== Mahdi 장전 기동 시작 ===== ",
+    "[2026-08-21 15:45:01.17] ===== Mahdi 장마감 자동 종료 시작 ===== ",
+    "[2026-08-21 15:46:14.46] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== ",
+]
+
+
+def _with_shutdowns(lines, *, clean=0, intentional=0, target=_TARGET):
+    m = crash_metrics.parse(lines, target)
+    m["clean_shutdowns"] = clean
+    m["intentional_stops"] = intentional
+    m["unexplained_deaths"] = crash_metrics.unexplained_deaths(
+        m["starts"], m["crashes"], intentional, clean
+    )
+    return m
+
+
+def test_the_startup_log_tells_the_two_kinds_of_deliberate_shutdown_apart():
+    """장마감 자동 종료와 사람의 수동 정지는 **합치지 않는다** — 하나는 스케줄, 하나는 결정이다."""
+    m = crash_metrics.parse_shutdowns(_STARTUP_LOG_0821, date(2026, 8, 21))
+    assert m == {"intentional_stops": 1, "clean_shutdowns": 1}
+
+
+def test_only_the_completion_lines_are_counted_not_the_start_lines():
+    """「시작」과 「완료」가 쌍으로 남는다 — 둘 다 세면 종료 수가 정확히 두 배가 된다."""
+    starts_only = [ln for ln in _STARTUP_LOG_0821 if "시작" in ln]
+    assert crash_metrics.parse_shutdowns(starts_only, date(2026, 8, 21)) == {
+        "intentional_stops": 0, "clean_shutdowns": 0,
+    }
+
+
+def test_the_2026_08_21_manual_stop_is_no_longer_an_unexplained_death():
+    """**이 fix의 전부.** 기동 2 − 죽음 0 − 자동 종료 1 − 수동 정지 1 = **0**.
+
+    종전 식(`기동 − 죽음 − 1`)이면 1이었고, 그 1이 08-21 지표의 오탐이다.
+    """
+    assert crash_metrics.unexplained_deaths(2, 0, 1, 1) == 0
+    assert crash_metrics.unexplained_deaths(2, 0, 0, 1) == 1  # 수동 정지를 안 세면 오탐이 돌아온다
+
+
+def test_a_real_unexplained_death_still_fires():
+    """**경보를 끈 것이 아니라 고친 것**이어야 한다 — 08-19 10:32 형태를 여기서 고정한다.
+
+    그날 기동 3회 · 사유가 남은 죽음 1건 · 장마감 자동 종료 1회 · 수동 정지 0회 →
+    남는 1건이 「표식 없이 사라진 기동」이다(워치독이 3분 공백 뒤 되살렸다).
+    """
+    m = _with_shutdowns(_REAL_CRASH, clean=1)
+    assert m["unexplained_deaths"] == 1
+
+
+def test_more_shutdowns_than_starts_does_not_print_a_negative():
+    """전날 프로세스를 오늘 껐으면 종료가 기동보다 많을 수 있다 — 음수는 그 자체가 오보다."""
+    assert crash_metrics.unexplained_deaths(0, 0, 1, 1) == 0
+
+
+def test_an_unreadable_startup_log_says_it_does_not_know(tmp_path):
+    """종료 표식을 못 읽으면 **0이 아니라 「모른다」**다(규약 C) — 그리고 그 사실을 인쇄한다."""
+    (tmp_path / crash_metrics.CRASH_LOG_FILENAME).write_text(
+        chr(10).join(_REAL_CRASH), encoding="utf-8"
+    )
+    m = crash_metrics.collect(tmp_path, _TARGET)
+    assert m["unexplained_deaths"] is None and m["intentional_stops"] is None
+    assert "모른다" in report.render({"date": "2026-08-19"}, crash=m)
+
+
+def test_the_report_names_the_manual_stop_instead_of_burying_it():
+    """사람이 내린 정지는 **별도 줄**로 인쇄된다 — 빼기만 하면 그 사실이 사라진다."""
+    out = report.render(
+        {"date": "2026-08-21"},
+        crash=_with_shutdowns(_REAL_CRASH, clean=1, intentional=1),
+    )
+    assert "사람이 일부러 내린 정지 **1회**" in out
+    # 3 − 1 − 1 − 1 = 0 이므로 **경고 줄은 안 나온다**(안내 문구 안의 같은 표현과 구별한다).
+    assert "**사유 없이 끝난 기동" not in out
 
 
 def test_report_admits_when_it_cannot_attribute_at_all():

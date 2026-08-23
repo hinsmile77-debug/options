@@ -43,6 +43,10 @@ WATCHDOG_LOG_FILENAME = "watchdog.log"
 # 「점검이 제때 있었다」로 읽히므로, `tests/test_ops_watchdog_metrics.py`가 일치를 강제한다.
 MISSING_CHECK_MARKER = "MISSING_CHECK"
 
+# 2026-08-23 (08-21 §4 Fix#4) — DEGRADED 사건의 **종료 줄**.
+# 원본은 `scripts/watchdog_observation_loop.py`가 `RECOVERED — ...`로 남긴다.
+RECOVERED_MARKER = "RECOVERED"
+
 # `watchdog_observation_loop._LOCK_SWEEP_MARKER`의 복제본(2026-08-19). 같은 이유로 계약
 # 테스트가 일치를 강제한다 — 갈라지면 청소 건수가 0으로 세어지고, 그 0은 「락이 안 남았다」로
 # 읽힌다. 실제로는 **세션 teardown이 git을 죽이고 있다**는 신호를 통째로 잃는 것이다.
@@ -84,6 +88,10 @@ def parse(lines: list[str], target: date) -> dict:
     degraded = 0
     missing_check = 0
     lock_swept = 0
+    # 2026-08-23 (08-21 §1-11 / §4 Fix#4) — **사건이 몇 번 끝났는가.**
+    # `degraded_checks`는 「아팠던 분 수」이고 이 값은 「사건 수」다. 08-21에 16분이 세 구간
+    # (13:39~14:02 · 14:44 · 15:14)이었는데, 그 구분을 사람이 비-OK 16행을 손으로 묶어 냈다.
+    recovered = 0
     for line in lines:
         m = _LINE_RE.match(line.rstrip("\n"))
         if not m:
@@ -108,6 +116,10 @@ def parse(lines: list[str], target: date) -> dict:
             restarts += 1
         elif body.startswith("ALERT_ONLY"):
             alert_only += 1
+        elif body.startswith(RECOVERED_MARKER):
+            # **회복은 DEGRADED의 반대가 아니라 그 사건의 닫힘이다.** 종료 줄이 없던 08-21까지는
+            # 이 값이 0이고, 그 0은 「사건이 없었다」가 아니라 「셀 수 없었다」이다(규약 C).
+            recovered += 1
         elif body.startswith("DEGRADED"):
             # 2026-08-14 Fix#2 — **살아 있는데 적재가 0인 분.** 재기동을 유발하지 않으므로
             # `restarts`와 섞으면 안 된다: 저쪽은 「조치했다」이고 이쪽은 「조치하지 않기로
@@ -136,6 +148,10 @@ def parse(lines: list[str], target: date) -> dict:
         # 2026-08-14 Fix#2. **0은 두 가지다**(규약 C): 이 키가 있고 0이면 「적재가 끊긴 분이
         # 없었다」이고, 키가 아예 없으면 「그날은 이 판정 자체가 없던 버전이다」이다.
         "degraded_checks": degraded,
+        # 2026-08-23 Fix#4. **`degraded_checks`와 나란히 읽는다** — 「16분 / 3사건」과
+        # 「16분 / 1사건」은 완전히 다른 하루다. 키가 있고 0이면 「그날 닫힌 사건이 없었다」
+        # (아직 아프거나, 아예 안 아팠거나), 키가 없으면 「그날은 종료 줄 자체가 없던 버전이다」.
+        "recovered_episodes": recovered,
         # 2026-08-19 Fix#4. **0은 두 가지다**(규약 C): 키가 있고 0이면 「장전 점검이 제때 있었다」,
         # 키가 아예 없으면 「그날은 이 판정 자체가 없던 버전이다」. 그 구분이 이 키의 존재 이유다.
         "missing_check_alerts": missing_check,

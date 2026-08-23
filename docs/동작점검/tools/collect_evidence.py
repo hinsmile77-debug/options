@@ -212,6 +212,25 @@ CHAIN_COLLECT_BUDGET_SECONDS = 50.0      # mahdi/main.OPTION_CHAIN_CYCLE_COLLECT
 GLOBAL_READ_TIMEOUT_SECONDS = 4.0        # mahdi/broker/rest_client._HTTP_READ_TIMEOUT_SECONDS
 BUDGET_WARN_RATIO = 0.90                 # 시간대 평균이 예산의 이만큼을 넘으면 적신호
 P50_TIMEOUT_WARN_RATIO = 0.80            # mahdi/ops/log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN
+
+# ===== 2026-08-23 (08-21 §1-14 / §5 고도화#1) — **검열된 p50은 중앙값이 아니라 하한이다** =====
+#
+# 08-21 지연창 98개 중 상당수가 p50 4.03~4.05초를 냈고, read timeout이 4.0초이므로 그 값은
+# **타임아웃 벽에 눌린 값**이다. 그런데 이 도구도 리포트도 그것을 「4.03초」로 평범하게 인쇄했고
+# 네 회차가 실제 응답시간처럼 읽었다. `≥`가 붙어 있었다면 **「6초로 늘리면 몇 %가 더 들어오는가」를
+# 이 데이터로는 계산할 수 없다**는 것이 한눈에 보였을 것이다.
+#
+# 재료는 새로 만들지 않는다: `rest_client._log_if_slow`가 **타임아웃 호출을 임계와 무관하게
+# 반드시 남긴다**(08-05 Fix#4). 임계 3.0초 < timeout 4.0초이므로 검열된 호출은 전부 그 줄에 있다.
+# 포맷 원본: `mahdi.broker.rest_client.LOG_SLOW_CALL`
+SLOW_CALL_RE = re.compile(
+    r"느린 REST 호출 ([\d.]+)초 = 페이서대기 ([\d.]+)초 \+ HTTP ([\d.]+)초 "
+    r"\(배율 ([\d.]+)배, (\w+) (\S+)\)"
+)
+# p50이 타임아웃의 이 배수를 넘으면 「벽에 닿았다」로 본다. 1.00이 아닌 이유는 최근접 순위법
+# p50이 4.00 바로 아래(3.99)로 떨어질 수 있기 때문이고, 그 창도 검열된 창이다.
+# 원천: `mahdi/ops/log_metrics.P50_CENSORED_FLOOR_RATIO`
+P50_CENSORED_FLOOR_RATIO = 0.98
 ZERO_ROW_RUN_ALERT_MINUTES = 20          # mahdi/ops/db_metrics.ZERO_ROW_RUN_ALERT_MINUTES
 
 # 조용히 지나가면 안 되는 사건들. 태그가 없는 로그라 **문구로 식별한다** —
@@ -499,7 +518,10 @@ class LoopScan:
         self.cycle_rest = collections.defaultdict(list)   # 시(hour) -> [REST수집 초]
         self.cycle_rows = collections.defaultdict(list)   # 시(hour) -> [rows]
         self.zero_row_minutes = set()                     # rows=0인 분(분 단위 정수)
-        self.latency_p50 = collections.defaultdict(list)  # 시(hour) -> [(건수, p50)]
+        self.latency_p50 = collections.defaultdict(list)  # 시(hour) -> [(창시각, 건수, p50)]
+        # 2026-08-23 고도화#1 — 검열(= read timeout에 잘린) 호출의 초 단위 시각.
+        # 창에 붙이려면 분보다 잘게 알아야 한다(창 경계에 걸린 호출의 소속이 갈린다).
+        self.censored_seconds = []
         # 2026-08-13 고도화 2 — 축 가용성. 상세 근거는 `MEMBER_TOKEN` 주석.
         self.member_first_seen = {}                       # 멤버 -> 최초 편입 시각
         self.member_last_seen = {}                        # 멤버 -> 마지막 관측 시각
@@ -569,6 +591,12 @@ class LoopScan:
                 for name in MEMBER_NAME_RE.findall(mm.group(1)):
                     self.member_first_seen.setdefault(name, hhmmss)
                     self.member_last_seen[name] = hhmmss
+        sc = SLOW_CALL_RE.search(msg)
+        if sc and sc.group(6) == CHAIN_ENDPOINT:
+            # **HTTP 구간만 본다.** 페이서 대기는 우리 쪽이고 검열은 상대 쪽 천장이다.
+            # 임계는 그날 실제 타임아웃이어야 하므로 호출 시점에 비교하지 않고 초만 모은다.
+            self.censored_seconds.append((hh * 3600 + mm * 60 + int(m.group(4)), float(sc.group(3))))
+
         if LATENCY_TOKEN in msg:
             for it in LATENCY_ITEM_RE.finditer(msg):
                 if it.group(1) == CHAIN_ENDPOINT:
@@ -657,6 +685,32 @@ class LoopScan:
         for hour in sorted(self.latency_p50):
             out.extend(self.latency_p50[hour])
         return sorted(out)
+
+    def window_censored_counts(self, timeout):
+        """반환: `{창시각(HH:MM:SS): 그 창에서 타임아웃에 잘린 호출 수}`.
+
+        입력: 그날 실제로 걸려 있던 read timeout.
+        계산: 창은 `[직전 창 끝, 이 창 끝)`이다 — `poll_rest_latency_snapshot`이 **직전 창의
+             표본을 비우면서** 줄을 남기므로 시각은 창의 **끝**이다.
+        해석: 상세 근거는 `P50_CENSORED_FLOOR_RATIO` 위 주석. 이 수를 창의 호출 수로 나눈 것이
+             「검열 비율」이고, 그 값이 있어야 `≥4.0초`가 얼마나 심한 하한인지 읽을 수 있다.
+        실패 조건: 없다 — 느린 호출 줄이 하나도 없으면 빈 dict이고, 호출측이 그것을
+                  「0%」가 아니라 **「안 셌다」**로 인쇄한다(규약 C).
+        """
+        windows = self.window_latency_p50()
+        if not windows or not self.censored_seconds:
+            return {}
+        ends = [hhmm_to_min(at[:5]) * 60 + int(at[6:8]) for at, _n, _p in windows]
+        span = min((b - a for a, b in zip(ends, ends[1:])), default=300) or 300
+        counts = collections.Counter()
+        for at_seconds, http_seconds in self.censored_seconds:
+            if http_seconds < timeout:
+                continue
+            for end, (label, _n, _p) in zip(ends, windows):
+                if at_seconds < end <= at_seconds + span:
+                    counts[label] += 1
+                    break
+        return dict(counts)
 
     def first_latency_breach(self, timeout, ratio):
         """반환: `p50/timeout`이 `ratio`에 **처음 닿은** 창 `(창시각, 호출 수, p50, 비율)`. 없으면 None.
@@ -830,6 +884,63 @@ def latest_report_before(root: Path, day: _date):
 def report_hypothesis_ids(text: str):
     """반환: 보고서 본문이 언급한 가설 id 집합."""
     return set(HYPOTHESIS_ID_RE.findall(text))
+
+
+# ===== 2026-08-23 (08-21 §1-3 / §4 Fix#6) — 크래시 판정을 **표식**으로 바꾼다 =====
+#
+# ## 이틀 연속 여덟 번 헛것을 가리켰다
+#
+# 종전 판정은 `observation_loop_crash.log`의 **mtime이 오늘인가** 하나였다. 그런데 08-19부터
+# `start_mahdi_premarket.bat`이 **기동할 때마다** 이 파일에 표식 한 줄을 append한다:
+#
+#     echo [%date% %time%] ===== 관측 루프 기동 ===== >> logs\observation_loop_crash.log
+#
+# 즉 **정상 기동만으로 mtime이 오늘이 된다.** 08-20·08-21 두 날 네 회차씩 **여덟 번** 이
+# 적신호가 떴고 여덟 번 다 크래시는 0건이었다. 08-20 §1-4가 이미 지적한 그대로다.
+#
+# ## 왜 이 파일에 파서를 또 쓰는가 — `mahdi/ops/crash_metrics.py`가 이미 있는데
+#
+# 이 스크립트는 **stdlib 전용**이다(파일 상단 docstring). 그 규약이 있어서 이 도구는 venv가
+# 깨진 날에도 돌고, 실제로 그것이 여러 번 유일한 증거원이었다. 그래서 같은 문법을 여기에도
+# 적는다 — 대신 **문구 상수를 공유하지 않는다는 사실 자체가 위험**이므로, 표식을 못 찾으면
+# 옛 방식으로 물러서고 **그 사실을 한 줄 인쇄한다**(조용한 실패 금지, 규약 C).
+_CRASH_START_MARKER_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})(?:[.,]\d+)?\]\s*=+\s*관측 루프 기동"
+)
+_CRASH_TRACEBACK_HEAD_RE = re.compile(r"^Traceback \(most recent call last\):")
+
+
+def crash_since_last_start(lines, day):
+    """반환: 그날 **마지막 기동 표식 이후**의 `{"at", "traceback", "count"}`. 표식이 없으면 None.
+
+    입력: 크래시 로그의 줄들(여러 날치가 섞여 있어도 된다), 대상 날짜.
+    계산: 뒤에서부터 그날의 마지막 표식을 찾고, 그 **뒤**의 줄만 본다.
+         `count`는 트레이스백 머리 줄 수 — 예외 연쇄(`During handling of ...`)가 있으면
+         실제 죽음보다 많이 세어지므로 **상한**이다(`crash_metrics`와 같은 규약).
+    실패 조건: 없다. 그날 표식이 하나도 없으면 None을 내고 호출측이 옛 방식으로 물러선다.
+    """
+    last = None
+    for index, line in enumerate(lines):
+        m = _CRASH_START_MARKER_RE.match(line)
+        if m and m.group(1) == day.isoformat():
+            last = (index, f"{int(m.group(2)):02d}:{m.group(3)}:{m.group(4)}")
+    if last is None:
+        return None
+    index, at = last
+    # **다음 표식에서 끊는다.** 안 끊으면 과거 날짜를 조회할 때 그 뒤 날들의 본문이 통째로
+    # 딸려 들어와 「그날 크래시」가 부풀려진다(도입 직후 08-20을 조회해 실제로 확인했다).
+    body = []
+    for line in lines[index + 1:]:
+        if _CRASH_START_MARKER_RE.match(line):
+            break
+        if line.strip():
+            body.append(line)
+    return {
+        "at": at,
+        "traceback": body,
+        # 콘솔이 남긴 `^C`가 줄 앞에 붙어 있을 수 있다 — 08-19 로그의 세 트레이스백이 전부 그랬다.
+        "count": sum(1 for ln in body if _CRASH_TRACEBACK_HEAD_RE.match(ln.lstrip("^C"))),
+    }
 
 
 def lever_schedule(root: Path):
@@ -1167,9 +1278,36 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                 return f"- {label} 최초 돌파: **{at[:5]}** — p50 {p50:.2f}초 / {n}건 (비율 **{ratio:.2f}**) {mark}"
             A(_breach(f"경고선(비율 {P50_TIMEOUT_WARN_RATIO:.2f})", warn_at, "⚠"))
             A(_breach("위험선(비율 1.00)", danger_at, "⛔"))
-            tsv = write_latency_windows(root, day, windows, timeout)
+            # 2026-08-23 고도화#1 — **검열 비율을 함께 낸다.** 상세 근거는
+            # `P50_CENSORED_FLOOR_RATIO` 위 주석.
+            censored = scan.window_censored_counts(timeout)
+            floored = [
+                (at, n, p50) for at, n, p50 in windows
+                if timeout and p50 >= timeout * P50_CENSORED_FLOOR_RATIO
+            ]
+            tsv = write_latency_windows(
+                root, day, windows, timeout, censored if scan.censored_seconds else None
+            )
             A(f"- 전체 **{len(windows)}창**: "
               + (f"`auto/{D}_지연창.tsv`" if tsv else "⚠ 파일로 못 뺐다(본문만 유효)"))
+            if floored:
+                cut_total = sum(censored.get(at, 0) for at, _n, _p in floored)
+                call_total = sum(n for _at, n, _p in floored)
+                pct = f"{cut_total / call_total * 100:.0f}%" if call_total else "—"
+                A(f"- ⛔ **p50이 타임아웃에 눌린 창 {len(floored)}개** — 그 창의 p50은 중앙값이 "
+                  f"아니라 **`≥{timeout:.1f}초`**(하한)다"
+                  + (f", 그 창들의 검열 비율 **{pct}**({cut_total}/{call_total}건)."
+                     if scan.censored_seconds else ", 검열 건수는 **못 셌다**(느린 호출 줄 0건)."))
+                A(f"  `≥`가 붙은 값으로는 **「제한시간을 {timeout:.0f}초에서 늘리면 몇 %가 더 "
+                  "들어오는가」를 계산할 수 없다** — 잘린 호출의 실제 소요를 이 통로는 모른다. "
+                  "**레버보다 계측이 먼저다**(08-21 사용자 조치 7).")
+                flags.append(
+                    f"`{CHAIN_ENDPOINT}` p50이 타임아웃에 검열된 창 {len(floored)}개 — "
+                    f"그 값들을 실제 응답시간으로 읽지 말 것(하한이다)"
+                )
+            else:
+                A(f"- ✅ p50이 타임아웃의 {P50_CENSORED_FLOOR_RATIO}배에 닿은 창 없음 — "
+                  "오늘 p50은 검열되지 않았다(실제 중앙값으로 읽어도 된다).")
             A("")
         A("| 시간대 | 사이클 | rows=0 | REST수집 평균(초) | 예산 대비 | p50 평균 | 창 최대 p50 | 최대/timeout | |")
         A("|---|---|---|---|---|---|---|---|---|")
@@ -1375,14 +1513,36 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     crash = logs / "observation_loop_crash.log"
     if crash.exists():
         mt = datetime.fromtimestamp(crash.stat().st_mtime, KST)
-        A(f"- `observation_loop_crash.log`: {fmt_bytes(crash.stat().st_size)} · 최종 {mt:%m-%d %H:%M}"
-          + ("  ← **오늘 갱신됨 ⚠**" if mt.date() == day else ""))
-        if mt.date() == day:
-            flags.append("크래시 로그가 오늘 갱신됐다 — 트레이스백 마지막 프레임을 반드시 인용할 것")
+        size = fmt_bytes(crash.stat().st_size)
+        segment = crash_since_last_start(read_text(crash).splitlines(), day)
+        if segment is None:
+            # 표식을 못 찾았다 — 옛 방식으로 돌아가되 **그 사실을 인쇄한다**(조용한 실패 금지).
+            A(f"- `observation_loop_crash.log`: {size} · 최종 {mt:%m-%d %H:%M}"
+              + ("  ← **오늘 갱신됨 ⚠**" if mt.date() == day else ""))
+            A("  ⚠ 기동 표식(`===== 관측 루프 기동 =====`)을 못 찾아 **옛 방식(mtime)으로 판정했다** — "
+              "`start_mahdi_premarket.bat`의 문구가 바뀌었거나 2026-08-19 이전 로그다. "
+              "**이 줄이 있는 동안 아래 판정은 믿을 수 없다.**")
+            if mt.date() == day:
+                flags.append("크래시 로그가 오늘 갱신됐다(표식 없음 — mtime 판정) — 트레이스백을 직접 볼 것")
+                A("")
+                A("```")
+                L.extend(read_text(crash).splitlines()[-12:])
+                A("```")
+        elif segment["traceback"]:
+            A(f"- `observation_loop_crash.log`: {size} · 당일 마지막 기동 "
+              f"{segment['at'] or '(시각 불명)'} **이후 트레이스백 {segment['count']}건 ⚠**")
+            flags.append(
+                f"당일 기동({segment['at'] or '시각 불명'}) 이후 크래시 {segment['count']}건 — "
+                "트레이스백 마지막 프레임을 반드시 인용할 것"
+            )
             A("")
             A("```")
-            L.extend(read_text(crash).splitlines()[-12:])
+            L.extend(segment["traceback"][-12:])
             A("```")
+        else:
+            A(f"- `observation_loop_crash.log`: {size} · (당일 기동 이후 크래시 없음"
+              + (f" — 마지막 기동 {segment['at']}" if segment["at"] else " — 당일 기동 표식 없음")
+              + f", 파일 최종 수정 {mt:%m-%d %H:%M})")
     A("")
 
     # ---- 7. 레버 ----
@@ -1678,14 +1838,22 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     return "\n".join(L)
 
 
-def write_latency_windows(root: Path, day: _date, windows, timeout) -> Path | None:
+def write_latency_windows(root: Path, day: _date, windows, timeout, censored=None) -> Path | None:
     """5분 창 전량을 `auto/{날짜}_지연창.tsv`로 뺀다. 반환: 쓴 경로(못 쓰면 None).
 
-    입력: 리포 루트 · 날짜 · `LoopScan.window_latency_p50()` · 그날 실제 read timeout.
-    계산: `창시각 · 호출수 · p50 · p50/timeout` 네 열. 정렬은 시각순(입력 그대로).
+    입력: 리포 루트 · 날짜 · `LoopScan.window_latency_p50()` · 그날 실제 read timeout ·
+         (선택) `LoopScan.window_censored_counts()`.
+    계산: `창시각 · 호출수 · p50초 · p50/timeout · 검열건수 · 검열% · p50표기` 일곱 열.
+         정렬은 시각순(입력 그대로).
     해석: 표는 **돌파 창만** 인쇄하고 전량은 여기로 뺀다 — 98창을 md에 실으면 그 표가
          §5-1을 통째로 밀어낸다. 손으로 다시 파싱하는 일(08-19 14:30 회차)이 없어지는 것이
          이 파일의 전부다.
+
+         2026-08-23(08-21 §1-14 / §5 고도화#1) — **`p50표기` 열이 이 파일의 새 요점이다.**
+         p50이 타임아웃의 `P50_CENSORED_FLOOR_RATIO`배를 넘으면 `4.03`이 아니라 **`≥4.0`**으로
+         적는다. 08-21에 네 회차가 「4.03초」를 실제 응답시간으로 읽었고, 그 오독 위에
+         「제한시간 6초」 처방이 이틀 연속 손익표에 올랐다.
+         `censored`가 없으면 그 두 열은 `-`다 — **0이 아니라 「안 셌다」**이다(규약 C).
     실패 조건: 쓰기에 실패해도 **조용히 None** — 증거 본문이 이것 때문에 안 나오면 안 된다.
     """
     if not windows:
@@ -1695,11 +1863,21 @@ def write_latency_windows(root: Path, day: _date, windows, timeout) -> Path | No
         out.parent.mkdir(parents=True, exist_ok=True)
         # 탭·개행은 `chr()`로 적는다 — 이 파일은 소스에 탭 문자를 두지 않는다.
         tab, lf = chr(9), chr(10)
-        head = tab.join(("창시각", "호출수", "p50초", "p50/timeout"))
+        head = tab.join(
+            ("창시각", "호출수", "p50초", "p50/timeout", "검열건수", "검열%", "p50표기")
+        )
         rows = [head]
         for at, n, p50 in windows:
             ratio = f"{p50 / timeout:.2f}" if timeout else "-"
-            rows.append(tab.join((at, str(n), f"{p50:.2f}", ratio)))
+            floored = timeout and p50 >= timeout * P50_CENSORED_FLOOR_RATIO
+            label = f">={timeout:.1f}" if floored else f"{p50:.2f}"
+            if censored is None:
+                cut_n = cut_pct = "-"
+            else:
+                cut = censored.get(at, 0)
+                cut_n = str(cut)
+                cut_pct = f"{min(cut / n, 1.0) * 100:.0f}" if n else "-"
+            rows.append(tab.join((at, str(n), f"{p50:.2f}", ratio, cut_n, cut_pct, label)))
         out.write_text(lf.join(rows) + lf, encoding="utf-8", newline=lf)
         return out
     except Exception:  # noqa: BLE001

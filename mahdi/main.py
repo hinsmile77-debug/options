@@ -501,6 +501,64 @@ OPTION_CHAIN_PRIORITY_SERIES = "regular"
 # 상한을 두는 이유는 행사가 창이 넓어지는 미래 변경에서 이 경로가 조용히 커지는 것을 막기 위함이다.
 OPTION_CHAIN_PRIORITY_RETRY_MAX_LEGS = 10
 
+# ===== 2026-08-23 (08-21 §1-9 / §4 Fix#2) — 먼슬리 **핵심 6레그**를 맨 앞으로 =====
+#
+# ## 사흘째 이월된 fix이고, 08-21에 결과가 확정됐다
+#
+#     먼슬리 절대 커버리지        90.1% → 76.1%  (▼14%p)
+#     먼슬리 레그 회복            128 → 114레그
+#     컷당한북 = `regular,...`    31건 (weekly_thu 20 · weekly_mon 11)
+#     `timeout_abort.priority_cut_minutes`  **267분**
+#
+# ## 북 순서는 이미 먼슬리 우선이었다 — 그런데도 먼슬리가 잘렸다
+#
+# `_books_due_this_cycle`이 입력 순서를 유지하고 `books[0]`이 먼슬리이므로 **북 사이**의
+# 순서는 옳았다(`test_collect_option_chain_cycle_visits_the_monthly_book_first`가 08-05부터
+# 그것을 지킨다). 문제는 **북 안**에 순서가 없었다는 것이다:
+#
+#     for strike in sorted(strikes):   ← 행사가 **오름차순**
+#
+# ATM±2 창(5행사가 × C/P = 10레그)에서 ATM은 정렬 중앙, 즉 **5~6번째**에 온다. 컷이 4번째에서
+# 걸리면 **먼 외가는 받아 놓고 ATM을 잃는다.** GEX·감마플립의 무게가 ATM 근처에 몰려 있으므로
+# 그 순서는 정확히 거꾸로다.
+#
+# ## 「예산을 떼어 놓는다」 = 순서를 앞으로 옮긴다
+#
+# 별도의 시간 예산 칸을 만들지 않는다. 데드라인 검사는 레그를 **순서대로** 훑으며 걸리므로,
+# 핵심을 앞에 두면 예산 배분은 자동으로 따라온다. 예산(50초) 자체는 안 늘린다 —
+# **최악의 사이클 길이가 종전과 같아야** 이 fix가 다음 분을 밀지 않는다.
+#
+# ## 왜 ±1인가
+#
+# ATM ±1칸 × Call/Put = **6레그**. 감마플립은 ATM 양옆의 부호 전환에서 나오므로 최소 3행사가가
+# 필요하고, 그보다 넓히면 「핵심」이 창 전체가 되어 이 순서가 아무것도 안 바꾼다.
+OPTION_CHAIN_PRIORITY_CORE_EACH_SIDE = 1
+
+# ===== 2026-08-23 (08-21 §1-8 · §3-3 / §4 Fix#8) — 버스트가 **돌았다**는 줄 =====
+#
+# ## 성공은 아무 줄도 안 남긴다
+#
+# 만기유동성 폴러는 실패했을 때만 찍는다. 08-21에 그 축의 로그는 26+22+16건이 **전부 실패
+# 경고**였고 **성공 줄은 0행**이었다. 그래서 장후 회차가 「08:30 버스트가 돌기는 했는가」에
+# 답하려고 `inquire-asking-price` **HTTP 호출 수를 세어 역산**해야 했다(§3-3).
+# 로그에 한 줄이면 그 우회가 통째로 없어진다.
+#
+# ## 「버스트」는 사이클이 아니라 **첫 바퀴**다
+#
+# `_expiry_liquidity_books_due`는 300초 주기로 슬롯(`minute % 10` ∈ {1,3,5})에 맞는 북
+# **하나씩만** 돌려준다. 사이클마다 줄을 남기면 하루 80줄이고, 그것은 08-04 §2-2에서 고친
+# 로그 폭증을 우리 손으로 재현하는 것이다. 세 북이 **각자 한 번씩** 돌면 그때 한 줄이다 —
+# 대가는 「기동 1회당 1건」이고 가설 `2026-08-21-fix6-expiry-burst-leaves-a-success-line`이
+# 상한을 3으로 뒀다.
+#
+# ## 실패한 북도 바퀴에 센다
+#
+# 「돌았는데 한 행도 못 건졌다」와 「아직 안 돌았다」는 다른 사실이고, 후자만 침묵해야 한다.
+# 그래서 북이 슬롯에 걸려 조회를 **시도한 순간** 바퀴에 넣고, 성공 행 수는 숫자로 함께 적는다.
+LOG_EXPIRY_BURST_DONE = (
+    "만기 유동성 버스트 완료: 북 %d개(%s) · %d레그 · 적재 %d행 (%s~%s)"
+)
+
 LOG_CHAIN_PRIORITY_RETRY = (
     "먼슬리 레그 재시도: %d개 중 %d개 회복(남은 예산 %.1f초) — 판단 주입력(GEX/감마플립)의 두께다"
 )
@@ -1980,6 +2038,35 @@ def _parse_option_quote(
         return None
 
 
+def _core_first_strikes(
+    strikes: frozenset[float],
+    atm: float | None,
+    each_side: int = OPTION_CHAIN_PRIORITY_CORE_EACH_SIDE,
+) -> list[float]:
+    """
+    입력: 그 북의 구독 행사가 집합, 지금 창의 중심(`RollingSubscriptionManager.current_atm`),
+         핵심으로 볼 편측 칸 수.
+    계산: **ATM에서 가까운 순으로 `each_side * 2 + 1`개를 앞에 세우고**, 나머지는 종전대로
+         오름차순으로 뒤에 붙인다.
+    해석: 상세 근거는 `OPTION_CHAIN_PRIORITY_CORE_EACH_SIDE` 위 주석. 이 함수가 하는 일은
+         「예산을 떼어 놓는 것」의 구현 그 자체다 — 데드라인은 순서대로 걸리므로 앞에 두는
+         것이 곧 먼저 떼어 두는 것이다.
+    실패 조건: 없다. `atm`이 None이면(구독 초기·테스트 더블) 정렬 중앙을 중심으로 본다 —
+              `_atm_liquidity_window`가 같은 폴백을 쓴다. 다만 **중심은 되도록 `current_atm`을
+              쓴다**: 상장 안 된 행사가가 섞이면 정렬 중앙이 어긋나고, 그 어긋남이 이 fix를
+              조용히 무력화한다(`RollingSubscriptionManager._current_atm` 주석이 같은 이유를 적었다).
+    """
+    ordered = sorted(strikes)
+    if not ordered:
+        return []
+    center = atm if atm is not None else ordered[len(ordered) // 2]
+    # 동률(양옆이 같은 거리)은 낮은 행사가부터 — 결정적이어야 로그와 테스트가 재현된다.
+    by_distance = sorted(ordered, key=lambda strike: (abs(strike - center), strike))
+    core = by_distance[: each_side * 2 + 1]
+    core_set = set(core)
+    return core + [strike for strike in ordered if strike not in core_set]
+
+
 async def _collect_option_chain_cycle(
     rest_client: KISRestClient,
     books: list[tuple[RollingSubscriptionManager, str]],
@@ -2084,7 +2171,15 @@ async def _collect_option_chain_cycle(
             continue
         any_strikes = True
         is_priority = series == OPTION_CHAIN_PRIORITY_SERIES
-        for strike in sorted(strikes):
+        # 2026-08-23 Fix#2 — **먼슬리만** 핵심 6레그를 앞으로 당긴다. 위클리는 종전대로
+        # 오름차순이다: 그 북들은 어차피 뒤에서 잘리므로 안쪽 순서가 판단 입력을 바꾸지 않고,
+        # 바꾸면 `db.book_coverage`의 시계열이 이유 없이 흔들린다.
+        # `getattr` 폴백은 이 파일의 `rate_limit_total_calls`와 같은 이유다(테스트 더블 보호).
+        cycle_strikes = (
+            _core_first_strikes(strikes, getattr(subscription_manager, "current_atm", None))
+            if is_priority else sorted(strikes)
+        )
+        for strike in cycle_strikes:
             for option_type in ("C", "P"):
                 symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
                 if symbol is None:
@@ -2933,6 +3028,10 @@ async def poll_expiry_liquidity(
 
     next_tick: float | None = None
     warning_throttle = WarningThrottle(logger, window_seconds=WARNING_THROTTLE_WINDOW_SECONDS)
+    # 2026-08-23 Fix#8 — 첫 바퀴 집계. 상세 근거는 `LOG_EXPIRY_BURST_DONE` 위 주석.
+    # `series -> {"legs", "rows", "at"}`. 세 북이 다 들어오면 한 줄 찍고 닫는다.
+    burst_seen: dict[str, dict] = {}
+    burst_logged = False
     while True:
         poll_time = _grid_poll_minute(db.local_now())
         due_books = _expiry_liquidity_books_due(books, poll_time)
@@ -2943,6 +3042,7 @@ async def poll_expiry_liquidity(
             if not window:
                 continue
             any_strikes = True
+            book_legs = 0
 
             atm_strike = window[len(window) // 2]
             anchor_symbol = master.option_symbol("C", atm_strike, underlying=underlying, series=series)
@@ -2970,6 +3070,7 @@ async def poll_expiry_liquidity(
                     symbol = master.option_symbol(option_type, strike, underlying=underlying, series=series)
                     if symbol is None:
                         continue
+                    book_legs += 1
                     try:
                         resp = await asyncio.to_thread(rest_client.get_asking_price, symbol)
                     except Exception as exc:
@@ -2988,6 +3089,10 @@ async def poll_expiry_liquidity(
                     if parsed_leg["volume"] is not None:
                         volume_total += parsed_leg["volume"]
 
+            # 2026-08-23 Fix#8 — **`continue`보다 앞이다.** 한 행도 못 건진 북도 「돌았다」이고,
+            # 그 사실을 여기서 안 세면 실패한 날의 버스트 줄이 영영 안 나온다(= 08-21과 같은 침묵).
+            burst_seen.setdefault(series, {"legs": book_legs, "rows": 0, "at": poll_time})
+
             if not spread_values:
                 continue
 
@@ -3003,6 +3108,22 @@ async def poll_expiry_liquidity(
                     "days_to_expiry": max((expiry - poll_time.date()).days, 0),
                 }
             )
+
+        # 2026-08-23 Fix#8 — 이번 사이클에 실제로 적재된 행을 그 북의 몫으로 되돌려 적는다.
+        for row in rows:
+            entry = burst_seen.get(row["series"])
+            if entry is not None:
+                entry["rows"] += 1
+        if not burst_logged and books and len(burst_seen) >= len(books):
+            visited = sorted(burst_seen.items(), key=lambda kv: kv[1]["at"])
+            logger.info(
+                LOG_EXPIRY_BURST_DONE,
+                len(visited), ",".join(series for series, _ in visited),
+                sum(item["legs"] for _, item in visited),
+                sum(item["rows"] for _, item in visited),
+                f"{visited[0][1]['at']:%H:%M}", f"{visited[-1][1]['at']:%H:%M}",
+            )
+            burst_logged = True
 
         # 슬롯이 아닌 분(due_books 비어 있음)은 "구독 전"이 아니라 정상적인 무작업 사이클이므로
         # 워밍업 재확인 경로로 새면 안 된다 — 그러면 위상 격자가 매 분 리셋된다(2026-07-31).
@@ -4171,6 +4292,9 @@ async def poll_signal_fusion_cycle(
                     vrp=vrp if vrp is not None else 0.0,
                     already_used_strategies_today=already_used_today,
                     last_entry_minutes_ago=last_entry_minutes,
+                    # 2026-08-23 Fix#3 — 판단 축 이탈/복귀 줄의 시각. 벽시계가 아니라
+                    # **그 분의 격자 시각**이어야 로그의 다른 줄과 나란히 읽힌다.
+                    now=poll_time,
                 )
 
                 # 2026-07-30(운영점검보고서 §2-2/§4 Fix#1): 예전엔 bool(decision.allowed_strategies)

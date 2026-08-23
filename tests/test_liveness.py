@@ -273,11 +273,58 @@ def test_unknown_ingest_falls_back_to_the_old_judgement():
 
 
 def test_ingest_outside_the_regular_session_is_not_an_alert():
-    """15:20 마감과 15:45 종료 사이는 폴링이 잦아드는 정상 구간이다 — 여기서 울리면 매일 운다."""
-    late = datetime(2026, 8, 14, 15, 30)
+    """15:30 단일가 종료와 15:45 종료 사이는 폴링이 잦아드는 정상 구간이다 — 여기서 울리면 매일 운다.
+
+    2026-08-23(08-21 §4 Fix#1) — 창의 끝이 **15:15에서 15:30으로** 넓어졌다. 그래서 이 테스트의
+    「창 밖」 표본도 15:30에서 15:35로 옮긴다. **15:30 자신은 이제 창 안이다** — 08-21의 빈손
+    구간이 정확히 15:30까지 이어졌고, 그것을 잡는 것이 이 fix의 전부다(아래 세 케이스가 고정한다).
+    """
+    late = datetime(2026, 8, 14, 15, 35)
     assert liveness.decide(_beat(late), late, ingest_minutes_recent=0).action == liveness.ACTION_OK
     early = datetime(2026, 8, 14, 8, 30)
     assert liveness.decide(_beat(early), early, ingest_minutes_recent=0).action == liveness.ACTION_OK
+
+
+# ===== 2026-08-23 (08-21 §1-13 / §4 Fix#1) — 단일가 구간의 빈손을 끝까지 본다 =====
+#
+# 08-21 15:05~15:30에 26분 연속 적재 0행이었고(당일 최장, 임계 20분 첫 초과) 그중 15:15 이후는
+# **감시 창 밖이라 아무도 안 봤다.** 15:20:01과 15:30:02의 판정은 `OK — 정상`이었다.
+# 아래 셋이 그 구멍을 고정한다 — 보고서 §4 Fix#1이 요구한 (a)(b)(c) 그대로다.
+
+
+def test_empty_ingest_during_the_closing_auction_is_degraded():
+    """(a) 15:25 적재 0분 → DEGRADED. 종전 창(15:15)에서는 여기가 통째로 안 보였다."""
+    at = datetime(2026, 8, 14, 15, 25)
+    decision = liveness.decide(_beat(at), at, ingest_minutes_recent=0)
+    assert decision.action == liveness.ACTION_DEGRADED
+    assert decision.reason == liveness.REASON_NO_INGEST
+
+
+def test_the_last_minute_of_the_closing_auction_is_still_watched():
+    """08-21의 빈손은 **15:30까지** 이어졌다 — 경계가 열려 있으면 이 fix는 10분을 남긴다."""
+    at = datetime(2026, 8, 14, 15, 30)
+    assert liveness.decide(_beat(at), at, ingest_minutes_recent=0).action == liveness.ACTION_DEGRADED
+
+
+def test_outside_the_window_ok_says_it_does_not_know_about_ingest():
+    """(b) 15:35 적재 0분 → OK지만 detail이 **「적재 상태 모름」**이라고 말한다.
+
+    `ACTION_IDLE`로 바꾸지 않는 것이 핵심이다 — 워치독 루프가 IDLE을 「기록 안 함」으로
+    처리하므로 그 구간이 로그에서 통째로 사라진다. 「모른다」를 「없다」로 바꾸면 더 나쁘다.
+    """
+    at = datetime(2026, 8, 14, 15, 35)
+    decision = liveness.decide(_beat(at), at, ingest_minutes_recent=0)
+    assert decision.action == liveness.ACTION_OK
+    assert "적재 상태 모름" in decision.detail
+
+
+def test_inside_the_window_a_healthy_ingest_keeps_the_old_wording():
+    """(c) 15:25 적재 정상 → OK. **문구가 종전 그대로여야 한다**(회귀 없음)."""
+    at = datetime(2026, 8, 14, 15, 25)
+    decision = liveness.decide(_beat(at), at, ingest_minutes_recent=3)
+    assert decision.action == liveness.ACTION_OK
+    assert decision.detail.startswith("정상 — 마지막 박동")
+    assert "모름" not in decision.detail
 
 
 def test_a_dead_heartbeat_still_wins_over_the_ingest_check():
@@ -606,3 +653,83 @@ def test_the_2026_08_12_watchdog_blackout_would_have_been_visible(tmp_path):
     check = liveness.read_watchdog_check(path)
     age = liveness.watchdog_check_age_seconds(check, datetime(2026, 8, 12, 10, 20, 0))
     assert age > liveness.WATCHDOG_CHECK_STALE_SECONDS
+
+
+# ===== 2026-08-23 (08-21 §1-11 / §4 Fix#4) — DEGRADED **사건**의 시작과 끝 =====
+#
+# 08-21에 워치독이 24분 동안 같은 문구를 14번 찍고 조용히 `OK`로 돌아갔다. 로그에는 사건의
+# 시작도 끝도 없었고, 사후에 세 구간(13:39~14:02 · 14:44 · 15:14)을 사람이 비-OK 16행을
+# 손으로 묶어 복원했다. 아래가 그 두 문장을 고정한다.
+
+
+def _episode_run(minutes, start=datetime(2026, 8, 21, 13, 39)):
+    """DEGRADED가 `minutes`분 이어진 뒤의 (상태, 마지막 진행 문구)."""
+    state, note = None, None
+    for i in range(minutes):
+        state, note, closing = liveness.track_degraded_episode(
+            state, start + timedelta(minutes=i), liveness.ACTION_DEGRADED
+        )
+        assert closing is None
+    return state, note
+
+
+def test_a_degraded_run_counts_the_minutes_it_has_lasted():
+    """「몇 분째인가」를 사람이 줄을 세어 구하지 않는다 — 판정 문구가 말한다."""
+    _state, note = _episode_run(24)
+    assert note == "연속 24분째(13:39부터)"
+
+
+def test_recovery_leaves_exactly_one_closing_line():
+    """회복하는 **그 한 번**에만 종료 줄이 나온다. 그 뒤의 OK는 조용하다.
+
+    08-21의 첫 구간을 그대로 쓴다: 13:39~14:02(24분) 뒤 14:03에 회복.
+    """
+    state, _ = _episode_run(24)
+    recovered_at = datetime(2026, 8, 21, 14, 3)
+    state, note, closing = liveness.track_degraded_episode(state, recovered_at, liveness.ACTION_OK)
+    assert state is None and note is None
+    assert closing == "적재 정지 24분 지속 후 회복(13:39~14:02)"
+    assert liveness.track_degraded_episode(
+        state, recovered_at + timedelta(minutes=1), liveness.ACTION_OK
+    ) == (None, None, None)
+
+
+def test_a_single_minute_episode_still_gets_its_closing_line():
+    """08-21의 14:44·15:14는 **1분짜리 사건**이었다 — 이것들이 사라지면 세 구간이 하나가 된다."""
+    state, note, _ = liveness.track_degraded_episode(
+        None, datetime(2026, 8, 21, 14, 44), liveness.ACTION_DEGRADED
+    )
+    assert note == "연속 1분째(14:44부터)"
+    _state, _note, closing = liveness.track_degraded_episode(
+        state, datetime(2026, 8, 21, 14, 45), liveness.ACTION_OK
+    )
+    assert closing == "적재 정지 1분 지속 후 회복(14:44~14:44)"
+
+
+def test_a_gap_in_the_watchdogs_own_log_is_not_reported_as_a_recovery():
+    """감시자가 멈춘 사이의 회복은 **모르는 것**이다 — 「회복」이라고 쓰면 없는 사실을 만든다.
+
+    08-12에 워치독 자신이 5시간 31분 막혀 있었다. 그 형태를 여기서 고정한다.
+    """
+    state, _ = _episode_run(3)
+    much_later = datetime(2026, 8, 21, 14, 30)
+    _state, _note, closing = liveness.track_degraded_episode(
+        state, much_later, liveness.ACTION_OK
+    )
+    assert "회복이 아니라" in closing or "모른다" in closing
+    assert "지속 후 회복" not in closing
+
+
+def test_a_run_that_ends_in_a_restart_is_not_called_a_recovery():
+    """적재가 돌아온 것과 프로세스가 죽은 것은 다르다 — 종료 줄이 그것을 갈라야 한다."""
+    state, _ = _episode_run(5)
+    at = datetime(2026, 8, 21, 13, 44)
+    _state, _note, closing = liveness.track_degraded_episode(state, at, liveness.ACTION_RESTART)
+    assert "RESTART" in closing and "회복" not in closing.replace("회복이 아니라", "")
+
+
+def test_yesterdays_episode_does_not_leak_into_today():
+    """날짜가 바뀌면 접는다 — 밤사이 남은 파일이 아침의 첫 OK에 가짜 종료 줄을 만들면 안 된다."""
+    state, _ = _episode_run(4)
+    tomorrow = datetime(2026, 8, 24, 9, 5)
+    assert liveness.track_degraded_episode(state, tomorrow, liveness.ACTION_OK) == (None, None, None)

@@ -216,6 +216,35 @@ def _write_state(state: dict) -> None:
         pass
 
 
+# ===== 2026-08-23 (08-21 §1-11 / §4 Fix#4) — DEGRADED 사건의 시작과 끝 =====
+#
+# 판정(「연속 몇 분째인가」·「언제 끝났는가」)은 `liveness.track_degraded_episode()`에 있고
+# 여기서는 **파일 I/O만** 한다 — 이 스크립트가 얇은 이유와 같다(모듈 docstring 참고).
+#
+# `.watchdog_state.json`에 얹지 않는 이유는 `_MISSING_CHECK_STATE` 주석에 이미 적혀 있다:
+# `liveness.next_state()`가 매번 새 dict를 만들어 세 키만 남기므로 **거기 얹은 값은 조용히
+# 사라진다.** 그러면 이 카운터가 영원히 1에서 멈춘다.
+_DEGRADED_EPISODE_STATE = liveness.degraded_episode_path(LOG_DIR)
+
+
+def _read_degraded_episode() -> dict | None:
+    try:
+        return json.loads(_DEGRADED_EPISODE_STATE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — 없거나 깨졌으면 「모른다」이고, 새 에피소드로 시작한다
+        return None
+
+
+def _write_degraded_episode(state: dict | None) -> None:
+    try:
+        if state is None:
+            _DEGRADED_EPISODE_STATE.unlink(missing_ok=True)
+            return
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _DEGRADED_EPISODE_STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — 못 써도 판정은 계속돼야 한다(카운터만 1로 되돌아간다)
+        pass
+
+
 def _restart() -> tuple[bool, str]:
     """기동 스크립트를 실행한다. 반환: (성공 여부, 요약).
 
@@ -371,6 +400,17 @@ def main() -> None:
     )
 
     stamp = f"[{now:%Y-%m-%d %H:%M:%S}]"
+
+    # 2026-08-23 Fix#4 — **로그 분기보다 앞이다.** OK 경로는 `minute % 10`에만 찍고 곧장
+    # return하므로, 종료 줄을 그 아래 두면 **열에 아홉은 사라진다**(08-21의 세 구간 중
+    # 14:44·15:14가 정확히 그렇게 사라졌을 것이다). 종료 줄은 주기와 무관하게 그 한 번만 찍는다.
+    episode, ongoing_note, closing_note = liveness.track_degraded_episode(
+        _read_degraded_episode(), now, decision.action,
+    )
+    _write_degraded_episode(episode)
+    if closing_note:
+        _log(f"{stamp} RECOVERED — {closing_note}")
+
     if decision.action == liveness.ACTION_IDLE:
         # 감시 창 밖의 IDLE은 안 남긴다 — 매분 한 줄이면 하루 1,000줄이다.
         #
@@ -398,7 +438,10 @@ def main() -> None:
     if decision.action == liveness.ACTION_DEGRADED:
         # **생존 신호 이상이 아니다** — 박동은 정상이고 적재만 끊겼다. 문구를 갈라 두지 않으면
         # 다음날 로그를 읽는 사람이 08-14의 「살아 있는데 비어 있다」를 죽음으로 오독한다.
+        # 2026-08-23 Fix#4 — 같은 문구가 08-21에 14줄 반복됐고 「몇 분째인가」를 사람이 세었다.
         message = f"관측 루프 적재 정지({decision.reason}) — {decision.detail}"
+        if ongoing_note:
+            message += f" · {ongoing_note}"
     else:
         message = f"관측 루프 생존 신호 이상({decision.reason}) — {decision.detail}"
     _log(f"{stamp} {decision.action.upper()} — {message}")

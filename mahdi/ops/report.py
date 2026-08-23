@@ -285,6 +285,11 @@ def _render_watchdog(watchdog: dict) -> list[str]:
         # RESTART는 「조치했다」이고 DEGRADED는 「조치하지 않기로 했다」이다(원인이 KIS 쪽이면
         # 재기동은 관측만 끊는다). 둘을 합치면 다음날 "워치독이 몇 번 개입했나"에 답할 수 없다.
         ["적재 정지(DEGRADED)", _fmt(watchdog.get("degraded_checks"), "{}")],
+        # 2026-08-23 (08-21 §1-11 / §4 Fix#4) — **분 수와 사건 수를 나란히 둔다.**
+        # 「16분 / 3사건」과 「16분 / 1사건」은 완전히 다른 하루인데, 08-21에는 그 구분을
+        # 사람이 비-OK 16행을 손으로 묶어 냈다. 종료 줄이 없던 날은 이 값이 0이고
+        # 그 0은 「사건이 없었다」가 아니라 **「셀 수 없었다」**이다(규약 C — 아래 각주).
+        ["└ 그중 닫힌 사건(RECOVERED)", _fmt(watchdog.get("recovered_episodes"), "{}")],
         # 2026-08-19 — **관측 루프와 무관한 축.** 저장소가 막혀 있던 것을 워치독이 연 것이고,
         # 이 값이 자라는 것 자체가 「세션 teardown이 git을 죽이고 있다」는 신호다.
         ["버려진 git 락 청소", _fmt(watchdog.get("stale_lock_sweeps"), "{}")],
@@ -302,6 +307,12 @@ def _render_watchdog(watchdog: dict) -> list[str]:
             "(08-18 16:20 · 08-19 12:41에 각각 자동 점검 세션이 마지막 산출물을 쓴 그 분에 생겼다). "
             "워치독이 열지 않으면 사람이 다음 커밋을 시도할 때까지 조용하다 — 08-19에 4시간 18분이 "
             "그랬다. **잦아지면 청소가 아니라 원인을 봐야 한다**(`mahdi/git_lock.py`)."
+        )
+    if watchdog.get("degraded_checks") and not watchdog.get("recovered_episodes"):
+        out.append(
+            "> ⚠ **적재 정지가 있었는데 닫힌 사건이 0이다.** 둘 중 하나다 — 장이 끝날 때까지 "
+            "안 나았거나(그러면 그 자체가 그날의 사건이다), **종료 줄이 없던 버전으로 돌았거나**"
+            "(2026-08-23 이전이 전부 그렇다). `levers.git_head`로 어느 쪽인지 가른다."
         )
     if watchdog.get("checks") == 0:
         out.append(
@@ -352,7 +363,25 @@ def _render_crash(crash: dict, metrics: dict | None = None) -> list[str]:
             "",
         ] + _render_crash_unattributed(crash)
     starts, crashes = crash.get("starts", 0), crash.get("crashes", 0)
+    # 2026-08-23 Fix#7 — **종료의 종류를 나란히 인쇄한다.** 종전에는 「장마감 정상 종료 1건」을
+    # 상수로 빼고 나머지를 전부 「사유 없는 죽음」으로 불렀고, 그래서 08-21 12:18의 **수동 정지**가
+    # 죽음으로 세어졌다. `None`은 「모른다」이고 0이 아니다(`premarket_startup.log`를 못 읽은 경우).
+    intentional = crash.get("intentional_stops")
+    clean = crash.get("clean_shutdowns")
     out = [f"- 기동 **{starts}회** · 사유가 남은 죽음 **{crashes}건**", ""]
+    if intentional is None or clean is None:
+        out += ["> ⚠ **종료 표식을 못 읽었다**(`premarket_startup.log`) — 「사유 없이 끝난 기동」을 "
+                "계산하지 않는다. 0이 아니라 **모른다**이다(규약 C).", ""]
+    else:
+        out += [
+            f"- 장마감 자동 종료 **{clean}회** · 사람이 일부러 내린 정지 **{intentional}회**",
+            "",
+        ]
+        if intentional:
+            out += ["> 🧍 **사람이 일부러 내린 정지는 죽음이 아니다.** 표식이 둘 있다 — "
+                    "`logs/.intentional_stop`과 `premarket_startup.log`의 「Mahdi 수동 정지」 줄. "
+                    "워치독은 그것을 읽고 되살리지 않았다(재기동 시도 0회). "
+                    "**08-21까지는 지표만 그것을 몰라 「사유 없이 끝난 기동」으로 셌다**(§1-17).", ""]
     if crashes:
         out += _table(
             ["기동 시각", "사유", "마지막 프레임", "상세"],
@@ -362,13 +391,16 @@ def _render_crash(crash: dict, metrics: dict | None = None) -> list[str]:
         )
         out += ["> **시각은 그 프로세스가 «뜬» 시각이다** — 죽은 시각이 아니다. 죽은 시각은 "
                 "`observation_loop.log`의 공백과 워치독의 `RESTART` 줄이 답한다(§11-1).", ""]
-    # **기동은 여러 번인데 사유가 그보다 적으면** 그 차이가 곧 「모르는 죽음」이다.
-    # 정상 종료(장마감 taskkill)도 사유를 안 남기므로 그 1건은 빼고 읽는다.
-    silent = starts - crashes - 1
-    if silent > 0:
-        out += [f"> ⚠ **사유 없이 끝난 기동 {silent}건** — 정상 종료 1건을 뺀 값이다. "
+    # **기동은 여러 번인데 어느 표식에도 안 걸리면** 그 차이가 곧 「모르는 죽음」이다.
+    #
+    # 2026-08-23 Fix#7 — 뺄셈의 항이 상수 `1`에서 **실제로 센 두 값**으로 바뀌었다:
+    # `기동 − 사유가 남은 죽음 − 장마감 자동 종료 − 사람의 수동 정지`. 계산은
+    # `crash_metrics.unexplained_deaths()`가 하고 여기서는 인쇄만 한다.
+    silent = crash.get("unexplained_deaths")
+    if silent:
+        out += [f"> ⚠ **사유 없이 끝난 기동 {silent}건** — 어떤 종료 표식에도 안 걸렸다. "
                 "그 프로세스는 예외 없이(외부 종료·행) 사라졌다. 08-19 10:32가 그 형태였고, "
-                "3분 공백 뒤 워치독이 되살렸다.", ""]
+                "3분 공백 뒤 워치독이 되살렸다. **이 값이 0이 아닌 날은 사람이 봐야 한다.**", ""]
     if crash.get("causes"):
         out += ["> 사유별: " + " · ".join(f"`{k}` {v}건" for k, v in crash["causes"].items()), ""]
     return out + _render_crash_unattributed(crash)
@@ -1217,6 +1249,7 @@ def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[st
         )
         out += ["> 시간대별 **p95**(초). 매일 같은 시간대가 붉으면 KIS 쪽 혼잡 패턴이다.", ""]
     out += _render_p50_timeout_cross(metrics, lat)
+    out += _render_censored_windows(lat)
     warnings = lat.get("warnings") or []
     threshold = lat.get("p95_warn_threshold")
     if warnings:
@@ -1236,6 +1269,67 @@ def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[st
         out += _render_latency_streak(warnings, previous, threshold)
     else:
         out += [f"> ✅ p95가 임계({threshold}초)를 넘은 (시간대, 엔드포인트) 없음.", ""]
+    return out
+
+
+def _render_censored_windows(lat: dict) -> list[str]:
+    """2026-08-23 (08-21 §1-14 / §5 고도화#1) — **검열된 p50은 `≥`로 인쇄한다.**
+
+    ## 08-21에 세 회차가 같은 숫자를 잘못 읽었다
+
+    그날 지연창 98개 중 상당수가 p50 **4.03~4.05초**를 냈다. read timeout이 **4.0초**이므로
+    그 값은 실제 중앙값이 아니라 **타임아웃 벽에 눌린 값**이다 — 4초를 넘은 호출은 전부
+    4.00~4.06으로 기록되므로 그 통로로는 상한을 알 수 없다. 그런데 리포트는 「4.03초」라고
+    평범하게 인쇄했고 네 회차가 그것을 실제 응답시간처럼 읽었다.
+
+    ## `≥`가 말하는 것
+
+    「이 값으로는 **6초로 늘렸을 때의 이득을 계산할 수 없다**」이다. 08-20·08-21 세 회차가
+    손익표에 올린 read timeout 상향의 전제가 바로 그 계산이었고, 재료가 애초에 없었다.
+    **레버보다 계측이 먼저다** — 이 표가 나온 뒤에 사람이 정한다(08-21 사용자 조치 7).
+    """
+    windows = lat.get("censored_windows")
+    if windows is None:
+        return []
+    ratio = lat.get("p50_censored_floor_ratio") or log_metrics.P50_CENSORED_FLOOR_RATIO
+    # **순서가 중요하다.** 벽에 닿은 창이 하나도 없으면 검열 비율은 애초에 물을 것이 없다 —
+    # 그 날에 「못 셌다」를 인쇄하면 멀쩡한 하루가 계측 사고처럼 보인다.
+    if not windows:
+        return [
+            f"> ✅ p50이 타임아웃의 {ratio}배에 닿은 창 없음 — **오늘 p50은 검열되지 않았다.** "
+            "그 값들은 실제 중앙값으로 읽어도 된다.",
+            "",
+        ]
+    if not lat.get("censored_measured"):
+        return [
+            f"> ⚠ **p50이 타임아웃에 눌린 창이 {len(windows)}개인데 검열 비율을 못 셌다** — "
+            "그날 느린 호출 줄이 하나도 없다. 「검열 0%」가 아니라 **「안 셌다」**이다(규약 C). "
+            "`rest_client._log_if_slow`는 타임아웃 호출을 임계와 무관하게 남기므로, "
+            "이 줄이 뜨는 날은 **파서 쪽을 먼저 의심할 것**(08-04에 362건이 그렇게 사라졌다).",
+            "",
+        ]
+    worst = sorted(windows, key=lambda w: (-(w.get("censored_pct") or 0), w["at"]))[:10]
+    out = [
+        f"- ⛔ **p50이 타임아웃에 눌린 창 {len(windows)}개** — 아래 값은 중앙값이 아니라 **하한**이다.",
+        "",
+    ]
+    out += _table(
+        ["창", "엔드포인트", "호출", "p50 표기", "검열"],
+        [[w["at"], f"`{w['endpoint']}`", f"{w['calls']}",
+          f"**≥{w['read_timeout']:.1f}초**(기록 {w['p50']:.2f})",
+          "—" if w.get("censored_pct") is None else f"{w['censored']}건 / {w['censored_pct']:.0f}%"]
+         for w in worst],
+    )
+    if len(windows) > len(worst):
+        out += [f"> 검열 비율 상위 {len(worst)}창만 인쇄했다(전체 {len(windows)}창). "
+                "전량은 `auto/{날짜}_지연창.tsv`에 있다.", ""]
+    out += [
+        "> **`≥`가 붙은 값으로는 「제한시간을 6초로 늘리면 몇 %가 더 들어오는가」를 계산할 수 없다.** "
+        "잘린 호출의 실제 소요가 4.1초인지 12초인지 이 통로는 모른다 — 08-14에 미검열 통로"
+        "(`inquire-balance`, read 10초)로 재보니 **10초 이상**이었다. "
+        "**레버보다 계측이 먼저다**(08-21 사용자 조치 7).",
+        "",
+    ]
     return out
 
 

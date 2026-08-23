@@ -996,3 +996,60 @@ def test_a_slow_but_uncensored_call_is_not_counted():
     # 0건일 때 점유율은 **None이지 0.0이 아니다** — 분모가 없는 비율을 0으로 인쇄하면
     # 「몰리지 않았다」로 읽히는데 사실은 「잴 것이 없었다」이다(규약 C).
     assert parsed["censored"]["phase_concentration"] is None
+
+
+# ===== 2026-08-23 (08-21 §4 Fix#3·#5·#8) — 새로 생긴 세 사건 줄의 계약 =====
+#
+# 셋 다 08-21에 **줄 자체가 없어서** 사람이 손으로 복원한 사실이다. 줄만 찍고 세지 않으면
+# 다음 사람이 그 줄의 존재를 다시 손으로 확인해야 하고, 문구가 바뀌어 파서가 눈이 먼 날
+# (08-04, 362건 → 0건)을 알아챌 방법도 없다.
+
+
+def test_expiry_burst_success_line_is_counted():
+    """08-21 §3-3 — 이 줄이 없어서 「버스트가 돌았는가」를 HTTP 호출 수로 역산했다."""
+    line = _emit(
+        "mahdi.main", "INFO", main.LOG_EXPIRY_BURST_DONE,
+        3, "regular,weekly_mon,weekly_thu", 30, 28, "08:31", "08:35",
+    )
+    assert _parse(line)["qualitative"]["expiry_burst_done"] == 1
+
+
+def test_member_axis_exit_and_return_are_counted_apart():
+    """이탈과 복귀는 **다른 사건**이다 — 한 칸에 합치면 「6번 빠지고 5번 돌아왔다」가 사라진다."""
+    from mahdi.fusion import engine as fusion_engine
+
+    exit_line = _emit(
+        "mahdi.fusion.engine", "INFO", fusion_engine.LOG_MEMBER_AXIS_EXIT,
+        "options_flow", 4, 3, 3, 2, "직전 편입 14:03:10 · 42분 유지",
+    )
+    return_line = _emit(
+        "mahdi.fusion.engine", "INFO", fusion_engine.LOG_MEMBER_AXIS_RETURN,
+        "options_flow", 3, 4, 2, 3, "직전 이탈 14:45:10 · 12분 부재",
+    )
+    qualitative = _parse(exit_line, return_line)["qualitative"]
+    assert qualitative["member_axis_exit"] == 1
+    assert qualitative["member_axis_return"] == 1
+
+
+def test_regime_warmup_end_line_is_counted():
+    """08-21 §1-12 — 이 줄이 없어서 warmup 종료를 로그로는 상한 74분까지만 좁혔다."""
+    from datetime import datetime
+
+    from mahdi.engines import regime_pipeline
+
+    line = _emit(
+        "mahdi.engines.regime_pipeline", "INFO", regime_pipeline.LOG_REGIME_WARMUP_END,
+        datetime(2026, 8, 21, 12, 19, 12), 29.0, 30, 30,
+    )
+    assert _parse(line)["qualitative"]["regime_warmup_end"] == 1
+
+
+def test_the_new_event_markers_report_zero_instead_of_disappearing():
+    """**0건인 날에도 키가 남아야 한다.**
+
+    이 넷은 가설의 주장 지표다. 키가 없으면 그 가설이 「경로 없음」으로 떨어지고, 사건이
+    0번이었던 하루가 fix의 실패로 읽힌다 — 08-06 §3-1이 겪은 사고의 형태다.
+    """
+    qualitative = _parse(_emit("mahdi.main", "INFO", "아무 상관 없는 줄"))["qualitative"]
+    for key in ("expiry_burst_done", "member_axis_exit", "member_axis_return", "regime_warmup_end"):
+        assert qualitative[key] == 0

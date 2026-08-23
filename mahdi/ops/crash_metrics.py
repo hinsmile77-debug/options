@@ -48,6 +48,42 @@ logger = logging.getLogger("mahdi.ops.crash_metrics")
 
 CRASH_LOG_FILENAME = "observation_loop_crash.log"
 
+# ===== 2026-08-23 (08-21 §1-17 / §4 Fix#7) — **사람이 일부러 끈 것을 죽음으로 세지 않는다** =====
+#
+# ## 08-21에 무슨 일이 있었나
+#
+# 리포트 §11-1-1은 「사유 없는 죽음」을 `기동 횟수 − 사유가 남은 죽음 − 1`로 셌다. 그 `− 1`은
+# 「장마감 정상 종료도 사유를 안 남긴다」를 뺀 것이고, 하드코딩된 상수다. 그날 12:18에 사람이
+# `stop_mahdi_manual.bat`으로 프로그램을 내렸고, 그 정지가 **그 1건으로 잡혔다.**
+#
+# **표식은 둘이나 있었다**: `logs/.intentional_stop` 파일과 `premarket_startup.log`의
+# `===== Mahdi 수동 정지 시작 (사람이 일부러 내림) =====` 줄. 워치독은 그것을 정확히 읽었고
+# (재기동 시도 0회, `liveness.intentional_stop_at`), **지표만 몰랐다.**
+#
+# `collect_evidence`의 크래시 mtime 오탐과 같은 병이다 — 판정이 표식을 안 보고 숫자 하나만 본다.
+#
+# ## 왜 상수 `1`을 세는 값으로 바꾸는가
+#
+# 종료 종류는 셋이다: 장마감 자동 종료 · 사람의 수동 정지 · 설명 안 되는 소멸. 앞의 둘은
+# **로그에 문구가 있고**, 마지막 하나만 없다. 「없는 것」을 세려면 「있는 것」을 다 빼야 하는데,
+# 종전 식은 그중 하나를 상수로 박아 두 번째를 세 번째로 만들었다.
+#
+# ## 대가 — 경보를 끄는 것이 아니라 고치는 것이다
+#
+# 표식 **없이** 사라진 기동에는 여전히 떠야 한다. 08-19 10:32이 그 형태였고(표식 없이 사라진 뒤
+# 워치독이 3분 만에 되살렸다), `tests/test_ops_crash_metrics.py`가 그 하루를 재현으로 고정한다.
+STARTUP_LOG_FILENAME = "premarket_startup.log"
+
+# `premarket_startup.log`의 종료 표식. **「완료」 줄을 센다** — 「시작」과 「완료」가 쌍으로
+# 남으므로 한쪽만 세야 하고, 완료 쪽이 「실제로 끝났다」에 더 가깝다.
+# 포맷 원본: `scripts/stop_mahdi_manual.bat` · `scripts/stop_mahdi_marketclose.bat`
+_INTENTIONAL_STOP_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2})\s+\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\]\s*=+\s*Mahdi 수동 정지 완료"
+)
+_CLEAN_SHUTDOWN_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2})\s+\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\]\s*=+\s*장마감 자동 종료 완료"
+)
+
 # `start_mahdi_premarket.bat`이 `echo [%date% %time%] ===== 관측 루프 기동 =====`로 남기는 줄.
 # `%time%`은 한 자리 시각에 **앞 공백**이 붙고(` 7:30:00.78`) 소수점 이하가 따라온다 —
 # `premarket_startup.log` 실측 형식이 그렇고, 그 형식을 그대로 받는다.
@@ -163,8 +199,46 @@ def parse(lines: list[str], target: date) -> dict:
     }
 
 
+def parse_shutdowns(lines: list[str], target: date) -> dict:
+    """
+    입력: `premarket_startup.log`의 줄들(여러 날치가 섞여 있어도 된다), 대상 날짜.
+    계산: 그날의 **의도적 종료** 두 종류를 센다 — 장마감 자동 종료와 사람의 수동 정지.
+    해석: 상세 근거는 `STARTUP_LOG_FILENAME` 위 주석. 둘을 **합치지 않는다**: 하나는 스케줄러가
+         매일 하는 일이고 다른 하나는 사람이 그날 내린 결정이다. 08-21에 후자가 1건 있었고
+         그것이 「사유 없이 끝난 기동」으로 잘못 세어졌다.
+    실패 조건: 없다 — 형식이 안 맞는 줄은 건너뛴다.
+    """
+    intentional = clean = 0
+    for line in lines:
+        m = _INTENTIONAL_STOP_RE.match(line)
+        if m and m.group(1) == target.isoformat():
+            intentional += 1
+            continue
+        m = _CLEAN_SHUTDOWN_RE.match(line)
+        if m and m.group(1) == target.isoformat():
+            clean += 1
+    return {"intentional_stops": intentional, "clean_shutdowns": clean}
+
+
+def unexplained_deaths(starts: int, crashes: int, intentional: int, clean: int) -> int:
+    """반환: **아무 표식도 안 남기고 사라진** 기동 수.
+
+    `기동 − 사유가 남은 죽음 − 장마감 자동 종료 − 사람의 수동 정지`. 음수는 0으로 접는다 —
+    종료 표식이 기동보다 많은 날(전날 프로세스를 오늘 껐다)에 음수를 인쇄하면 그 자체가 오보다.
+
+    ⚠ **이 값이 0이라고 「아무 일도 없었다」가 아니다.** 08-19 10:32처럼 표식 없이 사라진
+    기동이 있는 날에는 1 이상이어야 하고, 그 하루를 재현 테스트가 고정한다.
+    """
+    return max(starts - crashes - intentional - clean, 0)
+
+
 def collect(log_dir: Path, target: date) -> dict | None:
-    """반환: `parse()` 결과, 로그 파일이 없으면 None(= 「모른다」, 「크래시가 없었다」가 아니다)."""
+    """반환: `parse()` 결과에 종료 회계를 더한 것. 크래시 로그가 없으면 None
+    (= 「모른다」, 「크래시가 없었다」가 아니다).
+
+    2026-08-23 Fix#7 — `premarket_startup.log`를 **함께** 읽는다. 그 파일이 없으면 종료 수는
+    `None`으로 두고(0이 아니다 — 규약 C) 「사유 없는 죽음」도 계산하지 않는다.
+    """
     path = Path(log_dir) / CRASH_LOG_FILENAME
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -173,4 +247,22 @@ def collect(log_dir: Path, target: date) -> dict | None:
     except Exception:
         logger.warning("크래시 로그 읽기 실패: %s", path, exc_info=True)
         return None
-    return parse(lines, target)
+    result = parse(lines, target)
+
+    startup_path = Path(log_dir) / STARTUP_LOG_FILENAME
+    try:
+        startup_lines = startup_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        # 못 읽었다 = **모른다.** 0으로 접으면 08-21의 오탐이 그대로 돌아온다.
+        result.update(
+            {"intentional_stops": None, "clean_shutdowns": None, "unexplained_deaths": None}
+        )
+        return result
+
+    shutdowns = parse_shutdowns(startup_lines, target)
+    result.update(shutdowns)
+    result["unexplained_deaths"] = unexplained_deaths(
+        result["starts"], result["crashes"],
+        shutdowns["intentional_stops"], shutdowns["clean_shutdowns"],
+    )
+    return result

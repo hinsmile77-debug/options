@@ -94,10 +94,48 @@ def test_the_tsv_carries_every_window_because_the_table_only_shows_breaches(coll
 
     assert out is not None and out.name == "2026-08-14_지연창.tsv"
     lines = out.read_text(encoding="utf-8").splitlines()
-    assert lines[0].split(chr(9)) == ["창시각", "호출수", "p50초", "p50/timeout"]
+    # 2026-08-23 고도화#1 — 뒤 세 열(검열건수 · 검열% · p50표기)이 추가됐다.
+    assert lines[0].split(chr(9)) == [
+        "창시각", "호출수", "p50초", "p50/timeout", "검열건수", "검열%", "p50표기",
+    ]
     assert len(lines) == 6, "머리 1줄 + 창 5줄"
     assert lines[4].split(chr(9))[0][:5] == "14:06"
     assert lines[4].split(chr(9))[3] == "1.01"
+
+
+def test_a_censored_window_is_written_as_a_floor_not_as_a_median(collector, scan, tmp_path):
+    """**08-21에 네 회차가 잘못 읽은 그 값.**
+
+    14:06 창의 p50은 4.05초이고 read timeout은 4.0초다 — 그 값은 중앙값이 아니라 **하한**이다.
+    `4.05`로 적으면 「제한시간을 6초로 늘리면 흡수된다」는 추론이 자연스러워 보이는데,
+    그 계산의 재료가 애초에 없다는 것이 이 열의 요점이다.
+    """
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT, {"14:06:13": 41},
+    )
+    row = dict(zip(
+        out.read_text(encoding="utf-8").splitlines()[0].split(chr(9)),
+        out.read_text(encoding="utf-8").splitlines()[4].split(chr(9)),
+    ))
+    assert row["p50표기"] == ">=4.0"
+    assert row["검열건수"] == "41"
+    # 검열되지 않은 창은 표기가 **한 글자도 안 바뀐다**(회귀 없음).
+    early = dict(zip(
+        out.read_text(encoding="utf-8").splitlines()[0].split(chr(9)),
+        out.read_text(encoding="utf-8").splitlines()[1].split(chr(9)),
+    ))
+    assert early["p50표기"] == early["p50초"]
+
+
+def test_an_unmeasured_censoring_prints_a_dash_not_a_zero(collector, scan, tmp_path):
+    """「검열 0건」과 「안 셌다」는 다르다(규약 C) — 후자를 0으로 적으면 깨끗한 날로 읽힌다."""
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT, None,
+    )
+    row = out.read_text(encoding="utf-8").splitlines()[4].split(chr(9))
+    assert row[4] == "-" and row[5] == "-"
 
 
 def test_no_windows_means_no_file_rather_than_an_empty_one(collector, tmp_path):

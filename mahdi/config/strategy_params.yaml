@@ -58,6 +58,33 @@ weekly_0dte:
 
 # Signal Fusion 메타 라벨링(v6 §11.2) 결정론적 프록시 임계값 — 학습된 분류기가
 # 생기기 전까지(Phase 3) conviction_score를 TradePermission으로 매핑하는 데 쓴다.
+# ===== 2026-08-23 — 확신도의 분모를 **실질 멤버 수**로 바꾼다 (레버 F, 다섯 번째 만에 켰다) =====
+#
+# `fusion/engine.py`가 `MetaLabelInputs.available_member_count`에 무엇을 넣을지 고르는 스위치다.
+# `false`(기본)면 **가용 멤버 수**, `true`면 **비영 점수를 낸 멤버 수**(effective)다.
+#
+# ## 왜 지금 켜는가
+#
+# 08-11에 등재된 `2026-08-11-eF-effective-member-denominator`가 **네 번 유예**됐고
+# (08-12 · 08-13 · 08-14 · 08-16), 그중 앞 세 번은 사유조차 안 적혔다. 무조건발동일 08-25를
+# 이틀 앞두고 08-21 보고서가 A/B/C를 손익으로 제시했으며 사람이 **A(켠다)** 를 골랐다.
+#
+# ## 이 값이 무엇을 바꾸는가 — **확신도는 오른다**
+#
+# `resolve_conflicts()`는 0점 멤버를 동조·반대 어느 쪽에도 안 센다. 따라서
+# `available = effective + 중립`이고, 확신도 base(`동조 / 분모`)는 분모가 작아지는 쪽에서
+# **항상 크거나 같다.** 중립 축이 있는 날(= `regime_hmm`이 전량 중립인 대부분의 날)에는
+# 반드시 오른다. **HIGH_CONVICTION과 ENTER가 느는 것은 회귀가 아니라 예측대로다.**
+#
+# ⚠ 그리고 이 레버는 `strategy_palette.short_gamma_requires`를 통해 **프리미엄 매도(숏감마)
+# 계열의 문을 연다** — HIGH_CONVICTION이 그 계열의 필수 조건이기 때문이다. 그 계열 진입
+# 건수가 이 레버의 진짜 대가이고, `hypotheses.yaml`의 같은 항목이 그것을 대가 지표로 든다.
+#
+# ⚠ **효력은 다음 07:30 기동부터다** — 이 파일은 프로세스당 1회만 읽힌다(`@lru_cache`).
+# ⚠ **레버 E와 같은 날이 아니다.** E(`OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`)는 같은 날
+#   2026-09-01로 유예했다. 둘 다 판단 출력을 움직이므로 같은 날 켜면 귀속이 안 갈린다.
+use_effective_member_count: true
+
 meta_label_thresholds:
   no_trade_max: 0.15       # score < 이 값 -> NO_TRADE
   small_test_max: 0.35     # 이 값 미만 -> SMALL_TEST

@@ -298,7 +298,41 @@ _QUALITATIVE_MARKERS = {
     # 유일한 손실 유형**이라 여기서 따로 센다. DB 축(`db.chain_minute_coverage`)과 나란히 읽는다.
     # 포맷 원본: `mahdi.main.LOG_CHAIN_CYCLE_EMPTY`
     "chain_cycle_empty": "옵션체인 이번 분 전멸",
+    # ===== 2026-08-23 (08-21 §4 Fix#3·#5·#8) — 셋 다 「사건이 로그에 남는가」를 재는 축이다 =====
+    #
+    # 셋 모두 08-21에 **줄 자체가 없어서** 사람이 손으로 복원한 사실들이다:
+    #   · 만기유동성 버스트가 돌았는지  → HTTP 호출 수로 역산했다(§3-3)
+    #   · 판단 축이 언제 빠졌는지        → 로그 두 줄을 겹쳐 여섯 번 세었다(§1-10)
+    #   · warmup이 언제 끝났는지         → 로그로는 상한 74분까지만 좁혔다(§1-12)
+    #
+    # **여기 등록하는 것이 그 fix들의 절반이다.** 줄만 찍고 세지 않으면 다음 사람이 그 줄의
+    # 존재를 다시 손으로 확인해야 하고, 문구가 바뀌어 파서가 눈이 먼 날(08-04, 362건 → 0건)을
+    # 알아챌 방법도 없다. `_PARSER_AUDIT_TOKENS`가 그 눈멂을 잡는 장치이고 이 등록이 그 입구다.
+    #
+    # 포맷 원본: `mahdi.main.LOG_EXPIRY_BURST_DONE`
+    "expiry_burst_done": "만기 유동성 버스트 완료",
+    # 포맷 원본: `mahdi.fusion.engine.LOG_MEMBER_AXIS_EXIT` / `LOG_MEMBER_AXIS_RETURN`
+    "member_axis_exit": "판단 축 이탈",
+    "member_axis_return": "판단 축 복귀",
+    # 포맷 원본: `mahdi.engines.regime_pipeline.LOG_REGIME_WARMUP_END`
+    "regime_warmup_end": "레짐 warmup 종료",
 }
+
+# ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
+#
+# `qualitative`는 Counter라 **0건인 항목은 키 자체가 안 생긴다.** 그 설계는 옳다: 옛 로그에
+# 없던 문구를 0으로 찍으면 「판정했고 0」과 「그 줄이 없던 버전」이 섞이기 때문이다(규약 C).
+#
+# 그런데 위 넷은 **가설의 주장 지표**다. 키가 없으면 그 가설이 「경로 없음」으로 떨어지고,
+# 그러면 사건이 0건이었던 하루가 fix의 실패로 읽힌다 — 08-06 §3-1이 겪은 사고의 형태다.
+#
+# 여기 등록된 마커는 **파서가 돌았다는 사실 자체를 0으로 표현한다.** 「이 버전에는 그 줄이
+# 있고, 오늘은 그 사건이 0번이었다」가 이 0의 뜻이다. 그 이전 날짜의 로그를 다시 파싱하면
+# 같은 0이 나오지만 뜻이 다르고, 그 구분은 `levers.git_head`와 가설의 `구현일`이 한다
+# (`hypotheses.measurable_on()`이 그것을 이미 강제한다).
+_QUALITATIVE_ALWAYS_PRESENT = (
+    "expiry_burst_done", "member_axis_exit", "member_axis_return", "regime_warmup_end",
+)
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
 # 2026-08-04(§2-1) 경고: 이 방식은 **예외가 처리되지 않고 위로 전파될 때만** 참이다. 예외를
@@ -673,6 +707,9 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             slow_calls.append(
                 {
                     "at": _hhmm(_seconds_of_day(m)),
+                    # 2026-08-23 고도화#1 — **창에 붙이려면 분보다 잘게 알아야 한다.**
+                    # `at`(HH:MM)만으로는 5분 창의 경계에 걸린 호출을 어느 창에 넣을지 못 정한다.
+                    "at_seconds": _seconds_of_day(m),
                     "total": float(m.group(6)),
                     "pacer": float(m.group(7)),
                     "http": float(m.group(8)),
@@ -796,7 +833,7 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         "bursts": _burst_metrics(calls),
         "stalls": _stall_metrics(calls),
         "slow_calls": _slow_call_metrics(slow_calls),
-        "rest_latency": _rest_latency_metrics(latency_windows),
+        "rest_latency": _rest_latency_metrics(latency_windows, slow_calls),
         "atm_rolls": _atm_roll_metrics(atm_rolls),
         "budget_exceeded": {
             "count": len(budget_events),
@@ -853,7 +890,11 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "httpx_lines": total_lines - human_lines - traceback_lines,
             "by_level": dict(levels),
         },
-        "qualitative": dict(qualitative),
+        # 2026-08-23 — 위 `_QUALITATIVE_ALWAYS_PRESENT`의 마커는 0이어도 키를 남긴다.
+        "qualitative": {
+            **{key: 0 for key in _QUALITATIVE_ALWAYS_PRESENT},
+            **dict(qualitative),
+        },
         # 2026-08-06 Fix#4 — 위 `qualitative`에 합산된 "줄이 안 남은" 건수. 리포트 §11이
         # `줄 N + 억제 M = 총계`로 나란히 찍는다. 08-06 실측: read_timeout 124 + 81 = 205건
         # (그날 리포트는 126건만 냈다 — 실제의 61%).
@@ -984,7 +1025,74 @@ def read_timeout_for_label(endpoint: str) -> float:
     return _ENDPOINT_READ_TIMEOUT_BY_LABEL.get(endpoint, GLOBAL_HTTP_READ_TIMEOUT_SECONDS)
 
 
-def _rest_latency_metrics(windows: list[dict]) -> dict:
+# ===== 2026-08-23 (08-21 §1-14 / §5 고도화#1) — **검열된 p50은 중앙값이 아니라 하한이다** =====
+#
+# ## 08-21에 세 회차가 같은 숫자를 잘못 읽었다
+#
+# 그날 지연창 98개 중 상당수가 p50 **4.03~4.05초**를 냈다. `inquire-price`의 read timeout은
+# **4.0초**이므로 그 값은 실제 중앙값이 아니라 **타임아웃 벽에 눌린 값**이다(우측 검열).
+# 4초를 넘는 호출은 전부 4.00~4.06으로 기록되므로 그 통로로는 **상한을 알 수 없다.**
+#
+# 그런데 리포트는 그것을 「4.03초」라고 평범하게 인쇄했고, 장전·장중①·장중②·장후 네 회차가
+# 그 숫자를 실제 응답시간처럼 읽었다.
+#
+# ## 그 오독의 대가는 구체적이다
+#
+# 08-20·08-21 세 회차가 손익표에 올린 「read timeout 4.0 → 6.0초」는 *"조금만 더 기다리면 온다"*를
+# 전제한다. 그런데 **6초로 늘렸을 때 몇 %가 더 들어오는지를 오늘 데이터로는 구할 수 없다** —
+# 재료가 애초에 없다. 그 사실이 표기에 드러나야 「지금은 계산이 안 된다」가 한눈에 보인다.
+#
+# ## 재료는 이미 로그에 있었다 — 새 계측을 안 만든다
+#
+# `rest_client._log_if_slow`는 **타임아웃으로 끝난 호출을 임계와 무관하게 반드시 남긴다**
+# (08-05 Fix#4). 슬로우 임계는 3.0초이고 read timeout은 4.0초이므로, **검열된 호출은 전부
+# 그 줄에 있다.** 즉 창별 검열 비율은 `slow_calls`를 창에 붙이기만 하면 나온다 —
+# `rest_client`도 `poll_rest_latency_snapshot`도 건드리지 않는다.
+#
+# ## 임계 0.98의 뜻
+#
+# p50이 타임아웃의 0.98배를 넘으면 「중앙값 호출이 벽에 닿아 있다」로 본다. 정확히 1.00을
+# 쓰지 않는 이유는 최근접 순위법 p50이 4.00 바로 아래(3.99)로 떨어질 수 있기 때문이고,
+# 그 창도 검열된 창이다.
+P50_CENSORED_FLOOR_RATIO = 0.98
+
+
+def _censored_by_window(
+    windows: list[dict], slow: list[dict],
+) -> dict[tuple[float, str], int]:
+    """반환: `(창 시각, 엔드포인트) -> 그 창에서 타임아웃에 잘린 호출 수`.
+
+    입력: 5분 창 요약, 느린 호출 목록(`at_seconds`가 있어야 한다).
+    계산: 창은 `(직전 창 끝, 이 창 끝]`이다 — `poll_rest_latency_snapshot`이 **직전 창의 표본을
+         비우면서** 줄을 남기므로 줄의 시각은 창의 **끝**이고, 창의 시작은 그 앞 줄의 시각이다.
+
+         ⚠ **고정 길이(300초)로 가정하면 안 된다.** 재기동이 있는 날에는 그 폴러의 타이머가
+         다시 시작하므로 창 하나가 짧아진다(08-21 12:19 재기동이 그랬다). 도입 당시 「가장 짧은
+         간격」을 창 길이로 삼았다가 그 짧은 창 때문에 **11시대 검열이 57건 중 2건으로
+         과소 계상**됐다 — 경계는 계산하는 것이 아니라 **줄에 적혀 있는 것**을 쓴다.
+    실패 조건: 없다. `at_seconds`가 없는 옛 파싱 결과는 조용히 빠진다 — 그때는 검열 수가
+              0이 되지만, 호출측이 그 0을 「검열 없음」으로 인쇄하지 않도록
+              `censored_measured`를 함께 낸다.
+    """
+    if not windows or not slow:
+        return {}
+    ends = sorted({w["at"] for w in windows})
+    counts: dict[tuple[float, str], int] = collections.defaultdict(int)
+    for call in slow:
+        at = call.get("at_seconds")
+        if at is None:
+            continue
+        if call["http"] < read_timeout_for_label(call["endpoint"]):
+            continue
+        # 그 호출을 담는 창 = 호출 시각 **이상인 가장 이른 창 끝**. 마지막 창 끝보다 뒤의
+        # 호출은 어느 창에도 안 들어간다(그 창의 요약 줄이 아직 안 나왔다).
+        index = bisect.bisect_left(ends, at)
+        if index < len(ends):
+            counts[(ends[index], call["endpoint"])] += 1
+    return dict(counts)
+
+
+def _rest_latency_metrics(windows: list[dict], slow: list[dict] | None = None) -> dict:
     """
     입력: 5분 창마다 남은 엔드포인트별 응답시간 요약(`poll_rest_latency_snapshot`).
     계산: 엔드포인트별 전일 종합(호출 수 가중 p50/p95 근사, 최대)과 **시간대 x 엔드포인트**
@@ -1000,6 +1108,8 @@ def _rest_latency_metrics(windows: list[dict]) -> dict:
     """
     if not windows:
         return {}
+    # 2026-08-23 고도화#1 — 창마다 「그 창의 호출 중 몇 %가 타임아웃에 잘렸나」.
+    censored = _censored_by_window(windows, slow or [])
     by_endpoint: dict[str, list[dict]] = collections.defaultdict(list)
     for w in windows:
         by_endpoint[w["endpoint"]].append(w)
@@ -1041,8 +1151,32 @@ def _rest_latency_metrics(windows: list[dict]) -> dict:
         for endpoint, p95 in sorted(row.items())
         if p95 > REST_LATENCY_P95_WARN_SECONDS
     ]
+    # 2026-08-23 고도화#1 — **검열된 창의 목록.** p50이 타임아웃의 `P50_CENSORED_FLOOR_RATIO`배를
+    # 넘은 창만 담는다 — 그 창의 p50은 중앙값이 아니라 **하한**이고, 리포트가 `≥`를 붙여 인쇄한다.
+    censored_windows = []
+    for w in sorted(windows, key=lambda x: (x["at"], x["endpoint"])):
+        timeout = read_timeout_for_label(w["endpoint"])
+        if not timeout or w["p50"] < timeout * P50_CENSORED_FLOOR_RATIO:
+            continue
+        cut = censored.get((w["at"], w["endpoint"]), 0)
+        censored_windows.append({
+            "at": _hhmm(w["at"]), "endpoint": w["endpoint"], "calls": w["n"],
+            "p50": w["p50"], "read_timeout": timeout,
+            "censored": cut,
+            # 분모는 그 창의 **전체 호출 수**다. 100%를 넘을 수 없고, 넘으면 창 배정이 틀린 것이다.
+            "censored_pct": round(min(cut / w["n"], 1.0) * 100, 1) if w["n"] else None,
+        })
+
     return {
         "endpoints": endpoints,
+        # 2026-08-23 고도화#1. **0은 두 가지다**(규약 C): 키가 있고 0이면 「검열된 창이 없었다」,
+        # 키가 없으면 「그날은 이 계측 자체가 없던 버전이다」.
+        "censored_window_count": len(censored_windows),
+        "censored_windows": censored_windows,
+        "p50_censored_floor_ratio": P50_CENSORED_FLOOR_RATIO,
+        # **검열 수를 실제로 셀 수 있었는가.** 느린 호출 줄이 하나도 없으면 「0건」이 아니라
+        # 「안 셌다」이고, 그 구분이 없으면 검열 0%가 「깨끗한 날」로 읽힌다.
+        "censored_measured": bool(slow),
         "p95_by_hour": {h: dict(sorted(row.items())) for h, row in sorted(grid.items(), key=lambda kv: int(kv[0]))},
         "p50_by_hour": {
             h: dict(sorted(row.items())) for h, row in sorted(grid_p50.items(), key=lambda kv: int(kv[0]))
