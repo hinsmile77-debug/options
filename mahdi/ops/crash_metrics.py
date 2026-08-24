@@ -74,6 +74,32 @@ CRASH_LOG_FILENAME = "observation_loop_crash.log"
 # 워치독이 3분 만에 되살렸다), `tests/test_ops_crash_metrics.py`가 그 하루를 재현으로 고정한다.
 STARTUP_LOG_FILENAME = "premarket_startup.log"
 
+# ===== 2026-08-24 (08-24 §3-3 / Fix#5 대안 B) — **표식을 늘린다, 판정을 느슨하게 하지 않는다** =====
+#
+# 08-24에 이 모듈은 「사유 없이 끝난 기동 1건」을 인쇄했다. 그런데 그날 종료는 예정대로였고
+# 표식도 **셋이나** 있었다(`.intentional_stop` 15:45:00.93 · `.last_marketclose_stop.txt`
+# 15:45:03 · 완료 줄). 문제는 **완료 줄이 15:46:09에 찍혔다**는 것 하나였다 — 이 계산이 도는
+# 15:45:14~15:46:06보다 3.9초 늦었다. 계산은 맞았고, 근거가 아직 안 찍혀 있었을 뿐이다.
+#
+# 배치 쪽을 고쳤다(`stop_mahdi_marketclose.bat` — 완료 줄을 taskkill 직후로). 여기서는 그것과
+# **독립인 두 번째 표식**을 함께 읽는다: `log_marketclose_stop.py`가 taskkill 직후에 쓰는
+# `.last_marketclose_stop.txt`(내용 = 그 종료 시각의 ISO 문자열)다. 배치 순서가 다시 흐트러져도
+# 이 파일은 항상 지표보다 앞선다.
+#
+# ## 왜 「지표 실행 중이면 자동 종료로 친다」로 우회하지 않는가
+#
+# 그것이 08-21에 고친 바로 그 병이다 — **표식을 안 보고 추정하는 판정.** 여기서 하는 것은
+# 추정이 아니라 **다른 표식 하나를 더 읽는 것**이고, 그 파일이 없으면 아무것도 세지 않는다.
+# 표식 없이 사라진 기동(08-19 10:32형)은 여전히 `unexplained_deaths`로 남아야 하고,
+# `tests/test_ops_crash_metrics.py`가 그 하루를 재현으로 고정한다.
+#
+# ## 파일은 **덮어쓰인다** — 그래서 「그날 껐다」만 답할 수 있다
+#
+# `log_marketclose_stop.py`가 매번 같은 경로에 이번 종료 시각을 쓴다. 즉 이 표식은 **가장
+# 최근 한 번**만 안다. 과거 날짜를 재집계할 때(`--date`) 이 표식으로 그날을 판정하면 오늘
+# 껐다는 사실이 그날로 새어 들어가므로, 날짜가 정확히 일치할 때만 쓴다.
+MARKETCLOSE_STOP_MARKER_FILENAME = ".last_marketclose_stop.txt"
+
 # `premarket_startup.log`의 종료 표식. **「완료」 줄을 센다** — 「시작」과 「완료」가 쌍으로
 # 남으므로 한쪽만 세야 하고, 완료 쪽이 「실제로 끝났다」에 더 가깝다.
 # 포맷 원본: `scripts/stop_mahdi_manual.bat` · `scripts/stop_mahdi_marketclose.bat`
@@ -220,6 +246,29 @@ def parse_shutdowns(lines: list[str], target: date) -> dict:
     return {"intentional_stops": intentional, "clean_shutdowns": clean}
 
 
+def marketclose_marker_day(log_dir: Path) -> date | None:
+    """반환: `.last_marketclose_stop.txt`가 가리키는 **날짜**. 파일이 없거나 못 읽으면 None.
+
+    입력: 로그 디렉터리.
+    계산: 파일 내용(ISO 시각 한 줄)의 날짜 부분만 취한다.
+    해석: 상세 근거는 `MARKETCLOSE_STOP_MARKER_FILENAME` 위 절 주석. 이 값은 **가장 최근
+         종료 하나**만 안다 — 파일이 매번 덮어쓰이기 때문이다.
+    실패 조건: 없다 — 형식이 깨져 있으면 None(= 「모른다」)이고, 호출측이 로그 줄만 쓴다.
+    """
+    path = Path(log_dir) / MARKETCLOSE_STOP_MARKER_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("장마감 종료 표식 읽기 실패: %s", path, exc_info=True)
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
 def unexplained_deaths(starts: int, crashes: int, intentional: int, clean: int) -> int:
     """반환: **아무 표식도 안 남기고 사라진** 기동 수.
 
@@ -261,8 +310,29 @@ def collect(log_dir: Path, target: date) -> dict | None:
 
     shutdowns = parse_shutdowns(startup_lines, target)
     result.update(shutdowns)
+
+    # 2026-08-24 Fix#5 대안 B — **두 번째 표식.** 상세 근거는
+    # `MARKETCLOSE_STOP_MARKER_FILENAME` 위 절 주석.
+    #
+    # 로그 줄이 이미 있으면 아무것도 안 더한다(같은 종료를 두 번 세면 `unexplained_deaths`가
+    # 음수로 접혀 「기동보다 종료가 많다」는 오보가 된다). **줄이 없을 때만** 이 표식이 답한다.
+    marker_day = marketclose_marker_day(log_dir)
+    marker_says_today = marker_day == target
+    if marker_says_today and not shutdowns["clean_shutdowns"]:
+        result["clean_shutdowns"] = 1
+        # 「무엇을 보고 그렇게 셌는가」를 값으로 남긴다 — 이 칸이 `보조표식`인 날은 배치의
+        # 완료 줄이 또 늦은 날이고, 그 자체가 봐야 할 사실이다(조용히 고쳐 주고 끝내지 않는다).
+        result["clean_shutdown_source"] = "보조표식"
+    elif shutdowns["clean_shutdowns"]:
+        result["clean_shutdown_source"] = "로그줄"
+    else:
+        result["clean_shutdown_source"] = None
+    # 표식 파일이 그날을 가리키는가 — `None`은 「파일이 없거나 다른 날이다」가 아니라
+    # **「그날이 아니다」**로만 읽는다(파일 부재는 `marker_day is None`으로 갈린다).
+    result["marketclose_marker_day"] = marker_day.isoformat() if marker_day else None
+
     result["unexplained_deaths"] = unexplained_deaths(
         result["starts"], result["crashes"],
-        shutdowns["intentional_stops"], shutdowns["clean_shutdowns"],
+        shutdowns["intentional_stops"], result["clean_shutdowns"],
     )
     return result

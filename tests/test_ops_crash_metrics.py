@@ -218,3 +218,105 @@ def test_three_stacked_tracebacks_before_the_marker_are_not_squashed_into_one():
         + _REAL_CRASH
     )
     assert crash_metrics.parse(lines, _TARGET)["unattributed"] == 3
+
+
+# ===== 2026-08-24 (08-24 §3-3 / Fix#5) — 표식이 **있는데** 「사유 없이 죽었다」가 났다 =====
+#
+# 그날 종료는 예정대로였다(15:45). 표식도 셋이나 있었다. 그런데 완료 줄이 **15:46:09**에
+# 찍혔고 지표는 15:45:14~15:46:06에 돌았다 — 3.9초 차이로 자기 근거를 못 봤다.
+#
+# 배치는 완료 줄을 taskkill 직후로 옮겼고(`stop_mahdi_marketclose.bat`), 여기서는 그와
+# 독립인 두 번째 표식(`.last_marketclose_stop.txt`)을 함께 읽는다. 아래 둘이 이 fix의
+# 양면이다 — **완료 줄이 먼저 찍힌 하루**는 0을 내고, **08-19형(표식 없이 사라진 기동)** 은
+# 여전히 1을 낸다. 후자가 이 fix의 대가 실측이다.
+
+_STARTUP_LOG_0824_FIXED = [
+    "[2026-08-24  7:30:00.90] ===== Mahdi 장전 기동 시작 ===== ",
+    "[2026-08-24 15:45:01.17] ===== Mahdi 장마감 자동 종료 시작 ===== ",
+    # Fix#5 이후의 위치 — taskkill 직후, 지표(15:45:14~)보다 앞이다.
+    "[2026-08-24 15:45:03.20] ===== 장마감 자동 종료 완료 (프로세스 정지 · 후처리 진행, "
+    "DB/Redis는 계속 실행) ===== ",
+]
+
+
+def _crash_log(tmp_path, lines):
+    (tmp_path / crash_metrics.CRASH_LOG_FILENAME).write_text(
+        chr(10).join(lines), encoding="utf-8"
+    )
+
+
+def test_the_new_completion_wording_still_matches_the_parser():
+    """문구를 바꾸면서 파서를 안 고치면 08-04(362건이 0건)를 재현한다 — 접두는 그대로여야 한다."""
+    assert crash_metrics.parse_shutdowns(_STARTUP_LOG_0824_FIXED, date(2026, 8, 24)) == {
+        "intentional_stops": 0, "clean_shutdowns": 1,
+    }
+
+
+def test_a_day_whose_completion_line_came_first_has_no_unexplained_death(tmp_path):
+    """**Fix#5의 주장.** 기동 1 − 죽음 0 − 자동 종료 1 = 0."""
+    _crash_log(tmp_path, ["[2026-08-24  7:30:00.78] ===== 관측 루프 기동 ====="])
+    (tmp_path / crash_metrics.STARTUP_LOG_FILENAME).write_text(
+        chr(10).join(_STARTUP_LOG_0824_FIXED), encoding="utf-8"
+    )
+    m = crash_metrics.collect(tmp_path, date(2026, 8, 24))
+    assert m["clean_shutdowns"] == 1 and m["unexplained_deaths"] == 0
+    # 로그 줄로 셌다 — 보조 표식이 아니다. 그 사실이 값으로 남는다.
+    assert m["clean_shutdown_source"] == "로그줄"
+
+
+def test_the_marker_file_answers_when_the_completion_line_is_still_late(tmp_path):
+    """**대안 B.** 배치 순서가 다시 흐트러져도 표식 파일은 항상 지표보다 앞선다.
+
+    08-24 실측을 그대로 옮긴다 — 완료 줄이 없는 상태(아직 안 찍힘)에서 표식 파일만 있다.
+    """
+    _crash_log(tmp_path, ["[2026-08-24  7:30:00.78] ===== 관측 루프 기동 ====="])
+    (tmp_path / crash_metrics.STARTUP_LOG_FILENAME).write_text(
+        chr(10).join(_STARTUP_LOG_0824_FIXED[:-1]), encoding="utf-8"
+    )
+    (tmp_path / crash_metrics.MARKETCLOSE_STOP_MARKER_FILENAME).write_text(
+        "2026-08-24T15:45:03.112306", encoding="utf-8"
+    )
+    m = crash_metrics.collect(tmp_path, date(2026, 8, 24))
+    assert m["clean_shutdowns"] == 1 and m["unexplained_deaths"] == 0
+    # **무엇을 보고 셌는가**가 값으로 남아야 한다 — 이 날은 배치가 또 늦은 날이다.
+    assert m["clean_shutdown_source"] == "보조표식"
+    assert "`logs/.last_marketclose_stop.txt`" in report.render({"date": "2026-08-24"}, crash=m)
+
+
+def test_the_marker_is_not_counted_twice_when_the_log_line_is_also_there(tmp_path):
+    """같은 종료를 두 번 세면 `unexplained_deaths`가 음수로 접혀 오보가 된다."""
+    _crash_log(tmp_path, ["[2026-08-24  7:30:00.78] ===== 관측 루프 기동 ====="])
+    (tmp_path / crash_metrics.STARTUP_LOG_FILENAME).write_text(
+        chr(10).join(_STARTUP_LOG_0824_FIXED), encoding="utf-8"
+    )
+    (tmp_path / crash_metrics.MARKETCLOSE_STOP_MARKER_FILENAME).write_text(
+        "2026-08-24T15:45:03.112306", encoding="utf-8"
+    )
+    assert crash_metrics.collect(tmp_path, date(2026, 8, 24))["clean_shutdowns"] == 1
+
+
+def test_yesterdays_marker_does_not_close_todays_missing_shutdown(tmp_path):
+    """표식 파일은 **덮어쓰인다** — 가장 최근 한 번만 안다. 다른 날에 새어 들어가면 안 된다.
+
+    08-19형(표식 없이 사라진 기동)이 여기서 여전히 1을 낸다 — **이것이 이 fix의 대가 실측이다.**
+    """
+    _crash_log(tmp_path, _REAL_CRASH)
+    (tmp_path / crash_metrics.STARTUP_LOG_FILENAME).write_text(
+        "[2026-08-19 15:46:14.46] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== ",
+        encoding="utf-8",
+    )
+    (tmp_path / crash_metrics.MARKETCLOSE_STOP_MARKER_FILENAME).write_text(
+        "2026-08-24T15:45:03.112306", encoding="utf-8"
+    )
+    m = crash_metrics.collect(tmp_path, _TARGET)
+    # 기동 3 − 사유가 남은 죽음 1 − 자동 종료 1 = **1**. 오늘 표식이 그날을 닫지 못한다.
+    assert m["unexplained_deaths"] == 1
+    assert m["marketclose_marker_day"] == "2026-08-24"
+
+
+def test_a_corrupt_marker_file_is_not_read_as_a_shutdown(tmp_path):
+    """형식이 깨진 표식은 **모른다**이지 「껐다」가 아니다(규약 C)."""
+    (tmp_path / crash_metrics.MARKETCLOSE_STOP_MARKER_FILENAME).write_text(
+        "(읽기 실패)", encoding="utf-8"
+    )
+    assert crash_metrics.marketclose_marker_day(tmp_path) is None

@@ -41,11 +41,24 @@ del /q "%PROJECT_DIR%\logs\.observation_loop_heartbeat.json" 2>nul
 cd /d "%PROJECT_DIR%"
 uv run python scripts\log_marketclose_stop.py
 
+REM 2026-08-24(08-24 §3-3 / Fix#5) — **완료 줄은 여기서 찍는다.** 종전에는 이 줄이 파일
+REM 맨 끝(daily_ops_report·collect_evidence 뒤)에 있었고, 그래서 08-24에 지표가
+REM 15:45:14~15:46:06에 도는 동안 자기 근거가 될 줄은 **15:46:09에** 찍혔다 — 3.9초 차이로
+REM `crash.unexplained_deaths = 1`(사유 없이 끝난 기동)이라는 오보가 났다. 실제로 「끝난」
+REM 시점은 taskkill이고 지표·증거 생성은 그 뒤의 후처리다.
+REM
+REM ⚠ **대가**: 이 줄이 앞으로 오면 후처리가 실패한 날에도 「완료」가 찍힌다. 그래서 문구에
+REM `프로세스 정지 · 후처리 진행`을 붙여 이 줄이 무엇을 보증하는지 문장 자체가 말하게 한다.
+REM `crash_metrics.py`가 판정에 쓰는 접두(`장마감 자동 종료 완료`)는 그대로 둔다 —
+REM 문구를 바꾸면서 파서를 안 고치면 08-04(362건이 0건으로 보고)를 우리 손으로 재현한다.
+echo [%date% %time%] ===== 장마감 자동 종료 완료 (프로세스 정지 · 후처리 진행, DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"
+
 REM 2026-08-01(운영점검보고서 2026-07-31 §5-2): 하루치 운영 지표를 자동 집계해
 REM docs\동작점검\auto\에 마크다운 + JSON 사이드카로 남긴다. 이 시점이 적기인 이유는 두 가지다 —
 REM 위 taskkill로 관측 루프가 이미 종료돼 **로그가 완결**돼 있고, DB/Redis는 의도적으로 계속
 REM 실행 중이라 SQL 집계가 가능하다. 스크립트가 최상위에서 예외를 삼키므로(exit 0) 실패해도
-REM 아래 종료 로그까지 정상적으로 진행된다.
+REM 뒤의 증거 생성까지 정상적으로 진행된다. **종료 표식(위 44~54행)은 이미 찍혀 있다** —
+REM 2026-08-24 Fix#5로 그 줄이 이 앞으로 왔다.
 REM
 REM 2026-08-03(운영점검보고서 §3-1): 이 줄만 출력이 파일로 리다이렉트되는데, **Python이
 REM 리다이렉트된 파일에 쓰는 인코딩은 콘솔 코드페이지(위 chcp 65001)가 아니라 OS 시스템
@@ -63,8 +76,9 @@ REM
 REM **반드시 daily_ops_report 뒤에 온다** — 이 스크립트의 §10이 방금 만들어진 지표의 §0/§1을
 REM 발췌해 싣기 때문이다. 앞에 두면 그 절이 "없음"으로 비고, 그 빈 자리는 조용하다.
 REM
-REM stdlib만 쓰므로 DB/Docker가 꺼져 있어도 돈다. 실패해도 아래 종료 로그는 정상 진행된다
-REM (배치는 오류에서 멈추지 않는다) — **종료 절차를 막지 않는 것이 이 자리의 조건**이다.
+REM stdlib만 쓰므로 DB/Docker가 꺼져 있어도 돈다. 실패해도 배치는 오류에서 멈추지 않는다 —
+REM **종료 절차를 막지 않는 것이 이 자리의 조건**이다. 2026-08-24 Fix#5 이후 종료 표식은
+REM 이 줄보다 **앞**에 찍히므로, 이 스크립트가 실패해도 「끝났다」는 사실 자체는 남는다.
 REM 날짜는 스크립트가 KST로 계산한다(`--out-dir`). `%date%`는 OS 로캘을 따라 형식이 바뀌어
 REM PC마다 다른 파일명을 만든다 — daily_ops_report.py가 `--out-dir`을 두는 것과 같은 이유다.
 REM 2026-08-19: `--prune-days 7` — 증거 다이제스트만 7일치를 남긴다.
@@ -79,7 +93,5 @@ REM `mahdi/ops/campaign.py`가 여러 날을 접는 원자재라(min_days 10) �
 REM 루트 보고서는 git 추적이라 지워도 용량이 안 줄고 grep 대상만 잃는다(소급 인용 꼬리 43일).
 REM 스크립트가 `_증거_*.md` 파일명 패턴으로만 지우므로 여기서 숫자를 바꿔도 그 범위는 안 넓어진다.
 uv run python "docs\동작점검\tools\collect_evidence.py" --phase post --out-dir "docs\동작점검\auto" --prune-days 7 >> "%LOG_FILE%" 2>&1
-
-echo [%date% %time%] ===== 장마감 자동 종료 완료 (DB/Redis는 계속 실행) ===== >> "%LOG_FILE%"
 
 endlocal

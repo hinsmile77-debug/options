@@ -383,6 +383,13 @@ def _render_crash(crash: dict, metrics: dict | None = None) -> list[str]:
             f"- 장마감 자동 종료 **{clean}회** · 사람이 일부러 내린 정지 **{intentional}회**",
             "",
         ]
+        # 2026-08-24 Fix#5 대안 B — **무엇을 보고 셌는가.** `보조표식`인 날은 배치의 완료
+        # 줄이 또 지표보다 늦게 찍힌 날이고, 그 사실이 조용히 고쳐지고 끝나면 안 된다.
+        if crash.get("clean_shutdown_source") == "보조표식":
+            out += ["> 📌 **장마감 종료를 로그 줄이 아니라 `logs/.last_marketclose_stop.txt`로 "
+                    "셌다.** 그 줄이 이 지표보다 늦게 찍혔다는 뜻이다 — 08-24에 그 3.9초가 "
+                    "「사유 없이 끝난 기동 1건」이라는 오보를 만들었고, `stop_mahdi_marketclose.bat`의 "
+                    "완료 줄 위치를 확인할 것(Fix#5).", ""]
         if intentional:
             out += ["> 🧍 **사람이 일부러 내린 정지는 죽음이 아니다.** 표식이 둘 있다 — "
                     "`logs/.intentional_stop`과 `premarket_startup.log`의 「Mahdi 수동 정지」 줄. "
