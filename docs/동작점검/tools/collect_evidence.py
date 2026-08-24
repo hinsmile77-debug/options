@@ -823,6 +823,129 @@ def discarded_items(root: Path):
     return out
 
 
+# ===== 2026-08-24 (08-24 §1-1 / Fix#1) — **「전일」은 달력의 어제가 아니다** =====
+#
+# 08-24(월) §9가 `2026-08-23_지표.json`(토요일)을 기대해 「없음 ⚠」을 냈다. 그 파일은 앞으로도
+# 영영 안 생긴다 — **토요일에는 장이 안 선다.** 월요일마다 뜨는 헛경보이고, 08-24 장전 회차가
+# 그것을 이상점 1-1로 올렸다.
+#
+# ## 만들 것이 아니라 이어 붙일 것이다
+#
+# 장전 계획은 「하루씩 거슬러 올라가며 파일이 있는 첫 날을 찾는다」는 **새 부품**을 제안했다.
+# 그런데 그 부품은 이미 있다 — 자동 지표 §1이 「⚠ 직전 거래일 2026-08-21 기준이다 — 그 사이
+# 비거래일 2일을 건너뛰었다」를 정확히 인쇄한다(`scripts/daily_ops_report._delta_baseline_metric`).
+#
+# **그 로직을 복제하지 않는다.** 이 파일은 stdlib 전용이라(파일 헤더) `mahdi.ops.market_calendar`를
+# 임포트할 수 없고, 달력을 여기 다시 적으면 두 곳이 조용히 갈라진다(규약 A). 대신 **파일이
+# 진실원천**이라는 이 파일의 다른 규약을 쓴다(`latest_report_before` docstring과 같은 방식):
+# 지표 사이드카가 **실재하는 가장 가까운 날**을 찾는다.
+#
+# ## 왜 5일에서 멈추는가
+#
+# 무한히 거슬러 오르면 **진짜 부재가 조용히 통과한다** — 지표가 일주일째 안 만들어진 날에도
+# 「7일 전 것이 있으니 정상」이 된다. 연휴 최대치(추석·설 4~5일)를 덮으면서 그보다 긴 침묵은
+# 사건으로 남기는 자리가 5다. 못 찾으면 **적신호를 낸다** — 이 fix는 경보를 끄는 것이 아니다.
+PREV_SIDECAR_MAX_BACKTRACK_DAYS = 5
+
+
+def previous_metric_sidecar(auto: Path, day: _date, max_back=PREV_SIDECAR_MAX_BACKTRACK_DAYS):
+    """반환: `(찾은 날짜, 거슬러 오른 일수)` — `max_back`일 안에 없으면 `(None, max_back)`.
+
+    입력: `auto/` 디렉터리, 오늘 날짜.
+    계산: 어제부터 하루씩 거슬러 오르며 `{날짜}_지표.json`이 **실재하는** 첫 날을 고른다.
+    해석: 상세 근거는 위 절 주석. 「거슬러 오른 일수 − 1」이 곧 건너뛴 비거래일 수다.
+    실패 조건: 없다 — 못 찾으면 `None`이고 호출측이 그 사실을 적신호로 낸다.
+    """
+    for back in range(1, max_back + 1):
+        candidate = day - timedelta(days=back)
+        if (auto / f"{candidate.isoformat()}_지표.json").is_file():
+            return candidate, back
+    return None, max_back
+
+
+# ===== 2026-08-24 (08-24 §3-2 / 고도화#4) — **§8-2의 거울상: 아직 안 정한 것** =====
+#
+# ## 오늘 무슨 일이 있었나
+#
+# 장중 두 회차가 「사고 싶다 336번 중 실행 경로는 23번」을 **신규 P1**으로 올렸다. 장후에
+# 원인을 찾으니 `small_strangle_buy`의 |δ| 0.20~0.30이 구독 창 밖이라는 것이었고 — **그 결정은
+# `NEXT_TODO.md`의 「⚠ 남은 결정 하나 — 사람이 골라야 한다」에 (a)/(b)/(c) 체크박스와 함께
+# 08-18부터 엿새째 열려 있었다.** 검증 캠페인도 08-19부터 근거를 쌓고 있었다.
+#
+# ## 08-19와 **같은 문장, 반대 방향**이다
+#
+#     08-19  닫힌 것(폐기된 진단)을 새것으로 착각해 되살렸다   → §8-2가 그것을 막는다
+#     08-24  열린 것(미결 결정)을 새 결함으로 착각해 P1을 올렸다 → 아무것도 안 막고 있었다
+#
+# 두 목록은 **같은 파일에서 뽑을 수 있다.** §8-2는 「다시 올리지 마라」를 말하고 이 절은
+# 「아직 안 정했다」를 말한다.
+#
+# ## ⚠ 이 절은 판정을 하지 않는다
+#
+# §8-2와 같은 규약이다. 목록을 눈앞에 두는 것이 전부이고, 오늘 사고는 그것으로 막혔을 것이다.
+# 「미체크 항목이 2개 이상」을 조건에 두는 이유: **선택지가 하나인 것은 결정이 아니라 할 일**이고,
+# 그것은 §8-1의 체크박스 목록이 이미 보여 준다. 여기 실려야 하는 것은 **갈림길**이다.
+#
+# ## 문구 목록이 왜 이렇게 좁은가 — 실측으로 좁혔다
+#
+# 처음에는 제목에 `결정`만 있으면 담았다. 그러자 **닫힌 결정 둘**이 함께 딸려 왔다:
+# `### Fix#6 — EGW00201 1건: 고치지 않는다(결정)`(이미 정한 것)과
+# `## 2026-07-31 사용자 결정 필요`(항목이 전부 `- [x]`인 옛 절). 그 둘이 매일 실리면 이 절은
+# **소음이 되고, 소음이 되면 진짜 갈림길이 그 안에 묻힌다** — 이 파일이 `MEASUREMENT_MAP`
+# 주석에 적어 둔 「틀린 경보는 진짜 경보를 죽인다」가 그대로 적용되는 자리다.
+#
+# 그래서 **「아직 안 정했다」를 말하는 문구만** 담는다(`결정` 단독은 안 담는다). 그리고
+# **최상위 체크박스만** 센다 — `- [x]` 항목 아래 딸린 미체크 하위 항목은 그 항목의 세부이지
+# 갈림길이 아니다(07-31 절이 정확히 그 형태였다).
+_DECISION_HEADING_RE = re.compile(
+    r"^(#{2,4})\s+.*(남은 결정|결정 필요|결정 대기|미결|골라야|골라 주|고를 것|선택지|사용자 확인 대기)"
+)
+_OPEN_BOX_RE = re.compile(r"^- \[ \]\s+(.*)$")
+_ANY_HEADING_RE = re.compile(r"^(#{1,6})\s+")
+# 미체크 항목이 이 수 미만이면 「결정」이 아니라 할 일 목록으로 본다.
+DECISION_MIN_OPEN_CHOICES = 2
+
+
+def pending_decisions(root: Path):
+    """반환: `[(줄번호, 제목, [미체크 항목])]` — **사람이 고르기로 하고 미뤄 둔 것.** 못 읽으면 `None`.
+
+    입력: 리포 루트.
+    계산: `NEXT_TODO.md`에서 제목에 결정·골라야·선택지가 있는 절을 찾아, 다음 헤딩 전까지의
+         **미체크 체크박스**를 모은다. 그것이 `DECISION_MIN_OPEN_CHOICES`개 이상인 절만 남긴다.
+    해석: 상세 근거는 위 절 주석. **판정하지 않는다** — 목록을 그대로 넘긴다.
+    실패 조건: 파일을 못 읽으면 `None`. 빈 목록(`[]`)과 **다른 값**이다(규약 C) —
+         전자는 「못 읽었다」, 후자는 「열린 결정이 없다」이며 조치가 다르다.
+    """
+    path = root.joinpath(*_NEXT_TODO_REL)
+    # `read_text()`는 실패 시 **참인 문자열**을 준다 — `discarded_items`와 같은 함정이다.
+    if not path.is_file():
+        return None
+    text = read_text(path)
+    if text.startswith("(읽기 실패)"):
+        return None
+    out, current = [], None
+    for n, line in enumerate(text.splitlines(), 1):
+        heading = _ANY_HEADING_RE.match(line)
+        if heading:
+            if current and len(current[2]) >= DECISION_MIN_OPEN_CHOICES:
+                out.append(current)
+            decision = _DECISION_HEADING_RE.match(line)
+            # 폐기·종결 헤딩은 **열린 결정이 아니다** — 그쪽은 §8-2가 이미 인쇄한다.
+            if decision and not _DISCARD_HEADING_RE.match(line):
+                current = (n, line.lstrip("# ").strip(), [])
+            else:
+                current = None
+            continue
+        if current is None:
+            continue
+        box = _OPEN_BOX_RE.match(line)
+        if box:
+            current[2].append((n, box.group(1).strip()))
+    if current and len(current[2]) >= DECISION_MIN_OPEN_CHOICES:
+        out.append(current)
+    return out
+
+
 # ---------------------------------------------------------------- 전일 지시 대조
 # 2026-08-14 장전 §6 / 고도화 1. 상세 근거는 §8-1 절 말미의 인용.
 #
@@ -884,6 +1007,101 @@ def latest_report_before(root: Path, day: _date):
 def report_hypothesis_ids(text: str):
     """반환: 보고서 본문이 언급한 가설 id 집합."""
     return set(HYPOTHESIS_ID_RE.findall(text))
+
+
+# ===== 2026-08-24 (08-24 §1-2 / Fix#2) — **이름이 바뀐 것을 「없어진 것」으로 세지 않는다** =====
+#
+# 08-24 장전 §8-1이 「전일 보고서가 언급했는데 yaml에 없는 id **13개**」를 적신호로 올렸다.
+# 그중 실제 부재는 **0건**이었다 — 08-23 세션이 가설을 등재하면서 슬러그를 바꿨을 뿐이다:
+#
+#     보고서: 2026-08-23-fix1-...      yaml: 2026-08-23-fix5-...
+#
+# 종전 대조는 「완전일치 또는 `id + '-'` 접두」였다. 접두 규약은 **보고서가 짧게 부르는 경우**
+# (`2026-08-12-g1` → `...-g1-reconnect-as-cost`)를 위한 것이라 **꼬리가 같고 머리가 다른**
+# 이 형태를 못 잡는다.
+#
+# ## 슬러그 일치는 「후보」로만 인쇄하고 **판정하지 않는다**
+#
+# 서로 다른 두 가설이 같은 슬러그를 가질 수 있다(`...-fix3-parser-blind`가 두 날에 있으면
+# 둘 다 `parser-blind`다). 그래서 **완전일치·접두 일치가 먼저**이고, 슬러그 일치는
+# 「개명 후보」로 인쇄하되 §12 적신호에서는 뺀다 — 08-19 Fix#5가 「못 잡는 판정기를 실으면
+# 거짓 안심이 남는다」고 적은 것의 반대 방향 조심이다: **틀리게 이어 붙이는 판정기**도 같다.
+_HYPOTHESIS_DATE_PREFIX_RE = re.compile(r"^20\d\d-\d\d-\d\d-")
+_HYPOTHESIS_FIX_PREFIX_RE = re.compile(r"^(?:fix|p|g|adv|e|c|wiring)\d*-")
+
+
+def hypothesis_slug(hid: str) -> str:
+    """반환: 날짜와 `fixN`류 접두를 뗀 **꼬리**. 개명을 따라가는 유일한 축이다.
+
+    입력: 가설 id(`2026-08-23-fix1-broker-knows-what-we-hold`).
+    계산: 앞의 `YYYY-MM-DD-`를 떼고, 이어지는 `fix1-`/`p2-`/`g1-`/`wiring2-` 한 마디를 뗀다.
+    해석: 상세 근거는 위 절 주석. **판정용이 아니라 후보 제시용**이다.
+    실패 조건: 없다 — 형태가 다르면 뗄 것을 못 떼고 원문에 가까운 값을 낸다.
+    """
+    rest = _HYPOTHESIS_DATE_PREFIX_RE.sub("", str(hid))
+    return _HYPOTHESIS_FIX_PREFIX_RE.sub("", rest)
+
+
+def rename_candidates(missing, known):
+    """반환: `{보고서 id: [같은 슬러그를 가진 yaml id]}` — 없으면 그 키는 안 생긴다.
+
+    입력: 완전일치·접두 일치에 실패한 id들, yaml에 실재하는 id 집합.
+    계산: 슬러그가 같은 것을 모은다.
+    실패 조건: 없다.
+    """
+    by_slug = {}
+    for k in known:
+        by_slug.setdefault(hypothesis_slug(k), []).append(k)
+    out = {}
+    for i in missing:
+        hit = sorted(by_slug.get(hypothesis_slug(i)) or [])
+        if hit:
+            out[i] = hit
+    return out
+
+
+# 2026-08-24 Fix#2 변경 B — **「미등재」로 올리기 전에 §8-2 폐기 목록을 먼저 본다.**
+#
+# 08-19 Fix#5의 §8-2는 목록을 **눈앞에 놓기만** 했다. 그것으로 사람이 읽으면 막히지만,
+# **자동 적신호는 여전히 그 항목을 「미등재」로 올린다** — 그리고 적신호는 사람이 읽기 전에
+# 먼저 눈에 띈다. 폐기된 안건의 id가 적신호에 매일 실리면 그것이 곧 「재등재하라」는 지시로
+# 읽힌다(08-19에 실제로 그렇게 읽혔다).
+#
+# **낱말 겹침으로 맞추지 않는다** — `discarded_items` 위 절 주석이 그 판정기를 실측으로
+# 기각했다(알려진 두 사례가 각각 낱말 1개만 공유). 여기서는 **id 문자열 자체**가 폐기 블록
+# 안에 있는지만 본다. 없으면 아무 말도 안 한다 — 못 잡는 것보다 **틀리게 잡는 것**이 나쁘다.
+def discarded_hypothesis_ids(root: Path, ids):
+    """반환: `{id: (줄번호, 그 줄)}` — 폐기·종결 블록 **안에서** 그 id가 언급된 것만.
+
+    입력: 리포 루트, 확인할 id들.
+    계산: `NEXT_TODO.md`를 훑어 폐기 절/헤딩 안에 있는 줄에서 id를 **문자열 그대로** 찾는다.
+    해석: 상세 근거는 위 절 주석. **판정하지 않는다** — 인쇄하고 적신호에서만 뺀다.
+    실패 조건: 파일을 못 읽으면 `None`(= 「대조하지 못했다」, 빈 dict와 다르다).
+    """
+    path = root.joinpath(*_NEXT_TODO_REL)
+    if not path.is_file():
+        return None
+    text = read_text(path)
+    if text.startswith("(읽기 실패)"):
+        return None
+    wanted = list(ids)
+    out, in_section = {}, False
+    for n, line in enumerate(text.splitlines(), 1):
+        if _DISCARD_SECTION_RE.match(line):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            in_section = False
+        if _DISCARD_HEADING_RE.match(line):
+            # 헤딩 자체가 폐기 선언이면 그 아래 블록도 폐기 맥락이다 — 다음 헤딩까지 유지한다.
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        for i in wanted:
+            if i in line and i not in out:
+                out[i] = (n, truncate(line.strip(), 110))
+    return out
 
 
 # ===== 2026-08-23 (08-21 §1-3 / §4 Fix#6) — 크래시 판정을 **표식**으로 바꾼다 =====
@@ -1645,14 +1863,43 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         unregistered = sorted(
             i for i in ids if not any(k == i or k.startswith(i + "-") for k in known)
         )
-        if unregistered:
-            A(f"- ⚠ 직전 보고서가 언급했는데 **yaml에 없는 id {len(unregistered)}개**: "
-              + ", ".join(f"`{i}`" for i in unregistered))
+        # ===== 2026-08-24 Fix#2 — **개명과 폐기를 「부재」에서 갈라낸다** =====
+        #
+        # 상세 근거는 `hypothesis_slug` / `discarded_hypothesis_ids` 위 절 주석. 세 갈래로
+        # 나눠 **셋 다 인쇄하고**, 적신호에는 마지막 것만 올린다:
+        #   개명 후보 — 슬러그가 같은 yaml id가 있다(08-24의 13건이 전부 이 형태였다)
+        #   폐기 확정 — 그 id가 `NEXT_TODO.md`의 폐기 블록 안에 있다(재등재 대상이 아니다)
+        #   진짜 부재 — 위 둘 다 아니다. **이것만 적신호다.**
+        renamed = rename_candidates(unregistered, known)
+        discarded_ids = discarded_hypothesis_ids(root, [i for i in unregistered if i not in renamed])
+        really_missing = [
+            i for i in unregistered if i not in renamed and i not in (discarded_ids or {})
+        ]
+        if renamed:
+            A(f"- 🔁 **개명 후보 {len(renamed)}건** — 슬러그가 같은 항목이 yaml에 있다"
+              "(**판정하지 않는다**: 서로 다른 두 가설이 같은 슬러그를 가질 수 있다)")
+            for i in sorted(renamed):
+                A(f"  - `{i}` → " + ", ".join(f"`{k}`" for k in renamed[i]))
+        if discarded_ids:
+            A(f"- ⛔ **폐기 확정 {len(discarded_ids)}건 — 재등재 대상이 아니다**")
+            for i in sorted(discarded_ids):
+                line_no, quoted_line = discarded_ids[i]
+                A(f"  - `{i}` — NEXT_TODO:{line_no}  {quoted_line}")
+        if discarded_ids is None and unregistered:
+            # 규약 C — 대조를 **못 했다**와 「걸린 것이 없다」를 가른다.
+            A("- ⚠ `NEXT_TODO.md`를 못 읽어 **폐기 목록과 대조하지 못했다** — 아래 목록에 "
+              "이미 폐기된 항목이 섞여 있을 수 있다.")
+        if really_missing:
+            A(f"- ⚠ 직전 보고서가 언급했는데 **yaml에 없는 id {len(really_missing)}개**: "
+              + ", ".join(f"`{i}`" for i in really_missing))
             flags.append(
-                f"전일 보고서의 등재 제안 {len(unregistered)}건이 **미등재**"
-                f"({', '.join(unregistered[:3])}{'…' if len(unregistered) > 3 else ''}) — "
+                f"전일 보고서의 등재 제안 {len(really_missing)}건이 **미등재**"
+                f"({', '.join(really_missing[:3])}{'…' if len(really_missing) > 3 else ''}) — "
                 "**등재 창은 개장(09:00)에 닫힌다**(소급 금지)"
             )
+        elif unregistered:
+            A(f"- ✅ 완전일치에 실패한 {len(unregistered)}건은 **전부 개명이거나 폐기다** — "
+              "진짜 미등재 0건(2026-08-24 Fix#2)")
         else:
             A("- 직전 보고서가 언급한 id는 전부 yaml에 있다")
         A("")
@@ -1702,10 +1949,43 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     A("> 목록을 눈앞에 두는 것이 이 절의 전부이고, 두 사고 다 그것으로 막혔을 것이다.")
     A("")
 
+    # ---- 8-3. 사람이 고르기로 하고 미뤄 둔 것 (2026-08-24 §3-2 / 고도화#4) ----
+    #
+    # **§8-2의 거울상이라 바로 옆에 둔다.** 저쪽은 「다시 올리지 마라」이고 이쪽은
+    # 「아직 안 정했다」다 — 08-19는 닫힌 것을 되살렸고 08-24는 열린 것을 새것으로 착각했다.
+    A("## 8-3. 「사람이 고르기로 하고 미뤄 둔 것」 — 아직 안 정한 갈림길")
+    A("")
+    pending = pending_decisions(root)
+    if pending is None:
+        # 규약 C — §8-2와 같은 자리다. 여기서 조용히 비면 이 절은 **매일 통과**한다.
+        A("⚠ `docs/dev_memory/NEXT_TODO.md`를 못 읽었다 — 이 절은 **검사한 것이 아니다**.")
+        flags.append("`NEXT_TODO.md`를 못 읽어 「미결 결정」 목록을 확인하지 못했다")
+    elif not pending:
+        A("(열려 있는 결정이 없다 — 선택지가 둘 이상 달린 미체크 절을 찾지 못했다.)")
+    else:
+        A(f"**{len(pending)}건.** 이 회차가 무엇을 신규 결함으로 올리기 전에 여기부터 본다 — "
+          "**여기 있는 것은 결함이 아니라 아직 안 고른 것이다.**")
+        A("")
+        A("```")
+        for line_no, title, choices in pending:
+            A(f"NEXT_TODO:{line_no}  {truncate(title, 110)}")
+            for choice_line, choice in choices:
+                A(f"    :{choice_line}  [ ] {truncate(choice, 100)}")
+        A("```")
+        A("")
+    A("> **이 절이 있는 이유**: 08-24 장중 두 회차가 「사고 싶다 336번 중 실행까지 간 것은 23번」을")
+    A("> **신규 P1**으로 올렸다. 그 답은 위 목록에 (a)/(b)/(c) 체크박스와 함께 **엿새째 열려**")
+    A("> 있었다(§3-2). §8-2가 「닫힌 것을 되살리는 실수」를 막고 이 절이 **그 반대 방향의 실수**를")
+    A("> 막는다 — 두 목록은 같은 파일에서 나온다. **여기서도 판정은 하지 않는다**(§8-2와 같은")
+    A("> 규약): 목록을 눈앞에 두는 것이 전부이고, 08-24 사고는 그것으로 막혔을 것이다.")
+    A("")
+
     # ---- 9. 산출물 ----
     A("## 9. 산출물 존재 점검")
     A("")
-    prev_hint = (day - timedelta(days=1)).isoformat()
+    # 2026-08-24 Fix#1 — **직전 거래일**을 찾는다. 상세 근거는 `previous_metric_sidecar` 위 절 주석.
+    prev_day, prev_back = previous_metric_sidecar(auto, day)
+    prev_hint = (prev_day or (day - timedelta(days=1))).isoformat()
     targets = [
         (f"docs/동작점검/auto/{D}_지표.md", "post"),
         (f"docs/동작점검/auto/{D}_지표.json", "post"),
@@ -1743,8 +2023,23 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         if ph == "post" and "post" in cfg_phases and state.startswith("**없음"):
             flags.append(f"장후 산출물 누락: `{rel}`")
     A("")
+    # 2026-08-24 Fix#1 — **찾은 날짜를 함께 인쇄한다.** 「어제 것이 없다」와 「직전 거래일
+    # 것을 쓰고 있다」는 다른 사실이고, 후자는 정상이다.
+    if prev_day is None:
+        A(f"- ⚠ **최근 {PREV_SIDECAR_MAX_BACKTRACK_DAYS}일 안에 지표 사이드카가 하나도 없다** — "
+          "전일 델타가 통째로 빈다(위 줄은 달력상 어제를 가리킨다).")
+        flags.append(
+            f"직전 {PREV_SIDECAR_MAX_BACKTRACK_DAYS}일 안에 `_지표.json`이 **하나도 없다** — "
+            "연휴가 아니면 지표 생성이 며칠째 안 돈 것이다(전일 델타는 나중에 복구할 수 없다)"
+        )
+    elif prev_back > 1:
+        A(f"- 전일 사이드카는 **직전 거래일 {prev_day}** 기준이다 — 그 사이 비거래일 "
+          f"**{prev_back - 1}일**을 건너뛰었다(달력상 어제는 `{(day - timedelta(days=1)).isoformat()}`).")
+    A("")
     A("> 전일 사이드카(`_지표.json`)가 없으면 **전일 델타가 통째로 빈다.** 로그는 이틀치만")
-    A("> 남으므로 그 델타는 나중에 복구할 수 없다.")
+    A("> 남으므로 그 델타는 나중에 복구할 수 없다. **달력의 어제가 아니라 파일이 실재하는")
+    A(f"> 가장 가까운 날**을 최대 {PREV_SIDECAR_MAX_BACKTRACK_DAYS}일까지 찾는다(2026-08-24 Fix#1) —")
+    A("> 월요일마다 뜨던 「없음 ⚠」이 그 헛경보였다. 그보다 오래 비면 그때는 **진짜 부재**다.")
     A("")
 
     # ---- 10. 자동 지표 발췌 (장후) ----
