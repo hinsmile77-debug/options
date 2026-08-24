@@ -7088,3 +7088,92 @@ def test_short_frames_still_produce_a_tick_without_cumulative_fields():
     assert parsed is not None
     assert parsed[1].cum_buy_volume is None
     assert parsed[1].cum_sell_volume is None
+
+
+# ===== 2026-08-24 (08-24 §1-8·§1-9 / Fix#4·Fix#6) — 문턱과 한 줄 =====
+#
+# 08-24 오후에 먼슬리 되살리기가 3배 잦아졌고 남은 예산이 0.0초까지 내려갔다. 그리고
+# 15:10:50에 「3개 중 **0개** 회복」이 났다 — 되살리기가 실제로 실패한 첫 사례다. 전부 INFO라
+# 아무 경보도 안 걸렸고, 그 한 줄을 사람이 하루치 로그를 훑어서 찾았다.
+#
+# 같은 날 계좌 잔고 폴링이 두 번 통째로 빠졌고, 그 인과를 **하루에 세 번 뒤집었다** — 세 번 다
+# 서로 다른 파일의 줄을 밀리초로 맞춰 본 결론이다.
+
+
+def test_a_failed_revival_is_a_warning_not_an_info(caplog):
+    """**Fix#4의 전부.** 15:10:50 「3개 중 0개」가 그 형태다."""
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        mahdi_main._log_priority_retry(3, 0, 0.0)
+
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert "되살리기 실패" in record.getMessage()
+
+
+def test_a_tight_but_successful_retry_stays_info_with_its_own_wording(caplog):
+    """**두 사건을 한 문턱으로 묶지 않는다** — 성공한 사이클을 경보로 올리면 그 소음이
+    위 WARNING을 덮는다(08-24 값으로 전자 5건 · 후자 1건)."""
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        mahdi_main._log_priority_retry(3, 3, 2.9)
+
+    [record] = caplog.records
+    assert record.levelno == logging.INFO
+    assert "선할당이 바닥났다" in record.getMessage()
+
+
+def test_a_comfortable_retry_keeps_the_old_line(caplog):
+    """문턱 위(3.1초)는 종전 그대로여야 한다 — 이 fix는 평시 로그를 안 건드린다."""
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        mahdi_main._log_priority_retry(3, 3, 3.1)
+
+    [record] = caplog.records
+    assert record.levelno == logging.INFO
+    assert record.getMessage().endswith("판단 주입력(GEX/감마플립)의 두께다")
+
+
+def test_the_balance_poll_failure_line_carries_the_state_around_it(monkeypatch, caplog):
+    """**Fix#6의 전부.** 백오프 배율·이번/직전 예외 유형·마지막 성공 폴이 같은 줄에 있어야 한다.
+
+    08-24에는 이 넷이 서로 다른 파일에 흩어져 있었고, 그래서 같은 인과를 하루에 세 번
+    다르게 결론지었다.
+    """
+    class _FailingRestClient:
+        rate_limit_backoff_multiplier = 1.5
+
+        def get_balance(self):
+            raise httpx.ReadTimeout("KIS 느림")
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_account_balance_cycle(_FailingRestClient(), interval_seconds=1))
+
+    [record] = [r for r in caplog.records if "잔고 폴링 사이클 실패" in r.getMessage()]
+    message = record.getMessage()
+    assert "유형=ReadTimeout" in message
+    assert "백오프 1.50배" in message
+    # 기동 후 첫 사이클이라 둘 다 없다 — **「모른다」를 지어내지 않는다**(규약 C).
+    assert "직전 실패 유형=없음" in message and "마지막 성공 폴=없음" in message
+
+
+def test_the_balance_poll_line_does_not_invent_a_multiplier_it_cannot_read(monkeypatch, caplog):
+    """속성이 없는 클라이언트에서 1.00배로 지어내면 그 값이 다음 사람의 인과 추론을 망친다."""
+    class _BareRestClient:
+        def get_balance(self):
+            raise RuntimeError("KIS 500")
+
+    async def fake_sleep(seconds):
+        raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr("mahdi.main.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        with pytest.raises(RuntimeError, match="stop-loop"):
+            _run(poll_account_balance_cycle(_BareRestClient(), interval_seconds=1))
+
+    [record] = [r for r in caplog.records if "잔고 폴링 사이클 실패" in r.getMessage()]
+    assert "백오프 모름" in record.getMessage()

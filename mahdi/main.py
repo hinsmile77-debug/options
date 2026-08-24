@@ -564,8 +564,71 @@ LOG_EXPIRY_BURST_DONE = (
     "만기 유동성 버스트 완료: 북 %d개(%s) · %d레그 · 적재 %d행 (%s~%s)"
 )
 
+# ===== 2026-08-24 (08-24 §1-9 / Fix#4) — 「남은 예산」을 **사건**으로 만든다 =====
+#
+# ## 값은 이미 로그에 다 있었다 — 없던 것은 문턱이다
+#
+# 08-24 오후에 이 줄이 3배 잦아졌고 남은 예산이 한 번은 **0.0초**까지 내려갔다. 그리고
+# 15:10:50에 「3개 중 **0개** 회복」이 났다 — 되살리기가 실제로 **실패한 첫 사례**다.
+# 그 한 줄을 찾는 데 사람이 하루치 로그를 훑었다. 전부 INFO라 아무 경보도 안 걸렸고,
+# 회복률(하루 평균)은 그 실패를 평균 안에 접어 없앴다.
+#
+# ## 두 사건을 **한 문턱으로 묶지 않는다**
+#
+#     회복 실패 (회복 < 대상)          되살리기가 안 됐다        → WARNING
+#     간신히 성공 (남은 예산 < 3.0초)   선할당이 바닥났다        → INFO(문구만 다르다)
+#
+# 08-24 값으로 전자 1건 · 후자 5건이다. 하나로 묶으면 6건이 같은 얼굴이 되고, 그러면
+# 「예산이 빠듯했다」가 「먼슬리가 비었다」를 덮는다 — **다른 사건은 다른 줄이어야 한다.**
+#
+# ## 3.0초인 이유
+#
+# 레그 하나를 더 부르는 데 드는 시간이 그 언저리다(페이서 1.0초 + HTTP p50 0.6~1.5초에
+# 재시도 여지). 그보다 적게 남았으면 **다음 레그를 부를 수 없다** — 성공했어도 그것은
+# 선할당이 바닥난 상태이고, 그 사실이 예산 컷보다 먼저 보여야 한다.
+CHAIN_PRIORITY_RETRY_BUDGET_FLOOR_SECONDS = 3.0
+
+# **머리를 공유한다.** `mahdi/ops/log_metrics._PRIORITY_RETRY_RE`가 이 접두
+# (`먼슬리 레그 재시도: N개 중 M개 회복`)로 세므로, 세 변종이 갈라지면 그 파서가 조용히
+# 일부만 센다 — 08-04에 문구만 바꾸고 파서를 안 고쳐 362건이 0건으로 보고된 그 사고다.
+_LOG_CHAIN_PRIORITY_RETRY_HEAD = "먼슬리 레그 재시도: %d개 중 %d개 회복(남은 예산 %.1f초)"
+
 LOG_CHAIN_PRIORITY_RETRY = (
-    "먼슬리 레그 재시도: %d개 중 %d개 회복(남은 예산 %.1f초) — 판단 주입력(GEX/감마플립)의 두께다"
+    _LOG_CHAIN_PRIORITY_RETRY_HEAD + " — 판단 주입력(GEX/감마플립)의 두께다"
+)
+# 회복 < 대상. **WARNING이다** — 먼슬리 핵심 레그가 이번 분에 실제로 비었다는 뜻이고,
+# 그 분의 GEX·감마플립은 얇은 재료로 계산된다.
+LOG_CHAIN_PRIORITY_RETRY_FAILED = (
+    _LOG_CHAIN_PRIORITY_RETRY_HEAD + " — 되살리기 실패(판단 주입력이 이번 분에 얇아졌다)"
+)
+# 회복은 됐는데 남은 예산이 문턱 아래. **INFO를 유지한다** — 성공한 사이클이고, 경보로
+# 올리면 그 소음이 위 WARNING을 덮는다.
+LOG_CHAIN_PRIORITY_RETRY_BUDGET_FLOOR = (
+    _LOG_CHAIN_PRIORITY_RETRY_HEAD + " — 선할당이 바닥났다(다음 레그를 부를 시간이 없었다)"
+)
+
+# ===== 2026-08-24 (08-24 §1-8 / Fix#6) — 백오프와 잔고 폴링 실패를 **같은 줄에서** 잇는다 =====
+#
+# 08-24 12:34:32에 계좌 잔고 조회가 한 사이클 통째로 빠졌다(당일 첫 사례). 그 인과를 하루에
+# **세 번 뒤집었다**: 장중 ①이 「지연 상승이 떨어뜨린 첫 지점」, 장중 ②가 「7번 중 1번짜리
+# 우연」, 장후가 「확대→실패는 2/21이지만 실패→확대는 2/2」. **세 번 다 서로 다른 파일의 줄을
+# 밀리초로 맞춰 보고 내린 결론이다.** 한 줄에 있었으면 처음부터 갈렸다.
+#
+# 그 순간의 상태는 전부 **이미 메모리에 있다** — 페이서 배율·이번/직전 예외 유형·마지막 성공
+# 폴 시각. 새로 재는 것이 하나도 없다.
+#
+# ## 왜 「킬스위치 조건평가=건너뜀」이라고 적지 않는가
+#
+# 계획 초안은 그 문구였다. 그런데 **틀린 문장이다**: `_build_account_state_for_candidate`는
+# DB의 **가장 최근** 스냅샷을 읽으므로, 이번 사이클이 빠져도 킬스위치는 직전 스냅샷으로
+# 계속 평가된다. 「건너뜀」이라고 적으면 안 일어난 일을 매번 인쇄하게 되고, 그것이 이 저장소가
+# 08-21에 고친 병(표식을 안 보고 추정하는 판정)의 문장판이다.
+#
+# 대신 **마지막 성공 폴 시각**을 싣는다 — 킬스위치가 지금 무엇을 보고 있는지가 그 값이고,
+# 그것이 「얼마나 낡은 계좌 상태로 평가 중인가」에 답한다. `없음`은 기동 후 첫 성공 전이다.
+LOG_BALANCE_POLL_FAILED = (
+    "계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀 "
+    "(유형=%s · 직전 실패 유형=%s · 백오프 %s · 마지막 성공 폴=%s)"
 )
 # 2026-08-05(§2-4) — 트레이스백 표본을 다 쓴 뒤의 요약 줄.
 #
@@ -2296,6 +2359,25 @@ async def _collect_option_chain_cycle(
     return rows, latest_spot, any_strikes, missing_priority
 
 
+def _log_priority_retry(attempted: int, recovered: int, budget_left: float) -> None:
+    """먼슬리 되살리기 한 사이클을 **사건의 종류에 따라** 다른 줄로 남긴다 (2026-08-24 Fix#4).
+
+    입력: 시도한 레그 수, 회복한 레그 수, 그 시점의 남은 수집 예산(초).
+    계산: 회복 실패(회복 < 시도)면 WARNING, 성공했지만 남은 예산이 문턱 아래면 INFO에
+         다른 문구, 그 외에는 종전 문구 그대로.
+    해석: 상세 근거는 `CHAIN_PRIORITY_RETRY_BUDGET_FLOOR_SECONDS` 위 절 주석.
+         **두 사건을 한 문턱으로 묶지 않는다** — 「간신히 성공」과 「실패」는 다른 사건이고,
+         묶으면 앞의 것이 뒤의 것을 덮는다(08-24 실측 전자 5건 · 후자 1건).
+    실패 조건: 없다 — 시도가 0이면 호출측이 아예 안 부른다(「안 돌았다」는 침묵이 맞다).
+    """
+    if recovered < attempted:
+        logger.warning(LOG_CHAIN_PRIORITY_RETRY_FAILED, attempted, recovered, budget_left)
+    elif budget_left < CHAIN_PRIORITY_RETRY_BUDGET_FLOOR_SECONDS:
+        logger.info(LOG_CHAIN_PRIORITY_RETRY_BUDGET_FLOOR, attempted, recovered, budget_left)
+    else:
+        logger.info(LOG_CHAIN_PRIORITY_RETRY, attempted, recovered, budget_left)
+
+
 async def _retry_priority_legs(
     rest_client: KISRestClient,
     missing: list[tuple[float, str]],
@@ -2725,8 +2807,7 @@ async def poll_option_chain(
             if retry_spot is not None:
                 latest_spot = retry_spot
             if priority_retry_calls:
-                logger.info(
-                    LOG_CHAIN_PRIORITY_RETRY,
+                _log_priority_retry(
                     priority_retry_calls, len(recovered),
                     max(collect_deadline - time.monotonic(), 0.0),
                 )
@@ -4609,6 +4690,9 @@ async def poll_account_balance_cycle(
     # `None`인 동안(기동 후 첫 사이클)은 세션 시작을 하한으로 쓴다. 그보다 앞선 시각을 지어낼
     # 근거가 없고, 세션 시작은 어떤 당일 포지션보다도 앞선다.
     previous_balance_poll_at: datetime | None = None
+    # 2026-08-24 Fix#6 — **직전 실패의 유형.** 같은 예외가 반복되는가(구조적)와 매번 다른가
+    # (산발적)는 다른 사건이고, 그 구분은 한 줄 안에 두 값이 있어야만 장중에 보인다.
+    last_failure_kind: str | None = None
     while True:
         poll_time = _grid_poll_minute(db.local_now())
         try:
@@ -4645,8 +4729,24 @@ async def poll_account_balance_cycle(
                 position_ledger.log_reconcile(reconcile_result, poll_time)
                 position_ledger.apply_reconcile(conn, reconcile_result)
             previous_balance_poll_at = poll_time
-        except Exception:
-            logger.warning("계좌 잔고 폴링 사이클 실패 — 이번 사이클 건너뜀", exc_info=True)
+        except Exception as exc:
+            # 2026-08-24 Fix#6 — **그 순간의 상태 셋을 같은 줄에 싣는다.** 상세 근거는
+            # `LOG_BALANCE_POLL_FAILED` 위 절 주석. 셋 다 이미 메모리에 있는 값이라 새로
+            # 재는 것이 없고, 줄 수도 안 는다(내용만 는다).
+            #
+            # `getattr` 기본값을 두는 이유는 이 폴러의 기존 관행과 같다 — 속성이 없는 테스트
+            # 더블에서도 죽지 않아야 하고, **못 읽은 것을 1.0으로 지어내면 안 된다**(규약 C).
+            multiplier = getattr(rest_client, "rate_limit_backoff_multiplier", None)
+            logger.warning(
+                LOG_BALANCE_POLL_FAILED,
+                type(exc).__name__,
+                last_failure_kind or "없음",
+                "모름" if multiplier is None else f"{multiplier:.2f}배",
+                previous_balance_poll_at.strftime("%H:%M:%S")
+                if previous_balance_poll_at else "없음",
+                exc_info=True,
+            )
+            last_failure_kind = type(exc).__name__
 
         loop_now = asyncio.get_running_loop().time()
         next_tick, delay, overrun_seconds = _advance_fixed_tick(

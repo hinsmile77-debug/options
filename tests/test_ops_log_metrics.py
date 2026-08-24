@@ -448,7 +448,12 @@ def test_priority_retry_counts_attempts_and_recoveries():
         "— 판단 주입력(GEX/감마플립)의 두께다",
     ])
     pr = parsed["priority_retry"]
-    assert pr == {"cycles": 2, "attempted": 4, "recovered": 2, "recovery_pct": 50.0}
+    assert pr == {
+        "cycles": 2, "attempted": 4, "recovered": 2, "recovery_pct": 50.0,
+        # 2026-08-24 Fix#4 — **두 줄 다 회복 < 대상**이다(3개 중 2개 · 1개 중 0개).
+        # 회복률 50%는 그중 전멸 한 건을 평균에 접어 없앤다 — 그것이 이 칸을 만든 이유다.
+        "failed_cycles": 2, "failed_minutes": ["10:01", "10:02"],
+    }
 
 
 def test_priority_retry_is_zero_when_the_line_never_appears():
@@ -464,5 +469,58 @@ def test_priority_retry_log_format_matches_the_source_string():
     rendered = LOG_CHAIN_PRIORITY_RETRY % (5, 4, 8.25)
     parsed = _parse([f"2026-08-06 10:01:20,000 INFO:mahdi.main:{rendered}"])
     assert parsed["priority_retry"] == {
-        "cycles": 1, "attempted": 5, "recovered": 4, "recovery_pct": 80.0
+        "cycles": 1, "attempted": 5, "recovered": 4, "recovery_pct": 80.0,
+        "failed_cycles": 1, "failed_minutes": ["10:01"],
     }
+
+
+# ===== 2026-08-24 (08-24 §1-9 / Fix#4) — **파서를 먼저 넓히고 나서 문구를 바꾼다** =====
+#
+# 같은 날 `mahdi.main`이 회복 실패를 **WARNING**으로 올린다. 레벨이 `INFO`로 고정돼 있으면
+# 이 파서는 **정확히 그 사건에서만** 눈이 먼다 — 08-04에 반대 방향으로 겪은 그 사고다.
+
+
+def test_a_failed_revival_logged_as_warning_is_still_counted():
+    """이 fix의 전부 — 15:10:50 「3개 중 0개 회복」이 레벨 때문에 사라지면 안 된다."""
+    from mahdi.main import LOG_CHAIN_PRIORITY_RETRY_FAILED
+
+    rendered = LOG_CHAIN_PRIORITY_RETRY_FAILED % (3, 0, 0.0)
+    parsed = _parse([f"2026-08-06 15:10:50,000 WARNING:mahdi.main:{rendered}"])
+    assert parsed["priority_retry"]["cycles"] == 1
+    assert parsed["priority_retry"]["failed_cycles"] == 1
+    assert parsed["priority_retry"]["failed_minutes"] == ["15:10"]
+
+
+def test_a_tight_budget_success_is_not_counted_as_a_failure():
+    """**두 사건을 한 문턱으로 묶지 않는다** — 「간신히 성공」은 실패가 아니다."""
+    from mahdi.main import LOG_CHAIN_PRIORITY_RETRY_BUDGET_FLOOR
+
+    rendered = LOG_CHAIN_PRIORITY_RETRY_BUDGET_FLOOR % (3, 3, 2.9)
+    parsed = _parse([f"2026-08-06 14:31:20,000 INFO:mahdi.main:{rendered}"])
+    assert parsed["priority_retry"]["cycles"] == 1
+    assert parsed["priority_retry"]["failed_cycles"] == 0
+
+
+def test_all_three_retry_wordings_share_one_head():
+    """머리가 갈라지면 파서가 조용히 일부만 센다 — 계약을 여기서 못박는다."""
+    from mahdi import main
+
+    head = main._LOG_CHAIN_PRIORITY_RETRY_HEAD
+    for template in (
+        main.LOG_CHAIN_PRIORITY_RETRY,
+        main.LOG_CHAIN_PRIORITY_RETRY_FAILED,
+        main.LOG_CHAIN_PRIORITY_RETRY_BUDGET_FLOOR,
+    ):
+        assert template.startswith(head)
+
+
+def test_balance_poll_failure_is_counted_and_prints_zero_when_it_never_happens():
+    """분자를 센다 — 그리고 **0인 날에도 키가 있어야** 「그 줄이 없던 버전」과 갈린다(규약 C)."""
+    from mahdi.main import LOG_BALANCE_POLL_FAILED
+
+    rendered = LOG_BALANCE_POLL_FAILED % ("ReadTimeout", "없음", "1.50", "12:33:32")
+    parsed = _parse([f"2026-08-06 12:34:32,000 WARNING:mahdi.main:{rendered}"])
+    assert parsed["qualitative"]["balance_poll_failed"] == 1
+
+    quiet = _parse([_cycle_line("10:01")])
+    assert quiet["qualitative"]["balance_poll_failed"] == 0

@@ -233,6 +233,27 @@ SLOW_CALL_RE = re.compile(
 P50_CENSORED_FLOOR_RATIO = 0.98
 ZERO_ROW_RUN_ALERT_MINUTES = 20          # mahdi/ops/db_metrics.ZERO_ROW_RUN_ALERT_MINUTES
 
+# ===== 2026-08-24 (08-24 §1-8·§1-9 / Fix#6 B · Fix#4 B) — **분자와 분모를 같은 표에** =====
+#
+# 08-24에 이 두 인과를 하루에 여섯 번 대조했고 **결론이 세 번 뒤집혔다**:
+#
+#   「백오프가 확대되면 잔고 폴링이 실패하는가」   확대→실패 2/21  ·  실패→확대 2/2
+#   「먼슬리 되살리기가 실패했는가」               15:10:50에 3개 중 0개 — 하루치 로그를 훑어 찾았다
+#
+# 세 번 다 서로 다른 파일의 줄을 밀리초로 맞춰 본 결론이다. **비율을 읽으려면 분자와 분모가
+# 같은 표에 있어야 한다**(규약 E). 시간대 단위면 「같은 시간대에 둘 다 있었다」까지는 5초에
+# 보이고, 그보다 잘게 봐야 할 때 §5-1의 지연창 TSV로 내려가면 된다.
+#
+# 문구는 원본 상수의 복제다 — 이 파일은 stdlib 전용이라 임포트할 수 없다(파일 헤더).
+# **값이 갈라지면 이 파일이 틀린 것이다**(ANCHORS·CHAIN_COLLECT_BUDGET_SECONDS와 같은 규약).
+BALANCE_POLL_FAILED_TOKEN = "계좌 잔고 폴링 사이클 실패"   # mahdi/main.LOG_BALANCE_POLL_FAILED
+BACKOFF_EXPAND_TOKEN = "레이트리밋 백오프 확대"            # mahdi/broker/rest_client.LOG_BACKOFF_EXPAND
+PRIORITY_RETRY_TOKEN = "먼슬리 레그 재시도"                # mahdi/main._LOG_CHAIN_PRIORITY_RETRY_HEAD
+# 세 변종(평시 INFO · 되살리기 실패 WARNING · 선할당 바닥 INFO)이 같은 머리를 쓴다.
+# **레벨로 가르지 않는다** — 08-04에 레벨 강등으로 정규식이 눈이 멀어 362건이 0건이 됐다.
+PRIORITY_RETRY_RE = re.compile(r"먼슬리 레그 재시도: (\d+)개 중 (\d+)개 회복\(남은 예산 ([\d.]+)초\)")
+PRIORITY_RETRY_FAILED_TOKEN = "되살리기 실패"
+
 # 조용히 지나가면 안 되는 사건들. 태그가 없는 로그라 **문구로 식별한다** —
 # 레벨은 사람이 읽는 우선순위일 뿐 계측의 정체성이 아니다(2026-08-04 §2-1: 레벨이
 # WARNING→INFO로 내려가며 정규식이 통째로 눈이 멀어 362건을 0건으로 보고했다).
@@ -534,6 +555,13 @@ class LoopScan:
         self.member_total = None                          # 분모(6) — 로그가 알려 준다
         # 2026-08-14 고도화 3 — 계측 부재 신고. 상세 근거는 `MEASUREMENT_MAP` 주석.
         self.measurement_hits = collections.Counter()
+        # 2026-08-24 Fix#6 B · Fix#4 B — 시간대별 **분자와 분모**. 상세 근거는
+        # `BALANCE_POLL_FAILED_TOKEN` 위 절 주석.
+        self.balance_poll_failures = collections.Counter()   # 시(hour) -> 건수
+        self.backoff_expansions = collections.Counter()      # 시(hour) -> 건수
+        self.priority_retries = collections.Counter()        # 시(hour) -> 건수
+        self.priority_retry_failures = collections.Counter() # 시(hour) -> 회복 실패 건수
+        self.priority_retry_budget_min = {}                  # 시(hour) -> 남은 예산 최소(초)
 
     def feed(self, line):
         m = RECORD_RE.match(line)
@@ -603,6 +631,22 @@ class LoopScan:
                     # 2026-08-19 Fix#7 — **창 시각을 함께 싣는다.** 종전에는 `(건수, p50)`만
                     # 남겨 5분 창의 시계열이 시간대 안에서 사라졌다. 근거는 `window_latency_p50`.
                     self.latency_p50[hh].append((hhmmss, int(it.group(2)), float(it.group(3))))
+
+        # 2026-08-24 Fix#6 B · Fix#4 B — 시간대별로 센다.
+        if BALANCE_POLL_FAILED_TOKEN in msg:
+            self.balance_poll_failures[hh] += 1
+        if BACKOFF_EXPAND_TOKEN in msg:
+            self.backoff_expansions[hh] += 1
+        pr = PRIORITY_RETRY_RE.search(msg)
+        if pr:
+            self.priority_retries[hh] += 1
+            if int(pr.group(2)) < int(pr.group(1)) or PRIORITY_RETRY_FAILED_TOKEN in msg:
+                # **두 축을 다 본다.** 숫자(회복 < 대상)가 정본이고 문구는 그 확인이다 —
+                # 한쪽이 바뀌어도 다른 쪽이 남는다(08-04의 눈멂을 한 번 더 막는 자리다).
+                self.priority_retry_failures[hh] += 1
+            left = float(pr.group(3))
+            if hh not in self.priority_retry_budget_min or left < self.priority_retry_budget_min[hh]:
+                self.priority_retry_budget_min[hh] = left
 
         for key, tokens in ALWAYS_QUOTE.items():
             if any(t in msg for t in tokens):
@@ -1586,6 +1630,51 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                     f"`rows=0`이 **{length}분 연속**({lo}~{hi}) — 흩어진 0행 분과 다른 사건이다. "
                     "신선도 창(5분)을 넘긴 분의 판단은 체인을 아예 못 본다"
                 )
+        A("")
+
+    # ---- 5-1-1. 백오프 · 잔고폴링 · 먼슬리 되살리기 (2026-08-24 Fix#6 B · Fix#4 B) ----
+    #
+    # **왜 위 표에 열을 더하지 않고 표를 하나 더 두는가**: 위 표는 이미 9열이고, 거기 5열을
+    # 더하면 사람이 안 읽는다(이 파일이 §5-1 주석에 적어 둔 「표가 옆으로 넘치면 안 읽는다」와
+    # 같은 이유). 규약 E가 요구하는 것은 **한 표에 열을 몰아넣는 것이 아니라 분자와 분모가
+    # 같은 표에 있는 것**이고, 아래 다섯 열이 정확히 그 짝들이다. 시간대 축도 같다.
+    A("## 5-1-1. 백오프 × 잔고폴링 × 먼슬리 되살리기 — 분자와 분모를 같은 표에")
+    A("")
+    hours = sorted(
+        set(scan.balance_poll_failures)
+        | set(scan.backoff_expansions)
+        | set(scan.priority_retries)
+    )
+    if not hours:
+        A("(세 축 모두 당일 0줄 — **「없었다」가 아니라 「그 줄이 없는 버전일 수 있다」**다. "
+          f"문구: `{BALANCE_POLL_FAILED_TOKEN}` · `{BACKOFF_EXPAND_TOKEN}` · `{PRIORITY_RETRY_TOKEN}`)")
+        A("")
+    else:
+        A("| 시간대 | 백오프확대 | 잔고폴링실패 | 먼슬리재시도 | 회복실패 | 남은예산 창최소(초) |")
+        A("|---|---|---|---|---|---|")
+        for hh in hours:
+            budget_min = scan.priority_retry_budget_min.get(hh)
+            A(f"| {hh:02d}시 | {scan.backoff_expansions.get(hh, 0)} | "
+              f"{scan.balance_poll_failures.get(hh, 0)} | {scan.priority_retries.get(hh, 0)} | "
+              f"{scan.priority_retry_failures.get(hh, 0) or '—'} | "
+              f"{'—' if budget_min is None else f'{budget_min:.1f}'} |")
+        A("")
+        failed_total = sum(scan.priority_retry_failures.values())
+        if failed_total:
+            worst = ", ".join(
+                f"{hh:02d}시 {n}건" for hh, n in sorted(scan.priority_retry_failures.items())
+            )
+            flags.append(
+                f"먼슬리 되살리기 **실패 {failed_total}건**({worst}) — 그 분의 GEX·감마플립은 "
+                "핵심 6레그가 빈 채로 계산됐다. 「간신히 성공」과 다른 사건이다(2026-08-24 Fix#4)"
+            )
+        A("> **이 표가 있는 이유**: 08-24에 「백오프 확대가 잔고 폴링을 떨어뜨렸는가」를 하루에")
+        A("> 여섯 번 대조했고 **결론이 세 번 뒤집혔다**(확대→실패 2/21 · 실패→확대 2/2). 두 값이")
+        A("> 서로 다른 파일에 있었기 때문이다. 그리고 15:10:50의 「3개 중 0개 회복」은 사람이")
+        A("> 하루치 로그를 훑어서 찾았다 — 그 줄은 그날 **INFO**였다(지금은 WARNING이다).")
+        A("")
+        A("> ⚠ **건수는 그날 KIS 상태에 비례한다**(규약 F) — 이 표로 판정하지 말고 **인과의")
+        A("> 방향**을 본다: 같은 시간대에 둘 다 있으면 그때 지연창 TSV로 내려가 초 단위로 맞춘다.")
         A("")
 
     # ---- 5-2. 앙상블 멤버 가용성 (2026-08-13 고도화 2) ----

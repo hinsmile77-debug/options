@@ -152,8 +152,18 @@ _FAILURE_BUDGET_RE = re.compile(
 # 2026-08-06(고도화#1) — 먼슬리 레그 재시도(`mahdi.main.LOG_CHAIN_PRIORITY_RETRY`).
 # **시도와 회복을 둘 다 센다**: 회복 0건은 "KIS가 계속 느렸다"이고, 시도 0건은 "예산이 없었다"라
 # 원인이 다르다. 시도만 세면 그 둘이 같은 0으로 보인다.
+#
+# ===== 2026-08-24 (08-24 §1-9 / Fix#4) — **파서를 먼저 넓히고 나서 문구를 바꾼다** =====
+#
+# 같은 날 `mahdi.main`이 이 줄을 **회복 실패 때 WARNING으로** 올린다(15:10:50에 「3개 중
+# 0개 회복」이 났다 — 되살리기가 실제로 실패한 첫 사례다). 레벨만 `INFO`로 고정돼 있으면
+# 그 순간 이 파서는 **정확히 그 사건에서만 눈이 먼다.**
+#
+# 08-04에 같은 일이 반대 방향으로 일어났다(WARNING→INFO 강등에 정규식이 눈이 멀어 362건이
+# 0건으로 보고). 그래서 **레벨을 계측의 정체성으로 쓰지 않는다** — 레벨은 사람이 읽는
+# 우선순위이고, 이 파서가 세는 것은 「재시도가 돌았는가」다.
 _PRIORITY_RETRY_RE = re.compile(
-    _TS + r" INFO:mahdi\.main:먼슬리 레그 재시도: (\d+)개 중 (\d+)개 회복"
+    _TS + r" (?:INFO|WARNING):mahdi\.main:먼슬리 레그 재시도: (\d+)개 중 (\d+)개 회복"
 )
 # ===== 2026-08-12 고도화 1 — 재연결을 **비용**으로 계량한다 =====
 #
@@ -367,6 +377,17 @@ _QUALITATIVE_MARKERS = {
     "exit_triggered": "청산 판정",
     "exit_price_missing": "청산 평가에 현재가가 없다",
     "forced_flat_verified": "15:10 강제청산 자기검증",
+    # ===== 2026-08-24 (08-24 §1-8 / Fix#6) — 계좌 잔고 폴링이 한 사이클 통째로 빠진 것 =====
+    #
+    # 08-24 12:34:32에 당일 첫 사례가 났고, 그 인과를 **하루에 세 번 뒤집었다**(장중 ①이
+    # 「지연 상승이 떨어뜨렸다」, 장중 ②가 「7번 중 1번짜리 우연」, 장후가 「확대→실패는
+    # 2/21이지만 실패→확대는 2/2」). 세 번 다 서로 다른 파일의 줄을 밀리초로 맞춰 본 결론이다.
+    #
+    # 그 줄이 하루 몇 건인지조차 어느 지표에도 없었다. **분자를 먼저 센다** — 분모(백오프
+    # 확대)는 `backoff` 절이 이미 세고 있고, 둘을 나란히 놓는 것이 증거 수집기 §5-1의 일이다.
+    #
+    # 포맷 원본: `mahdi.main.LOG_BALANCE_POLL_FAILED`
+    "balance_poll_failed": "계좌 잔고 폴링 사이클 실패",
 }
 
 # ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
@@ -397,6 +418,10 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 2026-08-23 (실행 배선 ④·⑤) — 포지션이 0이면 셋 다 0이어야 한다. **0이 인쇄돼야
     # 검정된다**(`2026-08-23-wiring45-defence-runs-even-in-advisory`).
     "exit_triggered", "exit_price_missing", "forced_flat_verified",
+    # 2026-08-24 Fix#6 — **0이 인쇄돼야 「실패가 없던 하루」와 「그 줄이 없던 버전」이 갈린다.**
+    # 이 값은 하루 2건(08-24) 수준이라 0인 날이 흔하고, 그런 날 키가 없으면 이 축이 있는지
+    # 없는지 다음 사람이 매번 다시 확인해야 한다.
+    "balance_poll_failed",
 )
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
@@ -931,6 +956,16 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "cycles": len(priority_retries),
             "attempted": sum(r["attempted"] for r in priority_retries),
             "recovered": sum(r["recovered"] for r in priority_retries),
+            # 2026-08-24 Fix#4 — **「간신히 성공」과 「실패」는 다른 사건이다.** 회복률
+            # (recovery_pct)은 하루를 하나로 접어 그 구분을 지운다: 재시도 6번 중 다섯 번이
+            # 전량 회복이고 한 번이 전멸이어도 평균은 83%로 평범해 보인다. 08-24가 정확히
+            # 그 하루였고(전자 5건 · 후자 1건), 그 1건을 사람이 로그를 훑어 찾았다.
+            "failed_cycles": sum(
+                1 for r in priority_retries if r["recovered"] < r["attempted"]
+            ),
+            "failed_minutes": [
+                r["at"] for r in priority_retries if r["recovered"] < r["attempted"]
+            ],
             "recovery_pct": (
                 round(
                     sum(r["recovered"] for r in priority_retries)
