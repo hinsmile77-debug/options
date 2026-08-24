@@ -4,6 +4,54 @@ _완료 항목은 삭제하거나 SESSION_LOG로 이관_
 
 ---
 
+## [MW0601] 2026-08-24 — 일일점검 「사용자 조치 1~3」 착수분 **구현 완료**
+
+> 근거 전문: `docs/동작점검/2026-08-24_마흐디_일일점검.md` §3-3 · §1-1 · §1-2 · §3-2(마) ·
+> §1-8 · §1-9. 커밋 3개(Fix#5 / Fix#1·#2·고도화#4 / Fix#6·Fix#4). 테스트 2,010 → **2,023**.
+> 예측치 4건을 `hypotheses.yaml`에 **숫자를 보기 전에** 선등재했다.
+
+### 실린 것 — 셋
+
+| 조치 | 무엇 | 파일 |
+|---|---|---|
+| 1 | Fix#5 — 종료 완료 줄을 taskkill 직후로 + `.last_marketclose_stop.txt` 보조 표식 | `scripts/stop_mahdi_marketclose.bat` · `mahdi/ops/crash_metrics.py` · `report.py` |
+| 2 | Fix#1(직전 거래일) · Fix#2(개명·폐기 대조) · 고도화#4(§8-3 미결 결정) | `docs/동작점검/tools/collect_evidence.py` |
+| 3 | Fix#6(잔고 폴링 한 줄 + §5-1-1) · Fix#4(되살리기 문턱) | `mahdi/main.py` · `mahdi/ops/log_metrics.py` · 수집기 |
+
+### 계획에서 **바꾼 것 둘** — 착수 중에 근거가 뒤집힌 자리다
+
+- **Fix#6의 「킬스위치 조건평가=건너뜀」을 안 실었다.** 틀린 문장이다 —
+  `_build_account_state_for_candidate`는 DB의 **가장 최근** 스냅샷을 읽으므로 이번 사이클이
+  빠져도 킬스위치는 직전 스냅샷으로 계속 평가된다. 대신 **마지막 성공 폴 시각**을 싣는다:
+  킬스위치가 지금 무엇을 보고 있는지가 그 값이다. 안 일어난 일을 매번 인쇄하는 것이
+  08-21에 고친 병(표식을 안 보고 추정하는 판정)의 문장판이다.
+- **Fix#2의 「13 → 0」은 실측 「13 → 6」이었다.** 7건은 `fixN`만 바뀐 개명이라 슬러그로 이었고,
+  남은 6건은 **슬러그까지 바뀌었다**(`fix3-read-timeout-lever-fills-the-chain` →
+  `fix3-censored-p50-is-printed-as-a-floor`). 기계가 이어 붙일 근거가 없고, 억지로 잇는 것이
+  이 절의 회귀 위험이다(완전일치 우선 · 슬러그는 후보로만 인쇄).
+
+### 남은 것 — **이번에 안 한 것을 적어 둔다**
+
+- [ ] Fix#3 [P2] `mahdi/main.py:~4102` 진입 후보 0건에 사유 INFO 한 줄. **억제 필수**(사유 전환
+      시 + 5분 재확인, 없으면 하루 313줄). 사유는 이미 `signal_decisions`에 남으므로 없는 것은
+      기록이 아니라 **장중 가시성**이다.
+- [ ] 고도화#2 실행 깔때기(§5-4) — **Fix#3을 기다리지 않는다.** 재료는 DB 축에 이미 있다
+      (`enter_minutes` · `enter_minutes_with_candidate` · `strategy_rejected` · `reason`).
+- [ ] 고도화#3 재료 두께 15분 창(§5-5) — 지금은 매 회차 사람이 손으로 만든다.
+- [ ] 고도화#1 레버 전일 대비 `⭐ 오늘 바뀜` + §1 「오늘 처음 실린 커밋」. **Fix#1의 직전 거래일
+      찾기(`previous_metric_sidecar`)를 재사용한다** — 그 부품이 이제 있다.
+- [ ] `hypotheses.yaml` `2026-08-21-fix8`의 대가 지표를 `watchdog.checks` →
+      `silence_over_cadence_ratio`로 교체 검토(08-24 §3-5).
+
+### ⚠ 다음 거래일 아침에 확인할 것 — 이 세 커밋의 판정
+
+- `crash.clean_shutdowns == 1` · `unexplained_deaths == 0` · `starts == 1` · `unattributed == 3`.
+  **재기동이 있는 날은 `inconclusive`**(규약 C).
+- 지표 §11의 `clean_shutdown_source`가 `보조표식`이면 배치의 완료 줄이 또 늦은 것이다 —
+  그날은 배치 순서를 다시 본다.
+- 증거 §9에 「없음 ⚠」이 없고 §8-3이 델타 밴드 결정을 싣는가.
+- 증거 §5-1-1이 세 축을 같은 표에 내는가. WARNING 증가분이 하루 10줄 이하인가.
+
 ## [MW0601] 2026-08-21 — COCKPIT Flow Radar 축 일치 + CVD 추가, **수집기 틱 룰 P0 수정**
 
 > 근거 전문: [[DECISION_LOG]] 2026-08-21 1차. 테스트 1,841 -> **1,853**. ruff 신규 위반 0.
