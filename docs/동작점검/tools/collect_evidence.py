@@ -212,6 +212,18 @@ CHAIN_COLLECT_BUDGET_SECONDS = 50.0      # mahdi/main.OPTION_CHAIN_CYCLE_COLLECT
 GLOBAL_READ_TIMEOUT_SECONDS = 4.0        # mahdi/broker/rest_client._HTTP_READ_TIMEOUT_SECONDS
 BUDGET_WARN_RATIO = 0.90                 # 시간대 평균이 예산의 이만큼을 넘으면 적신호
 P50_TIMEOUT_WARN_RATIO = 0.80            # mahdi/ops/log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN
+# ===== 2026-08-25 (08-25 §1-8·§1-11 / P1-1) — **p95가 장중 회차에 닿는다** =====
+#
+# 08-25에 12:30·14:30 두 회차가 「p95(느린 쪽 5%)를 아무도 안 본다」를 신규 P1으로 올렸는데,
+# `daily_ops_report`는 그것을 전부 인쇄하고 있었다 — 그 파일이 **15:46에 생길 뿐이다.**
+# `LATENCY_ITEM_RE`는 p50/p95/p99/max 네 값을 다 잡아 놓고 p50만 쓰고 있었다(§5-1).
+# 임계는 리포트와 **같은 값**이어야 한다 — 두 곳이 갈리면 장중 판정과 장후 판정이 어긋난다.
+# 원천: mahdi/ops/log_metrics.REST_LATENCY_P95_WARN_SECONDS (stdlib 전용이라 복제, 값이
+# 갈라지면 이 파일이 틀린 것이다 — CHAIN_COLLECT_BUDGET_SECONDS와 같은 규약).
+P95_WARN_THRESHOLD_SECONDS = 2.5
+# 이틀 연속 성립 시 인쇄할 사전 대응 규칙. 조건·조치·⛔수동 발동 원칙은 hypotheses.yaml의
+# 해당 항목이 정본이다(2026-07-08 페이서 분리 500 폭주 203분이 ⛔의 근거).
+P95_TWO_DAY_RULE_ID = "2026-08-04-p5"
 
 # ===== 2026-08-23 (08-21 §1-14 / §5 고도화#1) — **검열된 p50은 중앙값이 아니라 하한이다** =====
 #
@@ -540,6 +552,11 @@ class LoopScan:
         self.cycle_rows = collections.defaultdict(list)   # 시(hour) -> [rows]
         self.zero_row_minutes = set()                     # rows=0인 분(분 단위 정수)
         self.latency_p50 = collections.defaultdict(list)  # 시(hour) -> [(창시각, 건수, p50)]
+        # 2026-08-25 P1-1 — 같은 줄의 p95도 보관한다(체인 엔드포인트, 창 단위).
+        self.latency_p95 = collections.defaultdict(list)  # 시(hour) -> [(창시각, 건수, p95)]
+        # 「이틀 연속」 판정용 — **전 엔드포인트**의 시간대별 (건수, p95) 표본. 지표 사이드카의
+        # `rest_latency.p95_by_hour`(호출 수 가중 평균)와 같은 식으로 접어야 어긋나지 않는다.
+        self.endpoint_p95_hourly = {}                     # 엔드포인트 -> {시: [(건수, p95)]}
         # 2026-08-23 고도화#1 — 검열(= read timeout에 잘린) 호출의 초 단위 시각.
         # 창에 붙이려면 분보다 잘게 알아야 한다(창 경계에 걸린 호출의 소속이 갈린다).
         self.censored_seconds = []
@@ -627,10 +644,18 @@ class LoopScan:
 
         if LATENCY_TOKEN in msg:
             for it in LATENCY_ITEM_RE.finditer(msg):
+                calls, p95 = int(it.group(2)), float(it.group(4))
                 if it.group(1) == CHAIN_ENDPOINT:
                     # 2026-08-19 Fix#7 — **창 시각을 함께 싣는다.** 종전에는 `(건수, p50)`만
                     # 남겨 5분 창의 시계열이 시간대 안에서 사라졌다. 근거는 `window_latency_p50`.
-                    self.latency_p50[hh].append((hhmmss, int(it.group(2)), float(it.group(3))))
+                    self.latency_p50[hh].append((hhmmss, calls, float(it.group(3))))
+                    # 2026-08-25 P1-1 — 같은 줄의 p95. 새로 재는 것이 아니라 안 쓰던 값이다.
+                    self.latency_p95[hh].append((hhmmss, calls, p95))
+                # 2026-08-25 P1-1 ④ — 이틀 연속 판정은 전 엔드포인트 축이다(08-25 성립 6구간에
+                # `inquire-balance`가 둘 있었다). 창 목록이 아니라 시간대 표본만 접어 둔다.
+                self.endpoint_p95_hourly.setdefault(it.group(1), {}).setdefault(hh, []).append(
+                    (calls, p95)
+                )
 
         # 2026-08-24 Fix#6 B · Fix#4 B — 시간대별로 센다.
         if BALANCE_POLL_FAILED_TOKEN in msg:
@@ -730,6 +755,33 @@ class LoopScan:
             out.extend(self.latency_p50[hour])
         return sorted(out)
 
+    def hourly_latency_p95_max(self, hour):
+        """반환: 그 시간대 `inquire-price` **창 최대 p95**. 창이 없으면 None.
+
+        「없음(None)」과 「0.00」은 다른 사실이다(규약 C) — 호출측이 문구를 가른다.
+        판정을 최대로 하는 이유는 `hourly_latency_p50` docstring과 같다(평균은 절벽을 눌러 없앤다).
+        """
+        items = self.latency_p95.get(hour) or []
+        return round(max(p for _at, _n, p in items), 2) if items else None
+
+    def hourly_p95_weighted(self):
+        """반환: `{엔드포인트: {시: 호출 수 가중 평균 p95}}`. 계측이 없으면 빈 dict.
+
+        지표 사이드카의 `rest_latency.p95_by_hour`와 **같은 식**(창 p95의 호출 수 가중 평균)이다.
+        「이틀 연속」 판정이 장후 리포트와 같은 축에 서야 하므로 최대가 아니라 가중 평균을 쓴다 —
+        두 축이 갈리면 장중 판정과 장후 판정이 어긋나고 사람은 어느 쪽을 믿을지 모른다.
+        """
+        out = {}
+        for endpoint, by_hour in self.endpoint_p95_hourly.items():
+            folded = {}
+            for hh, items in by_hour.items():
+                total = sum(n for n, _p in items)
+                if total:
+                    folded[hh] = round(sum(n * p for n, p in items) / total, 3)
+            if folded:
+                out[endpoint] = folded
+        return out
+
     def window_censored_counts(self, timeout):
         """반환: `{창시각(HH:MM:SS): 그 창에서 타임아웃에 잘린 호출 수}`.
 
@@ -778,6 +830,54 @@ class LoopScan:
             hits = sum(1 for x in self.minutes_seen if abs(x - t) <= ANCHOR_WINDOW_MIN)
             out.append((at, label, hits))
         return out
+
+
+# ===== 2026-08-25 P1-1 ③·④ — p95 임계 판정과 「이틀 연속」 겹침 =====
+
+def p95_breaches(grid, threshold=P95_WARN_THRESHOLD_SECONDS):
+    """반환: `[(엔드포인트, 시, 가중 p95)]` — 임계를 **넘는** 구간(엔드포인트·시 정렬).
+
+    입력은 `LoopScan.hourly_p95_weighted()`의 반환값이다. 판정 축이 지표 사이드카의
+    `warnings`(`p95 > p95_warn_threshold`)와 같아야 장중·장후 판정이 어긋나지 않는다.
+    """
+    return sorted(
+        (endpoint, hh, v)
+        for endpoint, by_hour in grid.items()
+        for hh, v in by_hour.items()
+        if v > threshold
+    )
+
+
+def two_day_p95_overlap(today_breaches, prev_lat):
+    """반환: 오늘 초과 구간 중 **직전 거래일에도 초과였던** 구간 목록. `prev_lat`이 None이면 None.
+
+    입력: `p95_breaches()`의 반환값, 직전 거래일 사이드카의 `rest_latency` 절(dict) 또는 None.
+    해석: **「판정 못 함(None)」과 「겹침 없음([])」은 다른 값이다**(규약 C) — 전자는 사이드카
+         부재·파손이고 후자는 「오늘만 나쁨」이다. 직전 날의 임계는 그 사이드카에 적힌 값을
+         쓴다(그날 실제로 걸려 있던 임계여야 한다 — `effective_read_timeout`과 같은 원칙).
+    실패 조건: 없다 — 못 읽는 입력은 호출측이 None으로 넘긴다.
+    """
+    if prev_lat is None:
+        return None
+    prev_threshold = float(prev_lat.get("p95_warn_threshold") or P95_WARN_THRESHOLD_SECONDS)
+    prev = {
+        (endpoint, int(hour_str))
+        for hour_str, row in (prev_lat.get("p95_by_hour") or {}).items()
+        for endpoint, value in row.items()
+        if value > prev_threshold
+    }
+    return [(ep, hh, v) for ep, hh, v in today_breaches if (ep, hh) in prev]
+
+
+def revival_failure_cell(failures_for_hour: int, retry_axis_measured: bool) -> str:
+    """반환: §5-1-1 「회복실패」 칸 문자열 — **0은 `0`으로 찍는다** (2026-08-25 P2-1).
+
+    종전의 `or '—'`는 「한 번도 실패 안 했다」(좋은 소식)와 「실패를 세는 눈이 없다」(계측
+    부재)를 같은 글자로 만들었다(08-25 §1-7). 재시도 줄이 하루 한 줄이라도 파싱됐으면 이
+    축은 세어진 것이고 그날의 0은 진짜 0이다. 하루 0줄이면 실패 축은 시험된 적이 없으므로
+    `—(계측없음)`으로 가른다(규약 C).
+    """
+    return str(failures_for_hour) if retry_axis_measured else "—(계측없음)"
 
 
 def effective_read_timeout(root: Path) -> float:
@@ -1570,15 +1670,34 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
             else:
                 A(f"- ✅ p50이 타임아웃의 {P50_CENSORED_FLOOR_RATIO}배에 닿은 창 없음 — "
                   "오늘 p50은 검열되지 않았다(실제 중앙값으로 읽어도 된다).")
+            # ===== 2026-08-25 (08-25 §1-8 / P1-2) — 하루 검열 건수를 **항상** 낸다 =====
+            #
+            # 08-25에 `window_censored_counts()`가 186건을 다 셌고 TSV에도 썼는데, 본문은
+            # `floored`(p50이 눌린 창)가 비어서 「✅ 검열되지 않았다」만 인쇄했다 — p50이 멀쩡한
+            # 날에도 **꼬리는 잘리고 있었다.** 위 `floored` 분기는 그대로 둔다(그것은 「p50 값
+            # 자체를 하한으로 읽으라」는 다른 경고다).
+            if scan.censored_seconds:
+                day_censored = sum(1 for _at, http in scan.censored_seconds if http >= timeout)
+                call_total_all = sum(n for _at, n, _p in windows)
+                hit_windows = sum(1 for at, _n, _p in windows if censored.get(at))
+                pct = f"{day_censored / call_total_all * 100:.2f}%" if call_total_all else "—"
+                A(f"- 하루 검열(타임아웃에 잘린 호출) **{day_censored}건 / {call_total_all}건({pct})** · "
+                  f"검열 창 {hit_windows}/{len(windows)} — **p50 상태와 무관하게 항상 인쇄한다.** "
+                  "p50이 안전해도 이 값이 커지면 꼬리부터 막히는 중이다(20종목 순차 수집에서는 "
+                  "「절반이 느려진다」보다 「5%가 완전히 막힌다」가 먼저 온다).")
+            else:
+                A("- 하루 검열 건수: **안 셌다**(느린 호출 줄 0건) — 「0%」가 아니다(규약 C).")
             A("")
-        A("| 시간대 | 사이클 | rows=0 | REST수집 평균(초) | 예산 대비 | p50 평균 | 창 최대 p50 | 최대/timeout | |")
-        A("|---|---|---|---|---|---|---|---|---|")
+        # 2026-08-25 P1-1 ② — 「p95 최대」 열. — 칸은 「그 시간대 p95 계측 없음」이지 0이 아니다(규약 C).
+        A("| 시간대 | 사이클 | rows=0 | REST수집 평균(초) | 예산 대비 | p50 평균 | 창 최대 p50 | 최대/timeout | p95 최대 | |")
+        A("|---|---|---|---|---|---|---|---|---|---|")
         for hh in sorted(scan.cycle_rest):
             rests = scan.cycle_rest[hh]
             rows = scan.cycle_rows[hh]
             mean = sum(rests) / len(rests)
             budget_ratio = mean / CHAIN_COLLECT_BUDGET_SECONDS
             p50, p50_max = scan.hourly_latency_p50(hh)
+            p95_max = scan.hourly_latency_p95_max(hh)
             # **판정은 창 최대로 한다** — 근거는 `hourly_latency_p50` docstring.
             ratio = (p50_max / timeout) if (p50_max is not None and timeout) else None
             mark = ""
@@ -1590,10 +1709,12 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
             # 08-19 10시가 그랬는데 표만 보면 알 수 없었다(10:36 재기동).
             restarts = [t[:5] for t, _m in scan.process_starts if t[:2] == f"{hh:02d}"]
             hour_label = f"{hh:02d}시" + ("".join(f" ⟳{t}" for t in restarts) if restarts else "")
+            p95_mark = "⚠" if (p95_max is not None and p95_max > P95_WARN_THRESHOLD_SECONDS) else ""
             A(f"| {hour_label} | {len(rests)} | {sum(1 for r in rows if r == 0)} | {mean:.1f} | "
               f"{budget_ratio * 100:.0f}% | {'—' if p50 is None else f'{p50:.2f}'} | "
               f"{'—' if p50_max is None else f'{p50_max:.2f}'} | "
-              f"{'—' if ratio is None else f'{ratio:.2f}'} | {mark or '—'} |")
+              f"{'—' if ratio is None else f'{ratio:.2f}'} | "
+              f"{'—' if p95_max is None else f'{p95_max:.2f}{p95_mark}'} | {mark or '—'} |")
             if ratio is not None and ratio >= 1.0:
                 flags.append(
                     f"{hh}시 `{CHAIN_ENDPOINT}` 창 최대 p50 {p50_max:.2f}초가 read timeout "
@@ -1610,6 +1731,60 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                     f"{hh}시 REST수집 평균 {mean:.1f}초 = 예산의 {budget_ratio * 100:.0f}% "
                     f"(경고선 {BUDGET_WARN_RATIO * 100:.0f}%)"
                 )
+        A("")
+        # ===== 2026-08-25 (08-25 §1-11 / P1-1 ③·④ · 고도화 1) — p95 임계와 「이틀 연속」을 장중에 =====
+        #
+        # 08-25에 이 판정 전부(임계 2.5초 · 초과 목록 · 이틀 연속 6구간 · 미리 정해 둔 조치)를
+        # `daily_ops_report`가 인쇄하고 있었는데 그 파일은 15:46에 생긴다. 장중 회차가 읽는 것은
+        # 이 절이고, 여기엔 p50만 있었다 — **없던 것은 계측이 아니라 경로다.**
+        p95_grid = scan.hourly_p95_weighted()
+        if not p95_grid:
+            A("- p95 판정: **계측 없음** — `REST 응답시간` 줄이 없거나 형식이 다르다. "
+              "**「p95=0」이 아니다**(규약 C).")
+        else:
+            today_breaches = p95_breaches(p95_grid)
+            if today_breaches:
+                A(f"- ⚠ p95(호출 수 가중) > **{P95_WARN_THRESHOLD_SECONDS}초** 구간 "
+                  f"**{len(today_breaches)}개**: "
+                  + " · ".join(f"{hh:02d}시 `{ep}` {v:.2f}초" for ep, hh, v in today_breaches)
+                  + " — 임계는 장후 지표와 같은 값이다(`log_metrics.REST_LATENCY_P95_WARN_SECONDS`).")
+            else:
+                A(f"- ✅ p95(호출 수 가중) > {P95_WARN_THRESHOLD_SECONDS}초 구간 없음 — "
+                  "오늘 꼬리(느린 쪽 5%)는 임계 아래다.")
+            # ④ 「이틀 연속」 — 새 입력을 만들지 않는다: 직전 거래일 지표 사이드카를 재사용한다.
+            prev51_day, _prev51_back = previous_metric_sidecar(auto, day)
+            prev51_lat = None
+            if prev51_day is not None:
+                try:
+                    prev51_lat = (json.loads(
+                        (auto / f"{prev51_day.isoformat()}_지표.json").read_text(encoding="utf-8")
+                    ) or {}).get("rest_latency") or {}
+                except Exception:
+                    prev51_lat = None
+            if prev51_day is None or prev51_lat is None:
+                A(f"- 이틀 연속 판정: **못 한다** — 직전 거래일 지표 사이드카를 "
+                  f"{'최근 %d일 안에 못 찾았다' % PREV_SIDECAR_MAX_BACKTRACK_DAYS if prev51_day is None else '못 읽었다'}. "
+                  "**「이틀 연속 아님」이 아니다**(규약 C).")
+            else:
+                both = two_day_p95_overlap(today_breaches, prev51_lat)
+                if both:
+                    joined = " · ".join(f"{hh:02d}시 `{ep}` {v:.2f}초" for ep, hh, v in both)
+                    A(f"- 🔔 **사전 대응 규칙 발동 조건 성립 — 규칙 `{P95_TWO_DAY_RULE_ID}`** · "
+                      f"이틀 연속(직전 거래일 {prev51_day}) 같은 구간 **{len(both)}개** / "
+                      f"오늘 성립 {len(today_breaches)}개: {joined}. "
+                      "미리 정해 둔 조치: **해당 시간대 위클리 폴링 2분 → 4분 격분(먼슬리는 안 "
+                      "건드린다)**. ⛔ **자동 발동하지 않는다** — 발동은 사람이 결정한다"
+                      "(2026-07-08 페이서 분리 500 폭주 203분).")
+                    flags.append(
+                        f"🔔 사전 대응 규칙 `{P95_TWO_DAY_RULE_ID}` 조건 성립 — "
+                        f"p95>{P95_WARN_THRESHOLD_SECONDS}초 이틀 연속 {len(both)}구간"
+                        f"(오늘 {len(today_breaches)}구간). 발동 여부는 사람이 정한다"
+                    )
+                elif today_breaches:
+                    # 「오늘만 나쁨」과 「이틀째 나쁨」을 가른다 — 안 가르면 이 줄은 한 주 안에
+                    # 배경 소음이 된다(08-15~16 ALERT_ONLY 94·113줄의 형태).
+                    A(f"- 이틀 연속 구간 **없음**(직전 거래일 {prev51_day} 대조) — 「오늘만 나쁨」이다. "
+                      "규칙은 이틀 연속에만 발동을 묻는다.")
         A("")
         A("> **판정은 「창 최대」로 한다** — 시간대 평균은 절벽을 눌러 없앤다. 08-14 13시는 평균")
         A("> 2.18초(0.55)로 조용했는데 창 최대는 3.53초(**0.88**)였고 그 20~60분 뒤 전멸이 시작됐다.")
@@ -1652,11 +1827,17 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     else:
         A("| 시간대 | 백오프확대 | 잔고폴링실패 | 먼슬리재시도 | 회복실패 | 남은예산 창최소(초) |")
         A("|---|---|---|---|---|---|")
+        # 2026-08-25 (08-25 §1-7 / P2-1) — 「회복실패」의 0은 **0으로 찍는다.** 근거는
+        # `revival_failure_cell` docstring.
+        retry_axis_measured = bool(scan.priority_retries)
         for hh in hours:
             budget_min = scan.priority_retry_budget_min.get(hh)
+            failed_cell = revival_failure_cell(
+                scan.priority_retry_failures.get(hh, 0), retry_axis_measured
+            )
             A(f"| {hh:02d}시 | {scan.backoff_expansions.get(hh, 0)} | "
               f"{scan.balance_poll_failures.get(hh, 0)} | {scan.priority_retries.get(hh, 0)} | "
-              f"{scan.priority_retry_failures.get(hh, 0) or '—'} | "
+              f"{failed_cell} | "
               f"{'—' if budget_min is None else f'{budget_min:.1f}'} |")
         A("")
         failed_total = sum(scan.priority_retry_failures.values())
