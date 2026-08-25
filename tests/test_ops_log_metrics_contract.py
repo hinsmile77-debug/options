@@ -365,7 +365,10 @@ def test_timeout_abort_line_is_parsed_and_counted_apart_from_budget():
     08-11 15:01~15:22의 22분은 "우리가 느렸다"가 아니라 "KIS가 4초 천장에 닿았다"였는데,
     종전 로그는 둘을 같은 줄로 냈다.
     """
-    line = _emit("mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, 17, 0, "regular,weekly_mon", "예")
+    line = _emit(
+        "mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT,
+        3, "예", 17, 0, "regular,weekly_mon", "예",
+    )
     metrics = _parse(line)
     abort = metrics["timeout_abort"]
     assert abort["count"] == 1
@@ -373,6 +376,69 @@ def test_timeout_abort_line_is_parsed_and_counted_apart_from_budget():
     assert abort["minutes"] == ["10:11"]
     # 예산 초과로 새어 들어가면 안 된다.
     assert metrics["budget_exceeded"]["count"] == 0
+
+
+def test_timeout_abort_lines_without_the_reset_tag_still_parse():
+    """2026-08-25 P1-3 — `(리셋=예|아니오)` 꼬리표는 **선택 그룹**이어야 한다(규약 C).
+
+    로그는 10MB×10 로테이션이라 이틀치가 남는다. 08-24 이전 줄(꼬리표 없음)이 안 읽히면
+    개명 대가가 지표 손실이 된다 — `데드라인이먼슬리에서끝남` 개명이 지킨 것과 같은 규약이다.
+    """
+    legacy = (
+        f"{_TS} WARNING:mahdi.main:옵션체인 연속 타임아웃 0회 — 남은 17레그를 포기하고 "
+        "이번 사이클을 접습니다(확정 실패 호출을 안 쏘고 다음 분을 정시에 시작한다, "
+        "2026-08-11 Fix#1). 적재 0행 · 컷당한북=regular,weekly_mon · 데드라인이먼슬리에서끝남=예"
+    )
+    abort = _parse(legacy)["timeout_abort"]
+    assert abort["count"] == 1
+    assert abort["skipped_legs_total"] == 17
+
+
+def test_order_blocked_line_with_a_reason_tail_is_still_counted():
+    """2026-08-25 P1-4 — 꼬리표가 붙어도 `qualitative.order_blocked`는 그대로 세어져야 한다.
+
+    이 카운트는 리포트가 「주문 0건이 신호 부재인가 막힘인가」를 가르는 축이다(08-25 실측 34건).
+    꼬리표를 붙이다 이 축을 죽이면 08-04의 눈멂(362건 → 0건)을 재현하는 것이다.
+    """
+    tailed = _emit(
+        "mahdi.main", "INFO", main.LOG_ORDER_BLOCKED,
+        "mode_not_auto_submit,no_entry_plan", "201W08247", 1, "advisory",
+        " · 계획미수립사유=option_price_missing_this_minute",
+    )
+    bare = _emit(
+        "mahdi.main", "INFO", main.LOG_ORDER_BLOCKED,
+        "mode_not_auto_submit,no_entry_plan", "201W08247", 1, "advisory", "",
+    )
+    assert _parse(tailed, bare)["qualitative"]["order_blocked"] == 2
+
+
+def test_entry_no_candidate_line_is_counted_and_zero_is_printed():
+    """2026-08-25 Fix#3 — 「진입 판단은 섰는데 살 종목이 없다」 줄이 세어지고, 0도 인쇄된다.
+
+    08-24에 ENTER 336분 중 313분이 이 상태였는데 로그 축이 없어 장중 두 회차가 신규 P1으로
+    오인했다. 0이 인쇄돼야 「고르는 데 실패가 없던 하루」와 「그 줄이 없던 버전」이 갈린다(규약 C).
+    """
+    line = _emit(
+        "mahdi.main", "INFO", main.LOG_ENTRY_NO_CANDIDATE,
+        "no_strike_match", "small_strangle_buy",
+    )
+    assert _parse(line)["qualitative"]["entry_no_candidate"] == 1
+    # 줄이 없는 날도 키가 0으로 실린다 — 예측(주장 지표)의 「경로 없음」 오판을 막는다.
+    assert _parse()["qualitative"]["entry_no_candidate"] == 0
+
+
+def test_entry_no_candidate_marker_is_a_substring_of_the_emitted_format():
+    """마커는 포맷 상수에서 파생돼야 한다(규약 A) — 문구를 바꾸면 이 테스트가 깨진다."""
+    marker = log_metrics._QUALITATIVE_MARKERS["entry_no_candidate"]
+    assert marker in main.LOG_ENTRY_NO_CANDIDATE
+
+
+def test_entry_no_candidate_survives_the_parser_audit():
+    """감사 토큰은 엄격 마커보다 **짧아야** 침묵을 잡는다(규약 C)."""
+    token = log_metrics._PARSER_AUDIT_TOKENS["entry_no_candidate"]
+    strict = log_metrics._QUALITATIVE_MARKERS["entry_no_candidate"]
+    assert token in main.LOG_ENTRY_NO_CANDIDATE
+    assert len(token) < len(strict), "감사 토큰이 엄격 마커만큼 길면 같이 눈이 먼다"
 
 
 def test_failure_budget_abort_is_counted_apart_from_consecutive_timeouts():
@@ -929,7 +995,7 @@ def test_priority_violation_label_separates_the_ordering_breach_from_a_tail_cut(
 def test_the_violation_label_is_read_from_every_cut_line():
     """세 컷 로그(예산/연속 타임아웃/실패 예산)가 **같은 라벨**을 실어야 한다."""
     timeout = _emit(
-        "mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, 17, 0, "regular,weekly_mon", "예"
+        "mahdi.main", "WARNING", main.LOG_CHAIN_TIMEOUT_ABORT, 3, "아니오", 17, 0, "regular,weekly_mon", "예"
     )
     failure = _emit(
         "mahdi.main", "WARNING", main.LOG_CHAIN_FAILURE_BUDGET, 6, 8, 12.5, 6, "regular", "예"

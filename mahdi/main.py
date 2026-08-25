@@ -448,8 +448,14 @@ LOG_CHAIN_BUDGET_EXCEEDED = (
 # **연속 카운터는 성공하면 0으로 되돌린다** — 누적이 아니라 연속이어야 단발 지터에 안 걸린다.
 OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT = 3
 
+# 2026-08-25 (08-25 §1-5 / P1-3) — `%d회`는 **발동 시점 값**이고, 그 뒤 `(리셋=예|아니오)`가 붙는다.
+# 「예」는 1단계 접기(위클리를 버리고 먼슬리 계속)가 그 트리거에서 카운터를 0으로 되돌렸다는
+# **코드가 아는 사실**이다. ⛔ 「1단계/2단계」 같은 해석 라벨은 싣지 않는다 — 08-25에 로그
+# 패턴에서 분기를 역산한 설명이 두 번 반증됐고, 반증된 가정을 로그 문자열에 굳히지 않는다.
+# 파서 안전: 괄호는 `%d회` **뒤에** 붙는다. `log_metrics._TIMEOUT_ABORT_RE`가 선택 그룹으로
+# 받으므로 옛 로그(괄호 없음)도 계속 읽힌다 — 계약은 `tests/test_ops_log_metrics_contract.py`.
 LOG_CHAIN_TIMEOUT_ABORT = (
-    "옵션체인 연속 타임아웃 %d회 — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
+    "옵션체인 연속 타임아웃 %d회(리셋=%s) — 남은 %d레그를 포기하고 이번 사이클을 접습니다"
     "(확정 실패 호출을 안 쏘고 다음 분을 정시에 시작한다, 2026-08-11 Fix#1). "
     "적재 %d행 · 컷당한북=%s · 데드라인이먼슬리에서끝남=%s"
 )
@@ -2221,6 +2227,11 @@ async def _collect_option_chain_cycle(
     failure_budget_base = 0
     abort_scope: str | None = None
     abort_reason: str | None = None
+    # 2026-08-25 (08-25 §1-5 / P1-3) — **발동 시점의 연속 타임아웃 수.** 컷 로그는 루프가 끝난
+    # 뒤에 나가는데, 그 사이 1단계 접기(아래 `_trigger`)가 카운터를 0으로 되돌리고 성공 레그도
+    # 0으로 되돌린다 — 08-25 실측 14건 중 12건이 「0회」로 찍혔고, 그 값에서 분기를 역산한
+    # 설명이 하루에 두 번 틀렸다. 로그에 실을 값은 리셋 전, 트리거가 선 그 순간의 값이다.
+    timeouts_at_abort = 0
     # 1단계를 **거쳤는가**. `abort_scope`는 2단계에서 덮이므로 그것만으로는 못 본다.
     # 이 값이 True면 위클리는 **먼저 의도적으로 버려진 것**이고, 그 뒤의 먼슬리 컷은 순서
     # 위반이 아니다(순서를 지킨 결과다). 구현 중 테스트가 이 구분을 잡았다.
@@ -2266,7 +2277,11 @@ async def _collect_option_chain_cycle(
         def _trigger(reason: str) -> None:
             """조기 포기 트리거 — 1단계(비우선만)로 접을 수 있으면 그렇게 하고, 아니면 전부 접는다."""
             nonlocal abort_scope, abort_reason, consecutive_timeouts, failure_budget_base
-            nonlocal dropped_non_priority_first
+            nonlocal dropped_non_priority_first, timeouts_at_abort
+            # P1-3 — **리셋되기 전에** 붙잡는다. 아래 1단계 분기가 카운터를 0으로 되돌리므로
+            # 여기가 이 값이 존재하는 마지막 지점이다. 첫 트리거만 잡는다(로그도 첫 이유만 낸다).
+            if abort_reason is None:
+                timeouts_at_abort = consecutive_timeouts
             if abort_scope is None and is_priority and non_priority_ahead[index + 1]:
                 abort_scope = _ABORT_SCOPE_NON_PRIORITY
                 dropped_non_priority_first = True
@@ -2339,9 +2354,12 @@ async def _collect_option_chain_cycle(
         cut_label = ",".join(cut_books) or "—"
         violation_label = "예" if priority_cut_before_others else "아니오"
         if abort_reason == "timeout":
+            # P1-3 — 루프 끝의 `consecutive_timeouts`가 아니라 **발동 시점 값**을 낸다.
+            # 리셋 여부는 `dropped_non_priority_first`가 곧 그 사실이다(1단계에서만 리셋된다).
             logger.warning(
                 LOG_CHAIN_TIMEOUT_ABORT,
-                consecutive_timeouts, skipped, len(rows), cut_label, violation_label,
+                timeouts_at_abort, "예" if dropped_non_priority_first else "아니오",
+                skipped, len(rows), cut_label, violation_label,
             )
         elif abort_reason == "failure_budget":
             remaining = (deadline - time.monotonic()) if deadline is not None else 0.0
@@ -4114,6 +4132,52 @@ def _record_risk_snapshot(
 # 없었다」, `REASON_*`는 「돌렸는데 못 골랐다」 — 셋은 서로 다른 사건이다.
 _SELECTION_NO_ENTRY_STRATEGY = "no_entry_strategy"
 
+# ===== 2026-08-25 (08-24 §1-6 / Fix#3) — 「진입 판단은 섰는데 살 종목이 없다」를 장중에 =====
+#
+# 08-24에 ENTER 336분 중 313분이 후보 0건이었는데 **로그에는 그 사실이 한 줄도 없었다.**
+# 사유는 매분 DB(`selected_instruments.reason` · `rejected`)에 남고 있었으므로 없던 것은
+# 기록이 아니라 **장중 가시성**이다 — 장중 두 회차가 이것을 신규 P1로 오인했고, 답은
+# `NEXT_TODO.md`에 08-18부터 열려 있던 미결 정정이었다(08-24 §3-2).
+#
+# ⚠ **억제 필수** — 사유가 바뀔 때 + 같은 사유가 이어지면 5분에 한 번만 남긴다. 억제가 없으면
+# 08-24 기준 하루 313줄이고, 그 줄들이 진짜 사건을 덮는다(08-15 `ALERT_ONLY` 94줄의 형태).
+# 그래서 이 줄의 건수는 「그 상태였던 분 수」가 아니다 — 분 수는 DB 축이 정본이다.
+ENTRY_NO_CANDIDATE_RELOG_SECONDS = 300.0
+LOG_ENTRY_NO_CANDIDATE = (
+    "진입 판단은 섰는데 살 종목이 없다 — 사유=%s · 탈락전략=%s "
+    "(사유 전환 시 + 5분 재확인만 남긴다 · 분 단위 정본은 signal_decisions.selected_instruments)"
+)
+
+
+def _log_no_candidate_entry(
+    selection_record: dict,
+    last_logged: tuple[tuple[str, str], float] | None,
+    mono_now: float,
+) -> tuple[tuple[str, str], float]:
+    """
+    입력: 후보가 빈 selection_record, 직전 발신 상태 `(사유 서명, monotonic)` 또는 None, 현재 monotonic.
+    계산: 사유 서명(선택기 사유 + 탈락 전략 집합)이 직전과 다르거나 5분이 지났으면 INFO 한 줄을 남긴다.
+    반환: 다음 호출에 넘길 상태 — 발신했으면 `(서명, mono_now)`, 억제했으면 이전 상태 그대로.
+    해석: 억제 규칙은 **「전환은 항상, 지속은 5분마다」**다. `WarningThrottle`을 쓰지 않는 이유:
+         저쪽은 카테고리별 창이라 사유가 A→B→A로 되돌아올 때 A가 창 안이라며 전환을 삼킨다.
+    실패 조건: 없다 — 로깅 실패가 판단 사이클을 막으면 안 되고, 이 함수는 예외를 만들 입력이 없다.
+    """
+    reason = str(selection_record.get("reason"))
+    strategies = ",".join(sorted({
+        str(r.get("strategy"))
+        for r in (selection_record.get("rejected") or [])
+        if r.get("strategy")
+    })) or "—"
+    signature = (reason, strategies)
+    if (
+        last_logged is not None
+        and last_logged[0] == signature
+        and mono_now - last_logged[1] < ENTRY_NO_CANDIDATE_RELOG_SECONDS
+    ):
+        return last_logged
+    logger.info(LOG_ENTRY_NO_CANDIDATE, reason, strategies)
+    return (signature, mono_now)
+
 # ===== 2026-08-17 → 2026-08-23 — 주문 제출 경로가 **배선됐다** =====
 #
 # 이 상수 하나가 «설정»과 «사실»을 가른다. `strategy_params.yaml`을 CONFIRM/FULL_AUTO로 바꿔도
@@ -4386,6 +4450,10 @@ async def poll_signal_fusion_cycle(
     # 미기입 경고는 1시간 창으로 억제한다 — 근거는 `LOG_EVENT_CALENDAR_NOT_COVERED` 주석.
     event_calendar_raw = get_event_calendar()
     calendar_throttle = WarningThrottle(logger, EVENT_CALENDAR_WARNING_WINDOW_SECONDS)
+    # 2026-08-25 Fix#3 — 「후보 0건」 줄의 억제 상태: (사유 서명, 마지막 발신 monotonic).
+    # `WarningThrottle`을 안 쓰는 이유: 저쪽은 카테고리별 창이라 사유가 A→B→A로 되돌아오면
+    # A가 창 안이라며 **사유 전환을 삼킨다.** 여기 규칙은 「전환은 항상, 지속은 5분마다」다.
+    no_candidate_logged: tuple[tuple[str, str], float] | None = None
     next_tick: float | None = None
     while True:
         poll_time = _grid_poll_minute(db.local_now())
@@ -4556,6 +4624,27 @@ async def poll_signal_fusion_cycle(
                         **rotation_snapshot(chain_legs, poll_time.date()),
                     }
                 risk_gate_state["selected_instrument_count"] = len(selection_record["candidates"])
+
+                # 2026-08-25 Fix#3 — 진입 판단이 섰는데(is_entry) 후보가 0건인 분. 상세 근거와
+                # 억제 규칙은 `LOG_ENTRY_NO_CANDIDATE` 위 절 주석. `is_entry`가 참이면
+                # `entry_candidates`가 비어 있지 않으므로 선택기는 반드시 돌았고, `reason`은
+                # 선택기 내부 사유(`REASON_*`)다 — 「돌릴 것이 없었다」와 섞이지 않는다.
+                if is_entry and not selection_record["candidates"]:
+                    no_candidate_reason = str(selection_record.get("reason"))
+                    rejected_strategies = ",".join(sorted({
+                        str(r.get("strategy"))
+                        for r in (selection_record.get("rejected") or [])
+                        if r.get("strategy")
+                    })) or "—"
+                    signature = (no_candidate_reason, rejected_strategies)
+                    mono_now = time.monotonic()
+                    if (
+                        no_candidate_logged is None
+                        or no_candidate_logged[0] != signature
+                        or mono_now - no_candidate_logged[1] >= ENTRY_NO_CANDIDATE_RELOG_SECONDS
+                    ):
+                        logger.info(LOG_ENTRY_NO_CANDIDATE, no_candidate_reason, rejected_strategies)
+                        no_candidate_logged = (signature, mono_now)
 
                 if is_entry:
                     if account_state is None:
@@ -5026,8 +5115,53 @@ ORDER_FILL_POLL_INTERVAL_SECONDS = 20.0
 ORDER_FILL_PHASE_OFFSET_SECONDS = 7.0
 
 LOG_ORDER_SUBMITTED = "주문 제출: %s %s %s %d계약 @%s · 로컬id=%s → 브로커번호=%s · rt_cd=%s"
-LOG_ORDER_BLOCKED = "주문 미제출 — 실행 경로 전제 미충족: %s (종목=%s 수량=%d 모드=%s)"
+# 2026-08-25 (08-25 §1-6 / P1-4) — 마지막 `%s`는 「계획 미수립 사유」 꼬리표다(없으면 빈 문자열).
+# 기존 괄호 **뒤**에 붙는 이유: `log_metrics`의 `order_blocked` 카운트는 부분문자열
+# 「주문 미제출」로 세고, 이 줄 수가 「주문 0건 = 신호 부재 vs 막힘」을 가르는 축이라
+# 줄 자체는 억제하지 않는다. 꼬리표 규칙은 `_entry_plan_block_reason_tail` docstring.
+LOG_ORDER_BLOCKED = "주문 미제출 — 실행 경로 전제 미충족: %s (종목=%s 수량=%d 모드=%s)%s"
 LOG_ORDER_STATE_CHANGED = "주문 상태 전이: %s %s → %s (체결 %d/%d @%s)"
+
+# (b)의 사유 라벨 — 가격은 있었는데 모드 게이트(ADVISORY_ONLY)가 계획 생성 자체를 건너뛴 분.
+# `engine.evaluate_entry()`가 그 게이트에서 `build_entry_plan()` 앞서 돌아온다 — 모드를 올리면 풀린다.
+ENTRY_PLAN_NOT_BUILT_IN_ADVISORY = "plan_not_built_in_advisory"
+# 꼬리표 재확인 주기. 억제는 「전환은 항상, 지속은 5분마다」 — Fix#3과 같은 규칙이다.
+ENTRY_PLAN_REASON_RELOG_SECONDS = 300.0
+# 꼬리표 억제 상태(프로세스 전역): {"signature": 사유, "at": monotonic}. 판단 사이클이 분당
+# 최대 한 번 이 경로를 지나므로 전역 하나로 충분하다.
+_entry_plan_reason_logged: dict = {}
+
+
+def _entry_plan_block_reason_tail(blockers: list, outcome_record: dict, gate_action) -> str:
+    """
+    입력: 제출 차단 사유 목록, 그림자 기록 dict, 게이트 판정(GateAction | None).
+    계산: `no_entry_plan`이 있으면 **왜 계획이 안 섰는지**를 세 상태로 갈라 꼬리표를 만든다:
+           (a) `entry_plan_blocked_by` 값 있음 → 그 값(그 분에 옵션 가격이 없었다 — 모드를 올려도 안 풀린다)
+           (b) 값 없음 + 게이트가 ADVISORY_ONLY → `plan_not_built_in_advisory`(가격은 있었다 — 모드를 올리면 풀린다)
+           (c) `no_entry_plan`이 없거나 (a)(b) 어느 쪽도 확인 못 함 → 꼬리표 없음(지어내지 않는다)
+    반환: ` · 계획미수립사유=...` 또는 `""`. 같은 사유가 이어지면 5분에 한 번만 돌려준다(전환은 항상).
+    해석: (a)와 (b)는 조치가 정반대다 — 전자는 수집을, 후자는 모드를 고친다. 같은 글자로 찍으면
+         이 로그는 그날 답해야 할 질문(실행 모드 상향의 선결 조건 ②)을 오히려 덮는다(규약 C).
+    실패 조건: 없다 — 확인 못 한 상태는 (c)로 떨어져 조용하다. 추측을 인쇄하는 것이 이 함수의 유일한 실패다.
+    """
+    if order_manager.BLOCKER_NO_ENTRY_PLAN not in blockers:
+        return ""
+    blocked_by = outcome_record.get("entry_plan_blocked_by")
+    if blocked_by:
+        reason = str(blocked_by)
+    elif gate_action == GateAction.ADVISORY_ONLY:
+        reason = ENTRY_PLAN_NOT_BUILT_IN_ADVISORY
+    else:
+        return ""
+    mono_now = time.monotonic()
+    if (
+        _entry_plan_reason_logged.get("signature") == reason
+        and mono_now - _entry_plan_reason_logged.get("at", 0.0) < ENTRY_PLAN_REASON_RELOG_SECONDS
+    ):
+        return ""
+    _entry_plan_reason_logged["signature"] = reason
+    _entry_plan_reason_logged["at"] = mono_now
+    return f" · 계획미수립사유={reason}"
 
 
 async def poll_open_orders(
@@ -5137,9 +5271,16 @@ def _submit_entry_order(
         reentry_cooldown_minutes=reentry_cooldown_minutes,
     )
     if blockers:
+        # 2026-08-25 (08-25 §1-6 / P1-4 · `2026-08-25-fix-entry-plan-block-reason-is-logged`) —
+        # `no_entry_plan`의 **왜**를 꼬리표로 싣는다. ⛔ **억제하는 것은 「줄」이 아니라
+        # 「꼬리표」다** — 줄을 억제하면 `qualitative.order_blocked`(리포트가 「주문 0건이 신호
+        # 부재인가 막힘인가」를 가르는 축)가 깨진다. 줄은 종전 그대로 분당 최대 1줄이고,
+        # 꼬리표만 사유 전환 시 + 5분 재확인으로 붙는다. 파서는 부분문자열 「주문 미제출」로
+        # 세므로 꼬리표는 기존 포맷 괄호 **뒤**다.
         logger.info(
             LOG_ORDER_BLOCKED, ",".join(blockers), outcome_record.get("symbol"),
             int(outcome_record.get("qty") or 0), outcome_record.get("mode"),
+            _entry_plan_block_reason_tail(blockers, outcome_record, gate_action),
         )
         return {"order_submitted": False, "submission_blockers": blockers}
 

@@ -6967,6 +6967,8 @@ def test_timeout_abort_drops_the_weekly_book_before_the_monthly(monkeypatch, cap
     # 두 북이 다 잘리긴 했다(먼슬리 잔여 + 위클리 전부). **순서가 지켜졌는지**는 컷당한북이
     # 아니라 아래 라벨이 답한다 — 그것이 Fix#5의 존재 이유다.
     assert "데드라인이먼슬리에서끝남=아니오" in message
+    # 2026-08-25 P1-3 — 1단계가 카운터를 되돌렸다는 사실이 로그에 실린다.
+    assert "(리셋=예)" in message
 
 
 def test_a_monthly_only_cycle_still_aborts_immediately(monkeypatch, caplog):
@@ -6988,6 +6990,150 @@ def test_a_monthly_only_cycle_still_aborts_immediately(monkeypatch, caplog):
     assert "데드라인이먼슬리에서끝남=아니오" in message, (
         "먼슬리 단독 사이클의 꼬리 컷을 위반으로 세면 08-12의 오독(priority_cut_minutes=2)이 재현된다."
     )
+    # 2026-08-25 P1-3 — 먼슬리 단독은 1단계를 못 거치므로(버릴 위클리가 없다) 리셋이 없다.
+    assert "(리셋=아니오)" in message
+
+
+class _FakeRestClientTimesOutThenRecovers:
+    """처음 N콜은 ReadTimeout, 그 뒤는 정상 응답 — 08-25 §1-5(발동 뒤 리셋·성공)의 재현."""
+
+    def __init__(self, clock: list[float], fail_first: int, seconds_per_call: float = 1.0) -> None:
+        self._clock = clock
+        self._fail_first = fail_first
+        self._seconds_per_call = seconds_per_call
+        self.calls: list[str] = []
+
+    def get_quote(self, symbol: str, market_div_code: str | None = None) -> dict:
+        self.calls.append(symbol)
+        self._clock[0] += self._seconds_per_call
+        if len(self.calls) <= self._fail_first:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return _OPTION_QUOTE_FIXTURE
+
+
+def test_timeout_abort_line_prints_the_count_at_trigger_time_not_after_resets(monkeypatch, caplog):
+    """**08-25 §1-5 / P1-3 재현.** 발동 뒤 리셋·성공이 와도 로그의 「N회」는 발동 시점 값이다.
+
+    08-25 실측 14건 중 12건이 「연속 타임아웃 0회」로 찍혔다 — 1단계 접기의 리셋과 성공 레그의
+    리셋이 로그보다 먼저 왔기 때문이다. 그 0에서 코드 분기를 역산한 설명이 하루에 두 번
+    반증됐다(§1-5 정정·재정정). 여기서는 먼슬리 3연속 타임아웃으로 1단계가 선 뒤 먼슬리가
+    **성공으로 돌아선다** — 옛 코드는 「0회」를 찍고, 고친 코드는 「3회(리셋=예)」를 찍는다.
+    """
+    from mahdi.main import _collect_option_chain_cycle
+
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    rest_client = _FakeRestClientTimesOutThenRecovers(
+        clock, fail_first=mahdi_main.OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT
+    )
+    books = [
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "regular"),
+        (_FakeManagerManyStrikes(frozenset({995.0, 997.5, 1000.0, 1002.5, 1005.0})), "weekly_mon"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="mahdi.main"):
+        rows, _spot, _any, _missing = _run(
+            _collect_option_chain_cycle(
+                rest_client, books, _FakeMaster(), "KOSPI200", datetime(2026, 8, 25, 14, 30),
+                WarningThrottle(logging.getLogger("mahdi.main"), 60.0), deadline=clock[0] + 50.0,
+            )
+        )
+
+    assert rows, "먼슬리는 실제로 회복됐다 — 그 성공의 리셋이 로그 값을 지우면 안 된다"
+    message = [r for r in caplog.records if "연속 타임아웃" in r.getMessage()][0].getMessage()
+    assert (
+        f"연속 타임아웃 {mahdi_main.OPTION_CHAIN_CONSECUTIVE_TIMEOUT_ABORT}회(리셋=예)" in message
+    ), "발동 시점 값과 리셋 사실이 함께 실려야 한다 — 「0회」는 08-25에 두 번 오독을 만든 그 값이다"
+
+
+# ===== 2026-08-25 Fix#3 / P1-4 — 「왜 안 골랐는가」·「왜 계획이 안 섰는가」를 장중에 =====
+
+
+def test_no_candidate_log_fires_on_transition_and_reconfirms_after_five_minutes(caplog):
+    """Fix#3 — 억제 규칙은 「전환은 항상, 지속은 5분마다」다.
+
+    억제가 없으면 08-24 기준 하루 313줄이고(08-15 `ALERT_ONLY` 94줄의 형태), `WarningThrottle`을
+    쓰면 사유가 A→B→A로 되돌아올 때 A가 카테고리 창 안이라며 **전환이 삼켜진다** — 그래서 따로 든다.
+    """
+    stuck = {
+        "reason": "no_strike_match",
+        "rejected": [{"strategy": "small_strangle_buy", "reason": "no_strike_match"}],
+    }
+    switched = {"reason": "no_entry_strategy", "rejected": []}
+
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        state = mahdi_main._log_no_candidate_entry(stuck, None, 0.0)        # 최초 → 발신
+        state = mahdi_main._log_no_candidate_entry(stuck, state, 60.0)      # 같은 사유 1분 → 억제
+        state = mahdi_main._log_no_candidate_entry(switched, state, 120.0)  # 사유 전환 → 발신
+        state = mahdi_main._log_no_candidate_entry(stuck, state, 180.0)     # A로 복귀도 전환 → 발신
+        state = mahdi_main._log_no_candidate_entry(stuck, state, 200.0)     # 같은 사유 20초 → 억제
+        mahdi_main._log_no_candidate_entry(stuck, state, 180.0 + 300.0)     # 5분 경과 → 재확인
+
+    lines = [r.getMessage() for r in caplog.records if "살 종목이 없다" in r.getMessage()]
+    assert len(lines) == 4
+    assert "사유=no_strike_match" in lines[0]
+    assert "탈락전략=small_strangle_buy" in lines[0]
+    assert "사유=no_entry_strategy" in lines[1]
+
+
+def test_entry_plan_block_reason_tail_distinguishes_three_states(monkeypatch):
+    """P1-4 규약 C — (a) 가격 없음 / (b) ADVISORY가 계획 생략 / (c) 해당 없음은 **다른 사건**이다.
+
+    (a)와 (b)는 조치가 정반대다: 전자는 수집을 고쳐야 하고(모드를 올려도 안 풀린다), 후자는
+    모드를 올리면 풀린다. 같은 글자로 찍으면 실행 모드 상향의 선결 조건 ②가 답을 못 얻는다.
+    """
+    blockers = ["mode_not_auto_submit", mahdi_main.order_manager.BLOCKER_NO_ENTRY_PLAN]
+
+    monkeypatch.setattr(mahdi_main, "_entry_plan_reason_logged", {})
+    tail_a = mahdi_main._entry_plan_block_reason_tail(
+        blockers, {"entry_plan_blocked_by": mahdi_main._ENTRY_PLAN_BLOCKED_NO_PRICE},
+        mahdi_main.GateAction.ADVISORY_ONLY,
+    )
+    assert tail_a == " · 계획미수립사유=option_price_missing_this_minute"
+
+    monkeypatch.setattr(mahdi_main, "_entry_plan_reason_logged", {})
+    tail_b = mahdi_main._entry_plan_block_reason_tail(
+        blockers, {"entry_plan_blocked_by": None}, mahdi_main.GateAction.ADVISORY_ONLY
+    )
+    assert tail_b == f" · 계획미수립사유={mahdi_main.ENTRY_PLAN_NOT_BUILT_IN_ADVISORY}"
+
+    monkeypatch.setattr(mahdi_main, "_entry_plan_reason_logged", {})
+    # (c-1) no_entry_plan 자체가 없다 → 꼬리표 없음.
+    assert mahdi_main._entry_plan_block_reason_tail(
+        ["mode_not_auto_submit"], {"entry_plan_blocked_by": None}, mahdi_main.GateAction.ADVISORY_ONLY
+    ) == ""
+    # (c-2) 값도 없고 게이트도 ADVISORY_ONLY가 아니다 → **지어내지 않는다**.
+    assert mahdi_main._entry_plan_block_reason_tail(
+        blockers, {"entry_plan_blocked_by": None}, None
+    ) == ""
+
+
+def test_order_blocked_line_prints_every_minute_even_when_the_tail_is_suppressed(monkeypatch, caplog):
+    """P1-4 ⛔ — 억제하는 것은 「줄」이 아니라 「꼬리표」다.
+
+    `qualitative.order_blocked`(08-24 실측 23 · 08-25 실측 34)는 리포트가 「주문 0건이 신호
+    부재인가 막힘인가」를 가르는 축이다. 줄을 억제하면 08-04의 눈멂(362건 → 0건)과 같은 형태가 된다.
+    """
+    monkeypatch.setattr(mahdi_main, "_entry_plan_reason_logged", {})
+    clock = [1000.0]
+    monkeypatch.setattr("mahdi.main.time.monotonic", lambda: clock[0])
+    record = {
+        "symbol": "201W08247", "symbol_resolved": True, "qty": 1, "mode": "advisory",
+        "entry_plan_blocked_by": mahdi_main._ENTRY_PLAN_BLOCKED_NO_PRICE,
+    }
+    with caplog.at_level(logging.INFO, logger="mahdi.main"):
+        for _ in range(3):
+            mahdi_main._submit_entry_order(
+                None, None, record, entry_plan=None,
+                gate_action=mahdi_main.GateAction.ADVISORY_ONLY,
+                now=datetime(2026, 8, 25, 14, 30), reentry_cooldown_minutes=0.0,
+            )
+            clock[0] += 60.0
+
+    lines = [r.getMessage() for r in caplog.records if "주문 미제출" in r.getMessage()]
+    assert len(lines) == 3, "줄은 매분 그대로 나와야 한다 — 억제 대상은 꼬리표뿐이다"
+    assert "계획미수립사유=option_price_missing_this_minute" in lines[0]
+    assert "계획미수립사유" not in lines[1]
+    assert "계획미수립사유" not in lines[2]
 
 
 def test_the_escalation_never_extends_the_time_budget(monkeypatch, caplog):
