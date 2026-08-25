@@ -186,6 +186,44 @@ def test_signal_reach_renders_missing_chain_columns_as_dashes():
     assert "None" not in section
 
 
+# ===== 2026-08-25 P2-2 — §14 「범위 밖」 자리에 기각 로그를 함께 낸다 =====
+
+
+def test_out_of_range_row_prints_the_rejection_log_count():
+    """08-25 §1-12 — 적재분 「0건」은 구조적 0이었다: 기각된 flip은 적재되지 않아 분자에 못 든다.
+
+    감시 대상 사건은 기각 로그 쪽이다(08-25 실측 4건 · 08-24 11건). 두 축은 서로를 대체하지
+    못한다 — 적재분 > 0은 「기각 가드가 뚫렸다」, 기각 건수는 「가드가 일했다」다.
+    """
+    metrics = {**_TODAY, "qualitative": {**_TODAY["qualitative"], "gamma_flip_out_of_leg_range": 4}}
+    out = report.render(
+        metrics, db_metrics={"signal_reach": _reach(gamma_flip_out_of_range_count=0)}
+    )
+    section = out.split("## 14. 신호 도달률", 1)[1].split("\n## ", 1)[0]
+    assert "적재분 0건 · 기각 로그 4건" in section
+    # 옛 불변식 문구는 이 값이 0인 두 이유((a) 안 일어남 / (b) 탐색 안 돎)를 못 가른다.
+    # (다른 행의 「08-07 Fix#1 이후 0이어야 한다」는 별개 불변식이라 남는다.)
+    assert "> 0 (불변식 — 0이어야 한다)" not in section
+    assert "flip 탐색이 아예 안 돈 날" in section
+
+
+def test_out_of_range_row_says_uncounted_when_the_log_axis_is_absent():
+    """규약 C — 기각 키가 없는 것은 「그 줄이 없던 버전의 로그」이지 0건이 아니다."""
+    metrics = {**_TODAY, "qualitative": {"egw00201": 40}}
+    out = report.render(
+        metrics, db_metrics={"signal_reach": _reach(gamma_flip_out_of_range_count=0)}
+    )
+    section = out.split("## 14. 신호 도달률", 1)[1].split("\n## ", 1)[0]
+    assert "기각 로그 셈 없음(그 줄이 없던 버전)" in section
+
+
+def test_rejection_counter_zero_is_printed_for_a_quiet_day():
+    """기각 0건인 날도 파서가 키를 0으로 만든다(`_QUALITATIVE_ALWAYS_PRESENT`) — §14 분모가
+    「셈 없음」으로 새지 않는다."""
+    parsed = log_metrics.parse_day([], date(2026, 8, 25))
+    assert parsed["qualitative"]["gamma_flip_out_of_leg_range"] == 0
+
+
 # ===== 2026-08-03 §5-5: 북별 감마 지형 =====
 
 

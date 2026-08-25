@@ -217,7 +217,12 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
         lines += _section("12. DB 적재", lambda: _render_db_tables(db_metrics))
         lines += _section("13. 판단/레짐/피처", lambda: _render_db_judgement(db_metrics))
         lines += _section("14. 신호 도달률 — 데이터가 판단까지 갔는가",
-                          lambda: _render_signal_reach(db_metrics))
+                          # 2026-08-25 P2-2 — §14의 「범위 밖」 자리에 **기각 로그 건수**를 함께
+                          # 낸다. 감시 대상 사건이 그쪽이다(적재분은 가드에 막혀 구조적으로 0).
+                          lambda: _render_signal_reach(
+                              db_metrics,
+                              (metrics.get("qualitative") or {}).get("gamma_flip_out_of_leg_range"),
+                          ))
         lines += _section("14-1. 앙상블 멤버별 가용성 — 어느 멤버가 왜 죽었는가",
                           lambda: _render_member_availability(db_metrics))
         lines += _section("14-2. 행사가 창 품질 — 수집한 행사가가 스팟을 감쌌는가",
@@ -1984,8 +1989,12 @@ def _pct_points(today: float | None, previous: float | None) -> float | None:
     return None if today is None or previous is None else round(today - previous, 1)
 
 
-def _render_signal_reach(db: dict) -> list[str]:
-    """2026-08-03 §5-1 — "데이터가 DB에 있는가"가 아니라 "판단까지 도달했는가"를 낸다."""
+def _render_signal_reach(db: dict, gamma_flip_rejections: int | None = None) -> list[str]:
+    """2026-08-03 §5-1 — "데이터가 DB에 있는가"가 아니라 "판단까지 도달했는가"를 낸다.
+
+    `gamma_flip_rejections`는 로그 축(`qualitative.gamma_flip_out_of_leg_range`)의 기각 건수다
+    (2026-08-25 P2-2). None은 「그 줄이 없던 버전의 로그」이지 0이 아니다(규약 C).
+    """
     reach = db.get("signal_reach") or {}
     if not reach.get("available"):
         return [
@@ -2012,13 +2021,26 @@ def _render_signal_reach(db: dict) -> list[str]:
             [
                 # 2026-08-05 §2-5 — 산출률 위/아래에 나란히 둔다. 산출률만 보면 "올라갔으니
                 # 좋아졌다"로 읽히는데, 08-05의 4.5%는 22건 중 21건이 여기 걸리는 값이었다.
+                #
+                # 2026-08-25 (08-25 §1-12 / P2-2) — **기각 로그 건수를 같은 자리에 낸다.**
+                # 적재분 범위 밖은 기각 가드(08-05 Fix#1)에 막혀 **구조적으로 0**이다 — 감시
+                # 대상 사건(기각된 flip, 08-25 실측 4건·08-24 11건)은 분자에 못 들어오고
+                # 있었다. 두 축은 서로를 대체하지 못한다(계약 테스트가 그 구분을 지킨다):
+                # 적재분 > 0은 「가드가 뚫렸다」, 기각 건수는 「가드가 일했다」다.
+                # ⚠ 「GEX 광폭 체인」을 되살리는 것이 아니다(08-04 폐기 유지) — 표기만 고친다.
                 "그중 수집 행사가 범위 밖",
                 (
                     "검사 불가(마이그레이션 023 미적용?)"
                     if reach.get("gamma_flip_out_of_range_count") is None
-                    else f"{reach['gamma_flip_out_of_range_count']:,}건"
+                    else f"적재분 {reach['gamma_flip_out_of_range_count']:,}건 · 기각 로그 "
+                    + (
+                        "셈 없음(그 줄이 없던 버전)"
+                        if gamma_flip_rejections is None
+                        else f"{gamma_flip_rejections:,}건"
+                    )
                 ),
-                "> 0 (불변식 — 0이어야 한다)",
+                "적재분 > 0 (불변식 — 가드 뚫림) · 기각이 0인 날은 (a) 기각할 것이 없었거나 "
+                "(b) flip 탐색이 아예 안 돈 날이다 — 가르는 축은 위 산출률이다",
             ],
             [
                 "체인 스냅샷 레그 수",
