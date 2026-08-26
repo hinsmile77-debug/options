@@ -317,6 +317,11 @@ MEASUREMENT_MAP = [
     # 사이클 줄은 분마다 나온다 — **0이면 그날 관측이 없었거나 파서가 눈이 먼 것**이고,
     # 둘 다 이 표에서 가장 먼저 보여야 하는 사실이다.
     ("B-1 사이클 관측", "옵션체인 사이클 소요 분해", None),
+    # 2026-08-26 (08-26 §1-7 / P2-3) — **체결 분류가 추정치였던 분.**
+    # 하루 46건(08-25 56건)이 나는데 **어느 지표에도 그 수가 없었다.** 장후 회차가 이틀치
+    # 로그를 손으로 훑어서야 알았고, 로그는 이틀치만 남으므로 그 확인은 그날이 마지막이었다.
+    # ⛔ **이상점이 아니다 — 만성이다.** 대체 축을 적어 적신호로 안 올린다.
+    ("B-3 체결 분류 폴백", "틱 룰 추정으로 폴백", "지표 `qualitative.tick_rule_fallback`"),
 ]
 
 # 레버 — `mahdi/ops/levers.py`의 `_SPEC`과 같은 이름을 쓴다. 값 해석은 하지 않고
@@ -329,6 +334,34 @@ LEVER_KEYS = [
     ("OPTION_CHAIN_READ_TIMEOUT_SECONDS", "mahdi/broker/rest_client.py"),
     ("REGIME_RESTORE_SESSION_WINDOW", "mahdi/engines/regime_pipeline.py"),
 ]
+
+# ===== 2026-08-26 (08-26 §1-3 / P2-1) — **「지남」만 보고 경고하면 다섯 회차 연속 오탐이다** =====
+#
+# §7은 「무조건발동일 < 오늘」이면 무조건 `⚠`와 적신호를 냈다. 그런데
+# `use_effective_member_count`는 **이미 `true`로 켜져 있고**, 위 표가 그 값을 파싱해서
+# 화면에 인쇄까지 하고 있었다 — **읽어 놓고 판정에 안 썼다.** 08-26에 다섯 회차가 연속으로
+# 같은 오탐을 봤다.
+#
+# 08-26 고도화 3이 정리한 네 사례 중 **2번**이 이 자리이고, 규약은 이렇다:
+# 「경고를 내는 코드는 **그 경고가 참이기 위한 조건을 전부 검사**하거나, 검사하지 않는 조건을
+# 경고 문구 안에 적는다.」 여기서 빠져 있던 조건이 **「레버가 아직 꺼져 있다」**이다.
+#
+# ⚠ **경고를 없애는 것이 아니라 등급을 내리는 것이다** — 날짜가 안 옮겨진 것은 사실이다.
+#
+# ## 왜 레버마다 따로 적는가
+#
+# **표기가 계열별로 갈린다.** yaml 불리언(`true`/`false`), yaml 숫자(`0` = 미설정),
+# 파이썬 `None`(= 전역값 사용 = OFF), 파이썬 빈 dict(`{}`), 파이썬 `False`가 전부 섞여 있다.
+# 하나의 「거짓처럼 보이는 값」 규칙으로 뭉치면 `0`이 유효한 설정인 레버에서 틀린다.
+# 그래서 **레버마다 「꺼짐」이 무엇인지를 명시한다** — 모르는 레버는 판정하지 않는다(규약 C).
+LEVER_OFF_LITERALS = {
+    "use_effective_member_count": ("false",),            # yaml 불리언
+    "reentry_cooldown_minutes": ("0",),                  # yaml 숫자 — 0 = 재진입 쿨다운 미설정
+    "SIGNAL_FUSION_PHASE_OFFSET_SECONDS": ("0", "0.0"),  # 파이썬 실수 — 0 = 위상 이동 없음
+    "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS": ("{}",),  # 파이썬 dict — 빈 dict = 등록된 시간대 없음
+    "OPTION_CHAIN_READ_TIMEOUT_SECONDS": ("none",),      # 파이썬 None = 전역값(4.0초) 사용
+    "REGIME_RESTORE_SESSION_WINDOW": ("false",),         # 파이썬 불리언
+}
 
 COMMIT_PREFIX = "[MW0601]"
 MSG_TRUNCATE = 220
@@ -755,6 +788,25 @@ class LoopScan:
             out.extend(self.latency_p50[hour])
         return sorted(out)
 
+    def window_latency_p95(self):
+        """반환: `{창시각: p95}`. 창이 없으면 빈 dict.
+
+        2026-08-26 (08-26 §1-10 / P2-5) — `2026-08-25-fix-p95-reaches-the-intraday-round`의
+        **②**다(①·③은 커밋 `c71574d`로 완료). p95는 `LATENCY_ITEM_RE`가 처음부터 잡아
+        `latency_p95`에 시간대별로 **이미 보관돼 있었다** — 없던 것은 계측이 아니라 열이다.
+
+        **이 회차가 그 대가를 세 번째로 치렀다**: 08-26에 절벽이 풀린 시각(15:26)을 p95로는
+        창 단위로 못 짚었다. p50만으로는 검열 벽에 눌려 회복이 안 보인다.
+
+        ⚠ 시각을 키로 준다 — `window_latency_p50()`과 **행 수가 다를 수 있다**(그 창에
+        p95 표본이 없는 경우). 그때 없는 것을 0으로 채우면 규약 C 위반이다.
+        """
+        out = {}
+        for hour in sorted(self.latency_p95):
+            for at, _n, p95 in self.latency_p95[hour]:
+                out[at] = p95
+        return out
+
     def hourly_latency_p95_max(self, hour):
         """반환: 그 시간대 `inquire-price` **창 최대 p95**. 창이 없으면 None.
 
@@ -990,6 +1042,26 @@ def discarded_items(root: Path):
 # 「7일 전 것이 있으니 정상」이 된다. 연휴 최대치(추석·설 4~5일)를 덮으면서 그보다 긴 침묵은
 # 사건으로 남기는 자리가 5다. 못 찾으면 **적신호를 낸다** — 이 fix는 경보를 끄는 것이 아니다.
 PREV_SIDECAR_MAX_BACKTRACK_DAYS = 5
+
+
+def _previous_priority_retry(auto: Path, day: _date):
+    """반환: `(직전 거래일 사이드카의 priority_retry 절, 그 날짜)` — 없으면 `(None, None)`.
+
+    2026-08-26 (08-26 §1-20 / P2-7). **새 입력을 만들지 않는다** — 08-24 Fix#1이 만든
+    `previous_metric_sidecar()`(「가장 가까운 날, 최대 5일」)를 그대로 재사용한다.
+    사이드카가 없거나 그 절이 없으면 `None`이고, 호출측은 그것을 「전일 없음」으로 인쇄한다 —
+    **「전일 0」이 아니다**(규약 C). 월요일마다 토요일 파일을 기대해 헛경보를 내던 그 자리다.
+    """
+    prev_day, _back = previous_metric_sidecar(auto, day)
+    if prev_day is None:
+        return None, None
+    try:
+        blob = json.loads(
+            (auto / f"{prev_day.isoformat()}_지표.json").read_text(encoding="utf-8")
+        ) or {}
+    except Exception:  # noqa: BLE001
+        return None, None
+    return (blob.get("priority_retry") or None), prev_day
 
 
 def previous_metric_sidecar(auto: Path, day: _date, max_back=PREV_SIDECAR_MAX_BACKTRACK_DAYS):
@@ -1305,6 +1377,35 @@ def crash_since_last_start(lines, day):
     }
 
 
+def lever_is_on(key: str, line: str):
+    """반환: `True`(켜짐) · `False`(꺼짐) · `None`(**판정 못 함**).
+
+    입력: 레버 이름과 §7이 소스에서 찾아낸 그 줄.
+    계산: 이름 뒤의 값만 떼어(`=`가 있으면 그 뒤, 없으면 `:` 뒤) 주석을 자르고,
+         `LEVER_OFF_LITERALS`에 적힌 「꺼짐」 표기와 대조한다.
+    해석: 상세 근거는 `LEVER_OFF_LITERALS` 위 주석.
+         **`None`과 `False`는 다른 값이다** — 전자는 「이 도구가 못 읽었다」이고 후자는
+         「레버가 꺼져 있다」다(규약 C). 못 읽은 것을 「꺼짐」으로 접으면 이 fix가 만들려던
+         등급 구분이 도로 사라진다.
+    실패 조건: 없다 — 못 읽으면 `None`이다.
+    """
+    off = LEVER_OFF_LITERALS.get(key)
+    if not off or key not in line:
+        return None
+    tail = line.split(key, 1)[1]
+    # `X: dict[int, int] = {}` 처럼 둘 다 있으면 `=` 쪽이 값이다. yaml은 `=`가 없다.
+    if "=" in tail:
+        value = tail.split("=", 1)[1]
+    elif ":" in tail:
+        value = tail.split(":", 1)[1]
+    else:
+        return None
+    value = value.split("#", 1)[0].strip().rstrip(",").strip().lower()
+    if not value:
+        return None
+    return value not in off
+
+
 def lever_schedule(root: Path):
     """반환: `{레버 이름: {"유예횟수": n, "무조건발동일": "YYYY-MM-DD", "발동일": ...}}`.
 
@@ -1396,6 +1497,8 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     L, A = [], None
     A = L.append
     flags = []
+    # 2026-08-26 P2-1 — 「발동은 끝났고 날짜만 안 옮겨진」 레버. **적신호가 아니다.**
+    lever_cleanup = []
 
     def due(hhmm):
         """그 시각이 이미 지났는가. **아직 안 온 일을 「없다」고 신고하지 않기 위한 것**이다
@@ -1647,8 +1750,12 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                 (at, n, p50) for at, n, p50 in windows
                 if timeout and p50 >= timeout * P50_CENSORED_FLOOR_RATIO
             ]
+            # 2026-08-26 P2-5 — p95를 함께 넘긴다. 08-25 fix의 **②**이고, 그 값은
+            # `latency_p95`에 처음부터 보관돼 있었다(없던 것은 계측이 아니라 열이다).
             tsv = write_latency_windows(
-                root, day, windows, timeout, censored if scan.censored_seconds else None
+                root, day, windows, timeout,
+                censored if scan.censored_seconds else None,
+                scan.window_latency_p95() or None,
             )
             A(f"- 전체 **{len(windows)}창**: "
               + (f"`auto/{D}_지연창.tsv`" if tsv else "⚠ 파일로 못 뺐다(본문만 유효)"))
@@ -1775,10 +1882,22 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                       "미리 정해 둔 조치: **해당 시간대 위클리 폴링 2분 → 4분 격분(먼슬리는 안 "
                       "건드린다)**. ⛔ **자동 발동하지 않는다** — 발동은 사람이 결정한다"
                       "(2026-07-08 페이서 분리 500 폭주 203분).")
+                    # ===== 2026-08-26 (08-26 §1-8 / P1-3) — **발동 창을 문구에 박는다** =====
+                    #
+                    # 08-04에 만들어진 뒤 3주째 **한 번도 발동한 적이 없다.** 미룬 것이 아니라
+                    # **그 결정을 내릴 수 있는 시각이 하루에 한 순간도 없었다**: 조건은 「이틀
+                    # 연속 같은 시간대」이고 그 판정이 서는 시각은 장후인데, 그때 그 시간대는
+                    # **언제나 과거**다. 08-26이 네 번째로 성립한 날이고 네 번 다 안 켜졌다.
+                    A("- ⏰ **발동 창은 「다음 거래일 장전(07:30 기동 전)」이다. 장중 발동은 "
+                      "하지 않는다** — 조건을 아는 시각은 항상 그 시간대가 지난 뒤이고, "
+                      "장중 재기동 대가는 **봉 30개(약 30분)**다"
+                      "(⚠ 「예열 89분」이 아니다 — 그 숫자는 기동 시각의 함수이고 08-26 §1-19가 "
+                      "정정했다). 이 줄을 **내일 아침 회차가 받는다.**")
                     flags.append(
                         f"🔔 사전 대응 규칙 `{P95_TWO_DAY_RULE_ID}` 조건 성립 — "
                         f"p95>{P95_WARN_THRESHOLD_SECONDS}초 이틀 연속 {len(both)}구간"
-                        f"(오늘 {len(today_breaches)}구간). 발동 여부는 사람이 정한다"
+                        f"(오늘 {len(today_breaches)}구간). **발동 창은 다음 거래일 장전**이고 "
+                        "발동 여부는 사람이 정한다"
                     )
                 elif today_breaches:
                     # 「오늘만 나쁨」과 「이틀째 나쁨」을 가른다 — 안 가르면 이 줄은 한 주 안에
@@ -1841,13 +1960,60 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
               f"{'—' if budget_min is None else f'{budget_min:.1f}'} |")
         A("")
         failed_total = sum(scan.priority_retry_failures.values())
+        # ===== 2026-08-26 (08-26 §1-20 / P2-7) — **9가 큰지 작은지 아무도 몰랐다** =====
+        #
+        # 종전 적신호는 「실패 9건」이라고만 적었다. 전일값이 없어 그 9가 평소인지 급증인지
+        # 판정할 수 없었고, 08-26 장후 회차가 **어제 사이드카를 손으로 열어 보고서야**
+        # 2건 → 9건(▲7)이고 회복률이 97.9% → 83.8%(▼14.1pt)임을 알았다.
+        #
+        # ⚠ **`recovery_pct`만 보면 안 된다** — 시도 수가 줄면 비율이 좋아 보인다.
+        # **실패 사이클 수와 회복률을 반드시 같이 낸다.**
+        #
+        # 이 비교가 가능해진 것 자체가 `2026-08-25-p2-1`(0을 0으로 인쇄한다)의 산물이다 —
+        # 어제 `0`이 `—`가 아니라 `0`으로 찍혔기에 날짜 간 비교가 성립했다.
+        prev_retry, prev_retry_day = _previous_priority_retry(auto, day)
+        retry_delta = ""
+        if prev_retry is None:
+            # 규약 C — 「전일 없음」은 「전일 0」이 아니다. 오경보를 내지 않는다(08-24 Fix#1).
+            retry_delta = " · 전일 대비 **—(전일 없음)**"
+        else:
+            prev_failed = prev_retry.get("failed_cycles")
+            prev_pct = prev_retry.get("recovery_pct")
+            bits = []
+            if prev_failed is None:
+                # 전일 사이드카는 있는데 그 키가 없다 — **옛 버전이다.** 0으로 접지 않는다.
+                bits.append("전일 사이드카에 `failed_cycles` 없음(옛 버전)")
+            else:
+                arrow = (
+                    "▲" if failed_total > prev_failed
+                    else ("▼" if failed_total < prev_failed else "—")
+                )
+                bits.append(f"전일 {prev_failed}건 {arrow}{abs(failed_total - prev_failed)}")
+            # ⚠ **회복률은 레그 기준(recovered/attempted)이고 위 실패는 사이클 기준이다.**
+            # 두 축을 나란히 놓되 **서로 나누거나 비교하지 않는다** — 분모가 다르다.
+            # 오늘 회복률은 장후 사이드카가 낸다(이 수집기는 레그 수를 안 센다).
+            bits.append(
+                f"전일 회복률 {prev_pct}%(레그 기준)" if prev_pct is not None
+                else "전일 회복률 **셈 없음**"
+            )
+            retry_delta = f" · 전일({prev_retry_day}) 대비 **{' · '.join(bits)}**"
+        A(f"- 먼슬리 되살리기 **실패 {failed_total}건**{retry_delta}")
+        A("")
+        A("> ⚠ **증감 화살표를 판정으로 읽지 않는다**(규약 G) — 이 축은 그날 KIS 상태에")
+        A("> 비례한다. ▲7이 곧 회귀가 아니다. 이 줄이 하는 일은 **두 수를 나란히 놓는 것**까지다.")
+        A("> ⚠ **회복률만 보면 안 된다** — 시도가 줄면 비율이 좋아 보인다. 실패 **사이클 수**와")
+        A("> 함께 읽어야 「간신히 성공」과 「전멸」이 갈린다(2026-08-24 Fix#4).")
+        A("> ⚠ **두 수의 분모가 다르다** — 실패는 **사이클** 기준이고 회복률은 **레그**")
+        A("> (`recovered/attempted`) 기준이다. 나란히 두되 서로 나누지 말 것.")
+        A("")
         if failed_total:
             worst = ", ".join(
                 f"{hh:02d}시 {n}건" for hh, n in sorted(scan.priority_retry_failures.items())
             )
             flags.append(
-                f"먼슬리 되살리기 **실패 {failed_total}건**({worst}) — 그 분의 GEX·감마플립은 "
-                "핵심 6레그가 빈 채로 계산됐다. 「간신히 성공」과 다른 사건이다(2026-08-24 Fix#4)"
+                f"먼슬리 되살리기 **실패 {failed_total}건**({worst}){retry_delta} — 그 분의 "
+                "GEX·감마플립은 핵심 6레그가 빈 채로 계산됐다. 「간신히 성공」과 다른 "
+                "사건이다(2026-08-24 Fix#4)"
             )
         A("> **이 표가 있는 이유**: 08-24에 「백오프 확대가 잔고 폴링을 떨어뜨렸는가」를 하루에")
         A("> 여섯 번 대조했고 **결론이 세 번 뒤집혔다**(확대→실패 2/21 · 실패→확대 2/2). 두 값이")
@@ -2039,32 +2205,56 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     # 2026-08-14 고도화 5 — 레버마다 **유예 회차와 무조건발동일**을 나란히 둔다.
     # 「지금 꺼져 있다」만으로는 그것이 오늘 결정된 유예인지 열 번째 망각인지 알 수 없다.
     schedule = lever_schedule(root)
-    A("| 레버 | 위치 | 현재 줄 | 유예 | 무조건발동일 |")
-    A("|---|---|---|---|---|")
+    A("| 레버 | 위치 | 현재 줄 | 지금 | 유예 | 무조건발동일 |")
+    A("|---|---|---|---|---|---|")
     for key, rel in LEVER_KEYS:
         p = root / rel
         found = "**파일 없음**"
+        raw_line = ""
         if p.exists():
             hits = [ln.strip() for ln in read_text(p).splitlines()
                     if key in ln and not ln.strip().startswith("#")]
-            found = truncate(hits[0], 90) if hits else "**키 없음(기본값으로 동작)**"
+            raw_line = hits[0] if hits else ""
+            found = truncate(raw_line, 90) if hits else "**키 없음(기본값으로 동작)**"
+        # 2026-08-26 P2-1 — **이 값이 판정의 두 번째 조건이다.** 근거는 `LEVER_OFF_LITERALS` 주석.
+        on = lever_is_on(key, raw_line) if raw_line else None
+        state = {True: "**켜짐**", False: "꺼짐", None: "판정 못 함"}[on]
         info = schedule.get(key, {})
         deferrals = info.get("유예횟수")
         deadline = info.get("무조건발동일")
         if deadline:
             left = (_date.fromisoformat(deadline) - day).days
             when = f"{deadline} (D{left:+d})" if left else f"{deadline} (**오늘**)"
-            if left < 0:
-                when = f"{deadline} (**{-left}일 지남 ⚠**)"
+            if left < 0 and on is True:
+                # **발동은 끝났고 날짜만 안 옮겨졌다.** 경고를 없애는 것이 아니라 등급을 내린다.
+                when = f"{deadline} (**{-left}일 지남 · 발동 완료 · 날짜 정리 필요**)"
+                lever_cleanup.append(
+                    f"레버 `{key}`는 **이미 켜져 있다**(현재 줄: `{truncate(raw_line, 60)}`). "
+                    f"무조건발동일({deadline})만 {-left}일 지난 채 남았다 — "
+                    "가설의 날짜를 옮기고 **실제로 켠 날짜를 그 줄 주석에 적을 것.**"
+                )
+            elif left < 0:
+                # 꺼져 있거나 판정 못 한 경우 — 종전 그대로 ⚠와 적신호다.
+                unread = " · **값을 못 읽었다**" if on is None else ""
+                when = f"{deadline} (**{-left}일 지남 ⚠**{unread})"
                 flags.append(
-                    f"레버 `{key}`의 무조건발동일({deadline})이 {-left}일 지났다 — "
+                    f"레버 `{key}`의 무조건발동일({deadline})이 {-left}일 지났고 "
+                    f"**{'값을 못 읽었다' if on is None else '아직 꺼져 있다'}** — "
                     "켜거나 날짜를 옮기고 사유를 적을 것(테스트가 실패 중일 것이다)"
                 )
         else:
             # 규약 C — 「기한이 없다」는 「여유가 있다」가 아니라 **「강제력이 없다」**이다.
             when = "— (강제력 없음)"
-        A(f"| `{key}` | `{rel}` | {found} | {deferrals + '회' if deferrals else '—'} | {when} |")
+        A(f"| `{key}` | `{rel}` | {found} | {state} | "
+          f"{deferrals + '회' if deferrals else '—'} | {when} |")
     A("")
+    if lever_cleanup:
+        # 2026-08-26 P2-1 — 적신호(§12)가 아니라 **정리 목록**이다. 판정에 영향이 없고,
+        # 그래서 여기 인쇄하되 `flags`에는 안 넣는다 — 등급을 내린 자리가 정확히 여기다.
+        A("> **발동은 끝났는데 날짜가 안 옮겨진 레버** (⚠ 아님 — 정리 항목):")
+        for line in lever_cleanup:
+            A(f"> - {line}")
+        A("")
     A("> **규약 H — 레버가 꺼진 날의 숫자로 그 레버의 가설을 판정하지 않는다.**")
     A("> 2026-08-12에 「오늘 켤 유일한 레버」가 안 켜졌는데 지표는 켜진 전제로 판정했다(§1-1).")
     A("")
@@ -2403,13 +2593,22 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     return "\n".join(L)
 
 
-def write_latency_windows(root: Path, day: _date, windows, timeout, censored=None) -> Path | None:
+def write_latency_windows(
+    root: Path, day: _date, windows, timeout, censored=None, p95=None,
+) -> Path | None:
     """5분 창 전량을 `auto/{날짜}_지연창.tsv`로 뺀다. 반환: 쓴 경로(못 쓰면 None).
 
     입력: 리포 루트 · 날짜 · `LoopScan.window_latency_p50()` · 그날 실제 read timeout ·
-         (선택) `LoopScan.window_censored_counts()`.
-    계산: `창시각 · 호출수 · p50초 · p50/timeout · 검열건수 · 검열% · p50표기` 일곱 열.
-         정렬은 시각순(입력 그대로).
+         (선택) `LoopScan.window_censored_counts()` · (선택) `LoopScan.window_latency_p95()`.
+    계산: `창시각 · 호출수 · p50초 · p50/timeout · 검열건수 · 검열% · p50표기 ·
+         p95초 · p95/timeout` 아홉 열. 정렬은 시각순(입력 그대로).
+
+         2026-08-26(08-26 §1-10 / P2-5) — **뒤 두 열이 이 파일의 새 요점이다.**
+         p50은 타임아웃 벽에 눌려(우측 검열) 4.03에서 멈추지만 p95는 그 위를 말한다 —
+         08-26에 절벽이 풀린 15:26을 p50 창으로는 못 짚었다.
+         ⚠ **「p95 없음」과 「p95=0」을 다른 문구로 적는다**(규약 C): 표본이 없는 창은 `-`이고
+         0.00초는 `0.00`이다. **이 한 칸이 틀리면 이 fix는 헛경보 생성기가 된다.**
+         ⚠ p95도 검열된다 — p50 열이 쓰는 `>=` 표기 규약을 그대로 따른다.
     해석: 표는 **돌파 창만** 인쇄하고 전량은 여기로 뺀다 — 98창을 md에 실으면 그 표가
          §5-1을 통째로 밀어낸다. 손으로 다시 파싱하는 일(08-19 14:30 회차)이 없어지는 것이
          이 파일의 전부다.
@@ -2429,7 +2628,8 @@ def write_latency_windows(root: Path, day: _date, windows, timeout, censored=Non
         # 탭·개행은 `chr()`로 적는다 — 이 파일은 소스에 탭 문자를 두지 않는다.
         tab, lf = chr(9), chr(10)
         head = tab.join(
-            ("창시각", "호출수", "p50초", "p50/timeout", "검열건수", "검열%", "p50표기")
+            ("창시각", "호출수", "p50초", "p50/timeout", "검열건수", "검열%", "p50표기",
+             "p95초", "p95/timeout")
         )
         rows = [head]
         for at, n, p50 in windows:
@@ -2442,7 +2642,18 @@ def write_latency_windows(root: Path, day: _date, windows, timeout, censored=Non
                 cut = censored.get(at, 0)
                 cut_n = str(cut)
                 cut_pct = f"{min(cut / n, 1.0) * 100:.0f}" if n else "-"
-            rows.append(tab.join((at, str(n), f"{p50:.2f}", ratio, cut_n, cut_pct, label)))
+            # 2026-08-26 P2-5 — **없는 것을 0으로 채우지 않는다**(규약 C).
+            # `p95 is None`은 「그 창에 p95 표본이 없다」이고 `0.00`은 「쟀고 0이었다」다.
+            window_p95 = (p95 or {}).get(at)
+            if window_p95 is None:
+                p95_text = p95_ratio = "-"
+            else:
+                p95_floored = timeout and window_p95 >= timeout * P50_CENSORED_FLOOR_RATIO
+                p95_text = f">={timeout:.1f}" if p95_floored else f"{window_p95:.2f}"
+                p95_ratio = f"{window_p95 / timeout:.2f}" if timeout else "-"
+            rows.append(tab.join(
+                (at, str(n), f"{p50:.2f}", ratio, cut_n, cut_pct, label, p95_text, p95_ratio)
+            ))
         out.write_text(lf.join(rows) + lf, encoding="utf-8", newline=lf)
         return out
     except Exception:  # noqa: BLE001
@@ -2516,6 +2727,118 @@ def prune_evidence(out_dir: Path, keep_days: int, today: _date) -> list[Path]:
     return removed
 
 
+# ===== 2026-08-26 (08-26 제5부 고도화 5) — **목록을 눈앞에 두는 것만으로는 부족하다** =====
+#
+# 08-26에 이 체제가 저지른 실수 셋은 전부 「증거를 안 본 것」이 아니라 **「눈앞의 증거를 잘못
+# 읽은 것」**이다:
+#   ① 14:30이 `.watchdog_state.json`을 `2026-08-21`로 인용했다 — **그 회차의 증거 파일에는
+#      `2026-08-26`이라 적혀 있었다.**
+#   ② 14:30 P0-1이 **폐기 목록의 Slack 항목**을 되살렸다 — §8-2가 그 줄을 같은 파일 안에
+#      놓았는데도. **08-19 장후 §4 Fix#1에 이어 두 번째다.**
+#   ③ 14:30 P0-1이 **존재하지 않는 파일**(`mahdi/ops/alerting.py`)을 지목했다.
+#
+# **§8-2가 「목록을 눈앞에 두는 것」까지였다면 이것은 「부딪히면 소리를 내는 것」이다.**
+#
+# ## (가) 인용 대조는 이번에 넣지 않았다
+#
+# 보고서에서 상태 파일 값을 뽑는 일은 보고서 문법에 의존해 **오탐 여지가 가장 크다.**
+# (나)·(다)는 각각 고정 키워드 대조와 경로 존재 확인이라 오탐 형태가 단순하고 사람이 즉시
+# 가려낸다. **못 잡는 판정기를 실으면 「검사했는데 안 걸렸다」는 거짓 안심이 남는다** —
+# 08-19 Fix#5가 같은 이유로 기계 판정을 뺐다. 그래서 잡을 수 있는 둘만 먼저 싣는다.
+#
+# ## 왜 낱말 겹침이 아니라 고정 키워드인가
+#
+# 08-19 Fix#5가 **구현 중에 실측했다**: 알려진 두 사례를 폐기 항목 제목과 대조하니 각각
+# **낱말 1개**만 공유했고(임계 2), 임계를 1로 내리면 무관한 줄이 대량으로 걸렸다.
+# 그래서 **폐기 목록 제목에서 뽑은 고정 키워드**로만 맞춘다 — 적게 잡지만 잡는 것은 확실히 잡는다.
+_DISCARD_KEYWORDS = ("Slack", "광폭 체인", "페이서 분리", "httpx INFO")
+
+# 보고서에서 경로를 뽑는다. **백틱 안의 `*.py`만** 본다 — 산문 속 파일명까지 보면 오탐이 폭증한다.
+#
+# ⚠ **`/`가 있는 것만 본다.** 보고서는 같은 파일을 `mahdi/notify.py`로도 `notify.py`로도
+# 부르고, 뒤엣것은 **경로가 아니라 약칭**이다. 구현 중에 실측했다: 08-26 보고서에서 이 정규식이
+# 7건을 잡았는데 그중 다섯이 약칭(`report.py`·`notify.py`·`collect_evidence.py` 등)이었다.
+# 약칭까지 「없는 파일」로 세면 **진짜 하나(`mahdi/ops/alerting.py`)가 그 다섯에 묻힌다** —
+# 08-19 Fix#5가 말한 「틀린 경보는 진짜 경보를 죽인다」가 여기서도 그대로다.
+_REPORT_PY_PATH_RE = re.compile(r"`([\w.-]+(?:/[\w.-]+)+\.py)(?::\d+)?`")
+
+# 목록만 내고 판정하지 않는 절의 제목들. Fix 계획이 실리는 자리다.
+_REPORT_FIX_SECTION_RE = re.compile(r"^#{2,4}\s+.*(제4부|Fix 구현계획|P0|P1|P2)")
+
+
+def verify_report(root: Path, report: Path) -> str:
+    """보고서 한 편을 폐기 목록·리포 실물과 대조해 **목록만** 낸다. 반환: 마크다운 본문.
+
+    입력: 리포 루트와 검사할 보고서 경로.
+    계산: (나) 폐기 목록 키워드가 Fix 절 본문에 나오는가 · (다) 백틱 안 `*.py`가 실재하는가.
+    해석: 상세 근거는 위 절 주석. ⚠ **판정하지 않고 목록만 낸다**(§8-2·§8-3과 같은 규약).
+         걸린 줄을 자동으로 지우지 않는다 — **자동으로 지우면 그것이 새로운 조용한 실패가 된다.**
+    실패 조건: 보고서를 못 읽으면 그 사실을 인쇄한다. **종료 코드는 언제나 0이다** —
+              오탐 하나가 회차를 막으면 다음부터 아무도 이 모드를 안 부른다.
+    """
+    out = [f"# 보고서 자기검증 — `{report.name}`", ""]
+    if not report.is_file():
+        return "\n".join(out + [f"⛔ **파일이 없다**: `{report}`", ""])
+    text = read_text(report)
+    if text.startswith("(읽기 실패)"):
+        return "\n".join(out + [f"⛔ **못 읽었다**: `{report}`", ""])
+    lines = text.splitlines()
+
+    # ---- (나) 폐기 목록 대조 ----
+    out += ["## (나) 폐기·종결 목록과 부딪히는가", ""]
+    discarded = discarded_items(root)
+    if discarded is None:
+        out += ["⛔ **`NEXT_TODO.md`를 못 읽었다** — 이 대조는 **안 돌았다.** "
+                "「안 걸렸다」가 아니다(규약 C).", ""]
+    else:
+        in_fix, hits = False, []
+        for n, line in enumerate(lines, 1):
+            if line.startswith("#"):
+                in_fix = bool(_REPORT_FIX_SECTION_RE.match(line))
+            if not in_fix:
+                continue
+            for kw in _DISCARD_KEYWORDS:
+                if kw in line:
+                    hits.append((n, kw, truncate(line.strip(), 140)))
+        if hits:
+            out += [f"⚠ **{len(hits)}줄이 폐기 목록 키워드와 부딪힌다.** "
+                    "폐기된 것을 되살리는 중인지 **사람이 확인할 것.**", ""]
+            out += ["| 줄 | 키워드 | 본문 |", "|---|---|---|"]
+            out += [f"| {n} | `{kw}` | {body} |" for n, kw, body in hits]
+            out += ["", f"> 대조한 폐기 항목 {len(discarded)}건. "
+                    "**목록만 낸다 — 지우거나 고치지 않는다.**", ""]
+        else:
+            out += [f"✅ 부딪히는 줄 없음(폐기 항목 {len(discarded)}건 · "
+                    f"키워드 {len(_DISCARD_KEYWORDS)}개와 대조).", ""]
+
+    # ---- (다) 경로 실재 확인 ----
+    out += ["## (다) 지목한 파일이 리포에 실재하는가", ""]
+    seen, missing = set(), []
+    for n, line in enumerate(lines, 1):
+        for m in _REPORT_PY_PATH_RE.finditer(line):
+            rel = m.group(1)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            if not (root / rel).exists():
+                missing.append((n, rel))
+    if missing:
+        out += [f"⚠ **{len(missing)}개 경로가 리포에 없다.** 08-26 14:30이 지목한 "
+                "`mahdi/ops/alerting.py`가 정확히 이 형태였다(알림 모듈은 `mahdi/notify.py`다).", ""]
+        out += ["| 줄 | 경로 |", "|---|---|"]
+        out += [f"| {n} | `{rel}` |" for n, rel in missing]
+        out += ["", "> ⚠ **오탐이 있을 수 있다** — 앞으로 만들 파일을 미리 적은 것일 수 있고, "
+                "그것은 잘못이 아니다. **사람이 가른다.**", ""]
+    else:
+        out += [f"✅ 백틱 안 `*.py` 경로 {len(seen)}개가 전부 실재한다.", ""]
+
+    out += ["---", "",
+            "> ⚠ **이 모드는 판정하지 않는다.** 걸린 줄은 「틀렸다」가 아니라 「봐야 한다」다.",
+            "> ⛔ **(가) 인용 대조는 아직 없다** — 상태 파일 값 추출은 오탐 여지가 가장 커서 "
+            "이번에 안 실었다. **「검사했는데 안 걸렸다」로 읽지 말 것.**", ""]
+    return "\n".join(out)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="마흐디 일일 운영점검 증거 수집기")
     ap.add_argument("--phase", choices=["pre", "intra", "post", "all"], default="post",
@@ -2532,10 +2855,25 @@ def main(argv=None):
     ap.add_argument("--prune-days", type=int, default=None, metavar="N",
                     help="--out-dir 안의 `_증거_*.md` 중 N일보다 오래된 것을 지운다"
                          " (지표.json·지표.md·보고서는 대상이 아니다. 기본: 끔)")
+    # 2026-08-26 고도화 5 — 보고서 자기검증. 상세 근거는 `verify_report` 위 절 주석.
+    ap.add_argument("--verify-report", default=None, metavar="파일",
+                    help="그 보고서를 폐기 목록·리포 실물과 대조해 **목록만** 낸다"
+                         " (증거 수집은 하지 않는다)")
     args = ap.parse_args(argv)
 
     start = Path(args.root) if args.root else Path(__file__).resolve().parent
     root = find_repo_root(start)
+    if args.verify_report:
+        target = Path(args.verify_report)
+        if not target.is_absolute():
+            target = root / target
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass
+        print(verify_report(root, target))
+        # **종료 코드는 언제나 0이다** — 오탐 하나가 회차를 막으면 다음부터 아무도 안 부른다.
+        return 0
     if not (root / "logs").is_dir():
         eprint(f"[collect_evidence] 경고: {root}/logs 가 없다. --root 로 리포 루트를 지정하라.")
     day = parse_date(args.date)

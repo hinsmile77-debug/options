@@ -95,8 +95,10 @@ def test_the_tsv_carries_every_window_because_the_table_only_shows_breaches(coll
     assert out is not None and out.name == "2026-08-14_지연창.tsv"
     lines = out.read_text(encoding="utf-8").splitlines()
     # 2026-08-23 고도화#1 — 뒤 세 열(검열건수 · 검열% · p50표기)이 추가됐다.
+    # 2026-08-26 P2-5 — 그 뒤로 두 열(p95초 · p95/timeout)이 더 붙었다.
     assert lines[0].split(chr(9)) == [
         "창시각", "호출수", "p50초", "p50/timeout", "검열건수", "검열%", "p50표기",
+        "p95초", "p95/timeout",
     ]
     assert len(lines) == 6, "머리 1줄 + 창 5줄"
     assert lines[4].split(chr(9))[0][:5] == "14:06"
@@ -141,3 +143,81 @@ def test_an_unmeasured_censoring_prints_a_dash_not_a_zero(collector, scan, tmp_p
 def test_no_windows_means_no_file_rather_than_an_empty_one(collector, tmp_path):
     """빈 파일은 「쟀는데 0창이었다」로 읽힌다 — 그날 파서가 눈먼 것과 구별되지 않는다."""
     assert collector.write_latency_windows(tmp_path, date(2026, 8, 14), [], TIMEOUT) is None
+
+
+# ===== 2026-08-26 (08-26 §1-10 / P2-5) — 지연창 TSV가 p95를 싣는다 =====
+
+
+def test_the_tsv_carries_p95_next_to_p50(collector, scan, tmp_path):
+    """`2026-08-25-fix-p95-reaches-the-intraday-round`의 **②**다(①·③은 `c71574d`로 완료).
+
+    **이 회차가 그 대가를 세 번째로 치렀다** — 08-26에 절벽이 풀린 시각(15:26)을 p95로는
+    창 단위로 못 짚었다. p50은 타임아웃 벽에 눌려 회복을 못 보여 준다.
+    """
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT,
+        None, scan.window_latency_p95(),
+    )
+    head = out.read_text(encoding="utf-8").splitlines()[0].split(chr(9))
+    row = dict(zip(head, out.read_text(encoding="utf-8").splitlines()[4].split(chr(9))))
+
+    assert "p95초" in head and "p95/timeout" in head
+    assert row["p95초"] not in ("", "-"), "그 창에는 p95 표본이 있다"
+
+
+def test_a_window_without_p95_is_a_dash_not_a_zero(collector, scan, tmp_path):
+    """⚠ **「p95 없음」과 「p95=0」을 다른 문구로 인쇄한다**(규약 C).
+
+    이 한 칸이 틀리면 이 fix는 헛경보 생성기가 된다 — 원 가설이 같은 주의를 이미 적어 뒀다.
+    """
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT, None, {},
+    )
+    row = dict(zip(
+        out.read_text(encoding="utf-8").splitlines()[0].split(chr(9)),
+        out.read_text(encoding="utf-8").splitlines()[1].split(chr(9)),
+    ))
+    assert row["p95초"] == "-"
+    assert row["p95/timeout"] == "-"
+
+
+def test_a_measured_zero_p95_is_printed_as_zero(collector, scan, tmp_path):
+    """**쟀는데 0인 창**은 `0.00`이다. 위 테스트와 이 테스트가 함께 규약 C를 지킨다."""
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    first_at = scan.window_latency_p50()[0][0]
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT, None, {first_at: 0.0},
+    )
+    row = dict(zip(
+        out.read_text(encoding="utf-8").splitlines()[0].split(chr(9)),
+        out.read_text(encoding="utf-8").splitlines()[1].split(chr(9)),
+    ))
+    assert row["p95초"] == "0.00"
+    assert row["p95/timeout"] == "0.00"
+
+
+def test_a_censored_p95_is_written_as_a_floor_too(collector, scan, tmp_path):
+    """p95도 타임아웃 벽에 눌린다 — p50 열이 쓰는 `>=` 표기 규약을 그대로 따른다."""
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    first_at = scan.window_latency_p50()[0][0]
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT, None, {first_at: 4.05},
+    )
+    row = dict(zip(
+        out.read_text(encoding="utf-8").splitlines()[0].split(chr(9)),
+        out.read_text(encoding="utf-8").splitlines()[1].split(chr(9)),
+    ))
+    assert row["p95초"] == ">=4.0"
+
+
+def test_omitting_p95_keeps_the_old_columns_byte_identical(collector, scan, tmp_path):
+    """**p95를 안 넘긴 호출의 앞 일곱 열은 한 글자도 안 바뀐다** — 회귀 판정선이다."""
+    (tmp_path / "docs" / "동작점검" / "auto").mkdir(parents=True)
+    out = collector.write_latency_windows(
+        tmp_path, date(2026, 8, 14), scan.window_latency_p50(), TIMEOUT, {"14:06:13": 41},
+    )
+    row = out.read_text(encoding="utf-8").splitlines()[4].split(chr(9))
+    assert row[:7] == ["14:06:13", "53", "4.03", "1.01", "41", "77", ">=4.0"]
+    assert row[7:] == ["-", "-"]
