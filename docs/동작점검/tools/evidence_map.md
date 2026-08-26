@@ -20,13 +20,23 @@
 
 ### 상태 파일
 
-| 파일 | 의미 |
-|---|---|
-| `logs/.last_successful_start.txt` | 마지막 정상 기동 시각 |
-| `logs/.last_cockpit_start.txt` | COCKPIT 기동 시각 |
-| `logs/.last_marketclose_stop.txt` | 장마감 종료 시각 |
-| `logs/.watchdog_state.json` | `{date, restarts, last_alert_at}` — 그날 재기동 횟수 |
-| `logs/.watchdog_last_check.json` | `{at, action, detail}` — 워치독의 마지막 판정. `감시 창 밖`이면 정상 대기 |
+**「이 지표가 못 보는 것」 열이 규약 I의 자리다**(`README.md` — 2026-08-26 고도화 3).
+그 칸이 비어 있으면 다음 사람이 그 파일을 전지(全知)로 읽는다.
+
+| 파일 | 의미 | **이 파일이 못 보는 것** |
+|---|---|---|
+| `logs/.last_successful_start.txt` | 마지막 정상 기동 시각 | 그 기동이 **끝까지 살았는가** — 죽은 시각은 `observation_loop_crash.log`가 안다 |
+| `logs/.last_cockpit_start.txt` | COCKPIT 기동 시각 | 지금도 떠 있는가 — 기동만 적고 종료는 안 적는다 |
+| `logs/.last_marketclose_stop.txt` | 장마감 종료 시각 | 종료가 **성공했는가** · 잔존 프로세스가 있는가 |
+| `logs/.watchdog_state.json` | **이상(DEGRADED/RESTART)이 있었던 마지막 회차**의 `{note, date, restarts, last_alert_at}` | **「오늘 워치독이 돌았는가」** — 정상인 날은 이 파일을 **안 쓴다.** 그래서 `date`가 어제여도 오늘 워치독은 멀쩡할 수 있다 |
+| `logs/.watchdog_last_check.json` | `{at, action, detail}` — 워치독의 마지막 판정. `감시 창 밖`이면 정상 대기 | 그 사이에 **무슨 일이 있었는가** — 마지막 한 번만 남는다 |
+
+> ⚠ **`.watchdog_state.json`과 `.watchdog_last_check.json`을 섞지 말 것** (2026-08-26 §1-5 / P2-2).
+> 「오늘 워치독이 돌았는가」에 답하는 것은 **`.watchdog_last_check.json`**이다.
+> 08-26에 두 회차가 `.watchdog_state.json`의 `date`를 그 질문의 답으로 읽어 오독했다 —
+> **그날 그 파일은 필요할 때 정확히 갱신됐고**(14:10 첫 DEGRADED), 문제는 파일이 아니라
+> 읽는 쪽이 그 뜻을 몰랐다는 것이다. 이제 그 파일이 `note` 키로 스스로 말한다.
+> ⛔ **정상일 때도 쓰게 만들지 않았다** — 매 회차 쓰면 「이상이 있었던 마지막 날」이 사라진다.
 
 ## 자동 산출물
 
