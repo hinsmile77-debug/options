@@ -233,7 +233,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                           lambda: _render_outcomes_by_chain_input(db_metrics))
         lines += _section("15. 북별 감마 지형 (장 마지막 스냅샷)",
                           lambda: _render_book_gamma_map(db_metrics, previous))
-        lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics))
+        # 2026-08-26 P1-5 — 토글 줄 옆에 「오늘 버려진 경보 N건」을 붙이려면 로그 축이 필요하다.
+        lines += _section("16. 매크로/안전장치", lambda: _render_db_misc(db_metrics, metrics))
         lines += _section("16-1. 보유 포지션 — 브로커가 무엇을 들고 있다고 말했는가",
                           lambda: _render_positions(db_metrics))
         lines += _section("16-2. 포지션 원장 — 우리는 왜 들고 있다고 아는가",
@@ -2108,7 +2109,7 @@ def _minutes(seconds: float | None) -> float | None:
     return None if seconds is None else seconds / 60.0
 
 
-def _render_db_misc(db: dict) -> list[str]:
+def _render_db_misc(db: dict, log: dict | None = None) -> list[str]:
     macro = db.get("macro") or {}
     out = _table(
         ["컬럼", "non-null", "고유값"],
@@ -2125,8 +2126,16 @@ def _render_db_misc(db: dict) -> list[str]:
     if slack.get("available"):
         enabled = slack.get("enabled")
         label = {True: "**켜짐**", False: "**꺼짐**", None: "미설정(env 기본값)"}[enabled]
+        # 2026-08-26 (08-26 §1-17 / P1-5) — **토글 상태만으로는 절반이다.**
+        # 08-26에 이 줄이 「꺼짐」이라고 정확히 말했는데, 그날 실제로 **여덟 건이 버려졌다**는
+        # 사실은 어디에도 없었다. 「꺼져 있었다」와 「꺼져 있어서 N건을 잃었다」는 다른 문장이다.
+        # 축이 아예 없는 날(옛 로그)은 `None`이라 「0건」이 아니라 「셈 없음」으로 적는다(규약 C).
+        dropped = ((log or {}).get("qualitative") or {}).get("alert_suppressed_toggle_off")
+        dropped_note = (
+            f" · 오늘 버려진 경보 **{dropped}건**" if dropped is not None else " · 버려진 경보 셈 없음"
+        )
         out += [
-            f"- **Slack 경보 토글**: {label} ({slack.get('source')})",
+            f"- **Slack 경보 토글**: {label} ({slack.get('source')}){dropped_note}",
             "",
         ]
         if enabled is False:
@@ -2136,6 +2145,14 @@ def _render_db_misc(db: dict) -> list[str]:
                 "(08-14 §3-3이 그 구분 없이 전자로 진단했다).",
                 "",
             ]
+            if dropped:
+                out += [
+                    f"> ⛔ **오늘 {dropped}건이 그렇게 사라졌다.** `mahdi/notify.py`가 토글을 보고 "
+                    "버린 경보 수이고, 그 줄이 없던 08-26 이전에는 이 수를 아무도 셀 수 없었다. "
+                    "**Slack을 켜라는 뜻이 아니다**(2026-08-01 보류 결정 유지) — 「불렀는데 안 갔다」와 "
+                    "「안 불렀다」를 가르는 수다.",
+                    "",
+                ]
     rl = db.get("rate_limiter") or {}
     out += [
         f"- `rate_limiter_status_history` {rl.get('rows', 0):,}행 / 밀림 **{rl.get('overrun_rows', 0)}건** / "
@@ -2215,6 +2232,21 @@ def _render_order_notices(db: dict, log: dict) -> list[str]:
 
     **DB 축과 로그 축을 함께 읽는 절이다.** 통보 0건이 「체결이 없었다」인지 「스트림이 안
     붙었다」인지는 DB만 봐서는 못 가린다 — 둘 다 0행이다. 로그의 구독 성립 줄이 그 구분이다.
+
+    ===== 2026-08-26 (08-26 §1-16 / P1-6) — **그 지시를 코드가 안 따르고 있었다** =====
+
+    아래 조기 반환이 `not_configured and total == 0`만 보고 「구독하지 않았다」로 닫았다.
+    `subscribed`는 바로 위에서 **읽어 놓고 안 썼다.** 그래서 08-26에 **아홉 번 구독에
+    성공한** 통로를 정반대로 인쇄했다 — 위 독스트링이 *"구독 성립 줄이 그 구분이다"* 라고
+    적어 둔 바로 그 자리다.
+
+    08-24·08-25까지는 `subscribed = 0`이라 **분기가 우연히 옳았다.** 08-26 07:44 재기동으로
+    처음 「둘 다 참」인 날이 되면서 드러났다 — 그날 첫 기동에서 `KIS_HTS_ID`가 비어 경고가
+    한 건 났고, 사람이 값을 채워 재기동한 뒤 구독이 아홉 번 성립했다. **경고 줄은 재기동
+    이전의 사실이고, 지우지 않는다.**
+
+    ⚠ **`subscribed = 0 · not_configured = 1`인 날의 출력은 한 글자도 안 바뀌어야 한다** —
+    그것이 이 fix의 회귀 판정선이고 `tests/test_ops_report_order_notices.py`가 고정한다.
     """
     notices = db.get("order_notices")
     qualitative = (log or {}).get("qualitative") or {}
@@ -2229,7 +2261,9 @@ def _render_order_notices(db: dict, log: dict) -> list[str]:
     mismatched = notices.get("field_count_mismatched", 0)
     distribution = notices.get("field_count_distribution") or {}
 
-    if not_configured and total == 0:
+    # 2026-08-26 P1-6 — **`not subscribed`가 이 분기의 세 번째 조건이다.** 구독이 한 번이라도
+    # 성립했으면 통로는 열렸던 것이고, 그날 경고가 있었다는 사실은 아래 본문이 따로 말한다.
+    if not_configured and total == 0 and not subscribed:
         return [
             "- **체결통보를 구독하지 않았다** — `KIS_HTS_ID`가 비어 있다.",
             "",
@@ -2245,6 +2279,17 @@ def _render_order_notices(db: dict, log: dict) -> list[str]:
         f"- 필드 수 분포: {', '.join(f'`{k}개` {v}건' for k, v in sorted(distribution.items())) or '—'}",
         "",
     ]
+
+    # 2026-08-26 P1-6 — **둘 다 참인 날**(경고도 있었고 구독도 성립했다). 08-26이 그 첫 실물이다.
+    # 이 줄이 없으면 다음 사람이 위 「구독 성립 9회」와 로그의 미설정 경고를 나란히 보고
+    # 둘 중 하나가 틀렸다고 읽는다 — **둘 다 맞고, 시각이 다를 뿐이다.**
+    if not_configured and subscribed:
+        out += [
+            f"> ⚠ **오늘 기동 중 설정이 바뀌었다** — 첫 기동에서는 `KIS_HTS_ID`가 비어 경고 "
+            f"{not_configured}건이 났고, 재기동 후 구독이 {subscribed}회 성립했다. "
+            "**경고 줄은 재기동 이전의 사실이다.**",
+            "",
+        ]
 
     if total == 0:
         out += [

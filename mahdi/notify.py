@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 
 import httpx
@@ -28,12 +29,74 @@ _LEVEL_ICON = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "🚨"}
 
 _queue: asyncio.Queue[str] | None = None
 
+# ===== 2026-08-26 (08-26 §1-17 / P1-5) — **꺼진 스위치가 여덟 번 조용히 버렸다** =====
+#
+# 08-26에 워치독이 DEGRADED를 77분 연속 발령했고 `liveness.ALERT_COOLDOWN_SECONDS=600`으로
+# `notify_sync(…, level="CRITICAL")`이 **8회 발동**했다(`.watchdog_state.json`의 `last_alert_at`이
+# 14:30:02 → 15:23:02으로 움직인 것이 증거다). 아래 두 함수의 `if not enabled: return`이
+# **로그 한 줄도 안 남기고** 그 8건을 전부 버렸다.
+#
+# 그 결과 그날 장후 회차는 「경보를 냈는데 안 갔다」와 「애초에 안 냈다」를 **구분할 방법이
+# 없었다.** 다음에 진짜로 사람을 불러야 할 때 같은 자리에서 같은 것을 못 가른다.
+#
+# ⛔ **Slack 토글을 켜는 것이 아니다.** `NEXT_TODO.md`의 「Slack 알림 — 2026-08-01 결정,
+# 보류 유지. **매 점검 보고서에서 다시 올리지 말 것**」은 그대로다(실거래 전환 검토 시점에
+# 자동으로 재검토 대상이 된다). **이 fix는 「안 울린 것」을 「안 울린 채 기록되는 것」으로
+# 바꿀 뿐이다.**
+#
+# 포맷을 상수로 두는 이유는 `mahdi/broker/rest_client.LOG_SLOW_CALL`과 같다 —
+# `mahdi/ops/log_metrics.py`가 이 문구를 부분문자열로 세고, 계약 테스트가 양쪽을 묶는다.
+LOG_ALERT_SUPPRESSED_TOGGLE_OFF = "알림 스킵(토글 꺼짐) — level=%s · %s"
+
+# level별 억제 창. 폭주 시 이 줄 자체가 소음이 되면 안 된다.
+#
+# ⚠ **억제해도 건수는 안 잃는다** — `mahdi/logutil.WarningThrottle`과 같은 규약으로 다음 줄에
+# 「최근 N초간 M건 추가 억제됨」을 붙이고, `log_metrics`가 그 M을 지표에 도로 더한다.
+# 억제가 지표를 먹으면 이 fix가 스스로를 눈멀게 한다(08-06 Fix#4가 그 자리에서 배운 것이다).
+#
+# ⚠ **일회성 스크립트에서는 이 딕셔너리가 사실상 무효다.** 워치독은 1분마다 **새 프로세스**로
+# 뜨므로 프로세스 메모리에 든 억제 상태가 매번 초기화된다 — 08-19 §4 Fix#1이 제안한 억제가
+# 정확히 그 이유로 「작동하지 않는다」로 기각됐다(`NEXT_TODO.md`의 「다시 올리지 말 것」).
+# **그쪽의 진짜 억제는 호출측의 `liveness.ALERT_COOLDOWN_SECONDS`(600초)다.**
+# 여기 억제는 장중 관측 루프(`notify()`)처럼 **한 프로세스가 오래 사는 경로**를 위한 것이다.
+_TOGGLE_OFF_LOG_WINDOW_SECONDS = 300.0
+_toggle_off_last_logged_at: dict[str, float] = {}
+_toggle_off_suppressed: dict[str, int] = {}
+
 
 def _get_queue() -> asyncio.Queue[str]:
     global _queue
     if _queue is None:
         _queue = asyncio.Queue()
     return _queue
+
+
+def _log_alert_dropped_by_toggle(message: str, level: str) -> None:
+    """토글이 꺼져 버려지는 경보를 **한 줄 남긴다.**
+
+    입력: 버려지는 메시지 본문과 레벨.
+    계산: 같은 레벨로 `_TOGGLE_OFF_LOG_WINDOW_SECONDS` 안에 이미 남겼으면 건수만 올리고
+         돌아간다. 다시 남길 차례가 되면 그동안 억제된 건수를 문구 끝에 붙인다.
+    해석: 상세 근거는 `LOG_ALERT_SUPPRESSED_TOGGLE_OFF` 위 주석.
+    실패 조건: 없다 — 이 함수는 예외를 던지지 않는다. 알림 경로의 로깅이 관측 루프를 죽이면
+              안 된다는 원칙은 `notify()` 본문과 같다.
+    """
+    now = time.monotonic()
+    last = _toggle_off_last_logged_at.get(level)
+    if last is not None and now - last < _TOGGLE_OFF_LOG_WINDOW_SECONDS:
+        _toggle_off_suppressed[level] = _toggle_off_suppressed.get(level, 0) + 1
+        return
+    suppressed = _toggle_off_suppressed.pop(level, 0)
+    _toggle_off_last_logged_at[level] = now
+    # 메시지를 통째로 싣지 않는다 — 경보 본문이 길면 이 줄이 로그를 덮는다.
+    body = message[:120]
+    if suppressed:
+        logger.info(
+            LOG_ALERT_SUPPRESSED_TOGGLE_OFF + " (최근 %.0f초간 %d건 추가 억제됨)",
+            level, body, _TOGGLE_OFF_LOG_WINDOW_SECONDS, suppressed,
+        )
+    else:
+        logger.info(LOG_ALERT_SUPPRESSED_TOGGLE_OFF, level, body)
 
 
 def notify(message: str, level: str = "INFO") -> None:
@@ -56,6 +119,8 @@ def notify(message: str, level: str = "INFO") -> None:
         logger.warning("Slack On/Off 설정 조회 실패 — 이번 알림 스킵", exc_info=True)
         return
     if not enabled:
+        # 2026-08-26 P1-5 — 조용히 버리지 않는다. 근거는 `LOG_ALERT_SUPPRESSED_TOGGLE_OFF` 주석.
+        _log_alert_dropped_by_toggle(message, level)
         return
 
     icon = _LEVEL_ICON.get(level, "")
@@ -89,6 +154,10 @@ def notify_sync(message: str, level: str = "INFO") -> None:
         logger.warning("Slack On/Off 설정 조회 실패 — 이번 알림 스킵", exc_info=True)
         return
     if not enabled:
+        # 2026-08-26 P1-5 — 08-26에 여덟 건이 정확히 이 자리에서 사라졌다(워치독 CRITICAL).
+        # ⚠ 워치독은 1분마다 새 프로세스라 위 억제 딕셔너리가 이 경로에서는 무효다 —
+        #   그쪽의 억제는 호출측 `liveness.ALERT_COOLDOWN_SECONDS`(600초)가 이미 하고 있다.
+        _log_alert_dropped_by_toggle(message, level)
         return
 
     icon = _LEVEL_ICON.get(level, "")

@@ -1226,3 +1226,56 @@ def test_the_fill_lookup_matches_across_the_padding_difference():
     assert _Fake().get_order_fill_status("0000007047")["state"] == rc.OrderState.FILLED.value
     # 다른 주문번호는 여전히 못 찾아야 한다 — 정규화가 서로 다른 주문을 뭉개면 안 된다.
     assert _Fake().get_order_fill_status("0000007048")["state"] == rc.OrderState.PENDING.value
+
+
+# ===== 2026-08-26 (08-26 §1-12 / P1-4) — 창 집계가 `p50 ÷ timeout`을 판정할 재료 =====
+
+
+def _latency_client() -> KISRestClient:
+    return KISRestClient(
+        _settings(),
+        _token_daemon(),
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+        min_request_interval=0.0,
+    )
+
+
+def test_drain_reports_the_read_timeout_that_was_actually_on_the_call():
+    """엔드포인트마다 read 타임아웃이 다르다 — **라벨만으로는 역산할 수 없다.**
+
+    그 값이 없으면 창 집계 자리에서 `p50 ÷ timeout` 판정을 못 한다. 08-26에 그것이 없어서
+    절벽의 선행 신호(13:44 0.89배)가 로그 어디에도 안 남았다.
+    """
+    client = _latency_client()
+    client._record_http_latency("https://x/uapi/domestic-futureoption/v1/quotations/inquire-price", 0.5)
+    client._record_http_latency("https://x/uapi/domestic-futureoption/v1/trading/inquire-balance", 0.5)
+
+    stats = client.drain_http_latency()
+    assert stats["inquire-price"]["timeout"] == 4.0
+    # 잔고는 08-05 Fix#2가 따로 늘려 둔 자리다 — 전역값과 다르다는 사실 자체가 요점이다.
+    assert stats["inquire-balance"]["timeout"] > 4.0
+
+
+def test_drain_counts_censored_calls_with_the_same_inequality_as_the_offline_parser():
+    """검열은 「타임아웃 **이상** 걸린 호출」이다.
+
+    `log_metrics._censored_metrics`가 오프라인에서 쓰는 부등호(`http >= read_timeout`)와
+    같아야 한다 — 두 축이 갈리면 장중 판정과 장후 판정이 어긋나고, 그때 사람은 어느 쪽을
+    믿을지 모른다.
+    """
+    client = _latency_client()
+    url = "https://x/uapi/domestic-futureoption/v1/quotations/inquire-price"
+    for seconds in (0.02, 3.99, 4.00, 4.06):
+        client._record_http_latency(url, seconds)
+
+    row = client.drain_http_latency()["inquire-price"]
+    assert row["n"] == 4
+    assert row["censored"] == 2  # 4.00과 4.06 — 3.99는 아니다
+
+
+def test_drain_still_empties_itself():
+    """하루치를 들고 있으면 12,852개 표본이 쌓인다 — 비우는 성질이 안 깨져야 한다."""
+    client = _latency_client()
+    client._record_http_latency("https://x/uapi/domestic-futureoption/v1/quotations/inquire-price", 1.0)
+    assert client.drain_http_latency()
+    assert client.drain_http_latency() == {}

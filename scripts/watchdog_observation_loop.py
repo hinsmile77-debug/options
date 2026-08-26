@@ -208,10 +208,29 @@ def _read_state() -> dict | None:
         return None
 
 
+# ===== 2026-08-26 (08-26 §1-5 / P2-2) — **파일이 자기가 무엇을 담는지 말하게 한다** =====
+#
+# 08-26에 두 회차가 이 파일의 `date`를 「오늘 워치독이 돌았는가」로 읽어 오독했다.
+# **문제는 파일이 아니라 읽는 쪽이 그 뜻을 몰랐다는 것이다** — 그날 이 파일은 필요할 때
+# 정확히 갱신됐다(14:10 첫 DEGRADED). 「오늘 돌았는가」는 `.watchdog_last_check.json`이 답한다.
+#
+# **권고 (나)를 유지한다 — 정상일 때도 쓰지 않는다.** 매 회차 쓰면 이 파일의 `date`가 「오늘」이
+# 되어 「이상이 있었던 마지막 날」이라는 정보가 통째로 사라진다. 대신 **키 하나로 뜻을 적는다.**
+#
+# 고도화 3이 정리한 형태의 3번 사례이고, 그 규약(「경고를 내는 코드는 그 경고가 참이기 위한
+# 조건을 전부 검사하거나, 검사하지 않는 조건을 문구 안에 적는다」)의 후자 쪽 적용이다.
+_STATE_NOTE = (
+    "이상(DEGRADED/RESTART)이 있었던 마지막 회차의 상태다. "
+    "오늘 워치독이 돌았는지는 .watchdog_last_check.json을 본다"
+)
+
+
 def _write_state(state: dict) -> None:
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        # `note`를 **먼저** 넣어 호출측이 넘긴 키를 덮지 않게 한다(같은 이름이 오면 그쪽이 이긴다).
+        payload = {"note": _STATE_NOTE, **state}
+        STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 

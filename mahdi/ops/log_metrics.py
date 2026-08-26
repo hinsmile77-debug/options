@@ -359,6 +359,12 @@ _QUALITATIVE_MARKERS = {
     #   가장 위험한 상태다.
     "order_notice_not_configured": "체결통보를 구독하지 않는다",
     "order_notice_stream_down": "체결통보 스트림 끊김",
+    # 2026-08-26 (08-26 §1-2 / P1-1) — **사건의 끝.** 끊김 줄만 있고 붙은 줄이 없으면
+    # 「한 번 끊기고 붙은 것」과 「10분째 못 붙는 것」이 같은 문구다. 이 축이 그 둘을 가른다.
+    # ⚠ **`order_notice_stream_down`과 나란히 읽는다** — 끊김 N건에 재연결 N건이면 전부
+    # 회복된 하루이고, 재연결이 하나 모자라면 **그 마지막 사건이 안 닫혔다.**
+    # 포맷 원본: `mahdi.main.LOG_ORDER_NOTICE_RECONNECTED`
+    "notice_stream_reconnect": "체결통보 재연결 성립",
     # ===== 2026-08-23 (실행 배선 ③) — 주문 =====
     #
     # `db.orders`(건수)와 나란히 읽는다. **DB가 답 못 하는 것을 이쪽이 답한다:** 주문 0건이
@@ -399,7 +405,50 @@ _QUALITATIVE_MARKERS = {
     #
     # 포맷 원본: `mahdi.main.LOG_ENTRY_NO_CANDIDATE`
     "entry_no_candidate": "진입 판단은 섰는데 살 종목이 없다",
+    # ===== 2026-08-26 (08-26 §1-17 / P1-5) — **경보를 보내려 했는데 스위치가 꺼져서 버렸다** =====
+    #
+    # 08-26에 워치독이 DEGRADED 77분 동안 CRITICAL 경보를 **8회** 냈고, `mahdi/notify.py`의
+    # `if not enabled: return`이 **로그 한 줄도 안 남기고** 전부 버렸다. 그래서 그날 장후
+    # 회차는 「경보를 냈는데 안 갔다」와 「애초에 안 냈다」를 구분할 수 없었다.
+    #
+    # ⛔ **Slack 토글은 켜지 않는다**(2026-08-01 보류 결정 유지). 이 축이 재는 것은
+    # 「울렸는가」가 아니라 **「울리려 한 것이 몇 건인가」**다.
+    #
+    # 포맷 원본: `mahdi.notify.LOG_ALERT_SUPPRESSED_TOGGLE_OFF`
+    "alert_suppressed_toggle_off": "알림 스킵(토글 꺼짐)",
+    # ===== 2026-08-26 (08-26 §1-7 / P2-3) — **체결 분류가 추정치였던 분** =====
+    #
+    # `mahdi.main`이 거래소 누적 필드를 못 받거나 자기검증에 실패하면 틱 룰 추정으로 폴백한다.
+    # 08-26에 46건, 08-25에 56건 났는데 **어느 지표에도 그 수가 없었다** — 장후 회차가 이틀치
+    # 로그를 손으로 훑어서야 알았고, 로그는 이틀치만 남으므로 그 확인은 그날이 마지막이었다.
+    #
+    # ⛔ **이상점이 아니다 — 만성이다.** 이 축은 세기만 한다. 0이 아닌 것 자체는 적신호가 아니고,
+    # 봐야 하는 것은 **전일 대비 급증**이다.
+    #
+    # 포맷 원본: `mahdi.main`의 「체결 분류: … 틱 룰 추정으로 폴백」
+    "tick_rule_fallback": "틱 룰 추정으로 폴백",
+    # ===== 2026-08-26 (08-26 §1-12 / P1-4) — **절벽의 선행 지표를 프로그램이 먼저 본다** =====
+    #
+    # 08-26에 `p50 ÷ read timeout`이 13:44 0.89(경고선) → 14:04 1.01(제한시간 추월)로 갔고
+    # 14:01~15:25는 85분 연속 rows=0이었다. 프로그램은 그 값을 창마다 계산하면서 **문턱을
+    # 갖고 있지 않았다** — 사람이 15:46 TSV로 표를 만들어야만 보였다(예고에서 확정까지 122분).
+    #
+    # ⚠ 이 줄은 등급에 따라 WARNING/ERROR로 갈린다. **레벨을 계측의 정체성으로 쓰지 않는다** —
+    # 08-04에 WARNING→INFO 강등으로 362건이 0건으로 보고된 그 자리다.
+    #
+    # 포맷 원본: `mahdi.main.LOG_REST_LATENCY_PRESSURE`
+    "rest_latency_pressure": "지연 경고선 돌파",
 }
+
+# ===== 2026-08-26 P1-5 — **억제된 건수를 지표에 도로 더한다** =====
+#
+# 아래 마커의 줄은 `mahdi/logutil.WarningThrottle`과 같은 규약으로 「최근 N초간 M건 추가
+# 억제됨」을 꼬리에 붙인다. 그 M을 안 세면 **억제가 곧 지표가 된다** — 억제 정책을 바꾸는
+# 순간 이 축이 조용히 움직이고, 그때 사람은 사건이 준 것으로 읽는다.
+#
+# 08-06 Fix#4가 예외 유형 축에서 정확히 같은 것을 고쳤다(실제 205건이 126건으로 보고됐다).
+# 그쪽은 트레이스백 생략 줄에만 걸려 있어 일반 마커에는 안 닿는다 — 여기가 그 확장이다.
+_QUALITATIVE_THROTTLED = frozenset({"alert_suppressed_toggle_off"})
 
 # ===== 2026-08-23 — **0을 인쇄해야 하는 마커** =====
 #
@@ -423,6 +472,9 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 인쇄돼야 검정된다**(`2026-08-23-wiring2-notice-stream-says-why-it-is-silent`).
     "order_notice_subscribed", "order_notice_received",
     "order_notice_not_configured", "order_notice_stream_down",
+    # 2026-08-26 P1-1 — **끊김이 0건인 날의 재연결 0건이 이 축의 정상값이다.** 키가 없으면
+    # 「안 끊겼다」와 「그 줄이 없던 버전」이 같은 빈칸으로 보인다(규약 C).
+    "notice_stream_reconnect",
     # 2026-08-23 (실행 배선 ③) — 08-24 예측이 「제출 0 · 미제출 N」이라 **0이 인쇄돼야
     # 검정된다**(`2026-08-23-wiring3-code-is-wired-but-config-still-blocks`).
     "order_submitted", "order_blocked", "order_state_changed",
@@ -440,6 +492,16 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 기각 0건인 날 키가 없으면 그 칸이 「셈 없음」으로 인쇄돼, 진짜 0(기각할 것이 없었다)과
     # 옛 로그가 섞인다.
     "gamma_flip_out_of_leg_range",
+    # 2026-08-26 P1-5 — **0이 인쇄돼야 「안 울렸다」와 「안 셌다」가 갈린다.** 경보가 한 건도
+    # 안 난 날이 흔하고, 그런 날 키가 없으면 이 축이 있는지 없는지 다음 사람이 매번 다시
+    # 확인해야 한다. 08-26 기준선은 8건이다.
+    "alert_suppressed_toggle_off",
+    # 2026-08-26 P2-3 — 만성이라 0인 날이 드물지만, **0인 날이야말로 이 키가 필요하다**:
+    # 폴백이 사라진 날과 그 줄이 없던 버전이 같은 0으로 보이면 안 된다(규약 C).
+    "tick_rule_fallback",
+    # 2026-08-26 P1-4 — **평온한 날의 0이 이 축의 정상값이다.** 키가 없으면 「돌파가 없었다」와
+    # 「문턱이 없던 버전」이 섞이고, 그러면 다음 절벽 날에 「전에는 안 났었다」를 못 말한다.
+    "rest_latency_pressure",
 )
 # 예외 유형은 트레이스백 마지막 줄(`모듈.예외명: 메시지`)만 센다 — 사건 1건 = 1줄이 보장된다.
 #
@@ -736,6 +798,14 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
         for key, marker in _QUALITATIVE_MARKERS.items():
             if marker in line:
                 qualitative[key] += 1
+                # 2026-08-26 P1-5 — 이 줄이 「그동안 억제된 M건」을 실었으면 그 M도 센다.
+                # 억제된 건들은 로그에 줄이 아예 없어, 이 숫자가 유일한 흔적이다.
+                if key in _QUALITATIVE_THROTTLED:
+                    m = _THROTTLE_SUPPRESSED_RE.search(line)
+                    if m:
+                        extra = int(m.group(1))
+                        qualitative[key] += extra
+                        qualitative_suppressed[key] += extra
         for key, prefix in _EXCEPTION_PREFIXES.items():
             if line.startswith(prefix):
                 qualitative[key] += 1

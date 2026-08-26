@@ -45,7 +45,15 @@ def _encrypt(plaintext: str, key: str = _KEY, iv: str = _IV) -> str:
 def _settings(**overrides) -> KISSettings:
     defaults = dict(KIS_APP_KEY="k", KIS_APP_SECRET="s", KIS_ACCOUNT_NO="12345678", KIS_ENV="vps")
     defaults.update(overrides)
-    return KISSettings(**defaults)
+    # 2026-08-26 — **`.env`를 끊고 만든다.** `KISSettings`는 `env_file=PROJECT_ROOT/.env`를
+    # 읽으므로, 여기서 안 넘긴 키가 **그 PC의 `.env`에서 조용히 채워진다.**
+    #
+    # 08-26 장전에 사람이 `.env`에 `KIS_HTS_ID`를 넣자 아래
+    # `test_missing_hts_id_yields_none_so_the_caller_can_warn_instead_of_crashing`이
+    # **그 PC에서만** 붉어졌다(다른 PC에서는 여전히 통과한다). 테스트가 재는 것은 「HTS ID가
+    # 없을 때의 동작」인데, 실제로 재고 있던 것은 「이 PC의 `.env`에 그 키가 있는가」였다.
+    # 멀티 PC에서 같은 커밋이 다른 결과를 내는 형태이고, 그것은 계측이 아니라 우연이다.
+    return KISSettings(_env_file=None, **defaults)
 
 
 def test_subscription_ack_keeps_the_cipher_material_it_used_to_throw_away():

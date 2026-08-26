@@ -1119,3 +1119,109 @@ def test_the_new_event_markers_report_zero_instead_of_disappearing():
     qualitative = _parse(_emit("mahdi.main", "INFO", "아무 상관 없는 줄"))["qualitative"]
     for key in ("expiry_burst_done", "member_axis_exit", "member_axis_return", "regime_warmup_end"):
         assert qualitative[key] == 0
+
+
+# ===== 2026-08-26 (08-26 제4부 P1-1·P1-4·P1-5·P2-3·P2-4) — 오늘 새로 생긴 네 축 =====
+
+
+def test_alert_dropped_by_toggle_is_counted():
+    """08-26 §1-17 — CRITICAL 경보 **8건**이 이 줄이 없어서 통째로 사라졌다.
+
+    ⛔ Slack 토글을 켜는 것이 아니다(2026-08-01 보류 결정 유지) — 이 축이 재는 것은
+    「울렸는가」가 아니라 **「울리려 한 것이 몇 건인가」**다.
+    """
+    from mahdi import notify
+
+    line = _emit(
+        "mahdi.notify", "INFO", notify.LOG_ALERT_SUPPRESSED_TOGGLE_OFF,
+        "CRITICAL", "관측 루프 적재 정지(no_ingest) — 77분째",
+    )
+    assert _parse(line)["qualitative"]["alert_suppressed_toggle_off"] == 1
+
+
+def test_alert_dropped_by_toggle_adds_back_the_suppressed_ones():
+    """**억제가 지표를 먹으면 안 된다** — 08-06 Fix#4가 예외 축에서 고친 것과 같은 자리다.
+
+    억제된 건들은 로그에 줄이 아예 없어, 꼬리의 숫자가 유일한 흔적이다.
+    """
+    from mahdi import notify
+
+    line = _emit(
+        "mahdi.notify", "INFO",
+        notify.LOG_ALERT_SUPPRESSED_TOGGLE_OFF + " (최근 %.0f초간 %d건 추가 억제됨)",
+        "CRITICAL", "관측 루프 적재 정지(no_ingest)", 300.0, 7,
+    )
+    metrics = _parse(line)
+    assert metrics["qualitative"]["alert_suppressed_toggle_off"] == 8  # 줄 1 + 억제 7
+    assert metrics["qualitative_suppressed"]["alert_suppressed_toggle_off"] == 7
+
+
+def test_tick_rule_fallback_line_is_counted():
+    """08-26 §1-7 — 하루 46건(08-25 56건)인데 **어느 지표에도 그 수가 없었다.**"""
+    line = _emit("mahdi.main", "WARNING", main.LOG_VOLUME_SOURCE_TICK_RULE, "201V06")
+    assert _parse(line)["qualitative"]["tick_rule_fallback"] == 1
+
+
+@pytest.mark.parametrize("level", ["WARNING", "ERROR"])
+def test_latency_pressure_line_is_counted_regardless_of_log_level(level: str):
+    """이 줄은 등급에 따라 WARNING/ERROR로 갈린다 — **레벨은 계측의 정체성이 아니다.**
+
+    08-04에 WARNING→INFO 강등으로 362건이 0건으로 보고된 그 자리와 같은 형태의 위험이다.
+    """
+    line = _emit(
+        "mahdi.main", level, main.LOG_REST_LATENCY_PRESSURE,
+        "inquire-price", 3.56, 4.0, 0.89, "32건(71%)", 45,
+    )
+    assert _parse(line)["qualitative"]["rest_latency_pressure"] == 1
+
+
+def test_latency_pressure_warn_ratio_matches_the_parser_side():
+    """복제본이 조용히 갈라지면 장중 판정과 장후 판정이 어긋난다.
+
+    `main`은 `mahdi.ops`를 임포트하지 않는다(런타임/분석층 분리) — 그래서 복제하고
+    **이 테스트가 두 값을 묶는다**. `PRIORITY_SERIES_LABEL`이 이미 쓰는 규약이다.
+    """
+    assert main.REST_LATENCY_PRESSURE_WARN_RATIO == log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN
+
+
+def test_latency_pressure_endpoint_matches_the_report_side():
+    """판정 대상 엔드포인트가 리포트 §9-2와 같아야 한다 — 다르면 두 표가 다른 것을 말한다."""
+    from mahdi.ops import report
+
+    assert main.REST_LATENCY_PRESSURE_ENDPOINT == report._CHAIN_ENDPOINT
+
+
+def test_stream_down_line_survives_the_new_tail():
+    """P2-4 — 괄호 안이 `연속 N회 · 오늘 M회`로 바뀌어도 **같은 축으로 세어져야 한다.**
+
+    로그는 이틀치만 남는다. 문구를 바꾸느라 그 이틀을 「못 쟀다」로 만들면 꼬리표의 대가가
+    지표 손실이 된다(`_PRIORITY_LABEL` 개명과 같은 규약).
+    """
+    line = _emit(
+        "mahdi.main", "WARNING", main.LOG_ORDER_NOTICE_STREAM_DOWN,
+        "ConnectionClosedError: 1000", 2.0, 1, 8,
+    )
+    assert _parse(line)["qualitative"]["order_notice_stream_down"] == 1
+
+
+def test_stream_reconnect_line_is_counted():
+    """P1-1 — **사건의 끝.** 이 줄이 없으면 무통보 구간이 2초인지 10분인지 모른다."""
+    line = _emit(
+        "mahdi.main", "INFO", main.LOG_ORDER_NOTICE_RECONNECTED,
+        2.0, 8, "14:00:01", "14:00:03",
+    )
+    assert _parse(line)["qualitative"]["notice_stream_reconnect"] == 1
+
+
+def test_the_2026_08_26_markers_report_zero_instead_of_disappearing():
+    """**0건인 날에도 키가 남아야 한다** — 네 축 전부가 가설의 주장·대가 지표다.
+
+    경보가 0건인 날, 돌파가 0건인 날, 끊김이 0건인 날이 전부 흔하다. 그런 날 키가 없으면
+    「그 사건이 없었다」와 「그 줄이 없던 버전」이 같은 빈칸으로 보인다(규약 C).
+    """
+    qualitative = _parse(_emit("mahdi.main", "INFO", "아무 상관 없는 줄"))["qualitative"]
+    for key in (
+        "alert_suppressed_toggle_off", "tick_rule_fallback",
+        "rest_latency_pressure", "notice_stream_reconnect",
+    ):
+        assert qualitative[key] == 0

@@ -655,6 +655,53 @@ LOG_ATM_ROLL = "ATM 롤링: 스팟 %.2f — 행사가 %s → %s"
 LOG_WINDOW_STUCK = "창 고착 의심: %s — 임계 초과 거리가 다음 사이클에도 줄지 않음(롤링 미동작)"
 LOG_REST_LATENCY = "REST 응답시간(%.0f초 창): %s"
 
+# ===== 2026-08-26 (08-26 §1-12 / P1-4) — **절벽의 선행 지표를 사람의 표가 아니라 프로그램이 본다** =====
+#
+# 08-26에 옵션체인 적재가 13:40부터 무너져 **14:01~15:25는 85분 연속 rows=0**이었다.
+# 그 선행 신호는 `p50 ÷ read timeout`이고, 창 단위로 이렇게 갔다:
+#   13:34 **0.74** → 13:44:45 **0.89**(경고선) → 14:04 **1.01**(제한시간 추월) → 14:34 **1.18**
+#
+# **프로그램은 이 값을 창마다 계산할 재료를 다 갖고 있으면서 문턱을 갖고 있지 않았다.**
+# 로그 어디에도 그 사실이 없어, 사람이 15:46 지표와 TSV로 표를 만들어야만 보였다 —
+# 예고(13:44)에서 확정(15:46)까지 **122분**. 그 줄이 13:44:45에 찍혔다면 회복(15:26)까지
+# **102분을 예고로 갖고 있었을 것이다.**
+#
+# ⚠ **임계를 새로 정하지 않았다.** 0.8은 08-14 §2-2 / Fix#3이 정한 값이고
+# (`log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN`), 자동 리포트 §9-2와 증거 수집기가
+# 이미 그것으로 판정한다. **없던 것은 계측도 임계도 아니라 「장중에 그 값을 보는 자리」다** —
+# 08-25 P1-1(p95가 장중 회차에 닿는다)과 정확히 같은 형태의 결핍이다.
+#
+# ⚠ **호출수를 같은 줄에 싣는다.** 08-26에 창당 호출이 90건대 → 45건으로 반토막 났고,
+# 그것 없이는 「검열 32건(71%)」이 무엇의 71%인지 모른다.
+#
+# ⚠ **레벨을 계측의 정체성으로 쓰지 않는다.** 이 줄은 등급에 따라 WARNING/ERROR로 갈리고,
+# `log_metrics.qualitative.rest_latency_pressure`는 **문구로만** 센다(08-04의 교훈).
+LOG_REST_LATENCY_PRESSURE = (
+    "지연 경고선 돌파 — %s p50 %.2f초 ÷ 제한 %.2f초 = %.2f배 · 이 창 검열 %s · 호출 %d건"
+)
+
+# 이 판정에 쓰는 엔드포인트. 옵션체인 수집이 이 엔드포인트로 20레그를 순차로 돈다 —
+# 중앙값 호출이 타임아웃되면 그 사이클의 기대 성공 수가 0에 수렴하고, 수집은 **느려지는 것이
+# 아니라 비어 버린다.** `mahdi/ops/report._CHAIN_ENDPOINT`와 같은 값이고 계약 테스트가 묶는다.
+REST_LATENCY_PRESSURE_ENDPOINT = "inquire-price"
+
+# 경고선 배율의 **복제본**이다(`mahdi/ops/log_metrics.REST_LATENCY_P50_TIMEOUT_RATIO_WARN`).
+#
+# 이 모듈은 `mahdi.ops`를 임포트하지 않는다 — 런타임(main)과 분석층(ops)을 가르는 이 저장소의
+# 규약이고, `log_metrics`가 `mahdi.broker`를 안 부르는 것과 같은 방향이다. 그래서 복제하되
+# **계약 테스트가 두 값의 일치를 강제한다**(`tests/test_ops_log_metrics_contract.py`).
+# 복제 자체가 위험한 게 아니라 **복제가 조용히 갈라지는 것**이 위험하다.
+# 0.8의 근거는 08-14 §2-2 / Fix#3 — 그날 13:36 창의 p50이 타임아웃의 0.77배였고 24분 뒤 절벽이 왔다.
+REST_LATENCY_PRESSURE_WARN_RATIO = 0.8
+
+# 같은 등급이 이어지는 동안의 재인쇄 간격. **등급이 바뀌는 순간은 억제하지 않는다.**
+#
+# 창 자체가 5분(`REST_LATENCY_SNAPSHOT_SECONDS`)이라 이 값이 5분이면 부동소수 오차로 창이
+# 걸렀다 통과했다 한다 — 그래서 창보다 짧은 4분으로 두고, 결과적으로 **「등급 전환 시 1줄 +
+# 5분마다 1줄」**이 된다. 08-26처럼 돌파 창이 22개인 날에도 22줄이고, 대가 축의 상한(하루
+# 30줄)이 그것을 감시한다. **30줄을 넘는 날은 억제가 안 듣는 것이다.**
+REST_LATENCY_PRESSURE_REPEAT_SECONDS = 240.0
+
 # 2026-08-05 — 이벤트 캘린더 미기입 경고.
 #
 # 수기 테이블(`mahdi/config/event_calendar.yaml`)의 실패 모드는 "안 채우는 것"이 아니라
@@ -1796,6 +1843,17 @@ async def run_observation_loop_forever(
 # 종목별로 "지금 어느 분류를 쓰고 있는가"를 한 번씩만 알린다. 매 봉 찍으면 로그가 묻히고,
 # 아예 안 찍으면 **추정으로 떨어진 사실이 어디에도 안 남는다** — 08-19에 워치독이 청소를 조용히
 # 건너뛰던 것과 같은 형태의 침묵이다.
+#
+# 2026-08-26 (08-26 §1-7 / P2-3) — **포맷을 상수로 끌어올린다.** 그 줄이 하루 몇 건인지가
+# 어느 지표에도 없어서 08-26 장후 회차가 이틀치 로그를 손으로 훑어야 했다(08-25 56건 ·
+# 08-26 46건 — **어제가 더 많다. 만성이다**). 이제 `log_metrics`의
+# `qualitative.tick_rule_fallback`이 이 문구를 세고, 계약 테스트가 양쪽을 묶는다.
+# ⛔ **이상점으로 올리지 않는다.** 세기만 한다 — 봐야 하는 것은 전일 대비 급증이다.
+LOG_VOLUME_SOURCE_EXCHANGE = "체결 분류: %s — 거래소 누적값 사용"
+LOG_VOLUME_SOURCE_TICK_RULE = (
+    "체결 분류: %s — **틱 룰 추정으로 폴백**(거래소 누적 필드 없음 또는 자기검증 실패). "
+    "이 구간의 CVD는 추정치다."
+)
 _volume_source_seen: dict[str, str] = {}
 
 
@@ -1811,13 +1869,9 @@ def _log_volume_source(symbol: str, source: str) -> None:
         return
     _volume_source_seen[symbol] = source
     if source == "exchange":
-        logger.info("체결 분류: %s — 거래소 누적값 사용", symbol)
+        logger.info(LOG_VOLUME_SOURCE_EXCHANGE, symbol)
     else:
-        logger.warning(
-            "체결 분류: %s — **틱 룰 추정으로 폴백**(거래소 누적 필드 없음 또는 자기검증 실패). "
-            "이 구간의 CVD는 추정치다.",
-            symbol,
-        )
+        logger.warning(LOG_VOLUME_SOURCE_TICK_RULE, symbol)
 
 
 def _optional_float(fields: list[str], index: int) -> float | None:
@@ -2557,9 +2611,16 @@ async def poll_rest_latency_snapshot(
          바꾸면 폴링이 줄어 지연이 낮아지고 다시 폴링이 늘어나는 되먹임이 생긴다. 2026-07-08에
          페이서를 나눴다가 500 폭주로 203분을 잃은 전례가 있다 — **먼저 며칠 재고, 규칙은
          사람이 발동한다.**
+         2026-08-26(08-26 §1-12 / P1-4): 같은 창에서 **`p50 ÷ read timeout`을 그 자리에서
+         판정한다.** 상세 근거는 `LOG_REST_LATENCY_PRESSURE` 위 주석.
+         ⛔ **여전히 자동 적응은 없다** — 이 fix가 하는 일은 사람 앞에 놓는 것까지다.
     실패 조건: 표본이 없으면(그 창에 호출이 없었으면) 아무 줄도 남기지 않는다 — 장전/장후에
               매 5분 빈 줄을 찍지 않기 위함.
     """
+    # 2026-08-26 P1-4 — 마지막으로 인쇄한 등급과 그 시각(단조시계). 등급이 바뀌면 즉시 찍고,
+    # 같은 등급이 이어지면 `REST_LATENCY_PRESSURE_REPEAT_SECONDS`마다 한 번만 찍는다.
+    pressure_grade: str | None = None
+    pressure_logged_at: float | None = None
     while True:
         await asyncio.sleep(interval_seconds)
         try:
@@ -2575,6 +2636,58 @@ async def poll_rest_latency_snapshot(
             for endpoint, s in sorted(stats.items(), key=lambda kv: kv[1]["n"], reverse=True)
         )
         logger.info(LOG_REST_LATENCY, interval_seconds, body)
+        pressure_grade, pressure_logged_at = _log_rest_latency_pressure(
+            stats, pressure_grade, pressure_logged_at,
+        )
+
+
+def _log_rest_latency_pressure(
+    stats: dict[str, dict],
+    last_grade: str | None,
+    last_logged_at: float | None,
+) -> tuple[str | None, float | None]:
+    """창 집계에서 `p50 ÷ read timeout`이 경고선을 넘었는지 **그 자리에서** 판정한다.
+
+    입력: `drain_http_latency()`의 반환값 · 직전에 인쇄한 등급과 그 시각(`time.monotonic()`).
+    반환: 이번 창의 (등급, 마지막 인쇄 시각). 등급이 `None`이면 안전한 창이다.
+    계산: 옵션체인 엔드포인트의 p50을 그 호출에 실제로 걸려 있던 read timeout으로 나눈다.
+         `>= 1.0`이면 ERROR(중앙값 호출이 타임아웃을 넘겼다), `>= 0.8`이면 WARNING.
+    해석: 상세 근거는 `LOG_REST_LATENCY_PRESSURE` 위 주석. **판정만 하고 아무것도 안 바꾼다.**
+    실패 조건: 그 창에 옵션체인 호출이 없거나 타임아웃 값을 못 구하면 조용히 지나간다 —
+              **없는 것을 0으로 찍지 않는다**(규약 C). 이 함수는 예외를 던지지 않는다.
+    """
+    row = stats.get(REST_LATENCY_PRESSURE_ENDPOINT)
+    if not row:
+        return None, last_logged_at
+    timeout = row.get("timeout")
+    if not timeout:
+        return None, last_logged_at
+    ratio = row["p50"] / timeout
+    if ratio >= 1.0:
+        grade, level = "위험", logging.ERROR
+    elif ratio >= REST_LATENCY_PRESSURE_WARN_RATIO:
+        grade, level = "경고", logging.WARNING
+    else:
+        # 안전한 창으로 내려오면 등급을 푼다 — 다음에 다시 올라갈 때 그것이 「전환」이 된다.
+        return None, last_logged_at
+
+    now = time.monotonic()
+    if grade == last_grade and last_logged_at is not None:
+        if now - last_logged_at < REST_LATENCY_PRESSURE_REPEAT_SECONDS:
+            return grade, last_logged_at
+
+    # 검열 건수는 「안 셌다」와 「0건」을 가른다(규약 C) — 못 세는 창은 `—`다.
+    censored, calls = row.get("censored"), row["n"]
+    if censored is None:
+        censored_text = "셈 없음"
+    else:
+        pct = censored / calls * 100 if calls else 0.0
+        censored_text = f"{censored}건({pct:.0f}%)"
+    logger.log(
+        level, LOG_REST_LATENCY_PRESSURE,
+        REST_LATENCY_PRESSURE_ENDPOINT, row["p50"], timeout, ratio, censored_text, calls,
+    )
+    return grade, now
 
 
 async def poll_ws_heartbeat(
@@ -5326,7 +5439,65 @@ def _submit_entry_order(
 # 실제로 그 대가를 치렀다(재연결 폭주). 지수적으로 늘리고 상한을 둔다.
 ORDER_NOTICE_RECONNECT_DELAYS = (2.0, 5.0, 15.0, 30.0, 60.0)
 
-LOG_ORDER_NOTICE_STREAM_DOWN = "체결통보 스트림 끊김 — %s. %.0f초 뒤 재연결한다(누적 %d회)"
+# ===== 2026-08-26 (08-26 §1-9 / P2-4) — **한 이름이 두 수를 가리키고 있었다** =====
+#
+# 종전 문구는 `누적 %d회`인데 그 자리에 들어가던 `failures`는 **연결이 성립할 때마다 0으로
+# 리셋되는 값**이다 — 즉 실제로는 「연속」인데 「누적」이라 인쇄하고 있었다. 08-26에 끊김이
+# 8건 났고 재연결이 8/8 매번 2초에 성립했으므로, 그날 이 자리는 내내 1이었다. 하루 8회라는
+# 사실은 **로그 줄을 세어야만** 알 수 있었다.
+#
+# ⚠ **부분문자열 「체결통보 스트림 끊김」은 그대로 둔다** — `log_metrics`가 그것으로 세고,
+# 로그는 이틀치만 남으므로 문구를 바꾸면 그 이틀이 「못 쟀다」가 된다. **괄호 안만 바꾼다.**
+#
+# ⚠ **이것은 임계 완화가 아니다.** 대가 임계(하루 5건)는 그대로다 — 임계를 다시 정하는 것은
+# 사람의 결정이고(장후 결정 14), 이 fix는 그 결정에 필요한 **재료**를 만든다.
+LOG_ORDER_NOTICE_STREAM_DOWN = (
+    "체결통보 스트림 끊김 — %s. %.0f초 뒤 재연결한다(연속 %d회 · 오늘 %d회)"
+)
+
+# ===== 2026-08-26 (08-26 §1-2 / P1-1) — **한 번 끊기고 붙은 것과 10분째 못 붙는 것** =====
+#
+# 종전에는 둘이 **같은 문구**였다. 끊김 줄만 있고 붙은 줄이 없으니, 무통보 구간이 2초인지
+# 10분인지 로그로는 알 수 없었다. 08-26의 끊김 8건이 전부 2초에 회복됐다는 사실도 사람이
+# 시각을 손으로 맞춰 봐서 알았다.
+#
+# 08-21 Fix#4(DEGRADED 사건의 시작과 끝)와 **같은 형태를 그대로 쓴다** — 그때 「같은 문구
+# 14줄」을 사건 하나로 접은 그 규약이다.
+#
+# ⚠ **매 재연결마다 찍으면 폭주 시 소음이 된다.** 하루 `ORDER_NOTICE_RECONNECT_QUIET_AFTER`
+# 건까지는 그대로 찍고, 그 뒤로는 5분에 한 줄로 억제한다.
+LOG_ORDER_NOTICE_RECONNECTED = (
+    "체결통보 재연결 성립 — 직전 끊김으로부터 %.0f초 · 오늘 누적 %d회 · 무통보 구간 [%s ~ %s]"
+)
+ORDER_NOTICE_RECONNECT_QUIET_AFTER = 5
+ORDER_NOTICE_RECONNECT_REPEAT_SECONDS = 300.0
+
+
+def _log_order_notice_reconnected(
+    down_since: datetime,
+    disconnects_today: int,
+    last_logged_at: float | None,
+) -> float | None:
+    """재연결이 성립한 순간 **무통보 구간을 닫는 줄**을 남긴다.
+
+    입력: 그 사건이 시작된 시각 · 오늘(프로세스 생애) 누적 끊김 수 · 직전 인쇄 시각(단조시계).
+    반환: 이번에 인쇄했으면 그 시각, 억제했으면 받은 값 그대로.
+    계산: 하루 `ORDER_NOTICE_RECONNECT_QUIET_AFTER`건까지는 그대로 찍고, 그 뒤로는
+         `ORDER_NOTICE_RECONNECT_REPEAT_SECONDS`에 한 줄로 억제한다.
+    해석: 상세 근거는 `LOG_ORDER_NOTICE_RECONNECTED` 위 주석. 08-21 Fix#4와 같은 형태다.
+    실패 조건: 없다 — 이 함수는 예외를 던지지 않는다.
+    """
+    now_wall = db.local_now()
+    gap = (now_wall - down_since).total_seconds()
+    now = time.monotonic()
+    if disconnects_today > ORDER_NOTICE_RECONNECT_QUIET_AFTER and last_logged_at is not None:
+        if now - last_logged_at < ORDER_NOTICE_RECONNECT_REPEAT_SECONDS:
+            return last_logged_at
+    logger.info(
+        LOG_ORDER_NOTICE_RECONNECTED,
+        gap, disconnects_today, down_since.strftime("%H:%M:%S"), now_wall.strftime("%H:%M:%S"),
+    )
+    return now
 
 
 async def poll_order_notice_stream(
@@ -5358,6 +5529,12 @@ async def poll_order_notice_stream(
     connector = connect or websockets.connect
     sessions = 0
     failures = 0
+    # 2026-08-26 P1-1·P2-4 — 「연속」과 「오늘」을 가른다. `failures`는 연결이 서면 0으로
+    # 리셋되므로 **연속**이고, 아래 둘이 프로세스 생애 누적과 무통보 구간을 붙든다.
+    # ⚠ 재기동하면 `disconnects_today`는 0으로 돌아간다 — 하루 총계는 그때부터 다시 센다.
+    disconnects_today = 0
+    down_since: datetime | None = None
+    reconnect_logged_at: float | None = None
     # 같은 수신 시각에 두 건이 오면 PK가 부딪친다. 마이크로초 해상도라 사실상 안 겹치지만,
     # 겹치는 날 **두 번째 통보가 첫 번째를 덮어쓴다** — 체결 한 건이 소리 없이 사라지는 형태다.
     last_stamp: datetime | None = None
@@ -5390,6 +5567,13 @@ async def poll_order_notice_stream(
                     on_notice=_persist, state=stream_state,
                 )
                 failures = 0
+                # 2026-08-26 P1-1 — **사건의 끝이다.** 여기서 안 찍으면 무통보 구간이 2초인지
+                # 10분인지 로그로는 알 수 없다. 상세 근거는 `LOG_ORDER_NOTICE_RECONNECTED` 주석.
+                if down_since is not None:
+                    reconnect_logged_at = _log_order_notice_reconnected(
+                        down_since, disconnects_today, reconnect_logged_at,
+                    )
+                    down_since = None
                 await stream.run_once()
         except Exception as exc:
             stream_state.last_error = f"{type(exc).__name__}: {exc}"
@@ -5400,8 +5584,14 @@ async def poll_order_notice_stream(
             min(failures, len(ORDER_NOTICE_RECONNECT_DELAYS) - 1)
         ]
         failures += 1
+        disconnects_today += 1
+        # 2026-08-26 P1-1 — **사건의 시작이다.** 이미 끊겨 있는 동안의 재시도 실패는 새 사건이
+        # 아니므로 첫 끊김의 시각을 유지한다 — 그래야 무통보 구간이 「사건 하나」로 남는다.
+        if down_since is None:
+            down_since = db.local_now()
         logger.warning(
-            LOG_ORDER_NOTICE_STREAM_DOWN, stream_state.last_error or "정상 종료", delay, failures
+            LOG_ORDER_NOTICE_STREAM_DOWN,
+            stream_state.last_error or "정상 종료", delay, failures, disconnects_today,
         )
         if max_sessions is not None and sessions >= max_sessions:
             return

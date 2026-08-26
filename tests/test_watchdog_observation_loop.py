@@ -297,3 +297,57 @@ def test_a_young_lock_survives_the_watchdog(monkeypatch, tmp_path):
     watchdog.main()
 
     assert lock.exists()
+
+
+# ===== 2026-08-26 (08-26 §1-5 / P2-2) — 파일이 자기가 무엇을 담는지 말한다 =====
+
+
+def test_state_file_says_what_it_holds(tmp_path, monkeypatch):
+    """08-26에 두 회차가 이 파일의 `date`를 「오늘 워치독이 돌았는가」로 읽어 오독했다.
+
+    **문제는 파일이 아니라 읽는 쪽이 그 뜻을 몰랐다는 것이다** — 그날 이 파일은 필요할 때
+    정확히 갱신됐다(14:10 첫 DEGRADED). 「오늘 돌았는가」는 `.watchdog_last_check.json`이 답한다.
+    """
+    import json as _json
+
+    monkeypatch.setattr(watchdog, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(watchdog, "STATE_FILE", tmp_path / ".watchdog_state.json")
+    watchdog._write_state({"date": "2026-08-26", "restarts": 0, "last_alert_at": None})
+
+    written = _json.loads((tmp_path / ".watchdog_state.json").read_text(encoding="utf-8"))
+    assert "이상(DEGRADED/RESTART)이 있었던 마지막 회차" in written["note"]
+    assert ".watchdog_last_check.json" in written["note"]
+    # 원래 세 키는 그대로다 — `liveness.next_state()`가 읽는 계약이 안 깨져야 한다.
+    assert written["date"] == "2026-08-26"
+    assert written["restarts"] == 0
+    assert written["last_alert_at"] is None
+
+
+def test_the_note_never_overwrites_a_real_key(tmp_path, monkeypatch):
+    """호출측이 같은 이름을 넘기면 그쪽이 이긴다 — 설명이 데이터를 덮으면 안 된다."""
+    import json as _json
+
+    monkeypatch.setattr(watchdog, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(watchdog, "STATE_FILE", tmp_path / ".watchdog_state.json")
+    watchdog._write_state({"note": "호출측이 적은 것", "date": "2026-08-26"})
+
+    written = _json.loads((tmp_path / ".watchdog_state.json").read_text(encoding="utf-8"))
+    assert written["note"] == "호출측이 적은 것"
+
+
+def test_the_state_file_is_still_read_back_unchanged(tmp_path, monkeypatch):
+    """`note`가 붙어도 `_read_state()` → `liveness.next_state()` 왕복이 안 깨진다."""
+    from datetime import datetime
+
+    from mahdi import liveness
+
+    monkeypatch.setattr(watchdog, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(watchdog, "STATE_FILE", tmp_path / ".watchdog_state.json")
+    watchdog._write_state({"date": "2026-08-26", "restarts": 2, "last_alert_at": None})
+
+    state = watchdog._read_state()
+    nxt = liveness.next_state(
+        state, datetime(2026, 8, 26, 15, 0, 0),
+        liveness.WatchdogDecision(action=liveness.ACTION_IDLE, reason="OK", should_alert=False),
+    )
+    assert nxt["restarts"] == 2

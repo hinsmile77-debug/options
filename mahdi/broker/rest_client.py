@@ -657,6 +657,11 @@ class KISRestClient:
         # 2026-08-04(고도화#5) — 엔드포인트별 HTTP 소요시간 표본. `_log_if_slow`가 이미 매 호출마다
         # 재고 있는 값이라 추가 계측 비용이 없다(임계 이상만 로깅할 뿐 측정은 전부 하고 있었다).
         self._http_samples: dict[str, list[float]] = {}
+        # 2026-08-26 (08-26 §1-12 / P1-4) — 표본을 넣을 때 **그 호출에 실제로 걸려 있던 read
+        # 타임아웃**을 함께 기록한다. 엔드포인트마다 다르고(`_ENDPOINT_READ_TIMEOUT_SECONDS`)
+        # 라벨만으로는 역산할 수 없다 — 그 값이 없으면 `p50 ÷ timeout` 판정을 창 집계 자리에서
+        # 못 한다. 추가 계측 비용은 dict 대입 하나다.
+        self._http_timeout_by_endpoint: dict[str, float] = {}
         self._http_samples_lock = threading.Lock()
 
     @property
@@ -702,22 +707,36 @@ class KISRestClient:
         """
         with self._http_samples_lock:
             samples, self._http_samples = self._http_samples, {}
+            timeouts = dict(self._http_timeout_by_endpoint)
         out: dict[str, dict] = {}
         for endpoint, values in samples.items():
             ordered = sorted(values)
+            # 2026-08-26 P1-4 — `timeout`과 `censored`가 창 집계에서 `p50 ÷ timeout` 판정을
+            # 가능하게 하는 두 값이다. **검열은 「타임아웃 이상 걸린 호출」이고**,
+            # `log_metrics._censored_metrics`가 오프라인에서 쓰는 정의(`http >= read_timeout`)와
+            # 같은 부등호를 쓴다 — 두 축이 갈리면 장중 판정과 장후 판정이 어긋난다.
+            read_timeout = timeouts.get(endpoint)
             out[endpoint] = {
                 "n": len(ordered),
                 "p50": _percentile(ordered, 0.50),
                 "p95": _percentile(ordered, 0.95),
                 "p99": _percentile(ordered, 0.99),
                 "max": ordered[-1],
+                "timeout": read_timeout,
+                "censored": (
+                    sum(1 for v in ordered if v >= read_timeout)
+                    if read_timeout is not None else None
+                ),
             }
         return out
 
     def _record_http_latency(self, url: str, http_seconds: float) -> None:
         endpoint = endpoint_label(url)
+        # 2026-08-26 P1-4 — 그 호출에 실제로 걸린 read 타임아웃을 라벨과 함께 남긴다.
+        read_timeout = float(timeout_for_url(url).read or _HTTP_READ_TIMEOUT_SECONDS)
         with self._http_samples_lock:
             self._http_samples.setdefault(endpoint, []).append(http_seconds)
+            self._http_timeout_by_endpoint[endpoint] = read_timeout
 
     def _log_if_slow(
         self, method: str, url: str, pacer_seconds: float, http_seconds: float,
