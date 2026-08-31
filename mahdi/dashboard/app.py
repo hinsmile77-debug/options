@@ -196,7 +196,7 @@ def render() -> None:
     decision_context = get_latest_decision_context()
     _render_cards(build_decision_summary_cards(decision_context["latest"]))
     if decision_context["history"]:
-        st.plotly_chart(build_decision_history_table(decision_context["history"]), width='stretch')
+        st.plotly_chart(build_decision_history_table(decision_context["history"]), width='stretch', key='decision_history')
     else:
         st.caption("아직 Signal Fusion 판단 이력이 없습니다.")
 
@@ -231,7 +231,7 @@ def render() -> None:
     # "8개 중 하나를 100% 확신"으로 읽힌다(08-05 화면이 정확히 그 상태였다).
     st.plotly_chart(
         build_regime_probability_chart(snapshot.regime_prob, is_warmup=snapshot.regime_is_warmup),
-        width='stretch',
+        width='stretch', key='regime_prob',
     )
     if snapshot.regime_is_warmup:
         st.caption(
@@ -254,7 +254,7 @@ def render() -> None:
                 # 구분할 수 없다. 선물 1분봉 종가가 곧 롤링에 쓰인 그 값이다.
                 futures_price=snapshot.price_series[-1] if snapshot.price_series else None,
             ),
-            width='stretch',
+            width='stretch', key='gamma_profile',
         )
         # 2026-08-05(P0-2) — 판단 근거와 같은 북(먼슬리)만 그린다는 사실을 화면에 남긴다. 위클리
         # 북의 만기 Pinning은 별도 신호(v6 §A3)이고 여기서 합산하면 서로를 덮으므로, 여기 없다는
@@ -268,11 +268,11 @@ def render() -> None:
         st.subheader("수급 (Position Intelligence)")
         st.plotly_chart(
             build_position_flow_chart(snapshot.foreign_net, snapshot.institution_net, snapshot.individual_net),
-            width='stretch',
+            width='stretch', key='position_flow',
         )
 
     st.subheader("Cross-asset Stress (VIX 기간구조·USDCNH·US10Y)")
-    st.plotly_chart(build_macro_snapshot_table(snapshot.macro_snapshot), width='stretch')
+    st.plotly_chart(build_macro_snapshot_table(snapshot.macro_snapshot), width='stretch', key='macro_snapshot')
     if snapshot.macro_snapshot is None:
         st.caption("아직 매크로 스냅샷 폴링 데이터가 없습니다.")
     elif snapshot.macro_snapshot.get("us10y_yield") is None:
@@ -282,7 +282,7 @@ def render() -> None:
     if snapshot.expiry_liquidity:
         st.plotly_chart(
             build_expiry_liquidity_table(snapshot.expiry_liquidity, today=snapshot.as_of.date()),
-            width='stretch',
+            width='stretch', key='expiry_liquidity',
         )
     else:
         st.caption("아직 만기 유동성 폴링 데이터가 없습니다.")
@@ -295,21 +295,21 @@ def render() -> None:
         st.caption(f"종목: {snapshot.option_flow_symbol}")
         st.plotly_chart(
             build_cvd_chart(snapshot.option_timestamps, snapshot.option_cvd_series, x_range=flow_x_range),
-            width='stretch',
+            width='stretch', key='flow_opt_cvd',
         )
         st.plotly_chart(
             build_ofi_sparkline(snapshot.option_timestamps, snapshot.option_ofi_series, x_range=flow_x_range),
-            width='stretch',
+            width='stretch', key='flow_opt_ofi',
         )
         st.plotly_chart(
             build_vpin_chart(snapshot.option_timestamps, snapshot.option_vpin_series, x_range=flow_x_range),
-            width='stretch',
+            width='stretch', key='flow_opt_vpin',
         )
         st.plotly_chart(
             build_absorption_chart(
                 snapshot.option_timestamps, snapshot.option_absorption_series, x_range=flow_x_range
             ),
-            width='stretch',
+            width='stretch', key='flow_opt_absorption',
         )
         st.caption(_ABSORPTION_CAPTION)
         st.plotly_chart(
@@ -319,7 +319,7 @@ def render() -> None:
                 snapshot.option_microprice_series,
                 x_range=flow_x_range,
             ),
-            width='stretch',
+            width='stretch', key='flow_opt_microprice',
         )
     else:
         st.caption("아직 활성 옵션 종목이 없습니다.")
@@ -328,24 +328,24 @@ def render() -> None:
     if snapshot.futures_flow_symbol is not None:
         st.caption(f"종목: {snapshot.futures_flow_symbol}")
     st.plotly_chart(
-        build_cvd_chart(snapshot.timestamps, snapshot.cvd_series, x_range=flow_x_range), width='stretch'
+        build_cvd_chart(snapshot.timestamps, snapshot.cvd_series, x_range=flow_x_range), width='stretch', key='flow_fut_cvd'
     )
     st.plotly_chart(
-        build_ofi_sparkline(snapshot.timestamps, snapshot.ofi_series, x_range=flow_x_range), width='stretch'
+        build_ofi_sparkline(snapshot.timestamps, snapshot.ofi_series, x_range=flow_x_range), width='stretch', key='flow_fut_ofi'
     )
     st.plotly_chart(
-        build_vpin_chart(snapshot.timestamps, snapshot.vpin_series, x_range=flow_x_range), width='stretch'
+        build_vpin_chart(snapshot.timestamps, snapshot.vpin_series, x_range=flow_x_range), width='stretch', key='flow_fut_vpin'
     )
     st.plotly_chart(
         build_absorption_chart(snapshot.timestamps, snapshot.absorption_series, x_range=flow_x_range),
-        width='stretch',
+        width='stretch', key='flow_fut_absorption',
     )
     st.caption(_ABSORPTION_CAPTION)
     st.plotly_chart(
         build_microprice_vs_price_chart(
             snapshot.timestamps, snapshot.price_series, snapshot.microprice_series, x_range=flow_x_range
         ),
-        width='stretch',
+        width='stretch', key='flow_fut_microprice',
     )
 
 

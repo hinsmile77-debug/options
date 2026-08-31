@@ -243,6 +243,11 @@ SLOW_CALL_RE = re.compile(
 # p50이 4.00 바로 아래(3.99)로 떨어질 수 있기 때문이고, 그 창도 검열된 창이다.
 # 원천: `mahdi/ops/log_metrics.P50_CENSORED_FLOOR_RATIO`
 P50_CENSORED_FLOOR_RATIO = 0.98
+# 2026-08-31 (08-31 §1-11 / 제4부 P1-2) — 창의 검열 비율이 이 값을 넘으면 **p50과 별개의**
+# 적신호를 낸다. ⚠ **임계 완화가 아니라 새 축의 첫 잠정선이다** — 정상 분포를 아직 모른다.
+# 08-31 실측 최대는 54%였고 경고선 후보 30% / 위험선 후보 50%가 그날 회차의 제안이다.
+# 며칠 쌓고 사람이 확정한다(08-05 스팟 괴리율에서 「숫자를 보고 임계를 거는」 실수를 반복하지 않는다).
+CENSORED_WINDOW_ALERT_RATIO = 0.30
 ZERO_ROW_RUN_ALERT_MINUTES = 20          # mahdi/ops/db_metrics.ZERO_ROW_RUN_ALERT_MINUTES
 
 # ===== 2026-08-24 (08-24 §1-8·§1-9 / Fix#6 B · Fix#4 B) — **분자와 분모를 같은 표에** =====
@@ -322,6 +327,22 @@ MEASUREMENT_MAP = [
     # 로그를 손으로 훑어서야 알았고, 로그는 이틀치만 남으므로 그 확인은 그날이 마지막이었다.
     # ⛔ **이상점이 아니다 — 만성이다.** 대체 축을 적어 적신호로 안 올린다.
     ("B-3 체결 분류 폴백", "틱 룰 추정으로 폴백", "지표 `qualitative.tick_rule_fallback`"),
+    # ===== 2026-08-31 (08-31 §1-8 · §1-10 / 제5부 고도화 4) — **두 문구를 따로 센다** =====
+    #
+    # 08-31에 처음으로 두 사건이 같은 시간대에 겹쳤다(14시대). 한 줄로 묶어 세면
+    # **폐기된 진단을 되살리는 08-19형 사고**가 난다 — 뿌리가 다르기 때문이다:
+    #   · **기각**     — flip은 나왔는데 수집 행사가 범위 밖이라 버렸다.
+    #                   08-04 폐기 목록의 「GEX 광폭 체인」이 다루는 축이다.
+    #   · **산출 불가** — BS 계산 가능 레그가 6개에 못 미쳐 계산조차 못 했다.
+    #                   원인은 직전 분 적재 부족이고 그 결정과 **무관하다**(→ P1-1이 그 줄에
+    #                   `직전 분 적재 N행(HH:MM)`을 실어 인과를 한 줄에 넣었다).
+    #
+    # ⛔ **둘 다 만성이라 적신호로 올리지 않는다** — 대체 축을 적어 §12에서 뺀다.
+    # 이 표가 하는 일은 **두 수를 나란히 놓아 사람이 합쳐 읽지 않게 하는 것**까지다.
+    ("B-3 감마플립 기각(레그 범위 밖)", "감마플립 기각",
+     "지표 `qualitative.gamma_flip_out_of_leg_range`"),
+    ("B-3 감마플립 산출 불가(레그 부족)", "감마플립 산출 불가",
+     "지표 `qualitative.gamma_flip_uncomputable`"),
 ]
 
 # 레버 — `mahdi/ops/levers.py`의 `_SPEC`과 같은 이름을 쓴다. 값 해석은 하지 않고
@@ -1459,17 +1480,47 @@ def due_hypotheses(root: Path, day: _date):
     if not p.exists():
         return None, []
     items, cur = [], None
+    # ===== 2026-08-31 (08-27 P2-B · 08-31 제4부 P2-2) — **블록 스칼라를 읽는다** =====
+    #
+    # 종전 정규식은 `가설: |` 의 값으로 **`|` 한 글자**를 담았다. 이 저장소의 가설은 거의 전부
+    # 여러 줄 블록 스칼라(`|`)이므로, §8 표의 `가설` 열이 **닷새째 13행 통째로 빈칸**이었다
+    # (08-27 P2-B가 지시했고 나흘 밀렸다).
+    #
+    # 파서를 바꾸지 않고 **블록 본문을 이어 붙인다**: 마커(`|`/`>`, `|-`·`>-` 등 chomp 포함)를
+    # 만나면 그 다음 줄부터 **들여쓰기가 더 깊은 줄**을 값으로 모은다. 여전히 stdlib 전용이고
+    # YAML 파서를 들이지 않는다(이 파일의 헤더 규약).
+    #
+    # ⚠ **표 셀 안에서 `|`는 열 구분자다.** 본문에 `|`가 있으면 §8 표가 통째로 깨지므로
+    # 이스케이프한다 — 08-27이 「파이프 이스케이프」를 함께 지시한 이유가 그것이다.
+    block_key = None      # 지금 모으는 중인 블록 스칼라의 키
+    block_indent = 0      # 그 키가 놓인 들여쓰기 — 이보다 깊은 줄만 본문이다
     for raw in read_text(p).splitlines():
         if raw.startswith("- id:"):
             if cur:
                 items.append(cur)
             cur = {"id": raw.split("id:", 1)[1].strip().strip('"')}
+            block_key = None
             continue
         if cur is None:
             continue
-        m = re.match(r"^  (검증예정일|상태|가설|전제레버|구현일):\s*(.*)$", raw)
-        if m:
-            cur[m.group(1)] = m.group(2).strip().strip('"')
+        if block_key is not None:
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip())
+            if not stripped:
+                continue  # 블록 안의 빈 줄은 문단 구분이지 끝이 아니다
+            if indent > block_indent:
+                cur[block_key] = f"{cur[block_key]} {stripped}".strip()
+                continue
+            block_key = None  # 들여쓰기가 돌아왔다 — 블록이 끝났다
+        m = re.match(r"^(\s*)(검증예정일|상태|가설|전제레버|구현일):\s*(.*)$", raw)
+        if not m:
+            continue
+        indent, key, value = len(m.group(1)), m.group(2), m.group(3).strip().strip('"')
+        # `|`·`>`(+ `-`/`+` chomp, + 들여쓰기 지시자)만 블록 마커다. 그 밖의 값은 그대로 쓴다.
+        if re.fullmatch(r"[|>][-+]?\d*", value):
+            cur[key], block_key, block_indent = "", key, indent
+        else:
+            cur[key] = value
     if cur:
         items.append(cur)
 
@@ -1794,6 +1845,58 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                   "「절반이 느려진다」보다 「5%가 완전히 막힌다」가 먼저 온다).")
             else:
                 A("- 하루 검열 건수: **안 셌다**(느린 호출 줄 0건) — 「0%」가 아니다(규약 C).")
+            # ===== 2026-08-31 (08-31 §1-11 / 제4부 P1-2) — **적신호가 눈을 둘 더 뜬다** =====
+            #
+            # ## ① 검열률은 p50과 다른 속도로 움직인다
+            #
+            # 08-31 실측: `14:05` 창 검열 **27%** → `14:10` 창 **40%**인데, 같은 구간의
+            # p50 비율은 **0.72 → 0.86**이었다. **p50만 보는 눈은 그 급등을 못 본다** —
+            # 20종목 순차 수집에서는 「절반이 느려진다」보다 **「5%가 완전히 막힌다」가 먼저 온다**.
+            # 그래서 검열률을 p50과 **별개의 줄**로 올린다.
+            #
+            # ## ② `p95/timeout >= 1.0` 창은 08-27이 P2-E로 지시한 자리다
+            #
+            # 08-31에 `p95/timeout`이 **98창 중 대부분 1.00~1.01**이었는데 적신호에 한 줄도
+            # 안 올라왔다 — 나흘째 빈칸이었다.
+            #
+            # ⚠ **임계 30%는 완화가 아니라 새 축의 첫 잠정선이다.** 정상 분포를 모르므로
+            # 며칠 쌓고 사람이 정한다(08-05 스팟 괴리율에서 한 실수를 반복하지 않는다).
+            # ⚠ **검열을 못 센 날은 이 줄을 안 낸다** — 「0%」와 「안 셌다」를 같은 글자로
+            # 찍으면 이 fix가 헛경보 생성기가 된다(규약 C).
+            # ⚠ **줄 수를 스스로 억제한다** — 창마다 한 줄씩 내면 98줄이 되어 진짜 갈림길이
+            # 그 안에 묻힌다. 최악의 창 하나와 창 수만 낸다.
+            if scan.censored_seconds:
+                heavy = [
+                    (at, n, censored.get(at, 0) / n)
+                    for at, n, _p in windows
+                    if n and censored.get(at, 0) / n >= CENSORED_WINDOW_ALERT_RATIO
+                ]
+                if heavy:
+                    worst_at, worst_n, worst_ratio = max(heavy, key=lambda x: x[2])
+                    A(f"- ⛔ **검열률이 {CENSORED_WINDOW_ALERT_RATIO:.0%}를 넘은 창 "
+                      f"{len(heavy)}개** — 최악 **{worst_at[:5]}** "
+                      f"{worst_ratio:.0%}({censored.get(worst_at, 0)}/{worst_n}건). "
+                      "**p50과 다른 축이다** — 08-31에 p50 비율이 0.72→0.86일 때 이 값은 "
+                      "27%→40%로 뛰었다.")
+                    flags.append(
+                        f"`{CHAIN_ENDPOINT}` 검열률 {CENSORED_WINDOW_ALERT_RATIO:.0%} 초과 창 "
+                        f"{len(heavy)}개(최악 {worst_at[:5]} {worst_ratio:.0%}) — "
+                        "**p50 적신호와 별개다.** 꼬리부터 막히는 중이고, p50이 멀쩡해도 진행한다"
+                    )
+            # ② p95/timeout — 08-27 P2-E. p95 표본이 없는 창은 **건너뛴다**(0으로 채우지 않는다).
+            p95_by_window = scan.window_latency_p95()
+            if p95_by_window and timeout:
+                over = [(at, p95 / timeout) for at, p95 in p95_by_window.items() if p95 >= timeout]
+                if over:
+                    worst_at, worst_ratio = max(over, key=lambda x: x[1])
+                    A(f"- ⛔ **`p95/timeout >= 1.0`인 창 {len(over)}/{len(p95_by_window)}개** — "
+                      f"최악 **{worst_at[:5]}** 비율 {worst_ratio:.2f}. "
+                      "**상위 5%는 이미 제한시간을 넘고 있다**(08-27 P2-E가 지시한 자리).")
+                    flags.append(
+                        f"`{CHAIN_ENDPOINT}` `p95/timeout >= 1.0`인 창 "
+                        f"{len(over)}/{len(p95_by_window)}개(최악 {worst_at[:5]} {worst_ratio:.2f}) — "
+                        "**p95도 검열된다**(하한이다). 이 값들을 실제 응답시간으로 읽지 말 것"
+                    )
             A("")
         # 2026-08-25 P1-1 ② — 「p95 최대」 열. — 칸은 「그 시간대 p95 계측 없음」이지 0이 아니다(규약 C).
         A("| 시간대 | 사이클 | rows=0 | REST수집 평균(초) | 예산 대비 | p50 평균 | 창 최대 p50 | 최대/timeout | p95 최대 | |")
@@ -2277,8 +2380,12 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         A("| id | 검증예정일 | 상태 | 가설 | 전제레버 |")
         A("|---|---|---|---|---|")
         for it, note in due:
+            # 2026-08-31 (08-27 P2-B) — 블록 스칼라를 이어 붙인 뒤 **셀 안에서 파이프를
+            # 이스케이프하고 80자로 자른다.** 자르지 않으면 한 줄이 화면을 넘어가고,
+            # 이스케이프하지 않으면 본문의 `|` 하나가 §8 표를 통째로 깬다.
+            claim = truncate(it.get("가설", "").replace("|", "\\|"), 80)
             A(f"| `{it['id']}` | {it.get('검증예정일', '?')} ({note}) | {it.get('상태')} | "
-              f"{truncate(it.get('가설', ''), 90)} | {it.get('전제레버', '—')} |")
+              f"{claim} | {it.get('전제레버', '—')} |")
         overdue = [x for x in due if "지남" in x[1]]
         if overdue:
             flags.append(f"검증예정일이 지난 pending 가설 {len(overdue)}건 — 손 판정이 밀리고 있다")

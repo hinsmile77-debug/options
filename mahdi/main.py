@@ -3953,6 +3953,26 @@ def _member_unavailable_reasons(inputs: SignalInputs, now: datetime, scores=None
     return reasons
 
 
+def _chain_snapshot_minute(chain_rows: list[dict]) -> str | None:
+    """
+    입력: 이번 판단이 읽은 체인 스냅샷 행.
+    계산: 그 스냅샷에서 가장 최근 `timestamp`의 `HH:MM`. 행이 없거나 시각이 없으면 None.
+    해석: 2026-08-31 §1-10 / 제4부 P1-1 — 「감마플립 산출 불가」 줄에 **어느 분의 적재를 먹고
+         못 냈는가**를 함께 싣는다. 스냅샷은 `_chain_snapshot()`이 (만기·행사가·타입)별 최신
+         1건으로 구성하므로 행마다 시각이 조금씩 다를 수 있고, **가장 최근 것**이 그 판단이
+         본 「직전 분」이다.
+    실패 조건: 없다 — 로깅 보조라 어떤 입력에도 예외를 내지 않는다(모르면 None).
+    """
+    stamps = [row.get("timestamp") for row in chain_rows if row.get("timestamp") is not None]
+    if not stamps:
+        return None
+    try:
+        return max(stamps).strftime("%H:%M")
+    except (AttributeError, TypeError):
+        # 시각 형식이 예상과 다르면 **지어내지 않고 모른다고 한다**(규약 C).
+        return None
+
+
 def _build_signal_inputs(
     conn, regime_state: RegimeState | None, underlying: str = UNDERLYING,
     futures_symbol: str | None = None,
@@ -3996,7 +4016,18 @@ def _build_signal_inputs(
         gex = calculate_gex(legs, spot)
         # 2026-08-13 고도화 1 — `today`/`expiry`를 넘겨야 만기 당일 북이 **계산 전에** 빠지고
         # 매분 WARNING 대신 하루 1회 INFO가 남는다(08-13에 그 한 문장이 WARNING의 54.5%였다).
-        gamma_flip = find_gamma_flip(legs, spot, today=now.date(), expiry=gex_expiry)
+        #
+        # 2026-08-31 (08-31 §1-10 / 제4부 P1-1) — **산출 불가 줄이 자기가 무엇을 먹었는지 말하게
+        # 한다.** 넘기는 것은 `chain_rows` — **이 판단이 실제로 읽은 스냅샷**이다.
+        #
+        # ⚠ 리포트는 「옵션체인 사이클 소요 분해」의 `rows`를 전달하라고 적었는데, 그 값은
+        # **수집 폴러의 지역 변수**라 여기까지 오려면 모듈 사이로 새 전역 상태를 끌고 와야 한다.
+        # 같은 사실이 이 자리에 이미 있으므로(스냅샷의 행 수와 그 분) 배선을 짧게 잡는다 —
+        # 재는 값은 같다. 착수 전 코드 확인에서 다시 세운 계획이다.
+        gamma_flip = find_gamma_flip(
+            legs, spot, today=now.date(), expiry=gex_expiry,
+            snapshot_rows=len(chain_rows), snapshot_minute=_chain_snapshot_minute(chain_rows),
+        )
         # 2026-08-04 Fix#3 — 감마 월은 **노출이 0보다 클 때만** 기준선으로 쓴다.
         # `gamma_walls()`는 행사가별 |gamma x OI x ...| 합을 내림차순으로 줄 뿐이라, OI가 전부
         # 0인 북(08-04 weekly_mon이 그랬다)에서도 "노출 0짜리 1등 행사가"를 돌려준다. 그것을

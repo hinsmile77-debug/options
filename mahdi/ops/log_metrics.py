@@ -307,6 +307,23 @@ _QUALITATIVE_MARKERS = {
     # 후자가 0이 아니면 이 fix가 뚫린 것이다.
     # 포맷 원본: `mahdi.features.options_intel.LOG_GAMMA_FLIP_OUT_OF_LEG_RANGE`
     "gamma_flip_out_of_leg_range": "감마플립 기각(레그 범위 밖)",
+    # ===== 2026-08-31 (08-31 §1-8 · §1-10 / 제5부 고도화 4) — **기각과 산출 불가는 다른 사건이다** =====
+    #
+    # 08-31에 **처음으로 두 사건이 같은 시간대에 겹쳤다**(14시대). 그런데 뿌리가 다르다:
+    #   · **기각**     — flip은 나왔는데 수집 행사가 범위 밖이라 버렸다. 08-04 폐기 목록의
+    #                   「GEX 광폭 체인」이 다루는 축이다.
+    #   · **산출 불가** — BS 계산 가능 레그가 최소치(6)에 못 미쳐 **계산조차 못 했다.**
+    #                   원인은 직전 분 적재 부족이고, 위 폐기 결정과 **무관하다**.
+    #
+    # 두 문구를 하나의 「감마플립 문제」로 묶어 세면 **폐기된 진단을 되살리는 08-19형 사고**가
+    # 난다(그날 두 회차가 이미 폐기된 안건을 P1으로 다시 올렸다). 08-31 §1-17이 그 안건의
+    # 재개 조건 첫 성립을 보고했으므로 이 분리가 지금 특히 필요하다.
+    #
+    # ⚠ 위 `gamma_flip_out_of_leg_range`의 마커 문구는 **한 글자도 안 건드린다** —
+    # 08-25 P2-2가 §14의 분모로 그 축을 쓰고 있어 흔들리면 그쪽이 깨진다.
+    # 포맷 원본: `mahdi.features.options_intel.find_gamma_flip`의 산출 불가 WARNING
+    # (P1-1이 그 줄 **뒤에** 꼬리를 붙이므로 앞머리 문구가 마커로 성립한다)
+    "gamma_flip_uncomputable": "감마플립 산출 불가",
     # 2026-08-05(§2-6) — 사이클은 돌았는데 적재 0행인 분. **결손 지표(로그 기준)가 세지 않는
     # 유일한 손실 유형**이라 여기서 따로 센다. DB 축(`db.chain_minute_coverage`)과 나란히 읽는다.
     # 포맷 원본: `mahdi.main.LOG_CHAIN_CYCLE_EMPTY`
@@ -492,6 +509,10 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 기각 0건인 날 키가 없으면 그 칸이 「셈 없음」으로 인쇄돼, 진짜 0(기각할 것이 없었다)과
     # 옛 로그가 섞인다.
     "gamma_flip_out_of_leg_range",
+    # 2026-08-31 고도화 4 — **산출 불가가 0건인 날에도 키가 실려야** 「계산은 다 됐다」와
+    # 「그 줄이 없던 버전」이 갈린다(규약 C). 이 축은 기각과 **따로** 읽는 것이 목적이므로,
+    # 한쪽만 0으로 인쇄되면 사람이 둘을 다시 합쳐 읽게 된다.
+    "gamma_flip_uncomputable",
     # 2026-08-26 P1-5 — **0이 인쇄돼야 「안 울렸다」와 「안 셌다」가 갈린다.** 경보가 한 건도
     # 안 난 날이 흔하고, 그런 날 키가 없으면 이 축이 있는지 없는지 다음 사람이 매번 다시
     # 확인해야 한다. 08-26 기준선은 8건이다.
@@ -600,6 +621,9 @@ _PARSER_AUDIT_TOKENS = {
     # 엄격 마커는 "감마플립 기각(레그 범위 밖)"이다 — 괄호 안 문구를 바꾸면 엄격 파서가 0이
     # 되는데, 이 짧은 토큰이 그 침묵을 ⚠로 드러낸다.
     "gamma_flip_out_of_leg_range": "감마플립 기각",
+    # 2026-08-31 고도화 4 — 엄격 마커는 "감마플립 산출 불가"다. **P1-1이 그 줄 뒤에 꼬리를
+    # 붙였으므로** 앞머리가 바뀌면 두 fix가 서로를 눈멀게 한다. 이 짧은 토큰이 그 침묵을 드러낸다.
+    "gamma_flip_uncomputable": "감마플립 산출",
     "chain_cycle_empty": "이번 분 전멸",
     # 2026-08-25 Fix#3 — 엄격 마커는 「진입 판단은 섰는데 살 종목이 없다」 전문이다.
     "entry_no_candidate": "살 종목이 없다",
@@ -1378,6 +1402,67 @@ def _rest_latency_metrics(windows: list[dict], slow: list[dict] | None = None) -
         "p50_timeout_ratio_warn": REST_LATENCY_P50_TIMEOUT_RATIO_WARN,
         "global_read_timeout_seconds": GLOBAL_HTTP_READ_TIMEOUT_SECONDS,
         "warnings": warnings,
+        # 2026-08-31 고도화 1 ★ — 상세 근거는 `_close_transition` 위 절 주석.
+        "close_transition": _close_transition(windows),
+    }
+
+
+# ===== 2026-08-31 (08-31 §1-14 / 제5부 고도화 1 ★) — **장 마감이 대신 해 준 A/B 테스트** =====
+#
+# 08-31에 하루가 실험 하나를 공짜로 해 줬다. **15:20 정규장 마감 전후로 우리 코드와 호출량은
+# 그대로인데 응답시간만 100배 바뀌었다**:
+#
+#   15:20:46 창  p50 **2.42초** / **77건**
+#   15:30:46 창  p50 **0.02초** / **101건**   ← 호출 수는 오히려 늘었다
+#
+# 이 비(比)가 곧 **「그날 느렸던 것이 우리 탓인가 KIS 탓인가」의 답**이다:
+#   **1에 가까우면 우리 쪽 문제** — 마감 뒤에도 안 빨라졌다면 병목이 우리 코드·페이서에 있다.
+#   **0에 가까우면 KIS 부하** — 08-31 값은 `0.02 ÷ 2.42 = 0.008배`였다.
+#
+# 08-04 §2-6이 만든 귀속 판정표를 **매일 자동으로 채우는 축**이 된다. 지표 §17이 「모순」으로
+# 남겨 둔 자리의 첫 실측 결론이 이것이다.
+#
+# ⛔ **임계는 걸지 않는다 — 정상 분포를 모른다.** 며칠 쌓고 사람이 정한다
+# (08-05 스팟 괴리율에서 「숫자를 보고 임계를 거는」 실수를 반복하지 않는다).
+# ⚠ **두 구간 중 하나라도 창이 없으면 `ratio`는 `None`이다**(규약 C) — 「비를 못 쟀다」와
+# 「비가 0이다」는 다른 사실이고, 0으로 채우면 그 자리가 곧 다음 오독이다.
+# ⚠ **읽는 법은 「귀속」이지 「성적」이 아니다**(규약 G) — 이 축은 그날 KIS 상태에 비례한다.
+#
+# ⚠ 리포트(08-31 고도화 1)는 `scripts/daily_ops_report.py` §9-1에 「새 줄 하나」로 적었는데,
+# 그러면 **값이 사이드카에 안 남아 다음 날 대조할 수 없다.** 창 단위 표본은 이 함수가 이미
+# 손에 쥐고 있으므로 **계산을 여기에 두고 리포트는 인쇄만 한다** — 이 모듈이 지켜 온
+# 「판정하지 않는다, 값만 만든다」 경계 그대로다.
+# ⚠ **구간은 「분 단위로 닫힌다」** — 창 시각(`at`)은 초까지 있고 실측은 `15:20:46`처럼
+# 분 중간에 찍힌다(창을 비우는 폴러의 위상 때문이다). 경계를 `< 15:20:00`으로 잡으면
+# **08-31이 인용한 바로 그 창(15:20:46)이 빠진다.** 그래서 끝 분을 통째로 포함한다.
+CLOSE_TRANSITION_BEFORE = (14 * 60 + 50, 15 * 60 + 20)   # 마감 전 14:50 ~ 15:20 (끝 분 포함)
+CLOSE_TRANSITION_AFTER = (15 * 60 + 30, 15 * 60 + 45)    # 마감 후 15:30 ~ 15:45 (끝 분 포함)
+
+
+def _close_transition(windows: list[dict]) -> dict:
+    """
+    입력: 5분 창마다 남은 엔드포인트별 응답시간 요약(`_rest_latency_metrics`와 같은 것).
+    계산: 마감 전/후 두 구간의 **호출 수 가중 p50**과 호출 수, 그리고 `후 ÷ 전`.
+    해석: 위 절 주석. 구간 경계는 정규장 마감(15:20)이고, **바꾸면 이전 날들과 비교가 끊긴다.**
+    실패 조건: 없다 — 한쪽 구간에 창이 없으면 그 쪽 `p50`과 `ratio`가 `None`이다.
+    """
+    def _side(lo_min: int, hi_min: int) -> tuple[float | None, int]:
+        # 창 시각(`at`)은 창의 **끝**이다(`poll_rest_latency_snapshot`이 직전 창을 비우며 남긴다).
+        # 끝 분을 통째로 포함한다 — 위 상수 주석의 `15:20:46` 문제.
+        picked = [w for w in windows if lo_min * 60 <= w["at"] < (hi_min + 1) * 60]
+        calls = sum(w["n"] for w in picked)
+        if not calls:
+            return None, 0
+        return round(sum(w["p50"] * w["n"] for w in picked) / calls, 3), calls
+
+    before_p50, before_calls = _side(*CLOSE_TRANSITION_BEFORE)
+    after_p50, after_calls = _side(*CLOSE_TRANSITION_AFTER)
+    # 0으로 나누지 않는다. 마감 전 p50이 정확히 0인 날은 비가 무의미하므로 「못 쟀다」로 둔다.
+    ratio = round(after_p50 / before_p50, 4) if before_p50 and after_p50 is not None else None
+    return {
+        "before_window": "14:50~15:20", "before_p50": before_p50, "before_calls": before_calls,
+        "after_window": "15:30~15:45", "after_p50": after_p50, "after_calls": after_calls,
+        "ratio": ratio,
     }
 
 

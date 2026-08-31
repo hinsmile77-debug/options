@@ -182,7 +182,23 @@ class SignalFusionEngine:
                 reject_reasons.append(f"strategy_palette:{palette.reason}")
             strategy_gates = self._params.get("strategy_gates", {})
             cap = strategy_gates.get("max_priority_strategies_per_regime_day", 2)
-            allowed = enforce_daily_strategy_cap(palette.allowed_strategies, already_used_strategies_today, cap)
+            before_cap = palette.allowed_strategies
+            allowed = enforce_daily_strategy_cap(before_cap, already_used_strategies_today, cap)
+            # ===== 2026-08-31 (08-31 제4부 P2-3) — **조용한 컷은 사유를 남긴다** =====
+            #
+            # 종전에는 상한을 넘은 전략을 **아무 흔적 없이** 잘라냈다. 그래서 08-31에
+            # 「레짐일당 상한 2」를 지켰는지 **로그로도 DB로도 확인할 수 없었고**, 그날
+            # 절대원칙 판정표에 「판정 불가」로 남았다.
+            #
+            # 바로 아래 `enforce_reentry_cooldown`이 **이미 그렇게 하고 있다**(08-05에 같은
+            # 이유로 추가된 줄). 같은 패턴을 옆 줄에 맞추는 것이다.
+            #
+            # ⛔ **판정은 한 글자도 안 바뀐다** — `allowed`의 내용도 진입 여부도 확신도도
+            # 그대로고, **실제로 잘린 사이클에만** 사유 한 항목이 는다.
+            # ⚠ 상한 값(`max_priority_strategies_per_regime_day`)은 손대지 않는다 —
+            # 이 항목이 바꾸는 것은 「무엇을 재는가」이지 임계가 아니다.
+            if len(allowed) < len(before_cap):
+                reject_reasons.append("strategy_daily_cap")
             # 2026-08-11 고도화 D — 동일 전략 재진입 쿨다운. **기본 0(OFF)** 이라 종전과 같다.
             # 상한(가짓수)과 쿨다운(빈도)은 다른 것을 막는다 — 근거는
             # `strategy_palette.enforce_reentry_cooldown` 위 주석.
@@ -236,13 +252,37 @@ class SignalFusionEngine:
         # 값은 이미 여기 있었다 — `decision.effective_member_count`. 로그에만 없었다.
         # 파서는 옛 문구와 새 문구를 **둘 다** 읽는다(`collect_evidence.MEMBER_RE`) —
         # 08-04에 문구가 바뀌며 정규식이 눈이 멀어 362건을 0건으로 보고한 전례가 있다.
+        # ===== 2026-08-31 (08-31 §1-15 / 제4부 P1-4) — **분모가 1이면 로그가 그렇다고 말한다** =====
+        #
+        # 레버 F(`use_effective_member_count`)가 켜져 있으면 확신도의 분모가 **비영 멤버 수**다.
+        # 그 값이 1이면 합의비율이 **구조적으로 1.00**(최댓값)이 되어, 「의견을 낸 축이 하나뿐」인
+        # 상태가 「만장일치」로 읽힌다. 08-31에 그 상황에서 `HIGH_CONVICTION`이 3건 났다
+        # (14:51 · 14:54 · 15:36 — 전부 14:50 컷오프 뒤였다).
+        #
+        # ⛔ **동작은 바꾸지 않는다. 임계도 걸지 않는다 — 계측이 먼저다**(08-21 사용자 조치 7).
+        # 레버 F는 08-23에 다섯 번 만에 켠 것이고 `strategy_params.yaml:72-77`이 「확신도는
+        # 오른다」를 **예측으로 적어 뒀다.** 그 예측이 맞는 중인데 지금 되돌리면 무엇이 무엇을
+        # 만들었는지 영영 못 가른다. 며칠 쌓아 「분모 1이 하루에 몇 번, 몇 시에 나는가」를
+        # 안 뒤에 사람이 정한다.
+        #
+        # ⚠ **꼬리표는 줄 끝에만 붙인다** — 앞머리와 `비영 %d`의 자리를 건드리면
+        # `collect_evidence.MEMBER_RE`가 눈이 먼다(08-04에 문구가 움직여 362건이 0건이 됐다).
+        # ⚠ 억제는 이 함수의 구조가 이미 한다 — 이 줄은 **형태가 바뀔 때만** 찍히므로
+        # 분모 1이 여러 분 이어져도 줄은 전이 시점에 하나다(08-31 실측 3건).
+        denominator_note = (
+            " · ⚠ 분모 1 — 합의비율 구조적 1.00"
+            if self._params.get("use_effective_member_count", False)
+            and decision.effective_member_count <= 1
+            else ""
+        )
         logger.info(
-            "판단 형태 전이: 가용멤버 %s(%d/%d, 비영 %d) · %s · 사유 %s · 전략 %s%s",
+            "판단 형태 전이: 가용멤버 %s(%d/%d, 비영 %d) · %s · 사유 %s · 전략 %s%s%s",
             list(available), len(available), len(MEMBER_FIELDS), decision.effective_member_count,
             decision.trade_permission.value,
             list(decision.reject_reasons) or "없음",
             list(decision.allowed_strategies) or "없음",
             "" if previous is None else f" (직전 가용멤버 {list(previous[0])})",
+            denominator_note,
         )
 
     def _log_member_transitions(

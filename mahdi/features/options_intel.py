@@ -407,6 +407,19 @@ def with_computed_charm(
     return out
 
 
+def _snapshot_tail(rows: int | None, minute: str | None) -> str:
+    """
+    입력: 이번 판단이 읽은 체인 스냅샷의 행 수와 그 스냅샷의 분(`HH:MM`).
+    계산: 로그 줄 끝에 붙일 ` · 직전 분 적재 N행(HH:MM)` 꼬리. 행 수를 모르면 빈 문자열.
+    해석: 2026-08-31 §1-10 / P1-1. 상세 근거는 `find_gamma_flip` docstring.
+    실패 조건: 없다 — 로깅 보조라 어떤 입력에도 예외를 내지 않는다.
+    """
+    if rows is None:
+        return ""
+    # 분을 모르면 행 수만 적는다 — 없는 시각을 지어내지 않는다.
+    return f" · 직전 분 적재 {rows}행({minute})" if minute else f" · 직전 분 적재 {rows}행"
+
+
 def find_gamma_flip(
     legs: Sequence[OptionLeg],
     spot: float,
@@ -417,6 +430,8 @@ def find_gamma_flip(
     *,
     today: date | None = None,
     expiry: date | None = None,
+    snapshot_rows: int | None = None,
+    snapshot_minute: str | None = None,
 ) -> float | None:
     """
     GEX 부호가 바뀌는 기초자산 레벨(Gamma Flip) — 이탈 시 urgency 모드.
@@ -441,6 +456,21 @@ def find_gamma_flip(
     없음"* 이라고 적어 두었는데 **이것이 사실과 정반대였다** — NaN은 "그 지점"이 아니라 합계를
     거쳐 전 구간을 오염시키고, 부호 비교를 조용히 무력화한다. 경고 억제가 그 사실을 덮었다.
     이제 억제하지 않고 **입력 단계에서 배제한다**(억제는 계산 결과를 못 믿게 만든다).
+
+    ===== 2026-08-31 (08-31 §1-10 / 제4부 P1-1) — **이 줄이 자기가 무엇을 먹었는지 말한다** =====
+
+    `snapshot_rows`/`snapshot_minute`는 **호출측이 이번 판단에 넘긴 체인 스냅샷**의 행 수와
+    그 스냅샷의 분이다. 산출 불가 WARNING 뒤에 `· 직전 분 적재 N행(HH:MM)`으로 붙는다.
+
+    08-31에 사람이 이 인과(산출 불가 <- 직전 분 적재가 6레그 미만)를 잇는 데 **로그 두 종류를
+    시각으로 맞춰 붙여야 했다.** 한 줄 안에 있으면 다음 사람은 안 붙여도 된다.
+
+    ⚠ **앞머리 문구("감마플립 산출 불가")는 건드리지 않는다** — `log_metrics`가 그 부분문자열로
+    세고(`gamma_flip_uncomputable`), 08-04에 문구가 움직이며 정규식이 눈이 멀어 362건이 0건으로
+    보고된 전례가 있다. **덧붙이기만 한다.**
+
+    ⚠ 둘 다 없으면(백테스트·단위 테스트·대시보드) 꼬리를 안 붙인다 — 「모른다」를 「0행」으로
+    찍으면 그 자리가 곧 다음 오독이다(규약 C).
     """
     usable = [leg for leg in legs if usable_for_black_scholes(leg)]
     if len(usable) < GAMMA_FLIP_MIN_LEGS:
@@ -456,10 +486,11 @@ def find_gamma_flip(
             return None
         logger.warning(
             "감마플립 산출 불가 — BS 계산 가능 레그 %d개(전체 %d개, 최소 %d 필요). "
-            "iv=0 %d개 / 잔존만기<=0 %d개",
+            "iv=0 %d개 / 잔존만기<=0 %d개%s",
             len(usable), len(legs), GAMMA_FLIP_MIN_LEGS,
             sum(1 for leg in legs if leg.iv <= 0),
             expiring,
+            _snapshot_tail(snapshot_rows, snapshot_minute),
         )
         return None
 

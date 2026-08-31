@@ -1268,6 +1268,7 @@ def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[st
         )
         out += ["> 시간대별 **p95**(초). 매일 같은 시간대가 붉으면 KIS 쪽 혼잡 패턴이다.", ""]
     out += _render_p50_timeout_cross(metrics, lat)
+    out += _render_close_transition(lat)
     out += _render_censored_windows(lat)
     warnings = lat.get("warnings") or []
     threshold = lat.get("p95_warn_threshold")
@@ -1288,6 +1289,50 @@ def _render_rest_latency(metrics: dict, previous: dict | None = None) -> list[st
         out += _render_latency_streak(warnings, previous, threshold)
     else:
         out += [f"> ✅ p95가 임계({threshold}초)를 넘은 (시간대, 엔드포인트) 없음.", ""]
+    return out
+
+
+def _render_close_transition(lat: dict) -> list[str]:
+    """2026-08-31 (08-31 §1-14 / 제5부 고도화 1 ★) — **장 마감이 대신 해 준 A/B 테스트.**
+
+    08-31에 하루가 실험 하나를 공짜로 해 줬다. 15:20 정규장 마감 전후로 **우리 코드와 호출량은
+    그대로인데 응답시간만 100배 바뀌었다**(2.42초/77건 → 0.02초/101건 — 호출은 오히려 늘었다).
+
+    **이 비가 곧 「그날 느렸던 것이 우리 탓인가 KIS 탓인가」의 답이다**:
+    **1에 가까우면 우리 쪽**(마감 뒤에도 안 빨라졌다면 병목이 우리 코드·페이서에 있다),
+    **0에 가까우면 KIS 부하**. 08-31 값은 **0.008배**였다.
+    08-04 §2-6이 만든 귀속 판정표를 매일 자동으로 채우는 축이 된다.
+
+    ⛔ **임계는 걸지 않는다 — 정상 분포를 모른다.** 며칠 쌓고 사람이 정한다.
+    계산은 `log_metrics._close_transition()`이 한다 — 이 함수는 인쇄만 한다.
+    """
+    ct = lat.get("close_transition")
+    if not ct:
+        # 구버전 사이드카다. **「비가 0이다」로 찍지 않는다**(규약 C).
+        return []
+    def _cell(p50: float | None, calls: int, window: str) -> str:
+        return f"{p50:.2f}초 / {calls:,}건 ({window})" if p50 is not None else f"**못 쟀다**({window} 창 없음)"
+    before = _cell(ct.get("before_p50"), ct.get("before_calls") or 0, ct.get("before_window", "?"))
+    after = _cell(ct.get("after_p50"), ct.get("after_calls") or 0, ct.get("after_window", "?"))
+    ratio = ct.get("ratio")
+    out = [
+        f"- **마감 전후 응답시간 비**: 마감 전 {before} → 마감 후 {after}",
+    ]
+    if ratio is None:
+        out += [
+            "  - 비 **못 쟀다** — 두 구간 중 한쪽에 창이 없다. **「0배」가 아니다**(규약 C).",
+            "",
+        ]
+        return out
+    # 판정하지 않는다 — 읽는 법만 적는다. 정상 분포를 모르므로 임계가 없다.
+    out += [
+        f"  - **비 = {ratio:.3f}배** — **1에 가까우면 우리 쪽 문제, 0에 가까우면 KIS 부하**다. "
+        "마감 뒤에는 우리 코드도 호출량도 그대로이므로, 그때 빨라졌다면 느렸던 원인은 우리가 아니다.",
+        "  - ⚠ **임계는 없다**(정상 분포를 아직 모른다). 며칠 쌓아 사람이 정한다 — "
+        "08-05 스팟 괴리율에서 「숫자를 보고 임계를 거는」 실수를 반복하지 않는다.",
+        "  - ⚠ **성적이 아니라 귀속이다**(규약 G). 비가 작다고 우리 코드가 좋아진 것이 아니다.",
+        "",
+    ]
     return out
 
 
@@ -1467,7 +1512,37 @@ def _render_member_availability(db: dict) -> list[str]:
             "**08-04 §2-10이 '가치가 높다'고 판정한 종가 형성 구간에서 앙상블이 4→3으로 얇아지는 것이 "
             "안 보였다.** 이 값이 9분보다 크게 늘면 단일가 밖에서도 체결이 끊긴 것이다."
         )
+    out += _render_effective_member_runs(db)
     out.append("")
+    return out
+
+
+def _render_effective_member_runs(db: dict) -> list[str]:
+    """2026-08-31 (08-31 §1-13 / 제5부 고도화 3) — **수준이 아니라 지속 시간을 낸다.**
+
+    08-31에 「판단에 의견을 낸 축」이 2로 내려간 것 자체는 새롭지 않았다. 새로운 것은
+    **그 상태가 얼마나 오래 갔는가**였다 — 1분 → 2분 → 3분 → **8분**(14:33부터, 그날 최장).
+    장중 게이지는 **최신 사이클의 값만** 보므로 이 형태를 구조적으로 못 본다: 「비영 2」가
+    한 분 스쳐 간 날과 여덟 분 눌러앉은 날이 같은 칸에 찍힌다.
+
+    ⛔ **임계는 걸지 않는다** — 며칠 쌓기 전에는 「8분이 긴가」를 아무도 모른다.
+    계산은 `db_metrics._effective_member_runs()`가 한다 — 이 함수는 인쇄만 한다.
+    """
+    runs = ((db.get("decisions") or {}).get("member_count") or {}).get("longest_run_by_level")
+    if not runs:
+        # 구버전 사이드카이거나 그날 판단 행이 없다. **「0분」으로 찍지 않는다**(규약 C).
+        return []
+    rows = [[f"비영 {level}", f"{minutes:,}분"] for level, minutes in sorted(runs.items(), key=lambda kv: int(kv[0]))]
+    out = _table(["의견 낸 축 수", "최장 연속"], rows)
+    thinnest = min(runs, key=lambda k: int(k))
+    out += [
+        f"> **가장 얇았던 수준은 비영 {thinnest}이고 최장 {runs[thinnest]:,}분** 이어졌다. "
+        "이 표가 재는 것은 **수준이 아니라 지속 시간**이다 — 한 분 스쳐 간 것과 여덟 분 "
+        "눌러앉은 것은 다른 사건이고, 최신 사이클만 보는 게이지는 그 차이를 못 본다(08-31 §1-13).",
+        "> ⚠ **임계는 없다.** 며칠 쌓아 사람이 정한다 — 지금 거는 임계는 표본 하루짜리다.",
+        "> ⚠ **연속은 판단 행 기준이다.** 사이클이 밀려 행이 없는 분은 연속을 **끊는다** — "
+        "관측이 끊긴 구간을 「오래 눌러앉았다」로 읽지 않기 위해서다.",
+    ]
     return out
 
 

@@ -1276,6 +1276,58 @@ def _dead_axis_by_member(conn: ConnectionLike, target: date) -> dict[str, int]:
     return {r[0]: int(r[1]) for r in sorted(rows, key=lambda r: -int(r[1])) if int(r[1]) > 0}
 
 
+# ===== 2026-08-31 (08-31 §1-13 / 제5부 고도화 3) — **움직인 것은 수준이 아니라 지속 시간이다** =====
+#
+# 08-31에 「판단에 의견을 낸 축」이 2로 내려간 것 자체는 새롭지 않았다. 새로운 것은
+# **그 상태가 얼마나 오래 갔는가**였다 — 1분 → 2분 → 3분 → **8분**(14:33부터, 그날 최장).
+#
+# 지금 게이지는 **최신 사이클의 값만** 본다. 그래서 이 형태를 **구조적으로 못 본다**:
+# 「비영 2」가 한 분 스쳐 간 날과 여덟 분 눌러앉은 날이 같은 칸에 찍힌다.
+#
+# ⛔ **임계는 걸지 않는다.** 이 값이 며칠 쌓이기 전에는 「8분이 긴가」를 아무도 모른다 —
+# 판정은 사람이 하고, 여기서는 값만 만든다(이 모듈의 경계).
+#
+# ⚠ **연속의 단위는 「행」이지 「분」이 아니다.** 판단 행은 사이클마다 한 줄이고 정상일에는
+# 1분에 하나지만, 사이클이 밀린 분에는 행 자체가 없다. **없는 분을 이어 붙이지 않는다** —
+# 시각 간격이 벌어지면 연속을 끊는다. 안 그러면 관측이 끊긴 구간이 「오래 눌러앉았다」로 읽힌다.
+_EFFECTIVE_RUN_MAX_GAP_MINUTES = 2
+
+
+def _effective_member_runs(conn: ConnectionLike, target: date) -> dict[str, int]:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: `effective_member_count` 수준마다 **가장 길게 연속으로 머문 분 수**. 수준을 키로 준다.
+    해석: 위 절 주석. 「비영 2가 8분 연속」 같은 형태를 표에서 바로 읽게 하는 것이 목적이다.
+    실패 조건: 그 키가 없는 날(2026-08-06 이전)은 빈 dict — 호출측이 「집계 전」으로 표시한다.
+    """
+    rows = _fetchall(
+        conn,
+        "SELECT timestamp, (risk_gate_state->>'effective_member_count')::int"
+        " FROM signal_decisions"
+        " WHERE timestamp::date=%s AND risk_gate_state ? 'effective_member_count'"
+        " ORDER BY timestamp",
+        (target,),
+    )
+    longest: dict[int, int] = {}
+    run_level: int | None = None
+    run_minutes = 0
+    previous = None
+    for stamp, level in rows:
+        if level is None:
+            run_level, run_minutes, previous = None, 0, None
+            continue
+        level = int(level)
+        gap_ok = (
+            previous is not None
+            and (stamp - previous).total_seconds() <= _EFFECTIVE_RUN_MAX_GAP_MINUTES * 60
+        )
+        run_minutes = run_minutes + 1 if (level == run_level and gap_ok) else 1
+        run_level, previous = level, stamp
+        longest[level] = max(longest.get(level, 0), run_minutes)
+    # 수준을 문자열 키로 준다 — JSON 왕복에서 int 키가 문자열이 되므로 처음부터 맞춘다.
+    return {str(level): longest[level] for level in sorted(longest)}
+
+
 def member_score_quality(conn: ConnectionLike, target: date) -> dict:
     """
     입력: DB 커넥션, 대상 날짜.
@@ -1467,6 +1519,8 @@ def decisions(conn: ConnectionLike, target: date) -> dict:
             # 즉 이 평균은 **그날 시장이 추세였는가**의 함수다. 총계만 보면 매번 같은 오독을
             # 반복하게 되므로 분해를 같은 칸에 인쇄한다(규약 F가 절대 건수에 한 것과 같은 처방).
             "dead_axis_by_member": _dead_axis_by_member(conn, target),
+            # 2026-08-31 고도화 3 — 상세 근거는 `_effective_member_runs` 위 절 주석.
+            "longest_run_by_level": _effective_member_runs(conn, target),
         }
     else:
         # 2026-08-06 이전 판단에는 이 키가 없다 — 0으로 채우면 "전 축이 죽었다"는 거짓 신호가 된다.
