@@ -6685,13 +6685,24 @@ def _due_series(poll_time: datetime) -> list[str]:
     return [series for _m, series in _books_due_this_cycle(books, poll_time)]
 
 
-def test_the_congestion_lever_is_down_by_default():
-    """**레버는 있고, 내려져 있다.** 기본 동작이 08-06 이전과 1비트도 달라지면 안 된다."""
+def test_the_congestion_lever_is_on_since_20260831():
+    """**레버가 켜졌다** — 2026-08-31 저녁, 무조건발동일(09-01) 하루 전에 사용자 승인으로.
+
+    `2026-08-12-eE-on-congested-hours`(유예 9회)의 발동이다. 이전에는 이 테스트가
+    "내려져 있다"를 지켰다 — 지금은 "그 값 그대로"를 지킨다. 값을 바꿀 때는
+    `hypotheses.yaml`의 그 항목과 이 테스트를 **같은 커밋에서** 옮길 것.
+    """
     from mahdi.main import OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS
 
-    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {}
-    assert _due_series(datetime(2026, 8, 7, 10, 0)) == ["regular", "weekly_mon"]
-    assert _due_series(datetime(2026, 8, 7, 10, 1)) == ["regular", "weekly_thu"]
+    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
+    # 혼잡 시간대(10시) — 위클리가 4분 주기로 격분된다.
+    assert _due_series(datetime(2026, 9, 1, 10, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 9, 1, 10, 1)) == ["regular", "weekly_thu"]
+    assert _due_series(datetime(2026, 9, 1, 10, 2)) == ["regular"]
+    assert _due_series(datetime(2026, 9, 1, 10, 3)) == ["regular"]
+    # 규칙 밖 시간대(9시) — 종전 2분 주기 그대로다.
+    assert _due_series(datetime(2026, 9, 1, 9, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 9, 1, 9, 1)) == ["regular", "weekly_thu"]
 
 
 def test_pulling_the_lever_halves_weekly_polling_in_that_hour_only(monkeypatch):

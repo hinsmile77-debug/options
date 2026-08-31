@@ -4120,3 +4120,34 @@ p50만 보는 눈은 그 급등을 구조적으로 못 본다.
 
 **검증.** `hypotheses.yaml`의 `2026-08-31-p1-4-a-denominator-of-one-says-so`.
 `tests/test_evidence_collector_members.py::test_the_denominator_tag_*` 3건.
+
+## 2026-08-31 저녁 — 레버 E를 켰다. 사전 대응 규칙도 같은 손잡이라 함께 닫힌다
+
+### [MW0601] 결정: 사용자 승인으로 무조건발동일(09-01)을 하루 앞두고 발동
+
+**증상.** `OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`가 유예 9회째였고, 무조건발동일
+2026-09-01이 하루 앞으로 다가와 있었다. 같은 손잡이인 사전 대응 규칙
+(`2026-08-04-p5-kis-latency-rule`)도 세 번째로 「이틀 연속 조건 성립」 상태였다.
+
+**원인.** 조건이 성립하는 시각(장후 15:46)에는 그 시간대가 항상 과거라 자동 회차는
+발동을 결정할 수 없는 구조였다(08-26 §1-8). 발동은 애초에 사람이 하는 것으로 설계돼 있다.
+
+**결정.** 사용자가 대화에서 직접 발동을 지시했다. `mahdi/main.py`의
+`OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`를 `{10: 4, 11: 4, 12: 4, 13: 4, 14: 4}`로
+바꿨다 — 마흐디 프로세스가 안 떠 있는 상태(장 마감 후 18:37, 프로세스 확인함)에서 값만
+바꿔 **재기동을 강제하지 않았다.** 효력은 다음 07:30(2026-09-01) 기동부터다.
+
+**Why.** 위상 집중 재발 여부(08-26이 걸어 둔 자체 조건)를 이 회차가 독립적으로 확인하지는
+않았다 — 대신 08-31 장후 자동조치의 권고(A: 켠다, 근거는 유예 9회 사유 0회 · 그날 예산
+컷 234건 중 233건이 이미 위클리를 잘라내고 있었다는 것)를 사람이 그 자리에서 받아들였다.
+장 마감 후에 값만 바꿔 다음 자연 기동에 실리게 하는 것이 재기동 대가(봉 30개) 없이
+「내일 아침 발동」의 취지를 만족시킨다.
+
+**How to apply.** 예측치는 새로 적지 않았다 — `2026-08-12-eE-on-congested-hours`의 기존
+넷(주장 `budget_exceeded.count` 08-12 기준선 74건 · `stale_pct <= 70.0`, 대가
+`book_coverage` 50%→약25% · `gex_input_missing_minutes` 기준선 4분)이 그대로 검정 축이다.
+`test_the_congestion_lever_is_down_by_default`를 `test_the_congestion_lever_is_on_since_20260831`로
+바꿔 새 기본값을 회귀로 고정했다 — **레버 값과 그 값을 지키는 테스트는 같은 커밋에서 옮긴다.**
+
+**검증.** `hypotheses.yaml`의 `2026-08-12-eE-on-congested-hours`(09-01 장후가 첫 실측
+판정). `tests/test_main.py::test_the_congestion_lever_is_on_since_20260831`.

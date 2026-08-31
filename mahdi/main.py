@@ -254,7 +254,18 @@ OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
 # **결론은 옳았지만 근거 하나가 틀렸다** — 틀린 근거를 규약 안에 굳히지 않는다.
 #
 # 체크 한 줄은 `docs/동작점검/tools/phases.md` **A-2**에 있다.
-OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS: dict[int, int] = {}
+#
+# ===== 2026-08-31 저녁 — **켰다.** 무조건발동일(2026-09-01)을 하루 앞두고 사용자 승인으로
+# 발동. 장 마감 후(15:45 이후) · 마흐디 프로세스 미가동 상태에서 값만 바꾼다 — 이 값은
+# 프로세스 기동 시점에 읽히므로(`@lru_cache`가 아니라 모듈 전역이지만 재기동 없이는 이미
+# 뜬 프로세스에 반영되지 않는다) 다음 07:30 기동부터 자연히 적용되고, **지금 이 시점에
+# 재기동을 강제하지 않는다**(재기동 대가 봉 30개를 아끼는 것이 목적).
+# 함께 닫히는 것: `hypotheses.yaml`의 사전 대응 규칙(`2026-08-04-p5-kis-latency-rule`)
+# 발동 여부 — 같은 레버라 한 번에 닫힌다.
+# 예측치는 `hypotheses.yaml`의 `2026-08-12-eE-on-congested-hours`에 **이미** 등재돼 있다
+# (주장 budget_exceeded.count 08-12 기준선 74건 · stale_pct <= 70.0, 대가 book_coverage
+# 50%→약25% · gex_input_missing_minutes 08-12 기준선 4분) — 새로 적지 않는다.
+OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS: dict[int, int] = {10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
 
 # 2026-07-31(운영점검보고서 2026-07-31 §4 우선순위 2) — 밀림으로 건너뛴 분을 먼슬리 10레그로
 # 회수할지 결정하는 임계. 다음 격자 틱까지 남은 대기 시간이 이보다 짧으면 회수를 시도하지 않는다
