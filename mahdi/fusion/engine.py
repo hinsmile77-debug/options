@@ -275,13 +275,29 @@ class SignalFusionEngine:
             and decision.effective_member_count <= 1
             else ""
         )
+        # ===== 2026-09-02 (09-02 §1-8 / 제4부 P1-3) — **비영 N이 「누가 빠졌는지」는 안 말한다** =====
+        #
+        # 09-02 14:06부터 비영이 3/6 → 2/6으로 내려앉아 그 시간대 판단의 72%가 2/6이었는데,
+        # 로그에는 「비영 2」만 있었다. **어느 축이 0점을 냈는지는 DB를 열어야만** 알 수 있었다
+        # (`db.decisions.member_count.dead_axis_by_member`). 08-19 Fix#6이 「가용 4/6이 실질
+        # 2.36이었다」를 고친 것과 같은 형태 — **값은 이미 여기 있고 로그에만 없다.**
+        #
+        # ⛔ **0은 중립이지 의견이 아니다**(`ensemble.EnsembleResult`). `available`에는 남아 있고
+        # `effective_member_count`에서만 빠지는 그 축들의 **이름**이 이 목록이다.
+        # ⚠ **꼬리표는 줄 끝에만 붙인다** — 앞머리와 `비영 %d`의 자리를 건드리면
+        # `collect_evidence.MEMBER_RE`가 눈이 먼다(08-04에 문구가 움직여 362건이 0건이 됐다).
+        # ⚠ **빈 목록도 찍는다**(규약 C) — `0점축=[]`가 없으면 「0점 축이 없었다」와
+        # 「이 줄이 아직 안 실렸다」가 같은 글자가 된다.
+        # ⚠ 줄 수는 안 는다 — 이 함수는 **형태가 바뀔 때만** 찍는다.
+        zero_axes = [name for name in available if getattr(member_scores, name) == 0.0]
         logger.info(
-            "판단 형태 전이: 가용멤버 %s(%d/%d, 비영 %d) · %s · 사유 %s · 전략 %s%s%s",
+            "판단 형태 전이: 가용멤버 %s(%d/%d, 비영 %d) · %s · 사유 %s · 전략 %s%s%s%s",
             list(available), len(available), len(MEMBER_FIELDS), decision.effective_member_count,
             decision.trade_permission.value,
             list(decision.reject_reasons) or "없음",
             list(decision.allowed_strategies) or "없음",
             "" if previous is None else f" (직전 가용멤버 {list(previous[0])})",
+            f" · 0점축={zero_axes}",
             denominator_note,
         )
 

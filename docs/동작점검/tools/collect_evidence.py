@@ -1540,6 +1540,44 @@ def due_hypotheses(root: Path, day: _date):
 
 
 # ---------------------------------------------------------------- 본문
+# ===== 2026-09-02 (09-02 §1-9 / 제4부 P1-4) — **개수는 분포를 안 말한다** =====
+#
+# 09-02에 `p95/timeout`이 **13:30부터 사실상 상시** 위험선 위였는데(하루 14/98창),
+# §12는 「14개」와 「최악 창」만 적었다. **흩어진 14창과 내리 이어진 14창은 다른 사건인데
+# 같은 글자로 보였다** — 「13:30 이후로 내리 이어졌다」는 사실은 사람이 `_지연창.tsv`를
+# 손으로 훑어야만 나왔다.
+#
+# ⛔ **임계는 손대지 않는다.** 위험선 1.0배는 08-27 P2-E가 정한 그대로다. 이 함수가 바꾸는
+#    것은 「무엇을 재는가」(개수 → 개수 + 최장 연속)이지 「얼마부터 위험한가」가 아니다.
+# ⚠ **p95 표본이 없는 창은 애초에 여기 안 들어온다** — `window_latency_p95()`가 이미
+#    걸러낸 것만 받는다. 그래서 연속은 「잰 창들」 사이의 연속이고, 「안 쟀다」를 「안 넘었다」로
+#    세지 않는다(규약 C). 그 사실을 호출측이 분모 `len(p95_by_window)`로 함께 인쇄한다.
+def _longest_over_run(
+    p95_by_window: dict[str, float], timeout: float,
+) -> tuple[int, str, str]:
+    """
+    입력: 창 시각 -> p95 초(표본이 있는 창만), read timeout 초.
+    계산: 시각 순으로 훑어 `p95 >= timeout`이 **끊기지 않고 이어진** 최장 구간의
+         길이와 그 시작·끝 창 시각.
+    해석: 09-02 §1-9. 같은 14창이라도 뭉쳐 있으면 한 번의 절벽이고 흩어져 있으면
+         산발이다. `cliff_episodes.md`가 묻는 「경고선 → 위험선」과 같은 축이다.
+    실패 조건: 넘은 창이 하나도 없으면 (0, "", "") — 호출측은 `over`가 빈 경우
+              이 함수를 부르지 않는다.
+    """
+    longest, longest_from, longest_to = 0, "", ""
+    run, run_from = 0, ""
+    for at, p95 in sorted(p95_by_window.items()):
+        if p95 >= timeout:
+            if run == 0:
+                run_from = at
+            run += 1
+            if run > longest:
+                longest, longest_from, longest_to = run, run_from, at
+        else:
+            run = 0
+    return longest, longest_from, longest_to
+
+
 def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     D = day.isoformat()
     logs = root / "logs"
@@ -1889,12 +1927,15 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                 over = [(at, p95 / timeout) for at, p95 in p95_by_window.items() if p95 >= timeout]
                 if over:
                     worst_at, worst_ratio = max(over, key=lambda x: x[1])
+                    longest, run_from, run_to = _longest_over_run(p95_by_window, timeout)
+                    streak = f"**최장 연속 {longest}창**({run_from[:5]}~{run_to[:5]})"
                     A(f"- ⛔ **`p95/timeout >= 1.0`인 창 {len(over)}/{len(p95_by_window)}개** — "
-                      f"최악 **{worst_at[:5]}** 비율 {worst_ratio:.2f}. "
+                      f"최악 **{worst_at[:5]}** 비율 {worst_ratio:.2f} · {streak}. "
                       "**상위 5%는 이미 제한시간을 넘고 있다**(08-27 P2-E가 지시한 자리).")
                     flags.append(
                         f"`{CHAIN_ENDPOINT}` `p95/timeout >= 1.0`인 창 "
-                        f"{len(over)}/{len(p95_by_window)}개(최악 {worst_at[:5]} {worst_ratio:.2f}) — "
+                        f"{len(over)}/{len(p95_by_window)}개(최악 {worst_at[:5]} {worst_ratio:.2f}, "
+                        f"최장 연속 {longest}창 {run_from[:5]}~{run_to[:5]}) — "
                         "**p95도 검열된다**(하한이다). 이 값들을 실제 응답시간으로 읽지 말 것"
                     )
             A("")
