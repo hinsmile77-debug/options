@@ -38,6 +38,21 @@ BURST_SPLIT_SECONDS = 60.0
 # vs 옵션체인 1.0 초과 — 두 무리가 두 자릿수 차이로 갈려 임계 선택이 민감하지 않다.
 CONTINUOUS_POLLER_DUTY_RATIO = 0.5
 
+# ===== 2026-09-02 (09-02 §1-11 / 제4부 P1-5) — **레버가 직접 조작하는 축을 잰다** =====
+#
+# 09-02에 레버 E(`OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`)의 「주장」 축이 `stale_pct`였는데,
+# 그 값은 **먼슬리** 체인의 분 단위 일치를 재고 레버는 **위클리** 폴링 간격을 넓힌다 — 2단계
+# 간접이라(규약 J) 반증이 났을 때 「레버가 실패했다」와 「지표가 그 레버를 못 잰다」를 못 갈랐다.
+#
+# 레버가 **직접** 줄이는 것은 그 시간대의 위클리 호출 수이고, 그것이 바로 움직이는 것은
+# **사이클 소요시간**이다. 그래서 그 값을 혼잡 시간대에 대해 따로 낸다.
+#
+# ⚠ **창을 레버에서 읽어오지 않는다.** `main`을 import하면 이 모듈이 순수 파서가 아니게 되고,
+# 더 나쁘게는 **레버의 시간대를 바꾸는 날 지표의 정의가 함께 바뀐다** — 그러면 전후 비교가
+# 끊긴다(09-02 P1-5의 회귀 위험 항목). 창은 여기 고정하고 산출물에 **함께 인쇄**한다.
+# 09-03 이후 레버에 09시가 추가되더라도 이 창은 사람이 명시적으로 옮기기 전에는 안 움직인다.
+CONGESTED_HOURS = (10, 11, 12, 13, 14)
+
 _TS = r"(\d{4}-\d\d-\d\d) (\d\d):(\d\d):(\d\d),(\d+)"
 
 _CYCLE_RE = re.compile(
@@ -755,6 +770,19 @@ def _seconds_of_label(label: str) -> int:
     """
     hours, minutes = label.split(":")
     return int(hours) * 3600 + int(minutes) * 60
+
+
+def _pctl(values: list[float], p: float) -> float | None:
+    """
+    입력: 값 목록, 분위(0~1).
+    계산: 최근접 순위법 백분위. 표본이 300 남짓이라 보간법과의 차이가 0.1초 미만이고,
+         **정렬된 실측값 하나를 그대로 돌려준다**는 성질이 사람이 로그와 대조할 때 유리하다.
+    실패 조건: 빈 목록이면 None — 0.0을 내면 「빠른 날」과 「표본이 없는 날」이 같은 칸이 된다.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    return round(ordered[min(len(ordered) - 1, int(round(p * (len(ordered) - 1))))], 1)
 
 
 def _stats(values: list[float]) -> dict:
@@ -1506,6 +1534,39 @@ def _parser_audit(strict: dict[str, int], loose: collections.Counter) -> dict:
     return {"blind": blind, "loose_counts": dict(loose)}
 
 
+def _congested_cycle_seconds(cycles: list[dict]) -> dict:
+    """
+    입력: 파싱된 사이클 목록.
+    계산: 혼잡 시간대(`CONGESTED_HOURS`)의 **사이클 소요시간**과 **분 안에서 끝난 초**의 분포.
+    해석: 위 `CONGESTED_HOURS` 절. 레버 E의 「주장」 축은 `stale_pct`(2단계 간접)가 아니라
+         이 값이어야 했다 — 레버가 그 시간대의 위클리 호출을 빼면 **바로** 짧아지는 값이다.
+         `end_second_*`는 같은 표를 위상 레버(Fix#10) 쪽에서 읽은 것이다: 판단 위상을 어디에
+         둘지는 「사이클이 분 안의 몇 초에 끝나는가」가 정하고, 09-02에 그 값을 7거래일 집계한
+         결과가 08-11의 예측치 25.0초를 폐기시켰다(전 구간 100% 미달).
+    실패 조건: 혼잡 시간대 사이클이 없는 날(장 안 연 날·조기 종료)은 `cycles: 0`에 나머지 None —
+              **0.0을 내면 안 된다**(규약 C: 빠른 날과 표본 없는 날이 같은 칸이 된다).
+    """
+    rows = [c for c in cycles if int(c["start"] // 3600) in CONGESTED_HOURS]
+    rests = [c["rest"] for c in rows]
+    ends = [c["end"] % 60 for c in rows]
+    return {
+        # 창을 **함께 인쇄한다** — 나중에 이 창을 옮기면 옛 사이드카와 새 사이드카를 나란히
+        # 놓았을 때 값이 왜 갈리는지가 지표 자신에게 적혀 있어야 한다.
+        "hours": list(CONGESTED_HOURS),
+        "cycles": len(rows),
+        "rest_p50": _pctl(rests, 0.5),
+        "rest_p95": _pctl(rests, 0.95),
+        "rest_max": round(max(rests), 1) if rests else None,
+        "end_second_p50": _pctl(ends, 0.5),
+        "end_second_p95": _pctl(ends, 0.95),
+        "end_second_max": round(max(ends), 1) if ends else None,
+        # 판단 위상(`main.SIGNAL_FUSION_PHASE_OFFSET_SECONDS`, 09-02부터 55.0초)보다 **먼저**
+        # 끝난 사이클의 비율. 이 값이 `chain_input_source.current` 비율의 상한이다 —
+        # 둘이 크게 갈리면 위상이 아니라 신선도 창(`option_chain_as_of`) 쪽을 봐야 한다.
+        "ended_before_55s_pct": round(sum(1 for e in ends if e <= 55) / len(ends) * 100, 1) if ends else None,
+    }
+
+
 def _cycle_metrics(
     cycles: list[dict],
     calls: list[tuple[float, str, str]],
@@ -1515,6 +1576,7 @@ def _cycle_metrics(
     if not cycles:
         return {
             "count": 0, "by_hour": [], "by_mod10": [],
+            "congested": _congested_cycle_seconds([]),
             "missing": {"count": 0, "list": [], "downtime_count": 0, "infra_count": 0},
             "duplicate_poll_minutes": {"count": 0, "list": [], "labelled": 0},
         }
@@ -1551,6 +1613,10 @@ def _cycle_metrics(
                 # 평균이 아니라 중앙값인 이유: 밀린 사이클 한 건이 60초를 넘기면 평균이 다음 분으로
                 # 넘어가 위상이 **거꾸로 돌아간 것처럼** 보인다(:55 → :05). 중앙값은 안 흔들린다.
                 "end_second_median": round(statistics.median(c["end"] % 60 for c in group), 1),
+                # 2026-09-02 P1-5 — 중앙값만으로는 **꼬리**가 안 보인다. 위상 레버를 어디에 둘지는
+                # "절반이 언제 끝나는가"가 아니라 "거의 다 언제까지 끝나는가"가 정한다.
+                "rest_p95": _pctl([c["rest"] for c in group], 0.95),
+                "end_second_p95": _pctl([c["end"] % 60 for c in group], 0.95),
             }
         )
 
@@ -1606,6 +1672,8 @@ def _cycle_metrics(
         "first_start": _hhmm(first),
         "last_start": _hhmm(last),
         "rest_seconds": _stats(rests),
+        # 2026-09-02 P1-5 — **레버 E가 직접 조작하는 축**(위 CONGESTED_HOURS 절 참고).
+        "congested": _congested_cycle_seconds(cycles),
         "over_60s": sum(1 for x in rests if x > 60),
         "rows_distribution": dict(sorted(collections.Counter(c["rows"] for c in cycles).items())),
         # 2026-08-07(§2-1 / Fix#3) — **두 사이클이 같은 분 라벨로 적재한 경우.**

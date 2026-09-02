@@ -309,10 +309,15 @@ def test_a_pipe_inside_the_claim_cannot_break_the_table():
 def test_the_premise_lever_column_is_field_absence_not_a_parser_bug(collector):
     """08-27 P2-B 부수 — 「전제레버가 전 행 `—`」의 원인을 가른다.
 
-    **파서 문제가 아니다.** 저장소 전체에서 `전제레버:` 키를 가진 항목은 넷뿐이고, 도래한
+    **파서 문제가 아니다.** 저장소 전체에서 `전제레버:` 키를 가진 항목은 다섯뿐이고, 도래한
     항목들은 그 키를 애초에 안 달았다. 파서는 달린 곳에서 값을 정확히 읽는다.
+
+    2026-09-02: 넷 → **다섯**. `2026-09-02-fix10-phase-offset-55s`가 위상 레버
+    `SIGNAL_FUSION_PHASE_OFFSET_SECONDS`를 전제레버로 달았다(3주 방치돼 있던 레버를 켠 항목).
+    **이 수가 오르는 것 자체가 이 테스트가 바라는 동작이다** — 새 항목이 규약 H(전제 레버가
+    꺼진 날의 숫자로 판정하지 않는다)를 실제로 쓰고 있다는 뜻이므로.
     """
     yaml_text = (PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml").read_text(encoding="utf-8")
-    assert yaml_text.count("\n  전제레버:") == 4, "이 수가 바뀌면 위 판정을 다시 해야 한다"
+    assert yaml_text.count("\n  전제레버:") == 5, "이 수가 바뀌면 위 판정을 다시 해야 한다"
     schedule = collector.lever_schedule(PROJECT_ROOT)
     assert "use_effective_member_count" in schedule

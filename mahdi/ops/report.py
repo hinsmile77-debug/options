@@ -636,6 +636,27 @@ def _render_by_hour(metrics: dict, previous: dict | None = None) -> list[str]:
             "> 평균이 아니라 중앙값인 이유: 60초를 넘긴 사이클 하나가 평균을 다음 분으로 넘겨 "
             "**위상이 거꾸로 돈 것처럼**(:55 → :05) 보이게 만든다.",
         ]
+    # 2026-09-02 P1-5 — **레버 E가 직접 조작하는 축**(`log_metrics.CONGESTED_HOURS` 절 참고).
+    congested = dig(metrics, "cycles.congested") or {}
+    if congested.get("cycles"):
+        label = "·".join(f"{h}시" for h in congested.get("hours") or [])
+        out += [
+            "",
+            f"- **혼잡 시간대({label}) 사이클 소요** — {congested['cycles']:,}사이클: "
+            f"p50 {_fmt(congested.get('rest_p50'), '{:.1f}초')} / "
+            f"p95 {_fmt(congested.get('rest_p95'), '{:.1f}초')} / "
+            f"최대 {_fmt(congested.get('rest_max'), '{:.1f}초')}",
+            f"- **그 시간대의 사이클 종료 초**: p50 :{_fmt(congested.get('end_second_p50'), '{:04.1f}')} / "
+            f"p95 :{_fmt(congested.get('end_second_p95'), '{:04.1f}')} / "
+            f"최대 :{_fmt(congested.get('end_second_max'), '{:04.1f}')} — "
+            f"판단 위상(:55) 전에 끝난 사이클 {_fmt(congested.get('ended_before_55s_pct'), '{:.1f}%')}",
+            "> 2026-09-02 §1-11 / P1-5. 레버 E(`OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`)의 「주장」 "
+            "축은 `stale_pct`(먼슬리 분단위 일치 — 레버가 손대지 않는 값, 규약 J 2단계 간접)가 "
+            "아니라 **이 줄**이어야 했다. 레버가 그 시간대의 위클리 호출을 빼면 바로 짧아지는 값이다.",
+            "> 아랫줄은 같은 표를 **위상 레버(Fix#10)** 쪽에서 읽은 것이다. 08-11의 예측치 25.0초는 "
+            "이 축으로 재자 7거래일 전부 0%였고(사이클이 그때 아직 안 끝난다), 그래서 09-02에 "
+            "55.0초로 켰다 — `ended_before_55s_pct`가 `chain_input_source.current` 비율의 **상한**이다.",
+        ]
     return out + [""] if out and out[-1] != "" else out
 
 
@@ -2163,6 +2184,24 @@ def _render_signal_reach(db: dict, gamma_flip_rejections: int | None = None) -> 
         ]
     elif source:
         out += ["", f"- 체인 입력 출처: 집계 전 — {source.get('reason', '')}"]
+    # 2026-09-02 P1-5 — 위 이산 판정의 **연속판**(마이그레이션 036). 바로 아래 붙여 인쇄하는
+    # 이유는 규약 F다: 같은 것을 재는 두 축이 떨어져 있으면 다음 사람이 하나만 읽는다.
+    # 08-18 이후 위 줄은 매일 98~100%라 **읽어도 아무것도 안 바뀌었다** — 이 줄이 그 안에서
+    # 「1분 늦었나 3분 늙었나」를 가른다.
+    newest = reach.get("chain_newest_age_seconds") or {}
+    if newest.get("available"):
+        behind = newest.get("behind_minutes") or {}
+        spread = " / ".join(f"{k}분 뒤 {v:,}분" for k, v in sorted(behind.items(), key=lambda kv: int(kv[0])))
+        out += [
+            f"- **체인 최신 레그 나이**: 중앙 {_fmt(newest.get('p50'), '{:.1f}초')} / "
+            f"p95 {_fmt(newest.get('p95'), '{:.1f}초')} / 최대 {_fmt(newest.get('max'), '{:.1f}초')}"
+            + (f" — {spread}" if spread else ""),
+            "> 2026-09-02 P1-5. 위 `stale_pct`가 08-18 이후 매일 98~100%로 상한에 붙어 개선 폭이 "
+            "안 보였다(1초 어긋나도 stale이고, 1분 늦은 체인과 3분 늙은 체인이 같은 칸이다). "
+            "이 줄은 같은 관측의 연속판이라 **레버가 초 단위로 움직인 것이 보인다**.",
+        ]
+    elif newest:
+        out += [f"- 체인 최신 레그 나이: 집계 전 — {newest.get('reason', '')}"]
     for warning in reach.get("warnings") or []:
         out.append(f"- ⚠ {warning}")
     # 2026-08-06 Fix#5 — 장전 표본만 있는 구간의 판정 유예. 경고가 아니지만 **보이기는 한다**.

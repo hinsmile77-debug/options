@@ -1235,6 +1235,12 @@ def _chain_input_source_counts(conn: ConnectionLike, target: date) -> dict:
          "느려졌다"만 알 수 있고 "몇 분이 늙은 값을 봤는가"는 못 센다.
     실패 조건: 컬럼이 없는 날(029 이전)은 `{"available": False}` — **0을 내면 안 된다**.
               그러면 08-11 이전 전 이력이 "체인 없음"으로 보인다.
+
+    ⚠ **2026-09-02(§1-11 / P1-5) — 이 값만 보고 레버를 판정하지 말 것.** 판정이 「분 단위 완전
+    일치」라 08-18 이후 매일 98~100%로 상한에 붙어 있고, 그 구간에서는 **초 단위 개선이 전혀
+    안 잡힌다.** 09-02에 레버 E의 「주장」 축으로 이 값을 읽다가 «레버가 실패했다»와 «지표가
+    그 레버를 못 잰다»를 못 가르고 멈췄다. 연속판은 `_chain_newest_age_stats`(036)이고,
+    레버 E가 **직접** 조작하는 축은 `log.cycles.congested`(log_metrics)다.
     """
     try:
         rows = _fetchall(
@@ -1253,6 +1259,56 @@ def _chain_input_source_counts(conn: ConnectionLike, target: date) -> dict:
         "available": True,
         "counts": counts,
         "stale_pct": round(counts.get("stale", 0) / judged * 100, 1) if judged else None,
+    }
+
+
+def _chain_newest_age_stats(conn: ConnectionLike, target: date) -> dict:
+    """
+    입력: DB 커넥션, 대상 날짜.
+    계산: 판단 시각 대비 **가장 새로운** 먼슬리 레그의 나이(초) 분포와, 그것을 분으로 접은
+         「몇 분 뒤처진 체인을 봤는가」 히스토그램.
+    해석: 마이그레이션 036 / 09-02 §1-11(제4부 P1-5). **`_chain_input_source_counts`를 대체하지
+         않는다 — 옆에 선다.** 저쪽은 「그 분 것인가」라는 이산 판정이고 08-18 이후 매일
+         98~100% stale로 상한에 붙어 있어, 그 상태에서는 위상·수집량 레버가 초 단위로 무엇을
+         바꿔도 지표가 안 움직인다(09-02가 레버 E를 그 축으로 읽다 멈춘 자리).
+
+         `behind_minutes`가 이 함수의 요점이다: 나이 = `60*k + 판단초`이므로 `age // 60`은
+         **뒤처진 분 수 k와 정확히 같다**(판단초 < 60). 「1분 늦은 체인」과 「3분 늙은 체인」이
+         `stale` 한 칸에 뭉쳐 있던 것을 이 줄이 가른다.
+    실패 조건: 컬럼이 없는 날(036 이전)은 `{"available": False}` — **0을 내면 안 된다**(규약 C).
+              그러면 09-02 이전 전 이력이 「체인이 항상 최신이었다」로 보인다.
+    """
+    try:
+        row = _fetchone(
+            conn,
+            "SELECT count(chain_newest_leg_age_seconds), "
+            "       percentile_cont(0.5) WITHIN GROUP (ORDER BY chain_newest_leg_age_seconds), "
+            "       percentile_cont(0.95) WITHIN GROUP (ORDER BY chain_newest_leg_age_seconds), "
+            "       max(chain_newest_leg_age_seconds) "
+            "FROM signal_decisions WHERE timestamp::date=%s",
+            (target,),
+        )
+    except Exception:
+        conn.rollback()
+        return {"available": False, "reason": "chain_newest_leg_age_seconds 미기록(마이그레이션 036 이전)"}
+    measured = int(row[0]) if row and row[0] is not None else 0
+    if not measured:
+        return {"available": False, "reason": "chain_newest_leg_age_seconds 미기록(마이그레이션 036 이전)"}
+    behind = _fetchall(
+        conn,
+        "SELECT floor(chain_newest_leg_age_seconds / 60)::int, count(*) "
+        "FROM signal_decisions WHERE timestamp::date=%s AND chain_newest_leg_age_seconds IS NOT NULL "
+        "GROUP BY 1 ORDER BY 1",
+        (target,),
+    )
+    return {
+        "available": True,
+        "measured": measured,
+        "p50": round(float(row[1]), 1),
+        "p95": round(float(row[2]), 1),
+        "max": round(float(row[3]), 1),
+        # 키는 문자열이다 — 이 dict은 JSON 사이드카로 저장된다(정수 키는 왕복에서 문자열이 된다).
+        "behind_minutes": {str(int(r[0])): int(r[1]) for r in behind},
     }
 
 
@@ -1873,6 +1929,8 @@ def signal_reach(conn: ConnectionLike, target: date) -> dict:
     out["gamma_flip_out_of_range_count"] = _gamma_flip_out_of_range_count(conn, target)
     # 2026-08-11 고도화 B — 판단이 **그 분** 체인을 봤는가(마이그레이션 029).
     out["chain_input_source"] = _chain_input_source_counts(conn, target)
+    # 2026-09-02 P1-5 — 위 이산 판정의 **연속판**(마이그레이션 036). 나란히 낸다.
+    out["chain_newest_age_seconds"] = _chain_newest_age_stats(conn, target)
 
     # 2026-08-06(§2-5 / Fix#5) — 표본이 **전부 장전**이면 아래 두 경고는 잴 대상이 아직 없다.
     # 장전에는 스팟이 설계상 없어(`mahdi.session.is_preopen`) `options_flow`가 미가용인 것이

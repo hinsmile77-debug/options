@@ -243,6 +243,8 @@ _SIGNAL_DECISION_COLUMNS = (
     "gex_expiry", "vrp", "chain_input_source",
     # 마이그레이션 031(§11.5). 미적용이면 매분 INSERT가 통째로 실패한다.
     "selected_instruments",
+    # 마이그레이션 036(09-02 P1-5). `chain_input_source`의 연속판 — 그쪽과 **함께** 낸다.
+    "chain_newest_leg_age_seconds",
 )
 
 
@@ -1516,8 +1518,8 @@ def insert_signal_decision(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
             "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
             "chain_oldest_leg_age_seconds, gex_expiry, vrp, chain_input_source, "
-            "selected_instruments) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "selected_instruments, chain_newest_leg_age_seconds) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
                 chain.get("gamma_flip"), chain.get("gex"),
@@ -1530,6 +1532,10 @@ def insert_signal_decision(
                 # NULL은 «선택기가 안 돌았다», 빈 목록+사유는 «돌았으나 고를 것이 없었다».
                 # 그 둘이 구분되지 않으면 이 컬럼은 쓸모가 없다(규약 C).
                 None if selected_instruments is None else json.dumps(selected_instruments),
+                # 2026-09-02 P1-5 — 마이그레이션 036. **`chain_input_source`를 대체하지 않는다.**
+                # 저쪽은 분 단위 이산 판정이라 08-18 이후 매일 98~100% stale로 상한에 붙었고,
+                # 그 상태에서는 위상 레버가 초 단위로 무엇을 바꿔도 지표가 안 움직인다.
+                chain.get("chain_newest_leg_age_seconds"),
             ),
         )
     conn.commit()
