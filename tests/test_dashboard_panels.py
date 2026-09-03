@@ -435,3 +435,56 @@ def test_absorption_chart_is_safe_when_nothing_can_be_judged_yet():
 
     assert list(fig.data[0].y) == []
     assert fig.layout.yaxis.range[1] >= 3.0
+
+
+def _vline_labels(fig) -> list[str]:
+    return [a.text for a in fig.layout.annotations if a.text]
+
+
+def test_gamma_profile_chart_stamps_both_price_lines_with_their_observation_time():
+    """2026-09-03 회귀 — 08-05가 지수선과 선물선을 갈라놓고도 **어느 쪽도 몇 시 값인지 안 적었다.**
+
+    09-03 화면: 지수 1,017.56(14:30) · 선물 1,030.45(15:34). 13p가 벌어져 있는데 시각이 없으니
+    그것이 베이시스인지 지연인지 화면에서 답할 수 없었다 — 08-05가 «창 이동 지연인가 두 가격의
+    차이인가» 때문에 선을 나눈 것과 같은 물음이 시간 축에 그대로 남아 있었다.
+    """
+    fig = build_gamma_profile_chart(
+        [1030.0], [10.0], spot=1017.56, gamma_flip=None, gamma_walls=[],
+        expiry=date(2026, 9, 10), futures_price=1030.45,
+        spot_asof=datetime(2026, 9, 3, 14, 30), spot_is_stale=True,
+        futures_asof=datetime(2026, 9, 3, 15, 34),
+    )
+
+    labels = _vline_labels(fig)
+    assert any("14:30" in t for t in labels)
+    assert any("15:34" in t for t in labels)
+
+
+def test_gamma_profile_chart_marks_a_stale_index_line_instead_of_calling_it_current():
+    """회색 점선 + "현재가"는 그 자체로 «지금 값»이라는 주장이다. 낡았으면 그렇게 말해야 한다."""
+    stale = build_gamma_profile_chart(
+        [1030.0], [10.0], spot=1017.56, gamma_flip=None, gamma_walls=[],
+        spot_asof=datetime(2026, 9, 3, 14, 30), spot_is_stale=True,
+    )
+    fresh = build_gamma_profile_chart(
+        [1030.0], [10.0], spot=1030.1, gamma_flip=None, gamma_walls=[],
+        spot_asof=datetime(2026, 9, 3, 14, 30), spot_is_stale=False,
+    )
+
+    assert any("낡음" in t for t in _vline_labels(stale))
+    assert not any("낡음" in t for t in _vline_labels(fresh))
+    assert any("현재가" in t for t in _vline_labels(fresh))
+    # 선은 지운 것이 아니라 다르게 그린다 — 스팟이 행사가 창의 어디에 있는지가 곧 사고의 크기다.
+    stale_line = [s for s in stale.layout.shapes if s.x0 == s.x1 == 1017.56]
+    assert len(stale_line) == 1
+    assert stale_line[0].line.color != fresh.layout.shapes[0].line.color
+
+
+def test_gamma_profile_chart_omits_the_clock_when_the_observation_time_is_unknown():
+    """시각을 모르면 지어내지 않는다 — 합성 폴백·구버전 행에서 `None`이 온다."""
+    fig = build_gamma_profile_chart(
+        [1030.0], [10.0], spot=1030.0, gamma_flip=None, gamma_walls=[], futures_price=1030.2
+    )
+
+    assert "지수 현재가" in _vline_labels(fig)
+    assert "선물(행사가 창 기준)" in _vline_labels(fig)

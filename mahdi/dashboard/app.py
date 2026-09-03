@@ -219,9 +219,30 @@ def render() -> None:
     # ⚠ 비교 대상은 `snapshot.as_of`가 **아니다.** 그 값은 `regime_state`의 최신 행 시각이라
     # (`data_source._load_from_db`), 장전에는 스팟도 레짐도 둘 다 전일 것이어서 날짜가 같아진다 —
     # 즉 가장 위험한 순간에 정확히 침묵한다. 벽시계 오늘과 비교해야 한다.
+    #
+    # 2026-09-03(감마맵 지수/선물 현재가 점검) — **날짜 비교로는 「오늘인데 낡음」을 못 잡는다.**
+    #
+    # 08-11의 이 판정은 «다른 날이면 경고»였다. 09-03 화면은 그 조건을 통과하면서 틀렸다:
+    # 스팟이 14:30에서 멈춘 채(옵션체인 REST 전멸 53분 + 복구가 15:20 스팟 컷오프를 넘김)
+    # 74분 뒤에도 `14:30:00 기준`이라는 **평범한 회색 캡션**을 달고 1,017.56을 현재가로 띄웠다.
+    # 브로커 종가는 1,032.82였다. 날짜는 같으니 경고가 안 뜬 것이다 — 08-11이 «시각만 있으면
+    # 사람이 매번 계산해야 한다»고 적은 그 문제가, 날짜 축에서만 해결돼 있었다.
+    #
+    # 이제 **엔진과 같은 경계**로 잰다(`data_source`가 `spot_is_stale`에 넣어 온다). 그래야
+    # 화면의 경고와 판단의 미가용이 같은 순간에 켜진다 — 규약 B.
+    # 날짜가 다른 경우는 여전히 날짜를 함께 쓴다(장전 전일 종가를 "오늘 15:19"로 읽지 않게).
     if snapshot.spot_asof is not None:
         if snapshot.spot_asof.date() != db.local_now().date():
             col2.caption(f"⚠ **{snapshot.spot_asof:%Y-%m-%d %H:%M:%S}** 기준 — 오늘 값이 아니다")
+        elif snapshot.spot_is_stale:
+            age_text = (
+                f"{snapshot.spot_age_minutes:.0f}분 전"
+                if snapshot.spot_age_minutes is not None else "시점 미상"
+            )
+            col2.caption(
+                f"⚠ **{snapshot.spot_asof:%H:%M:%S}** 기준({age_text}) — "
+                f"신선도 경계 {db.UNDERLYING_SPOT_MAX_AGE_MINUTES}분을 넘겼다. 지금 지수가 아니다"
+            )
         else:
             col2.caption(f"{snapshot.spot_asof:%H:%M:%S} 기준")
     col3.metric("레짐 안정성", "안정" if snapshot.stability_flag else "REGIME_UNSTABLE")
@@ -253,9 +274,24 @@ def render() -> None:
                 # 지수 선 하나만 그리면 창이 치우쳐 보일 때 그것이 창 이동 지연인지 두 가격의 차이인지
                 # 구분할 수 없다. 선물 1분봉 종가가 곧 롤링에 쓰인 그 값이다.
                 futures_price=snapshot.price_series[-1] if snapshot.price_series else None,
+                # 2026-09-03 — 두 선에 **관측 시각**을 붙인다. 08-05가 선을 갈라놨지만 시각이
+                # 없어서, 09-03의 13p 차이(지수 14:30 · 선물 15:34)가 베이시스인지 지연인지
+                # 화면에서 답할 수 없었다. 근거는 `build_gamma_profile_chart` docstring.
+                spot_asof=snapshot.spot_asof,
+                spot_is_stale=snapshot.spot_is_stale,
+                futures_asof=snapshot.timestamps[-1] if snapshot.timestamps else None,
             ),
             width='stretch', key='gamma_profile',
         )
+        # 낡은 스팟에서는 감마플립/감마월을 **긋지 않는다**(`data_source`가 비워서 보낸다) —
+        # 왜 사라졌는지를 화면이 말하지 않으면 "오늘은 월이 없다"로 오독된다.
+        if snapshot.spot_is_stale:
+            st.caption(
+                f"⚠ 지수 스팟이 **{snapshot.spot_asof:%H:%M} 기준**이라 감마플립·감마월을 "
+                f"산출하지 않았습니다 — 두 값은 스팟을 기준점으로 쓰는데, 낡은 기준점으로 고른 "
+                f"월은 행사가 창 밖을 가리킬 수 있습니다(2026-09-03 실측). "
+                f"GEX 막대는 스팟과 무관하므로 그대로입니다."
+            )
         # 2026-08-05(P0-2) — 판단 근거와 같은 북(먼슬리)만 그린다는 사실을 화면에 남긴다. 위클리
         # 북의 만기 Pinning은 별도 신호(v6 §A3)이고 여기서 합산하면 서로를 덮으므로, 여기 없다는
         # 것이 곧 "안 본다"가 아님을 함께 적어둔다(핀 리스크 패널은 아직 미구현).

@@ -103,6 +103,26 @@ class DashboardSnapshot:
     # 벌어져 있어도 어느 쪽이 낡은 것인지 알 수 없다(08-05 실측: 지수 1,042.85 vs 선물 1046대).
     # 합성 폴백에서는 None.
     spot_asof: datetime | None
+    # 2026-09-03(감마맵 지수/선물 현재가 점검) — 위 `spot_asof`가 **지금으로부터 몇 분 전인가**
+    # (벽시계 기준). 합성 폴백에서는 None.
+    #
+    # 09-03에 화면의 "지수 현재가"가 1,017.56(14:30 관측)인데 브로커 종가는 1,032.82였다. 원인은
+    # 14:31~15:23 옵션체인 REST 전멸 53분이고(지수 스팟은 옵션 시세 응답의 `bstp_nmix_prpr`에
+    # 얹혀 온다), 복구 시각 15:24가 `session.EQUITY_CONTINUOUS_TRADING_END`(15:20)를 지나 그날의
+    # 스팟이 14:30에서 끝났다. **여기까지는 설계대로다** — 문제는 화면이 그 74분을 말하지 않은
+    # 것이다: 아래 `spot_is_stale` 주석 참고.
+    spot_age_minutes: float | None
+    # 2026-09-03 — 위 나이가 **엔진의 신선도 경계**(`db.UNDERLYING_SPOT_MAX_AGE_MINUTES`)를
+    # 넘었는가. 판단 경로는 이 경계로 낡은 스팟을 「틀린 값 대신 미가용」으로 만드는데
+    # (`main._build_signal_inputs`), COCKPIT이 쓰는 `latest_underlying_spot_row()`에는 경계가
+    # 아예 없어서 **엔진이 접은 값을 화면은 현재가로 그리고 있었다.** 규약 B(화면과 판단이 같은
+    # 것을 본다, 2026-08-05 P0-2와 같은 형태)를 스팟에도 적용한다.
+    #
+    # 이 값이 True면 `gamma_flip`/`gamma_walls`는 **계산하지 않는다**(아래 `_load_from_db`).
+    # 표시만의 문제가 아니기 때문이다: 09-03 실측에서 스팟 1,017.56으로 감마월을 골랐는데
+    # 정작 체인 행사가는 1,025~1,035였다 — 창 밖 기준점으로 벽을 고른 셈이다.
+    # 합성 폴백에서는 False(그쪽은 스팟을 그 자리에서 만들어 쓰므로 낡을 수가 없다).
+    spot_is_stale: bool
     # chain/gamma_flip/gamma_walls는 전부 **`gex_expiry` 한 북**에서만 나온다 — 세 북(먼슬리 +
     # 위클리 월·목)을 합산하면 만기별 정보가 서로를 덮기 때문(2026-08-05 P0-2, 아래 `gex_expiry`
     # 주석 참고). 화면에 어느 북인지 반드시 함께 표시해야 하므로 만기를 스냅샷에 싣는다.
@@ -1577,6 +1597,14 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
     # 걸러 결과가 같지만, 규약이 어긋난 사본을 남겨둘 이유가 없다).
     legs, gex_expiry = signal_book_legs(chain_rows, today)
 
+    # 2026-09-03 — 스팟의 나이를 **벽시계**로 잰다. `as_of_ts`(regime_state 최신 시각)로 재면
+    # 안 되는 이유는 `app.render()`의 같은 판정 주석(2026-08-11 Fix#9)과 정확히 같다: 두 값이 함께
+    # 멈추는 구간(장전·폴러 전멸)에서 차이가 0이 되어 **가장 위험한 순간에 침묵한다.**
+    spot_age_minutes = (db.local_now() - spot_asof).total_seconds() / 60 if spot_asof else None
+    spot_is_stale = (
+        spot_age_minutes is not None and spot_age_minutes > db.UNDERLYING_SPOT_MAX_AGE_MINUTES
+    )
+
     # GEX 막대도 `legs`와 같은 북만 — 막대와 감마플립/감마월이 다른 체인에서 나오면 안 된다.
     by_strike: dict[float, float] = {}
     for row in chain_rows:
@@ -1601,9 +1629,14 @@ def _load_from_db(underlying: str) -> DashboardSnapshot | None:
         regime_is_warmup=bool(is_warmup) if is_warmup is not None else None,
         spot=spot,
         spot_asof=spot_asof,
+        spot_age_minutes=spot_age_minutes,
+        spot_is_stale=spot_is_stale,
         chain=chain,
-        gamma_flip=find_gamma_flip(legs, spot) if legs else None,
-        gamma_walls=_gamma_wall_strikes(legs, spot),
+        # 낡은 스팟으로는 **긋지 않는다** — 근거는 `spot_is_stale` 필드 주석(09-03 실측: 창 밖
+        # 스팟 1,017.56으로 1,025~1,035 체인의 월을 골랐다). GEX 막대는 스팟과 무관하게 행사가별
+        # 값이므로 그대로 그린다 — 없는 것만 없다고 쓴다.
+        gamma_flip=find_gamma_flip(legs, spot) if legs and not spot_is_stale else None,
+        gamma_walls=[] if spot_is_stale else _gamma_wall_strikes(legs, spot),
         gex_expiry=gex_expiry,
         futures_flow_symbol=futures_flow_symbol,
         timestamps=[row[0] for row in futures_rows],
@@ -1700,6 +1733,10 @@ def _synthetic_snapshot(seed: int | None = None) -> DashboardSnapshot:
         regime_is_warmup=False,  # 합성은 확률이 퍼진 형태라 학습된 판정을 흉내 낸다
         spot=float(spot[-1]),
         spot_asof=timestamps[-1],
+        # 합성 스팟은 이 함수가 방금 만든 값이라 낡을 수가 없다 — 0분으로 쓴다(None은 "모른다"인데
+        # 여기서는 모르는 게 아니다). 합성 모드 자체는 `is_live=False` 배너가 이미 알린다.
+        spot_age_minutes=0.0,
+        spot_is_stale=False,
         chain=chain,
         gamma_flip=float(spot[-1] - rng.uniform(-5, 5)),
         gamma_walls=[strikes[6]],  # 라이브와 동일하게 1개(엔진 top_n=1)

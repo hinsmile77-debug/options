@@ -10,7 +10,7 @@ GEX 부호는 극성(polarity) 정보이므로 다이버징 두 색 + 중립을 
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import plotly.graph_objects as go
 
@@ -22,6 +22,14 @@ _WALL_COLOR = "#E69F00"
 # 선물 기준선(2026-08-05 P1-6) — Flow Radar의 선물 계열과 같은 파랑 계열을 쓰면 GEX 양(+) 막대와
 # 섞이므로, 어느 시리즈 색과도 겹치지 않는 하늘색을 쓴다(Okabe-Ito 팔레트 내에서 선택).
 _FUTURES_COLOR = "#56B4E9"
+# 낡은 지수 스팟(2026-09-03) — 회색 점선은 "현재가"로 읽히므로, 신선도 경계를 넘긴 값은 **다른
+# 색으로** 긋는다. 부호 색(파랑/버밀리언)이나 선물 하늘색과 겹치지 않는 회갈색을 쓴다.
+_STALE_SPOT_COLOR = "#8C6D4F"
+
+
+def _at(moment: datetime | None) -> str:
+    """관측 시각을 라벨 꼬리에 붙일 짧은 형태로. 시각을 모르면 빈 문자열(지어내지 않는다)."""
+    return f" {moment:%H:%M}" if moment is not None else ""
 
 
 def build_gamma_profile_chart(
@@ -32,6 +40,9 @@ def build_gamma_profile_chart(
     gamma_walls: list[float],
     expiry: date | None = None,
     futures_price: float | None = None,
+    spot_asof: datetime | None = None,
+    spot_is_stale: bool = False,
+    futures_asof: datetime | None = None,
 ) -> go.Figure:
     """
     입력: 행사가/행사가별 GEX/스팟(지수)/감마플립/감마월 + `expiry`(이 값들이 나온 북의 만기)
@@ -47,6 +58,16 @@ def build_gamma_profile_chart(
          **그것이 창 이동 지연인지 두 가격의 차이인지 구분할 수 없었다.** 신호 도달률 배지가
          던지는 질문("행사가 창이 스팟을 따라가고 있는지 확인")을 이 차트에서 답할 수 있게 한다.
          두 값이 가까우면 선이 겹쳐 보이는데, 그것 자체가 "정상"이라는 정보다.
+
+         2026-09-03 `spot_asof`/`futures_asof`/`spot_is_stale`을 받는 이유: 08-05가 두 선을
+         갈라놓고도 **어느 쪽도 몇 시 값인지 안 적었다.** 09-03 화면의 지수선은 1,017.56(14:30
+         관측, 74분 전)이고 선물선은 1,030.45(15:34)였는데, 화면만 보면 그 13p가 베이시스인지
+         지연인지 알 수 없다 — 08-05가 "창 이동 지연인지 두 가격의 차이인지" 때문에 선을
+         나눈 것과 **똑같은 종류의 물음이 시간 축에 남아 있었다.**
+
+         `spot_is_stale`(엔진의 `db.UNDERLYING_SPOT_MAX_AGE_MINUTES` 경계)이면 선을 회갈색으로
+         긋고 라벨에 "낡음"을 쓴다. **선을 지우지는 않는다** — 그 값이 행사가 창의 어디에 있는지가
+         곧 사고의 크기이기 때문이다(09-03에는 체인 1,025~1,035의 왼쪽 밖에 있었다).
     """
     colors = [_POS_GEX_COLOR if g >= 0 else _NEG_GEX_COLOR for g in gex_by_strike]
 
@@ -58,13 +79,20 @@ def build_gamma_profile_chart(
             hovertemplate="행사가 %{x}: GEX %{y:,.0f}<extra></extra>",
         )
     )
-    fig.add_vline(x=spot, line_dash="dot", line_color=_NEUTRAL_COLOR, annotation_text="지수 현재가")
+    fig.add_vline(
+        x=spot,
+        line_dash="dot",
+        line_color=_STALE_SPOT_COLOR if spot_is_stale else _NEUTRAL_COLOR,
+        annotation_text=(
+            f"지수 {'낡음' if spot_is_stale else '현재가'}{_at(spot_asof)}"
+        ),
+    )
     if futures_price is not None:
         fig.add_vline(
             x=futures_price,
             line_dash="dashdot",
             line_color=_FUTURES_COLOR,
-            annotation_text="선물(행사가 창 기준)",
+            annotation_text=f"선물(행사가 창 기준){_at(futures_asof)}",
             annotation_position="bottom right",
         )
     if gamma_flip is not None:

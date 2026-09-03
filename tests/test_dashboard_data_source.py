@@ -279,6 +279,10 @@ def test_load_snapshot_omits_gamma_wall_when_top_exposure_is_zero(monkeypatch):
     responses = {
         **_BASE_RESPONSES,
         "regime": [(ts, 2, [0.1] * 8, None, False, False)],
+        # 2026-09-03 — 스팟을 `ts`로 **새로 준다**. `_BASE_RESPONSES`의 스팟은 07-06 것이라
+        # 09-03에 들어온 신선도 가드(`spot_is_stale`)에 먼저 걸려, 이 테스트가 겨누는
+        # 「노출 0 가드」가 아니라 「낡음」 때문에 통과하게 된다 — 이유가 바뀐 통과는 통과가 아니다.
+        "spot": [(1045.0, ts)],
         "chain": [
             (1045.0, "C", 0.0, 0.60, 0.02, 0.0, expiry, ts, 0.5, 0.5, 0, 1, 7.25, "regular"),  # oi=0 -> 노출 0
             (1047.5, "P", 0.0, 0.62, 0.03, 0.0, expiry, ts, 0.5, -0.5, 0, 1, 7.25, "regular"),
@@ -2202,3 +2206,99 @@ def test_absorption_threshold_scales_to_the_instruments_own_volatility(monkeypat
 
     # 범위 0.2 > 상한 max(2틱=0.1, 중앙값 0.1 x 0.5=0.05) = 0.1 -> 흡수 아님
     assert snap.absorption_series[-1] == 0.0
+
+
+def _stale_spot_responses(now: datetime, spot_asof: datetime, expiry: date) -> dict:
+    """감마월이 나올 만큼 노출이 충분한 체인 + 관측 시각만 다른 스팟."""
+    return {
+        **_BASE_RESPONSES,
+        "regime": [(now, 2, [0.1] * 8, None, False, False)],
+        "spot": [(1017.56, spot_asof)],
+        "chain": [
+            (1030.0, "C", 900.0, 0.60, 0.09, 900.0, expiry, now, 0.5, 0.5, 10, 1, 7.25, "regular"),
+            (1032.5, "P", 20.0, 0.62, 0.02, -200.0, expiry, now, 0.5, -0.4, 10, 1, 7.25, "regular"),
+        ],
+    }
+
+
+def test_load_snapshot_refuses_to_place_gamma_flip_and_walls_on_a_stale_spot(monkeypatch):
+    """2026-09-03 회귀 — 낡은 스팟은 **표시만의 문제가 아니다.**
+
+    09-03 15:44 실측: `underlying_spot_1m`의 그날 마지막 행이 14:30(1,017.56)이었다. 14:31~15:23
+    옵션체인 REST 전멸 53분 동안 스팟이 안 쌓였고(지수는 옵션 시세 응답의 `bstp_nmix_prpr`에
+    얹혀 온다), 복구 시각 15:24가 `session.EQUITY_CONTINUOUS_TRADING_END`(15:20)를 넘어 그날의
+    스팟이 14:30에서 끝났다. 그런데 COCKPIT은 그 74분 된 값으로 감마월을 골랐다 — 정작 체인
+    행사가는 1,025~1,035로 **스팟이 창 밖 왼쪽에 있었다.**
+
+    엔진은 같은 순간 `db.UNDERLYING_SPOT_MAX_AGE_MINUTES` 경계로 이미 「미가용」이었다. 화면만
+    옛 상태로 남아 있었던 것이 08-05 P0-2(엔진은 한 북, 화면은 세 북)와 정확히 같은 형태다.
+    """
+    now = datetime(2026, 9, 3, 15, 44)
+    responses = _stale_spot_responses(
+        now, spot_asof=datetime(2026, 9, 3, 14, 30), expiry=date(2026, 9, 10)
+    )
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: now)
+
+    snap = load_snapshot()
+
+    assert snap.spot_is_stale is True
+    assert snap.spot_age_minutes == pytest.approx(74.0)
+    assert snap.gamma_flip is None
+    assert snap.gamma_walls == []
+    # 값을 숨기지는 않는다 — 그 스팟이 행사가 창의 어디에 있는지가 곧 사고의 크기다.
+    assert snap.spot == 1017.56
+    # GEX 막대는 스팟을 기준점으로 쓰지 않으므로 그대로 남는다(없는 것만 없다고 쓴다).
+    assert [c.strike for c in snap.chain] == [1030.0, 1032.5]
+
+
+def test_load_snapshot_keeps_gamma_walls_when_the_spot_is_fresh(monkeypatch):
+    """위 가드가 정상 구간까지 끄면 그것은 고친 게 아니라 다른 방향으로 틀린 것이다."""
+    now = datetime(2026, 9, 3, 13, 0)
+    responses = _stale_spot_responses(
+        now, spot_asof=datetime(2026, 9, 3, 12, 58), expiry=date(2026, 9, 10)
+    )
+
+    @contextmanager
+    def fake_get_connection(settings=None):
+        yield _FakeConnection(responses)
+
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+    monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: now)
+
+    snap = load_snapshot()
+
+    assert snap.spot_is_stale is False
+    assert snap.spot_age_minutes == pytest.approx(2.0)
+    assert snap.gamma_walls == [1030.0]
+
+
+def test_load_snapshot_uses_the_same_freshness_boundary_as_the_engine(monkeypatch):
+    """규약 B — 화면의 경고와 판단의 미가용은 **같은 순간**에 켜져야 한다.
+
+    임계를 화면 쪽에 따로 적으면 두 값이 조용히 갈라진다. 경계는
+    `db.UNDERLYING_SPOT_MAX_AGE_MINUTES` 하나뿐이라는 것을 값이 아니라 **관계**로 지킨다.
+    """
+    now = datetime(2026, 9, 3, 13, 0)
+    boundary = db.UNDERLYING_SPOT_MAX_AGE_MINUTES
+
+    def snapshot_at_age(minutes: float):
+        responses = _stale_spot_responses(
+            now, spot_asof=now - timedelta(minutes=minutes), expiry=date(2026, 9, 10)
+        )
+
+        @contextmanager
+        def fake_get_connection(settings=None):
+            yield _FakeConnection(responses)
+
+        monkeypatch.setattr("mahdi.dashboard.data_source.db.get_connection", fake_get_connection)
+        monkeypatch.setattr("mahdi.dashboard.data_source.db.local_now", lambda: now)
+        return load_snapshot()
+
+    assert snapshot_at_age(boundary).spot_is_stale is False  # 경계값 자체는 아직 신선하다
+    assert snapshot_at_age(boundary + 0.5).spot_is_stale is True
