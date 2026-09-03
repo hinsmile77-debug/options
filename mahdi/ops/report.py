@@ -184,7 +184,7 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
                           lambda: _render_levers(levers))
     if hypotheses:
         lines += _section("0-1. 가설 검정 (구현 시점에 적어둔 예측 vs 오늘 실측)",
-                          lambda: _render_hypotheses(hypotheses))
+                          lambda: _render_hypotheses(hypotheses, db_metrics))
     if campaign:
         lines += _section("0-2. 검증 캠페인 (표본이 찰 때까지 판정하지 않는다)",
                           lambda: _render_campaign(campaign))
@@ -2651,8 +2651,53 @@ def _render_campaign(rows: list[dict]) -> list[str]:
     return out
 
 
-def _render_hypotheses(results: list[dict]) -> list[str]:
+# 2026-09-03 고도화 3 (근거: 09-03 §1-1) — **절벽일에는 대가 지표를 그대로 읽으면 안 된다.**
+#
+# 09-03에 두 가설의 지표가 실제로 오염됐다: `2026-08-12-eE-on-congested-hours`의 대가 축
+# `gex_input_missing_minutes`가 50분(기준선 4분)이었는데 그 대부분이 절벽 구간과 겹치고,
+# `2026-09-02-fix10-phase-offset-55s`의 주장 축 `chain_newest_age_seconds.p50` 57.4초도
+# 같은 이유로 순수하게 못 읽는다. **오염을 사람이 매번 기억해서 발라내야 하는 상태**였고,
+# 그 기억이 빠지는 날 규약 E가 막으려는 것(대가를 다른 사건의 값으로 재는 것)이 일어난다.
+#
+# ⚠ **새 축도 새 임계도 만들지 않았다.** 착수 시점의 계획은 로그 쪽에 최장 연속 축을 새로
+# 다는 것이었는데, 착수 전 확인에서 **그 축이 08-14 Fix#3으로 이미 있었다** —
+# `db.chain_minute_coverage.zero_row_longest_run.length`(09-03 실측 53분 · 14:31~15:23,
+# 리포트가 손으로 센 값과 정확히 같다)이고 임계 `ZERO_ROW_RUN_ALERT_MINUTES`(20분)까지
+# 이미 정해져 있었다. **없는 것을 만드는 대신 있는 것을 읽는다** — 같은 사실을 두 축으로
+# 세면 어느 쪽이 맞는지 묻는 날이 온다.
+#
+# ⛔ **판정을 무르지 않는다.** `hypotheses.evaluate`의 `verdict`는 한 글자도 안 바뀐다 —
+#    자동으로 판정을 무르면 그것이야말로 「숫자를 보고 기준을 고치는 것」이다.
+#    이 절이 하는 일은 표 **위에 문장 하나를 띄우는 것**뿐이다.
+
+
+def _cliff_run_minutes(db: dict | None) -> int:
+    """반환: 그날 최장 연속 `rows=0` 분 수. DB 집계가 없거나 구버전이면 0이다.
+
+    해석: **0과 「못 쟀다」를 여기서 가르지 않는다** — 근거가 없으면 주의를 안 띄우는 것이
+         맞다(없는 근거로 경고를 띄우는 것이 소음이다). 규약 C의 구분은 §4의
+         `_render_zero_row_run`이 이미 지고 있다(「측정 불가」를 그 자리에서 말한다).
+    """
+    run = ((db or {}).get("chain_minute_coverage") or {}).get("zero_row_longest_run") or {}
+    length = run.get("length")
+    return length if isinstance(length, int) else 0
+
+
+def _render_hypotheses(results: list[dict], db: dict | None = None) -> list[str]:
     out: list[str] = []
+    # 2026-09-03 고도화 3 — **표보다 먼저 읽히는 자리에 둔다.** 표 아래에 적으면 사람이
+    # 이미 숫자를 읽은 뒤다. 상세 근거는 위 `_cliff_run_minutes` 주석.
+    cliff_minutes = _cliff_run_minutes(db)
+    threshold = db_metrics_module.ZERO_ROW_RUN_ALERT_MINUTES
+    if cliff_minutes >= threshold:
+        out += [
+            f"> ⚠ **오늘은 절벽 발생일 — 대가 지표 해석 주의.** 옵션체인 `rows=0`이 "
+            f"**{cliff_minutes}분 연속**이었다(임계 {threshold}분 · §4의 최장 연속 0행 구간과 "
+            "같은 값이다). 그 구간에 걸친 지표는 **그 fix의 대가가 아니라 절벽의 값**일 수 "
+            "있다 — 규약 E(대가는 전용 축으로 잰다)가 이 자리에서 깨진다. 아래 판정을 그대로 "
+            "확정하지 말고 **절벽 없는 날에 재실측할 것**(2026-09-03 고도화 3).",
+            "",
+        ]
     # 2026-08-03 §5-4 — 예정일이 지났는데 아직 `상태: pending`인 항목을 **표 위로** 띄운다.
     # 규약상 `상태`는 사람이 손으로 확정해야 하는데, 확정 안 된 것이 표에 섞여 들어가면 놓치기
     # 쉽고 그렇게 쌓이면 "예측 → 실측 검정" 규약 자체가 무력해진다.

@@ -265,6 +265,12 @@ OPTION_CHAIN_SLOW_SERIES_EVERY_N_MINUTES = 2
 # 예측치는 `hypotheses.yaml`의 `2026-08-12-eE-on-congested-hours`에 **이미** 등재돼 있다
 # (주장 budget_exceeded.count 08-12 기준선 74건 · stale_pct <= 70.0, 대가 book_coverage
 # 50%→약25% · gex_input_missing_minutes 08-12 기준선 4분) — 새로 적지 않는다.
+# ===== 실제로 켠 날: **2026-08-31 저녁** (사용자 승인 — 무조건발동일 09-01을 하루 앞섬) =====
+# 2026-09-03 제4부 P2-1. 증거 §7이 「발동 완료 · 날짜 정리 필요」로 이 레버를 계속 부르면서
+# *"실제로 켠 날짜를 그 줄 주석에 적을 것"*을 요구한다 — 그 주석이 이 줄이다.
+# `hypotheses.yaml`의 `2026-08-12-eE-on-congested-hours`도 `발동일`·`무조건발동일`을 둘 다
+# 2026-08-31로 이미 정리해 뒀다(09-02 P2-1-a). 레버 F가 `strategy_params.yaml:87`에
+# 같은 형식으로 적혀 있다.
 OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS: dict[int, int] = {10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
 
 # 2026-07-31(운영점검보고서 2026-07-31 §4 우선순위 2) — 밀림으로 건너뛴 분을 먼슬리 10레그로
@@ -920,6 +926,13 @@ SIGNAL_FUSION_POLL_INTERVAL_SECONDS = 60.0
 #   대가  `overrun_by_poller["Signal Fusion 폴링"]` — :55에서 시작해도 60초 안에 끝나야 한다.
 #   대가  `db.decisions.decision.ENTER` / `reject_reason.entry_cutoff` 분포 — 컷오프(14:50)
 #         근처에서 한 분이 통째로 넘어가는지 본다(08-19 (a)가 지목한 대가).
+# ===== 실제로 켠 날: **2026-09-02** (커밋 `910c1e1`) =====
+# 2026-09-03 제4부 P2-1. **이 값은 08-11에 설계돼 3주 넘게 `10.0`으로 남아 있었다** —
+# 레버 상태표의 「켜짐」은 *상수가 존재한다*는 뜻이었지 적용됐다는 뜻이 아니었고, 그 3주를
+# 아무도 못 봤다. 켠 날을 여기 적어 두는 것이 그 착시를 막는 유일한 자리다.
+# 09-03이 첫 실거래일이었으나 같은 날 옵션체인 절벽(53분)이 겹쳐 `chain_newest_age_seconds.p50`
+# 판정이 오염됐다 — `hypotheses.yaml`의 `2026-09-02-fix10-phase-offset-55s`는 그래서
+# **절벽 없는 정상일에 재실측**하기로 하고 검증예정일을 미뤘다.
 SIGNAL_FUSION_PHASE_OFFSET_SECONDS = 55.0
 _SIGNAL_DECISION_REJECT_REASON_MAX_LENGTH = 50  # signal_decisions.reject_reason VARCHAR(50)
 

@@ -246,6 +246,44 @@ def _write_state(state: dict) -> None:
 _DEGRADED_EPISODE_STATE = liveness.degraded_episode_path(LOG_DIR)
 
 
+# ===== 2026-09-03 (09-03 §1-9 / 제4부 P2-3) — 회복 이력을 경보 안에 넣는다 =====
+#
+# 절벽 표본이 넷이 됐고 **회복 시각이 관측된 셋(08-26 · 09-01 · 09-03)이 전부 15:25~15:26**,
+# 즉 정규장 마감(15:20) +5~6분에 사람 손 없이 풀렸다. 시작 시각도 지속도 규모도 매번 달랐는데
+# 회복 시각만 세 번 같았다. 그 사실이 지금 `docs/동작점검/cliff_episodes.md`와 사람 머릿속에만
+# 있고 **경보 문구에는 없다** — 09-03에 이 함수는 DEGRADED를 45회 내면서 한 번도 그 말을 안 했다.
+#
+# ⛔ **자동 조치가 아니다.** 재기동 임계도 경보 조건도 안 건드린다. 08-26이 증명한 것은
+# **자동 재기동을 켜지 않은 것이 옳았다**는 것이다(재기동했다면 저절로 풀렸을 회복을 자기가
+# 고친 것으로 오해했을 것이다). 여기서 더하는 것은 사람이 읽을 문장 하나뿐이다.
+#
+# ⚠ **표본 수를 문구에 박는다.** 「3건 중 3건」이라고 적어야 다섯 번째 표본이 나왔을 때 이
+# 문구가 낡았다는 것이 보인다 — 「대체로」라고 쓰면 영원히 안 늙는다. 다섯 번째 표본이 나오면
+# `cliff_episodes.md`의 표와 **이 상수를 함께** 고칠 것.
+_NO_INGEST_RECOVERY_HINT = (
+    "참고: 같은 유형(no_ingest)의 과거 표본 3건(08-26 · 09-01 · 09-03)은 45~85분 만에 "
+    "**15:25~15:26**(정규장 마감 +5~6분)에 자연 회복했고 3건 다 우리 쪽 조치가 없었다 — "
+    "자동 조치가 아니라 사람이 「지금 재기동할 것인가」를 판단할 근거다"
+)
+
+# 참고 문구를 **몇 분째에 붙이는가**. 09-03의 DEGRADED는 45줄이었고, 매 줄에 붙이면 45줄이
+# 통째로 길어진다(§5 억제 규약 — 하루 30줄을 넘기면 억제가 안 듣는 것이다).
+# **에피소드 첫 분 + 이후 30분마다 한 번**이면 45분 사건에 2줄, 하루 최대 3~4줄이다.
+_RECOVERY_HINT_REPEAT_MINUTES = 30
+
+
+def _recovery_hint_due(episode: dict | None) -> bool:
+    """반환: 이번 DEGRADED 줄에 회복 이력 참고 문구를 붙일 차례인가.
+
+    해석: 사건의 **첫 분**과 그 뒤 30분마다 한 번. 상태를 못 읽었으면 붙이지 않는다 —
+         모르는 채로 매분 붙이면 억제가 통째로 풀린다.
+    """
+    minutes = (episode or {}).get("minutes")
+    if not isinstance(minutes, int) or minutes < 1:
+        return False
+    return minutes == 1 or minutes % _RECOVERY_HINT_REPEAT_MINUTES == 0
+
+
 def _read_degraded_episode() -> dict | None:
     try:
         return json.loads(_DEGRADED_EPISODE_STATE.read_text(encoding="utf-8"))
@@ -461,6 +499,10 @@ def main() -> None:
         message = f"관측 루프 적재 정지({decision.reason}) — {decision.detail}"
         if ongoing_note:
             message += f" · {ongoing_note}"
+        # 2026-09-03 P2-3 — **문구는 줄 끝에만 붙인다.** 앞머리(`DEGRADED — 관측 루프 적재
+        # 정지(...)`)를 건드리면 `mahdi/ops/watchdog_metrics.py`의 `startswith` 집계가 눈이 먼다.
+        if decision.reason == liveness.REASON_NO_INGEST and _recovery_hint_due(episode):
+            message += f" · {_NO_INGEST_RECOVERY_HINT}"
     else:
         message = f"관측 루프 생존 신호 이상({decision.reason}) — {decision.detail}"
     _log(f"{stamp} {decision.action.upper()} — {message}")

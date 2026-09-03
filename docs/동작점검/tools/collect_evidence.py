@@ -208,6 +208,48 @@ MEMBER_NAME_RE = re.compile(r"'([\w]+)'")
 # 조용한 것이 정상이다. 08-14 오후의 `options_flow` 이탈은 81분이었으므로 이 임계로 잡힌다.
 MEMBER_DROPOUT_ALERT_MIN = 30
 
+
+def _dropout_flag(name: str, seen: str, end_min: int, cycle_minutes: set) -> str:
+    """
+    입력: 멤버 이름, 그 멤버의 마지막 관측 시각(`HH:MM:SS`), 로그 끝 분,
+         `옵션체인 사이클 소요 분해`가 찍힌 분의 집합.
+    계산: 미관측 구간에 **판단 사이클이 살아 있었는가**로 두 사건을 가른다.
+    반환: §12에 실을 적신호 한 줄.
+    해석: 2026-09-03 P1-B (근거: 09-03 §1-6).
+
+         `member_last_seen`은 「판단 형태 전이」 줄에서만 갱신되는데 그 줄은 **형태가 바뀔
+         때만** 찍힌다. 그래서 판단이 멀쩡히 도는 **안정된 시간대일수록 이 적신호가 잘 뜬다** —
+         09-03 12:30 회차의 「63분째 미관측」 4건이 전부 그 오탐이었고 축은 하나도 안 죽어
+         있었다. **오탐이 진짜 정지를 덮는 것**이 이 자리의 위험이다.
+
+         가르는 재료는 이 파일이 이미 갖고 있다: 같은 구간에 사이클 로그가 계속 찍혔으면
+         판단 경로는 살아 있었던 것이다.
+
+    실패 조건: 없다. **적신호를 지우지 않는다** — 두 경우 다 적신호로 나가고 문구만 갈린다.
+         조용히 없애면 규약 C의 「안 셌다」와 구별이 안 된다.
+
+    ⛔ **임계(`MEMBER_DROPOUT_ALERT_MIN`)는 안 건드린다.** 바꾸는 것은 임계가 아니라
+       **무엇을 재는가**(마지막 관측 시각만 → 그 시각 + 같은 구간의 판단 사이클 생존)다.
+    """
+    seen_min = hhmm_to_min(seen[:5])
+    gap = end_min - seen_min
+    # **양 끝은 뺀다** — 마지막 관측이 있던 분과 로그 끝 분은 「그 사이」가 아니다.
+    between = sum(1 for m in cycle_minutes if seen_min < m < end_min)
+    if between:
+        return (
+            f"앙상블 멤버 `{name}`가 {seen} 이후 **{gap}분째 형태 무변화** — 그 사이 판단 "
+            f"사이클(`{CYCLE_TOKEN}`)은 **{between}분** 찍혔다. **축이 빠진 것이 아니라 형태가 "
+            "안 바뀌어 로그가 조용했던 것**일 가능성이 높다(09-03 §1-6). 그래도 DB "
+            "`member_scores`로 확인할 것 — 「형태가 같다」는 「그 축이 살아 있다」와 다른 말이다"
+        )
+    return (
+        f"앙상블 멤버 `{name}`가 {seen} 이후 **{gap}분째 미관측** — 축이 도중에 빠졌다. "
+        f"그 사이 판단 사이클(`{CYCLE_TOKEN}`)도 **0분**이라 판단 경로 자체가 멈춘 "
+        "**진짜 미관측**이다. 그 멤버가 죽은 이유가 자기 자신인지 **입력 고갈**인지 "
+        "갈라야 한다(08-14 오후가 후자였다)"
+    )
+
+
 CHAIN_COLLECT_BUDGET_SECONDS = 50.0      # mahdi/main.OPTION_CHAIN_CYCLE_COLLECT_BUDGET_SECONDS
 GLOBAL_READ_TIMEOUT_SECONDS = 4.0        # mahdi/broker/rest_client._HTTP_READ_TIMEOUT_SECONDS
 BUDGET_WARN_RATIO = 0.90                 # 시간대 평균이 예산의 이만큼을 넘으면 적신호
@@ -2213,12 +2255,9 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                 (n, t) for n, t in scan.member_last_seen.items()
                 if end_min - hhmm_to_min(t[:5]) >= MEMBER_DROPOUT_ALERT_MIN
             ]
+            # 2026-09-03 P1-B (근거: 09-03 §1-6) — 판정은 `_dropout_flag()`가 한다.
             for name, seen in sorted(dropped):
-                gap = end_min - hhmm_to_min(seen[:5])
-                flags.append(
-                    f"앙상블 멤버 `{name}`가 {seen} 이후 **{gap}분째 미관측** — 축이 도중에 빠졌다. "
-                    "그 멤버가 죽은 이유가 자기 자신인지 **입력 고갈**인지 갈라야 한다(08-14 오후가 후자였다)"
-                )
+                flags.append(_dropout_flag(name, seen, end_min, scan.cycle_minutes))
 
     # ---- 5-3. 계측 부재 신고 (2026-08-14 장중 §8 / 고도화 3) ----
     A("## 5-3. 계측 부재 — 「0건」인가 「재는 눈이 없는가」")
