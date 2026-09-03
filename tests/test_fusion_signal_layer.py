@@ -117,6 +117,37 @@ def _of(gex, spot, reference, *, wall=False):
     return build_member_scores(SignalInputs(gex=gex, spot=spot, **kwargs)).options_flow
 
 
+def test_options_flow_reference_is_the_single_source_for_score_and_record():
+    """2026-09-03(감마월 정의·매핑 점검 §1 / 이상점 5) — 기록과 판단이 갈릴 수 없어야 한다.
+
+    `main._build_signal_inputs()`는 이 함수로 `signal_decisions.gamma_reference_source`
+    (마이그레이션 037)를 채우고, `_options_flow_score()`는 **같은 함수**로 기준선을 고른다.
+    복사본이 아니라 같은 호출이라는 것을 여기서 못박는다 — 복사하면 아래 게이트 케이스에서
+    기록만 살아남는다.
+    """
+    from mahdi.fusion.signal_layer import options_flow_reference
+
+    assert options_flow_reference(1030.0, 1025.0) == (1030.0, "flip")
+    # flip이 없으면 월로 떨어진다 — 08-04 이후 실동작 경로다.
+    assert options_flow_reference(None, 1025.0) == (1025.0, "wall")
+    assert options_flow_reference(None, None) == (None, "none")
+
+
+def test_options_flow_reference_reports_none_when_the_fallback_gate_is_off(monkeypatch):
+    """게이트를 끄면 월이 있어도 «기준선 없음»이다 — 기록도 그렇게 남아야 한다.
+
+    이 케이스가 복사본을 잡는다: 기록 쪽이 규칙을 베껴 적었다면 `gamma_wall`이 non-NULL인데
+    `gamma_reference_source='wall'`로 남아, 08-04 이전으로 되돌린 날의 이력이 되돌리지 않은
+    날과 구분되지 않는다.
+    """
+    from mahdi.fusion.signal_layer import options_flow_reference
+
+    monkeypatch.setattr("mahdi.fusion.signal_layer.OPTIONS_FLOW_GAMMA_WALL_FALLBACK", False)
+
+    assert options_flow_reference(None, 1025.0) == (None, "none")
+    assert build_member_scores(SignalInputs(gex=-1.0, spot=1030.0, gamma_wall=1025.0)).options_flow is None
+
+
 def test_sign_convention_options_flow_says_revert_when_dealers_are_long_gamma():
     """GEX>=0(딜러 롱감마) → 스팟이 기준선에서 멀어진 **반대** 방향을 가리킨다(회귀)."""
     assert _of(gex=+1.0, spot=105.0, reference=100.0) == -1.0   # 위에 있으면 아래로

@@ -91,6 +91,7 @@ from mahdi.fusion.signal_layer import (
     UNTRAINED_MEMBER_FIELDS,
     SignalInputs,
     build_member_scores,
+    options_flow_reference,
 )
 from mahdi.fusion.strategy_palette import entry_strategies
 from mahdi import liveness, session
@@ -4175,9 +4176,22 @@ def _build_signal_inputs(
     chain_newest_leg_age_seconds = (
         (now - newest.replace(tzinfo=None)).total_seconds() if newest is not None else None
     )
+    # 2026-09-03(감마월 정의·매핑 점검 §1 / 이상점 5) — 마이그레이션 037. **판단이 실제로 쓴
+    # 기준선을 남긴다.** 022가 `gamma_flip`만 남긴 뒤 08-04에 감마 월 폴백이 들어왔고, 그때부터
+    # 이 컬럼은 «거의 안 쓰인 쪽»이 됐다(08-03~08-10 판단 2,944건 중 non-NULL 22건). 부호를
+    # 낸 값이 기록에 없으면 `spot - reference`가 딜러 위치를 잰 건지 지수↔선물 베이시스를 잰
+    # 건지 사후에 가를 수 없다(같은 점검의 이상점 6).
+    #
+    # **폴백 규칙을 여기서 다시 적지 않는다** — 점수를 내는 쪽과 같은 함수를 부른다. 복사하면
+    # 게이트 상수를 껐을 때 기록만 살아남아 조용히 갈린다.
+    _reference, reference_source = options_flow_reference(gamma_flip, gamma_wall)
     chain_inputs = {
         "chain_input_source": chain_input_source,
         "gamma_flip": gamma_flip,
+        # 마이그레이션 037. `gamma_wall`은 **부호 없는 집중도**(|gamma x OI| 최대 행사가)이지
+        # "최대 +GEX 행사가"가 아니다 — 순 GEX가 가장 음수인 행사가가 월일 수 있다.
+        "gamma_wall": gamma_wall,
+        "gamma_reference_source": reference_source,
         "gex": gex,
         # 레그 수는 **판단에 실제로 쓴 북 기준**이다(Fix#5로 먼슬리 전용이 됐다). 스냅샷 전체
         # 레그 수를 세면 위클리까지 포함돼 "신호에 쓴 입력의 크기"를 재지 못한다.

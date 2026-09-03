@@ -291,6 +291,57 @@ def test_gamma_walls_ranks_by_exposure():
     assert walls[0][1] > walls[1][1]
 
 
+def test_gamma_walls_adds_call_and_put_at_the_same_strike_instead_of_cancelling():
+    """2026-09-03(감마월 정의·매핑 점검 §1 / 이상점 7) — **정의의 핵심이 무방비였다.**
+
+    `gamma_walls()`는 `abs()`로 부호를 지운 뒤 합산한다. 즉 같은 행사가의 콜과 풋은
+    **상쇄되지 않고 더해진다** — 이것이 감마 월을 `calculate_gex()`의 «최대 +GEX 행사가»와
+    갈라놓는 유일한 성질이고, 08-04 폴백 이후 `options_flow`의 기준선이 서는 자리를 정한다.
+
+    그런데 `test_gamma_walls_ranks_by_exposure()`는 **행사가마다 레그가 1개뿐**이라 이 성질을
+    한 번도 지나가지 않는다. 누가 `abs()`를 지워도(= 부호 있는 순 GEX로 바꿔도) 그 테스트는
+    그대로 통과한다.
+
+    여기서는 상쇄된다면 **순위가 뒤집히는** 배치를 쓴다: 350은 콜·풋이 크기가 같아 부호를
+    쓰면 정확히 0이 되고, 355는 그보다 작은 콜 하나뿐이다.
+    """
+    legs = [
+        OptionLeg(strike=350, option_type="c", oi=100, iv=0.18, t_years=0.05, gamma=0.02),
+        OptionLeg(strike=350, option_type="p", oi=100, iv=0.18, t_years=0.05, gamma=0.02),
+        OptionLeg(strike=355, option_type="c", oi=100, iv=0.18, t_years=0.05, gamma=0.01),
+    ]
+
+    walls = gamma_walls(legs, spot=350, top_n=2)
+
+    # 상쇄된다면 350의 노출이 0이 되어 355가 1등이 된다.
+    assert walls[0][0] == 350
+    # 그리고 그 값은 콜 하나의 **2배**다 — "더해진다"를 크기로도 못박는다.
+    assert walls[0][1] == pytest.approx(2 * abs(0.02 * 100 * 250_000 * 350**2 / 100))
+    assert walls[1][0] == 355
+
+
+def test_gamma_walls_ranking_does_not_depend_on_the_spot():
+    """2026-09-03(같은 점검 / 이상점 1) — **스팟은 월의 선택을 바꾸지 않는다.**
+
+    `S²/100`은 전 행사가에 공통인 상수배라 argmax에서 약분되고, `abs()`가 부호를 지운다.
+    남는 것은 `Σ|γ×OI|` 하나다. 이 사실이 기록에 없어서 09-03에 «스팟 1,017.56으로 감마월을
+    골랐다»는 인과가 한 번 세워졌다 — 낡은 스팟이 실제로 훼손한 것은 화면의 「현재가」 선과
+    `_options_flow_score()`의 `sign(spot - wall)`이지, 월의 선택이 아니다.
+
+    낡은 스팟에서 월을 **안 긋는** 표시 정책(09-03 수정 3)은 이 성질과 무관하게 유지된다 —
+    그 정책의 근거가 바뀔 뿐이다.
+    """
+    legs = [
+        OptionLeg(strike=1030, option_type="c", oi=500, iv=0.18, t_years=0.05, gamma=0.03),
+        OptionLeg(strike=1025, option_type="p", oi=100, iv=0.18, t_years=0.05, gamma=0.02),
+    ]
+
+    stale = gamma_walls(legs, spot=1017.56, top_n=2)
+    fresh = gamma_walls(legs, spot=1032.82, top_n=2)
+
+    assert [strike for strike, _ in stale] == [strike for strike, _ in fresh]
+
+
 def test_gamma_walls_empty_legs():
     assert gamma_walls([], spot=350) == []
 

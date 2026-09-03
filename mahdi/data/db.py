@@ -245,6 +245,9 @@ _SIGNAL_DECISION_COLUMNS = (
     "selected_instruments",
     # 마이그레이션 036(09-02 P1-5). `chain_input_source`의 연속판 — 그쪽과 **함께** 낸다.
     "chain_newest_leg_age_seconds",
+    # 마이그레이션 037(09-03). 022가 남긴 `gamma_flip`은 08-04 폴백 이후 거의 안 쓰인 쪽이다 —
+    # 판단이 실제로 부호를 낸 기준선은 여기 두 컬럼에 있다.
+    "gamma_wall", "gamma_reference_source",
 )
 
 
@@ -1502,7 +1505,9 @@ def insert_signal_decision(
          ("ADVISORY"/"CONFIRM"/"AUTO"), (선택) 판단 시점의 옵션 체인 입력
          (`gamma_flip`/`gex`/`chain_leg_count`/`chain_oldest_leg_age_seconds` 키, 마이그레이션 022;
          `gex_expiry` 키는 마이그레이션 023 — 어느 북으로 GEX를 냈는지, 2026-08-04 §2-8/Fix#5;
-         `vrp` 키는 마이그레이션 024 — 팔레트 열을 정한 값, 2026-08-05 §2 이상점 1/Fix#1).
+         `vrp` 키는 마이그레이션 024 — 팔레트 열을 정한 값, 2026-08-05 §2 이상점 1/Fix#1;
+         `gamma_wall`/`gamma_reference_source` 키는 마이그레이션 037 — **판단이 실제로 쓴
+         기준선**과 그 출처, 2026-09-03 감마월 점검 이상점 5).
     계산: `signal_decisions`는 `decision_id`가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이
          새 행을 남기는 append-only 로그(§18.2 "거절된 신호도 기록한다")라 단순 INSERT만 한다.
     해석: 2026-08-03 §5-1 — 체인 입력을 판단 행에 함께 남겨야 "신호 도달률"을 사후 집계할 수
@@ -1518,8 +1523,9 @@ def insert_signal_decision(
             "INSERT INTO signal_decisions (timestamp, conviction, decision, reject_reason, "
             "risk_gate_state, exec_mode, gamma_flip, gex, chain_leg_count, "
             "chain_oldest_leg_age_seconds, gex_expiry, vrp, chain_input_source, "
-            "selected_instruments, chain_newest_leg_age_seconds) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "selected_instruments, chain_newest_leg_age_seconds, gamma_wall, "
+            "gamma_reference_source) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 timestamp, conviction, decision, reject_reason, json.dumps(risk_gate_state), exec_mode,
                 chain.get("gamma_flip"), chain.get("gex"),
@@ -1536,6 +1542,10 @@ def insert_signal_decision(
                 # 저쪽은 분 단위 이산 판정이라 08-18 이후 매일 98~100% stale로 상한에 붙었고,
                 # 그 상태에서는 위상 레버가 초 단위로 무엇을 바꿔도 지표가 안 움직인다.
                 chain.get("chain_newest_leg_age_seconds"),
+                # 2026-09-03 — 마이그레이션 037. **`gamma_flip`을 대체하지 않는다**: 둘 중
+                # 어느 쪽을 썼는지는 `gamma_reference_source`가 말하고, 그 판정은 점수를 내는
+                # 쪽과 같은 함수(`signal_layer.options_flow_reference()`)가 내린다.
+                chain.get("gamma_wall"), chain.get("gamma_reference_source"),
             ),
         )
     conn.commit()

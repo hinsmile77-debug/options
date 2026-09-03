@@ -3427,6 +3427,38 @@ def test_build_signal_inputs_fills_charm_and_gamma_wall(monkeypatch):
     assert build_member_scores(inputs).options_flow is not None
 
 
+def test_build_signal_inputs_records_the_reference_line_it_actually_used(monkeypatch):
+    """2026-09-03(감마월 정의·매핑 점검 §1 / 이상점 5) — 마이그레이션 037.
+
+    022는 `gamma_flip`만 판단 행에 남겼는데, 08-04 감마 월 폴백 이후 **그 컬럼은 거의 안 쓰인
+    쪽**이다(08-03~08-10 판단 2,944건 중 non-NULL 22건). 즉 `_options_flow_score()`가 실제로
+    부호를 낸 `spot - reference`의 `reference`가 DB에 한 번도 남지 않았고, 사후에 «그 선이
+    어디였나»를 되짚을 수 없었다(5분 이월 창 때문에 재계산도 당시와 같다는 보장이 없다).
+
+    이 픽스처는 flip이 안 나오는 북이라(`..._fills_charm_and_gamma_wall`과 같은 체인) 폴백
+    경로가 그대로 기록되는지가 여기서 갈린다.
+    """
+    _patch_chain(monkeypatch, _two_book_chain(), now=datetime(2026, 8, 5, 14, 30))
+
+    inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert chain_inputs["gamma_wall"] == inputs.gamma_wall
+    assert chain_inputs["gamma_flip"] is None
+    assert chain_inputs["gamma_reference_source"] == "wall"
+
+
+def test_build_signal_inputs_records_no_reference_when_the_chain_is_empty(monkeypatch):
+    """«이 컬럼 이전 행»(NULL)과 «쟀는데 없었다»('none')를 가르는 쪽 — 037 주석의 구분."""
+    monkeypatch.setattr("mahdi.main.db.latest_option_chain", lambda conn, underlying: [])
+    monkeypatch.setattr("mahdi.main.db.latest_underlying_spot", lambda conn, underlying, **kwargs: None)
+    monkeypatch.setattr("mahdi.main.db.latest_investor_flow", lambda conn, underlying: None)
+
+    _inputs, chain_inputs = _build_signal_inputs(conn=object(), regime_state=None, underlying="KOSPI200")
+
+    assert chain_inputs["gamma_wall"] is None
+    assert chain_inputs["gamma_reference_source"] == "none"
+
+
 def test_options_flow_falls_back_to_none_when_the_gate_is_off(monkeypatch):
     """게이트를 끄면 08-04 이전 동작과 **완전히 동일**해야 한다 — 되돌릴 수 있어야 한다."""
     monkeypatch.setattr("mahdi.fusion.signal_layer.OPTIONS_FLOW_GAMMA_WALL_FALLBACK", False)

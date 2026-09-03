@@ -117,6 +117,35 @@ def _regime_hmm_score(regime_state: RegimeState | None) -> float | None:
 # 되돌리면 08-04 이전 동작과 **완전히 동일**하다.
 OPTIONS_FLOW_GAMMA_WALL_FALLBACK = True
 
+# 기준선의 출처 — `signal_decisions.gamma_reference_source`(마이그레이션 037)에 그대로 실린다.
+REFERENCE_SOURCE_FLIP = "flip"
+REFERENCE_SOURCE_WALL = "wall"
+REFERENCE_SOURCE_NONE = "none"
+
+
+def options_flow_reference(
+    gamma_flip: float | None, gamma_wall: float | None
+) -> tuple[float | None, str]:
+    """
+    입력: 그 분의 감마플립과 감마 월(둘 다 없을 수 있다).
+    계산: `_options_flow_score()`가 실제로 쓸 기준선과 **그 출처 이름**을 함께 돌려준다.
+    해석: 2026-09-03 — 폴백 규칙이 두 곳에 적히는 것을 막는 자리다. 점수를 내는 쪽
+         (`_options_flow_score`)과 그 값을 기록하는 쪽(`main._build_signal_inputs`)이
+         **같은 함수**를 부른다. 규칙을 아는 쪽이 소유한다는 `IMPLEMENTED_MEMBER_FIELDS`의
+         원칙과 같다 — 기록이 판단을 복사하면 게이트 상수를 껐을 때 둘이 조용히 갈린다.
+
+         `SignalInputs`가 아니라 원시 두 값을 받는 이유: `main._build_signal_inputs()`는
+         `SignalInputs`를 만들기 **전에** 기록용 dict를 조립한다. 그 순서를 뒤집는 것보다
+         이 함수의 입력을 좁히는 편이 배선이 짧다.
+    실패 조건: 없음 — 둘 다 없으면 `(None, "none")`이다. 게이트를 끄면 월이 있어도
+              `(None, "none")`이 되고, 이는 08-04 이전 동작과 정확히 같다.
+    """
+    if gamma_flip is not None:
+        return gamma_flip, REFERENCE_SOURCE_FLIP
+    if OPTIONS_FLOW_GAMMA_WALL_FALLBACK and gamma_wall is not None:
+        return gamma_wall, REFERENCE_SOURCE_WALL
+    return None, REFERENCE_SOURCE_NONE
+
 
 def _options_flow_score(inputs: SignalInputs) -> float | None:
     """
@@ -130,9 +159,7 @@ def _options_flow_score(inputs: SignalInputs) -> float | None:
               Charm까지 포함해 성분이 하나도 없으면 None.
     """
     components: list[float] = []
-    reference = inputs.gamma_flip
-    if reference is None and OPTIONS_FLOW_GAMMA_WALL_FALLBACK:
-        reference = inputs.gamma_wall
+    reference, _source = options_flow_reference(inputs.gamma_flip, inputs.gamma_wall)
     if inputs.gex is not None and reference is not None and inputs.spot is not None:
         distance_sign = _directional_sign(inputs.spot - reference)
         if distance_sign != 0.0:

@@ -589,6 +589,12 @@ def test_the_schema_badge_would_catch_a_missing_migration_031():
     assert "selected_instruments" in db.signal_decision_columns()
 
 
+def test_the_schema_badge_would_catch_a_missing_migration_037():
+    """037 미적용을 배지가 잡는가 — 미적용이면 매분 INSERT가 통째로 실패한다(031과 같은 형태)."""
+    assert "gamma_wall" in db.signal_decision_columns()
+    assert "gamma_reference_source" in db.signal_decision_columns()
+
+
 def test_insert_signal_decision_is_plain_insert_not_upsert():
     # signal_decisions는 decision_id가 자동생성 UUID라 upsert 대상이 아니다 — 매 호출이 새 행.
     conn = FakeConnection()
