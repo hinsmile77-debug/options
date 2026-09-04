@@ -26,7 +26,12 @@ def build_position_flow_chart(foreign_net: float, institution_net: float, indivi
         )
     )
     fig.add_hline(y=0, line_color="#8A8A8A", line_width=1)
-    # KIS 응답(*_ntby_tr_pbmn)의 정확한 단위(원/천원)를 문서로 확인 못 해 "억원" 등 구체적 단위는
-    # 표기하지 않는다 — 실거래 규모로 검증되면 축 라벨에 단위를 되돌린다.
-    fig.update_layout(yaxis_title="순매수대금", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=280)
+    # 2026-09-04 단위 확정 — KIS 응답(*_ntby_tr_pbmn)의 단위는 **백만원**이다. HTS[7221]
+    # "투자자별 매매종합"(선물=계약, 옵션=억원) 12:05 스냅샷을 KOSPI200 선물 종가(A01609
+    # 1050.10) × 거래승수 25만원으로 환산해 대조한 결과, 외국인 +0.003%/기관 +0.09%/개인
+    # -1.4%(개인은 순계약 270으로 작아 평균체결가 차이가 크게 보이는 것)로 일치했다.
+    # 3주체 합이 0이 아닌 것은 브로커의 "기타법인"(당시 +22계약)을 적재하지 않기 때문이다.
+    fig.update_layout(
+        yaxis_title="순매수대금 (백만원)", showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=280
+    )
     return fig
