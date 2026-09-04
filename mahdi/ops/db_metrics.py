@@ -524,6 +524,41 @@ def _longest_run(minutes: list[str]) -> dict | None:
     }
 
 
+def _isolated_minutes(minutes: list[str]) -> list[str]:
+    """반환: `rows=0` 분 중 **앞뒤로 정상 분이 낀** 분(= 연속 구간에 속하지 않는 분)의 목록.
+
+    2026-09-04 §1-7 / 제4부 P2-B — `_longest_run`과 **반대쪽 절반**이다.
+
+    09-04는 `rows=0`이 세 번(14:34 · 14:51 · 15:06) 났는데 셋 다 다음 분에 회복돼
+    최장 연속은 **1분**이었다. 그 축만 보면 09-04는 「연속 1분짜리 평범한 날」로 접히고,
+    세 번의 완전실패는 어디에도 안 남는다. 09-03은 반대로 **53분 한 덩어리**이고 고립 분은
+    0개다 — 같은 「0행 3분/53분」이라는 총계로는 두 날이 갈리지 않는다.
+
+    ## 왜 「추세」에 이 축이 필요한가
+
+    09-03의 절벽은 갑자기 오지 않았다. 판단은 신선도 창(5분) 안의 직전 스냅샷으로 버티므로
+    단발 완전실패는 그날 실거래를 안 건드린다 — 그래서 **경보가 안 울리는 채로 잦아진다.**
+    그 빈도가 늘고 있는지 줄고 있는지 물으려면 전날과 비교할 수 있는 숫자가 있어야 하고,
+    지금까지는 그 숫자가 없었다.
+
+    ⛔ **임계는 두지 않는다.** 이 축은 세기만 한다 — 표본이 며칠 쌓이기 전에 경보선을 정하면
+    하루치로 지표를 정했다가 뒤집힌 08-16과 같은 실수가 된다.
+    """
+    if not minutes:
+        return []
+
+    def to_min(s: str) -> int:
+        return int(s[:2]) * 60 + int(s[3:])
+
+    pts = [to_min(x) for x in minutes]
+    known = set(pts)
+    return [
+        label
+        for label, m in zip(minutes, pts)
+        if (m - 1) not in known and (m + 1) not in known
+    ]
+
+
 def chain_minute_coverage(conn: ConnectionLike, target: date, underlying: str = "KOSPI200") -> dict:
     """
     입력: DB 커넥션, 대상 날짜.
@@ -581,6 +616,10 @@ def chain_minute_coverage(conn: ConnectionLike, target: date, underlying: str = 
         # 이 키가 없던 날(구버전)을 소비측이 갈라야 하기 때문이다(규약 C).
         "zero_row_longest_run": _longest_run(zero_minutes) or {"length": 0, "start": None, "end": None},
         "zero_row_run_alert_minutes": ZERO_ROW_RUN_ALERT_MINUTES,
+        # 2026-09-04 P2-B — 위 축의 **반대쪽 절반**. 상세 근거는 `_isolated_minutes` 주석.
+        # 규약 C — 0건인 날도 키가 실린다: 「단발이 없었다」와 「안 셌다」는 조치가 다르다.
+        "zero_row_isolated_minutes": _isolated_minutes(zero_minutes),
+        "zero_row_isolated_count": len(_isolated_minutes(zero_minutes)),
         "over_design_minutes": [[r[0], int(r[1])] for r in over],
         "over_design_count": len(over),
     }

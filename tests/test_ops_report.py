@@ -867,9 +867,18 @@ def test_headline_omits_a_judgement_row_it_cannot_measure():
     assert "재지 않았다" in text
 
 
-def test_headline_says_nothing_was_measured_when_all_three_are_absent():
+def test_headline_says_nothing_was_measured_when_they_are_all_absent():
+    """전부 없으면 「좋았다」가 아니라 **「재지 않았다」**로 적는다(규약 C).
+
+    ⚠ 건수를 여기 박아 두지 않는다 — 2026-09-04 P2-B가 네 번째 줄(단발 완전실패)을 더하면서
+    「3행」이 틀린 상수가 됐다. 그 숫자는 `HEADLINE_DB_METRICS`의 길이이고, 이 테스트가 지킬
+    것은 숫자가 아니라 **빠진 줄을 키로 열거하는가**이다.
+    """
     text = "\n".join(report._render_headline(_TODAY, None, {"tables": []}))
-    assert "판단 입력 3행이 이 집계에 없다" in text
+    assert f"판단 입력 {len(report.HEADLINE_DB_METRICS)}행이 이 집계에 없다" in text
+    for _label, path, _fmt, _dir in report.HEADLINE_DB_METRICS:
+        assert f"`db.{path}`" in text
+    assert "재지 않았다" in text
 
 
 # ===== 위상 이동 (2026-08-14 장중 §3 / 고도화 2) =====

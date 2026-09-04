@@ -62,6 +62,10 @@ HEADLINE_DB_METRICS: list[tuple[str, str, str, str | None]] = [
     ("**먼슬리 절대 커버리지**", "monthly_coverage.coverage_pct", "{:.1f}%", "up"),
     ("**GEX 입력 없던 분**", "signal_reach.gex_input_missing_minutes", "{:,.0f}분", "down"),
     ("**최장 연속 0행 구간**", "chain_minute_coverage.zero_row_longest_run.length", "{:,.0f}분", "down"),
+    # 2026-09-04 P2-B — 위 줄의 **반대쪽 절반**. 09-04는 최장 연속 1분(평범한 날)인데
+    # 완전실패가 세 번 났다. 두 줄이 나란히 있어야 09-03형(53분 한 덩어리)과 09-04형
+    # (1분씩 세 번)이 같은 날로 안 보인다. 상세 근거는 `db_metrics._isolated_minutes`.
+    ("**단발 완전실패**", "chain_minute_coverage.zero_row_isolated_count", "{:,.0f}건", "down"),
 ]
 
 
@@ -731,6 +735,7 @@ def _render_missing(metrics: dict, db_metrics: dict | None = None) -> list[str]:
     if coverage["zero_row_minutes"]:
         out += ["", "```", " ".join(coverage["zero_row_minutes"]), "```"]
     out += _render_zero_row_run(coverage)
+    out += _render_zero_row_isolated(coverage)
     out += _render_zero_row_causes(coverage.get("zero_row_by_cause"))
     if coverage["over_design_count"]:
         over = ", ".join(f"{t}({n}행)" for t, n in coverage["over_design_minutes"])
@@ -799,6 +804,34 @@ def _render_zero_row_run(coverage: dict) -> list[str]:
             "곧 **판단이 감마 지형 없이 간 시간**이다. §14의 「GEX 입력 없던 분」과 나란히 읽을 것.",
         ]
     return ["", f"- 최장 연속 0행 구간: **{length}분** ({span}, 임계 {threshold}분)"]
+
+
+def _render_zero_row_isolated(coverage: dict) -> list[str]:
+    """2026-09-04 §1-7 / P2-B — **몇 분 붙어 있었는가**의 반대쪽: 몇 번 따로 났는가.
+
+    위 `_render_zero_row_run`이 09-03의 53분을 잡는다면 이 줄은 09-04의 세 번을 잡는다.
+    두 날은 총계로도(3분 vs 53분) 최장 연속으로도(1분 vs 53분) 갈리지만, **09-04와
+    「하루 종일 아무 일 없던 날」은 최장 연속 축에서 갈리지 않는다** — 둘 다 한 자리 수다.
+    그 구별이 이 줄의 전부다.
+
+    ⛔ **임계가 없다.** 경고 표시를 안 하는 것이 의도다 — 단발 완전실패는 신선도 창(5분)이
+    덮으므로 그날 판단을 안 건드린다. 여기서 재는 것은 사고가 아니라 **추세**이고,
+    임계는 표본이 쌓인 뒤에 사람이 정한다.
+    """
+    if "zero_row_isolated_count" not in coverage:
+        # 규약 C — 없는 키는 「단발이 0건이었다」가 아니라 「그날은 안 셌다」이다.
+        return ["", "- 단발 완전실패: **측정 불가** — 이 집계에는 그 키가 없다(09-04 P2-B 이전)"]
+    count = coverage.get("zero_row_isolated_count") or 0
+    if not count:
+        return ["", "- 단발 완전실패(앞뒤가 정상인 0행 분): **0건**"]
+    listed = ", ".join(coverage.get("zero_row_isolated_minutes") or [])
+    return [
+        "",
+        f"- 단발 완전실패(앞뒤가 정상인 0행 분): **{count}건** — {listed}",
+        "> 연속 구간과 **다른 사건이다.** 신선도 창(5분)이 덮으므로 그날 판단은 안 끊긴다 — "
+        "그래서 경보가 안 울린 채로 잦아진다. 이 숫자는 그 빈도를 전날과 비교하기 위한 것이고, "
+        "임계는 두지 않는다(2026-09-04 P2-B).",
+    ]
 
 
 _ZERO_ROW_CAUSE_LABELS = (

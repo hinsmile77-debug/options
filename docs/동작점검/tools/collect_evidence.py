@@ -814,6 +814,26 @@ class LoopScan:
                 best = (cur_len, cur_start)
         return best[0], m2hhmm(best[1]), m2hhmm(best[1] + best[0] - 1)
 
+    def isolated_zero_row_count(self):
+        """반환: `rows=0` 분 중 **앞뒤로 정상 분이 낀** 분의 `(건수, 라벨 목록)`.
+
+        2026-09-04 §1-7 / P2-B — 위 `longest_zero_row_run`의 **반대쪽 절반**이다.
+
+        09-04는 「옵션체인 이번 분 전멸」 ERROR가 세 번(14:34 · 14:51 · 15:06) 났는데 셋 다
+        다음 분에 회복돼 최장 연속은 **1분**이었다. 그 축만 보면 그날은 평범한 날로 접힌다.
+        09-03은 반대로 **53분 한 덩어리**이고 고립 분은 0개다.
+
+        단발 완전실패는 신선도 창(5분)이 덮으므로 그날 판단을 안 끊는다 — **그래서 경보가
+        안 울린 채로 잦아진다.** 그 빈도가 늘고 있는지 물으려면 전날과 비교할 숫자가 있어야
+        하고, 지금까지 그 숫자는 어느 축에도 없었다.
+
+        ⛔ **임계는 두지 않는다.** 세기만 한다 — 표본 며칠로 경보선을 정하면 하루치로
+        지표를 정했다가 뒤집힌 08-16과 같은 실수가 된다.
+        """
+        pts = set(self.zero_row_minutes)
+        isolated = sorted(m for m in pts if (m - 1) not in pts and (m + 1) not in pts)
+        return len(isolated), [m2hhmm(m) for m in isolated]
+
     def hourly_latency_p50(self, hour):
         """반환: 그 시간대 `inquire-price` p50의 `(호출 수 가중 평균, 창 최대)`. 창이 없으면 `(None, None)`.
 
@@ -2110,6 +2130,15 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                     f"`rows=0`이 **{length}분 연속**({lo}~{hi}) — 흩어진 0행 분과 다른 사건이다. "
                     "신선도 창(5분)을 넘긴 분의 판단은 체인을 아예 못 본다"
                 )
+        # 2026-09-04 P2-B — 위 줄의 반대쪽 절반. 상세 근거는 `isolated_zero_row_count` 주석.
+        # **적신호로 올리지 않는다** — 단발은 신선도 창이 덮으므로 그날 사고가 아니다.
+        # 여기서 재는 것은 추세이고, 임계는 표본이 쌓인 뒤에 사람이 정한다.
+        iso_count, iso_list = scan.isolated_zero_row_count()
+        if iso_count:
+            A(f"- 단발 완전실패(앞뒤가 정상인 `rows=0` 분): **{iso_count}건** — {', '.join(iso_list)}")
+        else:
+            # 규약 C — 0건인 날도 줄이 실려야 「없었다」와 「안 셌다」가 갈린다.
+            A("- 단발 완전실패(앞뒤가 정상인 `rows=0` 분): **0건**")
         A("")
 
     # ---- 5-1-1. 백오프 · 잔고폴링 · 먼슬리 되살리기 (2026-08-24 Fix#6 B · Fix#4 B) ----
