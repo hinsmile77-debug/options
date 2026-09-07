@@ -455,6 +455,15 @@ def main() -> None:
         liveness.watchdog_check_path(LOG_DIR), now,
         action=decision.action, detail=decision.detail,
     )
+    # 2026-09-07 Fix A (09-07 §1-1) — **위 파일은 덮어쓴다. 이것은 쌓는다.**
+    # 09-07 07:30 미기동일의 30분이 「스케줄러가 안 불렀다」인지 「불렸는데 남길 것이
+    # 없었다」인지 네 회차가 전부 답하지 못했다. 답하려면 「불렸다」가 매분 남아 있어야
+    # 한다 — 근거·대가·하루치 회전은 `liveness.append_watchdog_check` 위 주석에 있다.
+    # **`_log()`가 아니다**(규약 E): `watchdog.log`에 매분 한 줄이면 하루 1,000줄이고
+    # 그 순간 `checks`·`max_silence_minutes`가 뜻을 잃는다.
+    liveness.append_watchdog_check(
+        liveness.watchdog_trail_path(LOG_DIR), now, action=decision.action,
+    )
 
     stamp = f"[{now:%Y-%m-%d %H:%M:%S}]"
 

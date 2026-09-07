@@ -364,6 +364,69 @@ def read_watchdog_check(path: Path) -> dict | None:
         return None
 
 
+# ===== 2026-09-07 Fix A (09-07 §1-1 / 제4부 Fix 후보 A) — **호출 공백과 판정 공백을 가른다** =====
+#
+# 09-07에 07:30 정규 기동이 안 떴고 워치독이 08:00:47에 대체 기동했다. 그 30분이
+# **「스케줄러가 워치독을 안 불렀다」인지 「불렸는데 남길 것이 없었다」인지** 그날 네 회차가
+# 전부 답하지 못했다. 답할 근거가 없었기 때문이다.
+#
+# ## 왜 기존 두 기록으로는 안 갈리는가
+#
+#   - `watchdog.log`: 정상일에 `OK`를 **10분에 한 줄**만 남긴다(안 그러면 하루 1,000줄이다).
+#     그래서 침묵의 해상도가 10분이고, 「9분 동안 안 불렸다」는 애초에 안 보인다.
+#   - `.watchdog_last_check.json`: **매번** 갱신되지만 **덮어쓴다.** 지금 이 순간은 답하지만
+#     「오늘 07:41에 불렸는가」는 영영 답하지 못한다.
+#
+# 그래서 **호출한 사실만** 담는 append-only 흔적을 따로 둔다. 이 파일은 판정을 만들지 않는다 —
+# 세는 것만 한다(`ops.watchdog_metrics.parse_trail`).
+#
+# ## 왜 `watchdog.log`에 얹지 않는가 — 규약 E
+#
+# 대가는 전용 축으로 잰다. 매분 한 줄을 저 로그에 얹으면 하루 1,000줄이고, 그 순간
+# `checks`·`max_silence_minutes`가 통째로 뜻을 잃는다(둘 다 「그 로그의 줄」로 정의돼 있다).
+# 종전 축을 한 글자도 안 건드리는 것이 이 fix의 조건이다.
+#
+# ## 하루치만 남긴다
+#
+# 1분 주기 × 24시간 = 1,440줄(약 45KB)이다. 날짜가 바뀐 첫 호출에서 파일을 새로 시작한다 —
+# 회전 스케줄러도 크기 임계도 두지 않는다(그 둘이 있으면 「언제 잘렸는가」가 또 하나의
+# 모르는 것이 된다). 대가: 지난 날짜를 재집계하면 흔적이 없다. 그때는 **「모른다」로 실린다**
+# (`invocation_trail_available: false`) — 0으로 접으면 「호출이 끊긴 적 없다」로 읽힌다.
+_WATCHDOG_TRAIL_FILENAME = ".watchdog_check_trail.tsv"
+
+
+def watchdog_trail_path(log_dir: Path) -> Path:
+    return log_dir / _WATCHDOG_TRAIL_FILENAME
+
+
+def append_watchdog_check(path: Path, now: datetime, *, action: str) -> None:
+    """
+    입력: 흔적 경로, 판정 시각, 그 판정의 `action`.
+    계산: `YYYY-MM-DD\tHH:MM:SS\t<action>` 한 줄을 덧붙인다. 파일의 **마지막 줄이 오늘이
+         아니면** 새로 시작한다(위 주석 「하루치만 남긴다」).
+    해석: 이 줄이 있다는 것은 **작업 스케줄러가 워치독을 실제로 불렀다**는 뜻이다.
+         `action`을 함께 남기는 이유는 `write_watchdog_check`와 같다 — 「불렸지만 감시 창
+         밖이었다」와 「불려서 정상이라고 판정했다」는 다른 사실이다.
+    실패 조건: 어떤 예외도 밖으로 내지 않는다 — **자기 기록을 못 썼다고 워치독이 멈추면 안 된다.**
+         읽기가 실패하면 이어 쓴다(지우는 쪽으로 기울지 않는다 — 오늘치를 날리는 것이
+         하루 더 쌓이는 것보다 비싸다).
+    """
+    today = now.date().isoformat()
+    line = f"{today}\t{now:%H:%M:%S}\t{action}\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = False
+        try:
+            tail = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            fresh = bool(tail) and not tail[-1].startswith(today)
+        except FileNotFoundError:
+            pass
+        with path.open("w" if fresh else "a", encoding="utf-8", newline="\n") as f:
+            f.write(line)
+    except Exception:
+        logger.warning("워치독 호출 흔적 기록 실패: %s", path, exc_info=True)
+
+
 def watchdog_check_age_seconds(check: dict | None, now: datetime) -> float | None:
     """반환: 워치독이 마지막으로 **판정한** 이후 경과 초. 기록이 없으면 None."""
     if not check:

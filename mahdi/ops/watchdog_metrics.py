@@ -63,6 +63,23 @@ _OK_CADENCE_MINUTES = 10.0
 # 가른다. 임계를 10분에 두면 스케줄러 지터 한 번에 매일 ⚠가 뜬다.
 SILENCE_WARN_MINUTES = _OK_CADENCE_MINUTES * 2
 
+# ===== 2026-09-07 Fix A (09-07 §1-1) — **호출 공백은 판정 공백과 다른 축이다** =====
+#
+# 위 `_OK_CADENCE_MINUTES`(10분)는 「워치독이 로그에 남기는 주기」다. 아래는 「작업 스케줄러가
+# 워치독을 부르는 주기」이고 **1분**이다. 두 값이 다르다는 사실 자체가 09-07에 답이 안 나온
+# 이유였다: 07:40~08:00의 20.8분 침묵이 「20번 안 불렸다」인지 「불렸는데 두 번째 OK 주기에만
+# 안 닿았다」인지, 10분 눈금으로는 물을 수조차 없다.
+#
+# 흔적의 출처는 `liveness.append_watchdog_check`이고, 그 함수 위 주석이 이 축의 근거다.
+_INVOCATION_CADENCE_MINUTES = 1.0
+
+# 그 다섯 배(5분)를 넘으면 **호출이 실제로 끊긴 것**으로 본다. 스케줄러 지터 한두 번은
+# 넘기고, 09-07형(30분 미호출)은 확실히 잡는 자리다. ⚠ **이 값으로 무엇도 재기동하거나
+# 차단하지 않는다** — 사람이 읽는 눈금이다.
+INVOCATION_GAP_WARN_MINUTES = _INVOCATION_CADENCE_MINUTES * 5
+
+TRAIL_FILENAME = ".watchdog_check_trail.tsv"
+
 
 def _watch_window_bounds(target: date) -> tuple[datetime, datetime]:
     return (
@@ -179,6 +196,106 @@ def parse(lines: list[str], target: date) -> dict:
     }
 
 
+def parse_trail(lines: list[str], target: date) -> dict:
+    """워치독 **호출 흔적**을 읽는다 — `parse()`가 읽는 판정 로그와 다른 파일이다.
+
+    입력: `.watchdog_check_trail.tsv`의 줄들(`YYYY-MM-DD\tHH:MM:SS\t<action>`), 대상 날짜.
+    계산: 그날 줄만 골라 **호출 횟수**와 **최장 호출 공백**을 낸다. 감시 창 경계를 양끝에
+         붙이는 것은 `parse()`와 같다(그 docstring의 근거가 그대로 적용된다).
+    해석: 이 축이 답하는 질문은 하나다 — **작업 스케줄러가 워치독을 불렀는가.**
+         `parse()`의 `max_silence_minutes`는 「불려서 무엇을 남겼는가」이고, 정상일에도
+         10분이 기본이다. 두 축을 나란히 두면 09-07의 20.8분이 갈린다:
+           호출 공백이 작다  → 불렸다. 남길 것이 없었을 뿐이다(관측 루프가 살아 있었다).
+           호출 공백도 크다  → **스케줄러가 안 불렀다.** 그때는 원인이 PC 쪽이다.
+    실패 조건: 없다 — 형식이 안 맞는 줄은 건너뛴다.
+    """
+    start, end = _watch_window_bounds(target)
+    stamps: list[datetime] = []
+    actions: dict[str, int] = {}
+    for line in lines:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 2 or parts[0] != target.isoformat():
+            continue
+        try:
+            hh, mm, ss = (int(x) for x in parts[1].split(":"))
+            at = datetime.combine(target, dtime(hh, mm, ss))
+        except ValueError:
+            continue
+        stamps.append(at)
+        action = parts[2] if len(parts) > 2 else ""
+        actions[action] = actions.get(action, 0) + 1
+
+    stamps.sort()
+    inside = [s for s in stamps if start <= s <= end]
+    edges = [start] + inside + [end]
+    gaps = [(b - a).total_seconds() / 60.0 for a, b in zip(edges, edges[1:])]
+    max_gap = max(gaps) if gaps else 0.0
+    worst_at = None
+    if gaps:
+        worst = max(range(len(gaps)), key=lambda i: gaps[i])
+        worst_at = f"{edges[worst]:%H:%M}~{edges[worst + 1]:%H:%M}"
+
+    return {
+        # 규약 C — 흔적 파일이 있는데 그날 줄이 0이면 「하루 종일 한 번도 안 불렸다」이고,
+        # 파일 자체가 없으면 「모른다」다(아래 `_absent_trail()`). **그 둘은 다른 사실이다.**
+        "invocation_trail_available": True,
+        "invocations": len(stamps),
+        "invocations_in_window": len(inside),
+        "max_invocation_gap_minutes": round(max_gap, 1),
+        # 규약 F — 주장 지표는 절대 건수로 세우지 않는다. 감시 창 길이와 호출 주기가
+        # 분모에서 약분되므로 이 배수에는 부등식을 걸어도 된다(`silence_over_cadence_ratio`와
+        # 같은 형태이고, 같은 이유다).
+        "invocation_gap_over_cadence_ratio": (
+            round(max_gap / _INVOCATION_CADENCE_MINUTES, 2)
+            if _INVOCATION_CADENCE_MINUTES else None
+        ),
+        "max_invocation_gap_window": worst_at,
+        "invocation_first_at": f"{stamps[0]:%H:%M:%S}" if stamps else None,
+        "invocation_last_at": f"{stamps[-1]:%H:%M:%S}" if stamps else None,
+        "invocation_actions": actions,
+        "invocation_cadence_minutes": _INVOCATION_CADENCE_MINUTES,
+        "invocation_gap_warn_minutes": INVOCATION_GAP_WARN_MINUTES,
+    }
+
+
+def _absent_trail() -> dict:
+    """흔적 파일이 없는 날의 값 — **0이 아니라 「모른다」다**(규약 C).
+
+    이 fix 이전 날짜를 재집계하거나, 워치독이 미등록인 PC가 여기 해당한다. 0으로 접으면
+    「호출이 한 번도 안 끊겼다」로 읽히고, 그것이 정확히 이 축이 막으려는 오독이다.
+    """
+    return {
+        "invocation_trail_available": False,
+        "invocations": None,
+        "invocations_in_window": None,
+        "max_invocation_gap_minutes": None,
+        "invocation_gap_over_cadence_ratio": None,
+        "max_invocation_gap_window": None,
+        "invocation_first_at": None,
+        "invocation_last_at": None,
+        "invocation_actions": {},
+        "invocation_cadence_minutes": _INVOCATION_CADENCE_MINUTES,
+        "invocation_gap_warn_minutes": INVOCATION_GAP_WARN_MINUTES,
+    }
+
+
+def collect_trail(log_dir: Path, target: date) -> dict:
+    """반환: `parse_trail()` 결과, 흔적 파일이 없으면 `_absent_trail()`.
+
+    **None을 반환하지 않는다** — 이 축은 `collect()`의 결과에 합쳐지고, 거기서 빠지면
+    소비측이 「그날은 이 판정 자체가 없던 버전이다」와 구분할 수 없다.
+    """
+    path = Path(log_dir) / TRAIL_FILENAME
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return _absent_trail()
+    except Exception:
+        logger.warning("워치독 호출 흔적 읽기 실패: %s", path, exc_info=True)
+        return _absent_trail()
+    return parse_trail(lines, target)
+
+
 def collect(log_dir: Path, target: date) -> dict | None:
     """반환: `parse()` 결과, 로그 파일이 없으면 None(= 「모른다」, 「정상」이 아니다)."""
     path = Path(log_dir) / WATCHDOG_LOG_FILENAME
@@ -189,4 +306,6 @@ def collect(log_dir: Path, target: date) -> dict | None:
     except Exception:
         logger.warning("워치독 로그 읽기 실패: %s", path, exc_info=True)
         return None
-    return parse(lines, target)
+    # 2026-09-07 Fix A — **판정 축 위에 호출 축을 얹는다.** 종전 키는 한 개도 안 바뀐다
+    # (`parse()`가 먼저이고 새 키는 이름이 전부 `invocation*`이라 겹치지 않는다).
+    return {**parse(lines, target), **collect_trail(log_dir, target)}
