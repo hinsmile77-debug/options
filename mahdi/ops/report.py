@@ -39,6 +39,11 @@ HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
     # 2026-08-06 고도화#1 — 먼슬리 레그 재시도로 살린 레그. **판단 주입력의 두께**다.
     # 0이면 재시도가 안 돌았거나(예산 없음) 놓친 레그가 없었던 것 — §12의 레그 완전성과 함께 읽는다.
     ("먼슬리 레그 회복", "priority_retry.recovered", "{:,.0f}레그", "up"),
+    # 2026-09-07 Fix C (09-07 §1-9 정정) — 위 줄의 **반대쪽 끝**. `recovered`는 살린 레그를
+    # 세고 이 줄은 **한 레그도 못 살린 분**을 센다. 09-07에 사람이 로그를 눈으로 훑어
+    # 「완전 실패 2건」이라 적었고 실제로는 3건이었다(13:38은 6개 중 1개 회복 = 부분).
+    # 이 줄이 있으면 그 셈을 사람이 하지 않는다. 상세 근거는 `log_metrics`의 같은 키.
+    ("└ 먼슬리 완전미회복", "priority_retry.total_failure_cycles", "{:,.0f}건", "down"),
     ("비200 응답", "rest.non_200.count", "{:,.0f}건", "down"),
     ("백오프 최대 배율", "backoff.max_multiplier", "{:.2f}배", "down"),
     ("느린 REST 호출", "slow_calls.count", "{:,.0f}건", "down"),

@@ -1108,6 +1108,27 @@ def parse_day(lines: Iterable[str], target: date) -> dict:
             "failed_minutes": [
                 r["at"] for r in priority_retries if r["recovered"] < r["attempted"]
             ],
+            # 2026-09-07 Fix C (09-07 §1-9 정정) — **「간신히 실패」와 「전멸」을 가른다.**
+            #
+            # 위 `failed_cycles`는 「회복 < 대상」을 전부 한 칸에 담는다. 그 칸 안에서
+            # 「6개 중 1개 회복」과 「7개 중 0개 회복」은 구분되지 않는다 — 앞의 것은 핵심
+            # 레그가 **일부** 빈 것이고 뒤의 것은 그 분의 되살리기가 **통째로** 실패한 것이다.
+            #
+            # 09-07에 사람이 정확히 그 자리에서 틀렸다: 장중② 회차가 하루치 로그를 눈으로
+            # 훑어 완전 실패를 「13:38·14:10 두 차례」로 적었는데, 13:38은 6개 중 1개를
+            # 회복한 **부분** 회복이었고 완전 미회복은 12:30·14:00·14:10 **세 차례**였다.
+            # 장후 회차가 원본 로그를 다시 세어 정정했다 — 이 축이 있었으면 정정 자체가
+            # 필요 없었다.
+            #
+            # **부분집합이다**: `total_failure_cycles <= failed_cycles`가 항상 성립한다.
+            # `attempted`를 조건에 넣는 이유는 「0개 중 0개 회복」(시도할 레그가 없던 분)을
+            # 전멸로 세지 않기 위함이다 — 그 분은 실패가 아니라 할 일이 없던 것이다.
+            "total_failure_cycles": sum(
+                1 for r in priority_retries if r["attempted"] and not r["recovered"]
+            ),
+            "total_failure_minutes": [
+                r["at"] for r in priority_retries if r["attempted"] and not r["recovered"]
+            ],
             "recovery_pct": (
                 round(
                     sum(r["recovered"] for r in priority_retries)

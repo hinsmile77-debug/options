@@ -453,6 +453,9 @@ def test_priority_retry_counts_attempts_and_recoveries():
         # 2026-08-24 Fix#4 — **두 줄 다 회복 < 대상**이다(3개 중 2개 · 1개 중 0개).
         # 회복률 50%는 그중 전멸 한 건을 평균에 접어 없앤다 — 그것이 이 칸을 만든 이유다.
         "failed_cycles": 2, "failed_minutes": ["10:01", "10:02"],
+        # 2026-09-07 Fix C — 그 둘 중 **전멸은 한 건**이다(1개 중 0개). 08-24가 만든 칸도
+        # 「6개 중 5개가 빈 것」과 「7개가 통째로 빈 것」은 아직 못 갈랐다.
+        "total_failure_cycles": 1, "total_failure_minutes": ["10:02"],
     }
 
 
@@ -460,6 +463,10 @@ def test_priority_retry_is_zero_when_the_line_never_appears():
     parsed = _parse([_cycle_line("10:01")])
     assert parsed["priority_retry"]["cycles"] == 0
     assert parsed["priority_retry"]["recovery_pct"] is None
+    # 2026-09-07 Fix C · 규약 C — **0건인 날도 키가 실린다.** 키가 아예 없으면 「전멸이
+    # 없었다」와 「그날은 이 축이 없던 버전이다」가 같은 모양이 된다.
+    assert parsed["priority_retry"]["total_failure_cycles"] == 0
+    assert parsed["priority_retry"]["total_failure_minutes"] == []
 
 
 def test_priority_retry_log_format_matches_the_source_string():
@@ -471,6 +478,8 @@ def test_priority_retry_log_format_matches_the_source_string():
     assert parsed["priority_retry"] == {
         "cycles": 1, "attempted": 5, "recovered": 4, "recovery_pct": 80.0,
         "failed_cycles": 1, "failed_minutes": ["10:01"],
+        # 2026-09-07 Fix C — 5개 중 4개는 **부분** 회복이다. 전멸이 아니다.
+        "total_failure_cycles": 0, "total_failure_minutes": [],
     }
 
 

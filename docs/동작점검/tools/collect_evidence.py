@@ -141,6 +141,15 @@ MARKET_HOURS = ("09:00", "15:20")
 WATCHDOG_EXPECT_INTERVAL_MIN = 10
 WATCHDOG_GAP_THRESHOLD_MIN = 25
 
+# 2026-09-07 Fix A (09-07 §1-1) — **위 두 값은 「기록」의 눈금이고, 아래는 「호출」의 눈금이다.**
+# 작업 스케줄러는 워치독을 1분마다 부르는데 워치독은 10분에 한 줄만 남긴다. 그래서 위
+# 25분 임계로는 「20번 안 불렸다」와 「불렸는데 두 번째 OK 주기에만 안 닿았다」가 안 갈린다 —
+# 09-07 07:40~08:00의 20.8분이 정확히 그 모양이었고, 네 회차가 원인을 못 갈랐다.
+# 흔적 파일의 출처는 `mahdi/liveness.append_watchdog_check`다.
+WATCHDOG_TRAIL_FILENAME = ".watchdog_check_trail.tsv"
+TAB_CHAR = "\t"
+WATCHDOG_INVOCATION_GAP_THRESHOLD_MIN = 5
+
 # 로그 한 줄의 머리. `logging` 레코드는 반드시 여기서 시작한다 —
 # 트레이스백 본문은 타임스탬프가 없어 이 정규식이 걸러 준다(형식이 아니라 구조가 만드는 구분).
 TS = r"(\d{4}-\d\d-\d\d) (\d\d):(\d\d):(\d\d),(\d+)"
@@ -674,6 +683,8 @@ class LoopScan:
         self.backoff_expansions = collections.Counter()      # 시(hour) -> 건수
         self.priority_retries = collections.Counter()        # 시(hour) -> 건수
         self.priority_retry_failures = collections.Counter() # 시(hour) -> 회복 실패 건수
+        # 2026-09-07 Fix C — 위 축의 **부분집합**. 「0개 회복」만 센다(부분 회복은 안 센다).
+        self.priority_retry_total_failures = collections.Counter()  # 시(hour) -> 완전 미회복 건수
         self.priority_retry_budget_min = {}                  # 시(hour) -> 남은 예산 최소(초)
 
     def feed(self, line):
@@ -765,6 +776,14 @@ class LoopScan:
                 # **두 축을 다 본다.** 숫자(회복 < 대상)가 정본이고 문구는 그 확인이다 —
                 # 한쪽이 바뀌어도 다른 쪽이 남는다(08-04의 눈멂을 한 번 더 막는 자리다).
                 self.priority_retry_failures[hh] += 1
+            # 2026-09-07 Fix C (09-07 §1-9 정정) — **완전 미회복만 따로 센다.**
+            # 09-07에 사람이 「6개 중 1개 회복」과 「7개 중 0개 회복」을 같은 범주로 묶어
+            # 완전 실패를 2건으로 적었다(실제 3건). 숫자로만 판정한다 — 문구가 바뀌어도
+            # 눈이 멀지 않는 것은 위 실패 축과 같은 이유다.
+            # `int(pr.group(1))`(대상 레그)을 함께 보는 이유: 「0개 중 0개 회복」은 실패가
+            # 아니라 **할 일이 없던 분**이다.
+            if int(pr.group(1)) and not int(pr.group(2)):
+                self.priority_retry_total_failures[hh] += 1
             left = float(pr.group(3))
             if hh not in self.priority_retry_budget_min or left < self.priority_retry_budget_min[hh]:
                 self.priority_retry_budget_min[hh] = left
@@ -2159,8 +2178,8 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
           f"문구: `{BALANCE_POLL_FAILED_TOKEN}` · `{BACKOFF_EXPAND_TOKEN}` · `{PRIORITY_RETRY_TOKEN}`)")
         A("")
     else:
-        A("| 시간대 | 백오프확대 | 잔고폴링실패 | 먼슬리재시도 | 회복실패 | 남은예산 창최소(초) |")
-        A("|---|---|---|---|---|---|")
+        A("| 시간대 | 백오프확대 | 잔고폴링실패 | 먼슬리재시도 | 회복실패 | 그중 완전미회복 | 남은예산 창최소(초) |")
+        A("|---|---|---|---|---|---|---|")
         # 2026-08-25 (08-25 §1-7 / P2-1) — 「회복실패」의 0은 **0으로 찍는다.** 근거는
         # `revival_failure_cell` docstring.
         retry_axis_measured = bool(scan.priority_retries)
@@ -2169,12 +2188,18 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
             failed_cell = revival_failure_cell(
                 scan.priority_retry_failures.get(hh, 0), retry_axis_measured
             )
+            # 2026-09-07 Fix C — 완전 미회복도 **0을 0으로 찍는다**(2026-08-25 P2-1과 같은
+            # 규약): `—`로 두면 「전멸이 없었다」와 「그 축을 안 셌다」가 같은 칸이 된다.
+            total_failed_cell = revival_failure_cell(
+                scan.priority_retry_total_failures.get(hh, 0), retry_axis_measured
+            )
             A(f"| {hh:02d}시 | {scan.backoff_expansions.get(hh, 0)} | "
               f"{scan.balance_poll_failures.get(hh, 0)} | {scan.priority_retries.get(hh, 0)} | "
-              f"{failed_cell} | "
+              f"{failed_cell} | {total_failed_cell} | "
               f"{'—' if budget_min is None else f'{budget_min:.1f}'} |")
         A("")
         failed_total = sum(scan.priority_retry_failures.values())
+        total_failed_total = sum(scan.priority_retry_total_failures.values())
         # ===== 2026-08-26 (08-26 §1-20 / P2-7) — **9가 큰지 작은지 아무도 몰랐다** =====
         #
         # 종전 적신호는 「실패 9건」이라고만 적었다. 전일값이 없어 그 9가 평소인지 급증인지
@@ -2213,6 +2238,13 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
             )
             retry_delta = f" · 전일({prev_retry_day}) 대비 **{' · '.join(bits)}**"
         A(f"- 먼슬리 되살리기 **실패 {failed_total}건**{retry_delta}")
+        # 2026-09-07 Fix C (09-07 §1-9 정정) — **위 한 수를 둘로 쪼갠다.** 09-07은 실패
+        # 12건이었는데 그중 전멸이 3건(12:30·14:00·14:10)이고 나머지 9건은 부분 회복이었다.
+        # 그 구분을 사람이 로그를 훑어 하다가 그날 실제로 틀렸다(「2건」으로 적었다).
+        A(f"  - 그중 **완전 미회복(0개 회복) {total_failed_total}건** · "
+          f"부분 회복 {failed_total - total_failed_total}건 "
+          "— 앞의 것은 그 분의 되살리기가 **통째로** 실패한 것이고, "
+          "뒤의 것은 핵심 레그가 **일부** 빈 채로 간 것이다")
         A("")
         A("> ⚠ **증감 화살표를 판정으로 읽지 않는다**(규약 G) — 이 축은 그날 KIS 상태에")
         A("> 비례한다. ▲7이 곧 회귀가 아니다. 이 줄이 하는 일은 **두 수를 나란히 놓는 것**까지다.")
@@ -2226,7 +2258,11 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                 f"{hh:02d}시 {n}건" for hh, n in sorted(scan.priority_retry_failures.items())
             )
             flags.append(
-                f"먼슬리 되살리기 **실패 {failed_total}건**({worst}){retry_delta} — 그 분의 "
+                f"먼슬리 되살리기 **실패 {failed_total}건**({worst}){retry_delta} — "
+                # 2026-09-07 Fix C — 적신호에도 분해를 실어 보낸다. 이 줄만 읽는 사람이
+                # 「실패 12건」을 「12분이 통째로 비었다」로 읽지 않게 한다(09-07의 오독).
+                f"그중 **완전 미회복 {total_failed_total}건** · 부분 회복 "
+                f"{failed_total - total_failed_total}건. 그 분의 "
                 "GEX·감마플립은 핵심 6레그가 빈 채로 계산됐다. 「간신히 성공」과 다른 "
                 "사건이다(2026-08-24 Fix#4)"
             )
@@ -2373,6 +2409,64 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         A("- 당일 기록 **0행** (감시 창 밖이면 정상 — `.watchdog_last_check.json` 을 볼 것)")
         if due("08:10"):
             flags.append("워치독 당일 기록이 0행 — 작업 스케줄러 등록/무장 상태를 확인할 것")
+    # ---- 6-1. 호출 공백 — 위 「기록 공백」과 **다른 축이다** (2026-09-07 Fix A) ----
+    #
+    # 위 표는 워치독이 **남긴 줄** 사이의 간격이다. 정상일에도 10분이 기본이라, 그 눈금으로는
+    # 「스케줄러가 안 불렀다」가 안 보인다. 아래 흔적은 **불린 사실 자체**를 매분 담는다.
+    A("")
+    A("### 6-1. 호출 공백 — 「안 불렸다」와 「불렸는데 남길 것이 없었다」")
+    A("")
+    trail = logs / WATCHDOG_TRAIL_FILENAME
+    trail_min = []
+    trail_actions = collections.Counter()
+    if trail.exists():
+        for row in read_text(trail).splitlines():
+            cells = row.split(TAB_CHAR)
+            if len(cells) < 2 or cells[0] != day.isoformat():
+                continue
+            try:
+                hh, mm = int(cells[1][:2]), int(cells[1][3:5])
+            except ValueError:
+                continue
+            trail_min.append(hh * 60 + mm)
+            trail_actions[cells[2] if len(cells) > 2 else ""] += 1
+    if not trail.exists():
+        # 규약 C — **0이 아니라 「모른다」다.** 이 fix 이전 날짜이거나 워치독 미등록 PC다.
+        A(f"- `{WATCHDOG_TRAIL_FILENAME}` **없음** — 호출 공백을 **측정하지 못했다**"
+          "(「끊긴 적 없다」가 아니다). 2026-09-07 Fix A 이전 날짜이거나 워치독이 이 PC에 "
+          "미등록이다.")
+    elif not trail_min:
+        A(f"- 흔적 파일은 있는데 당일 줄 **0행** — **하루 종일 한 번도 안 불렸다**는 뜻이다.")
+        flags.append(
+            "워치독 호출 흔적이 당일 0행 — 작업 스케줄러가 워치독을 한 번도 부르지 않았다"
+        )
+    else:
+        trail_min.sort()
+        inv_gaps = [
+            (a, b, b - a) for a, b in zip(trail_min, trail_min[1:])
+            if b - a >= WATCHDOG_INVOCATION_GAP_THRESHOLD_MIN
+        ]
+        A(f"- 당일 호출 **{len(trail_min)}회** "
+          f"({m2hhmm(min(trail_min))}~{m2hhmm(max(trail_min))} · "
+          + " · ".join(f"{k or '—'} {v}" for k, v in sorted(trail_actions.items())) + ")")
+        A(f"- 호출 간격 {WATCHDOG_INVOCATION_GAP_THRESHOLD_MIN}분 이상 공백: "
+          f"**{len(inv_gaps)}건** (정상 주기 1분)")
+        if inv_gaps:
+            A("")
+            A("| 마지막 호출 | 다음 호출 | 공백(분) |")
+            A("|---|---|---|")
+            for a, b, g in inv_gaps[:10]:
+                A(f"| {m2hhmm(a)} | {m2hhmm(b)} | {g} |")
+            for a, b, g in inv_gaps:
+                flags.append(
+                    f"워치독 **호출** 공백 {m2hhmm(a)}~{m2hhmm(b)} ({g}분) — 기록 공백이 아니라 "
+                    "스케줄러가 워치독을 안 부른 것이다(PC 전원·작업 스케줄러 쪽을 볼 것)"
+                )
+        A("")
+        A("> **이 절을 기록 공백(§6)과 겹쳐 읽는다.** 기록 공백만 크고 호출 공백이 작으면")
+        A("> 「불렸는데 남길 것이 없었다」(정상)이고, **둘 다 크면 안 불린 것**이다 —")
+        A("> 09-07 07:30 미기동의 원인을 그날 네 회차가 못 가른 이유가 이 축의 부재였다.")
+    A("")
     for name in (".watchdog_state.json", ".watchdog_last_check.json"):
         p = logs / name
         A(f"- `{name}`: {truncate(read_text(p), 200) if p.exists() else '**없음**'}")
