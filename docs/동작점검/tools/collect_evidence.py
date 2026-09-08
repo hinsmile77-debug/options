@@ -276,6 +276,33 @@ P95_WARN_THRESHOLD_SECONDS = 2.5
 # 해당 항목이 정본이다(2026-07-08 페이서 분리 500 폭주 203분이 ⛔의 근거).
 P95_TWO_DAY_RULE_ID = "2026-08-04-p5"
 
+# ===== 2026-09-08 (09-08 제4부 Fix 후보 D) — **「성립했다」와 「며칠째 안 정했다」는 다른 축이다** =====
+#
+# 위 🔔은 **그날 조건이 섰다**까지만 말한다. 그런데 09-08에 실제로 값이 나간 것은 성립이
+# 아니라 **미룸의 길이**였다: 같은 결정이 사람 개입 없이 지나가는 사이 15:01~15:28 절벽이
+# 났고, 그날 보고서는 그 길이를 **「3연속」이라고 산문에 손으로 적었다.** 그 수는 어느
+# 산출물에도 없다 — 재집계하면 다른 수가 나온다(실제로 5다).
+#
+# ## 무엇을 재는가 — 「성립 일수」가 아니라 「아직 안 덮은 시간대」다
+#
+# 규칙이 정한 조치는 **그 시간대를 혼잡 레버에 넣는 것**이다. 그러므로 결정이 열려 있다는
+# 것은 「🔔이 떴다」가 아니라 **「🔔에 뜬 시간대 중 레버가 아직 안 덮은 것이 있다」**이다.
+# 이렇게 재면 사람이 실제로 레버를 켜는 날 **저절로 0으로 떨어진다** — 별도의 「닫혔다」
+# 신호를 사람이 어딘가에 적어 줄 필요가 없다.
+#
+# ## `inquire-price`만 센다
+#
+# 조치가 **위클리 옵션 조회 주기**라, 잔고(`inquire-balance`)만 걸린 시간대는 이 레버로
+# 덮을 대상이 아니다. 그것까지 세면 08-28·08-31·09-01이 거짓으로 걸려 연속이 부풀고,
+# **부풀린 경보는 진짜 경보를 죽인다**(`MEASUREMENT_MAP` 주석의 그 규약).
+#
+# ⛔ **임계를 만들지 않는다.** 「N일 넘으면 경고」를 지금 긋지 않는다 — 표본이 얕다.
+# ⛔ **판정하지 않는다**(§8-2·§8-3과 같은 규약). 이 절은 세고, 결정은 사람이 한다.
+PREEMPTIVE_LEVER_KEY = "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS"
+PREEMPTIVE_ACTIONABLE_ENDPOINT = "inquire-price"
+# 거슬러 오를 최대 거래일 수. 연속이 끊기면 그 전에 멈추므로 평소엔 몇 번만 돈다.
+PREEMPTIVE_STREAK_MAX_DAYS = 40
+
 # ===== 2026-08-23 (08-21 §1-14 / §5 고도화#1) — **검열된 p50은 중앙값이 아니라 하한이다** =====
 #
 # 08-21 지연창 98개 중 상당수가 p50 4.03~4.05초를 냈고, read timeout이 4.0초이므로 그 값은
@@ -491,6 +518,11 @@ def fmt_bytes(n):
 def truncate(s, n=MSG_TRUNCATE):
     s = str(s).replace("\n", " ⏎ ").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _fmt_hours(hours):
+    """반환: 시(hour) 집합을 `9시·15시` 로. 비면 `없음` — **빈 집합과 None은 호출측이 가른다.**"""
+    return "·".join(f"{h}시" for h in sorted(hours)) if hours else "없음"
 
 
 def normalize(msg):
@@ -1164,6 +1196,122 @@ def _previous_priority_retry(auto: Path, day: _date):
     except Exception:  # noqa: BLE001
         return None, None
     return (blob.get("priority_retry") or None), prev_day
+
+
+def congested_lever_hours(root: Path):
+    """반환: 혼잡 시간대 레버가 **덮고 있는 시(hour) 집합** — 못 읽으면 `None`.
+
+    입력: 리포 루트.
+    계산: `mahdi/main.py`에서 주석이 아닌 `OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS = {...}`
+         줄을 찾아 `{시: 주기}` 의 키만 뽑는다. 값(주기)은 안 본다 — 이 절이 묻는 것은
+         「덮였는가」이지 「얼마로 덮였는가」가 아니다.
+    해석: **`None`과 `set()`은 다른 값이다**(규약 C) — 전자는 「이 도구가 못 읽었다」이고
+         후자는 「등록된 시간대가 없다」다. 못 읽은 것을 빈 집합으로 접으면 그날 전 시간대가
+         **거짓으로 「안 덮임」**이 된다.
+    실패 조건: 없다 — 못 읽으면 `None`이다.
+    """
+    path = root / "mahdi" / "main.py"
+    if not path.is_file():
+        return None
+    for line in read_text(path).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or PREEMPTIVE_LEVER_KEY not in stripped or "=" not in stripped:
+            continue
+        value = stripped.split("=", 1)[1].split("#", 1)[0].strip()
+        if not (value.startswith("{") and value.endswith("}")):
+            continue
+        return {int(h) for h in re.findall(r"(\d+)\s*:", value)}
+    return None
+
+
+def _sidecar_latency(auto: Path, day: _date):
+    """반환: 그날 사이드카의 `rest_latency` 절 — 없거나 `p95_by_hour`가 비면 `None`.
+
+    `p95_by_hour`가 빈 사이드카를 **거래일로 세지 않는다.** 08-17(대체공휴일)이 정확히 그
+    형태였고, 그것을 「미덮임 없음」으로 읽으면 08-18의 연속이 거짓으로 끊긴다 — 그날
+    §5의 🔔도 직전 거래일을 08-14로 잡았다. **두 곳이 같은 날을 가리켜야 한다.**
+    """
+    path = auto / f"{day.isoformat()}_지표.json"
+    if not path.is_file():
+        return None
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    latency = blob.get("rest_latency") or {}
+    return latency if latency.get("p95_by_hour") else None
+
+
+def _price_breach_hours(latency: dict):
+    """반환: 그날 `inquire-price` p95가 그날의 임계를 넘은 시(hour) 집합.
+
+    임계는 **그 사이드카에 적힌 값**을 쓴다 — 그날 실제로 걸려 있던 임계여야 한다
+    (`two_day_p95_overlap`·`effective_read_timeout`과 같은 원칙).
+    """
+    threshold = float(latency.get("p95_warn_threshold") or P95_WARN_THRESHOLD_SECONDS)
+    return {
+        int(hour)
+        for hour, row in (latency.get("p95_by_hour") or {}).items()
+        for endpoint, value in row.items()
+        if endpoint == PREEMPTIVE_ACTIONABLE_ENDPOINT and value > threshold
+    }
+
+
+def _previous_latency_day(auto: Path, day: _date, max_back=PREV_SIDECAR_MAX_BACKTRACK_DAYS):
+    """반환: 지연 계측이 실린 직전 거래일 — `max_back`일 안에 없으면 `None`.
+
+    `previous_metric_sidecar()`와 달리 **파일 존재만으로 고르지 않는다** — 빈 사이드카를
+    고르면 그날 이틀 연속 판정이 통째로 헛돈다(`_sidecar_latency` 주석 참고).
+    """
+    for back in range(1, max_back + 1):
+        candidate = day - timedelta(days=back)
+        if _sidecar_latency(auto, candidate) is not None:
+            return candidate
+    return None
+
+
+def preemptive_uncovered_history(auto: Path, root: Path, day: _date,
+                                 max_days=PREEMPTIVE_STREAK_MAX_DAYS):
+    """반환: `(레버가 덮는 시 집합 또는 None, [(날짜, 안 덮인 시 목록 또는 None), ...])`.
+
+    입력: `auto/` 디렉터리, 리포 루트, 기준일.
+    계산: 기준일부터 거슬러 오르며 **그날과 직전 거래일 모두** `inquire-price` p95가 임계를
+         넘은 시간대를 구하고, 거기서 레버가 덮는 시를 뺀다. **연속이 끊긴 날 하나까지만**
+         담고 멈춘다(그 날이 「언제부터인가」를 말해 준다).
+    해석: 목록 머리부터 「안 덮인 시가 비지 않은」 날의 수가 **연속 미덮임 거래일**이다.
+         `None`이 섞이면 그 지점부터는 **「0일」이 아니라 「모른다」**다(규약 C) —
+         사이드카가 없거나 레버를 못 읽은 경우다.
+    실패 조건: 없다 — 못 읽으면 목록이 짧아지거나 `None`이 실린다.
+    """
+    covered = congested_lever_hours(root)
+    rows, cursor = [], day
+    for _ in range(max_days):
+        latency = _sidecar_latency(auto, cursor)
+        if latency is None:
+            break
+        prev_day = _previous_latency_day(auto, cursor)
+        prev_latency = _sidecar_latency(auto, prev_day) if prev_day else None
+        if prev_latency is None:
+            # 이틀 연속 판정을 못 한다 — **「미덮임 없음」이 아니다.**
+            rows.append((cursor, None))
+            break
+        both = _price_breach_hours(latency) & _price_breach_hours(prev_latency)
+        uncovered = None if covered is None else sorted(both - covered)
+        rows.append((cursor, uncovered))
+        if not uncovered:
+            break
+        cursor = prev_day
+    return covered, rows
+
+
+def preemptive_uncovered_streak(rows):
+    """반환: 목록 머리부터 이어지는 **연속 미덮임 거래일 수**. `None`을 만나면 거기서 멈춘다."""
+    streak = 0
+    for _day, uncovered in rows:
+        if not uncovered:
+            break
+        streak += 1
+    return streak
 
 
 def previous_metric_sidecar(auto: Path, day: _date, max_back=PREV_SIDECAR_MAX_BACKTRACK_DAYS):
@@ -2748,6 +2896,62 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     A("> 있었다(§3-2). §8-2가 「닫힌 것을 되살리는 실수」를 막고 이 절이 **그 반대 방향의 실수**를")
     A("> 막는다 — 두 목록은 같은 파일에서 나온다. **여기서도 판정은 하지 않는다**(§8-2와 같은")
     A("> 규약): 목록을 눈앞에 두는 것이 전부이고, 08-24 사고는 그것으로 막혔을 것이다.")
+    A("")
+
+    # ---- 8-4. 사전 대응 규칙 — 「아직 안 덮은 시간대」가 며칠째인가 (2026-09-08 제4부 Fix D) ----
+    #
+    # §8-3이 `NEXT_TODO.md`에서 「아직 안 고른 갈림길」을 읽어 온다면, 이 절은 **산출물에서**
+    # 같은 것을 읽는다 — 사람이 어디에 적어 두지 않아도 남는 갈림길이다.
+    A("## 8-4. 사전 대응 규칙 — 「아직 안 덮은 시간대」가 며칠째인가")
+    A("")
+    covered_hours, uncovered_rows = preemptive_uncovered_history(auto, root, day)
+    if covered_hours is None:
+        # 규약 C — 못 읽은 것을 「덮인 시간대 없음」으로 접으면 전 시간대가 거짓 미덮임이 된다.
+        A(f"⚠ `mahdi/main.py`의 `{PREEMPTIVE_LEVER_KEY}`를 못 읽었다 — "
+          "이 절은 **검사한 것이 아니다**(「덮인 시간대가 없다」가 아니다).")
+        flags.append(
+            f"혼잡 시간대 레버(`{PREEMPTIVE_LEVER_KEY}`)를 못 읽어 "
+            "「사전 대응 규칙이 아직 안 덮은 시간대」를 세지 못했다"
+        )
+    elif not uncovered_rows:
+        A(f"(지연 계측이 실린 사이드카를 못 찾았다 — **「미덮임 없음」이 아니다**"
+          f"(규약 C). 레버가 덮는 시간대: {_fmt_hours(covered_hours)})")
+    else:
+        streak = preemptive_uncovered_streak(uncovered_rows)
+        head_day, head_uncovered = uncovered_rows[0]
+        if head_uncovered is None:
+            A(f"**모른다** — {head_day}의 직전 거래일 지연 계측을 "
+              f"{PREV_SIDECAR_MAX_BACKTRACK_DAYS}일 안에 못 찾아 이틀 연속 판정을 못 한다. "
+              "**「0일째」가 아니다**(규약 C).")
+        elif streak == 0:
+            A(f"**0일째 — 열린 것이 없다.** {head_day} 기준 이틀 연속 성립한 "
+              f"`{PREEMPTIVE_ACTIONABLE_ENDPOINT}` 시간대를 레버가 전부 덮고 있다 "
+              f"(레버: {_fmt_hours(covered_hours)}).")
+        else:
+            still = _fmt_hours(head_uncovered)
+            A(f"**연속 {streak}거래일.** 아직 안 덮은 시간대: {still} "
+              f"(레버가 덮는 것: {_fmt_hours(covered_hours)} · `{PREEMPTIVE_ACTIONABLE_ENDPOINT}`만 센다)")
+            A("")
+            A("| 날짜 | 이틀 연속 성립(price) 중 안 덮인 시 |")
+            A("|---|---|")
+            for row_day, row_uncovered in uncovered_rows:
+                if row_uncovered is None:
+                    cell = "**모른다**(직전 거래일 계측 없음)"
+                elif not row_uncovered:
+                    cell = "없음 — **여기서 끊긴다**"
+                else:
+                    cell = _fmt_hours(row_uncovered)
+                A(f"| {row_day} | {cell} |")
+        A("")
+    A("> **이 절이 있는 이유**: 09-08에 같은 결정이 사람 개입 없이 세 번째로 지나갔고 그날")
+    A("> 오후에 28분 절벽이 났다. 그런데 그 「세 번째」는 **보고서 산문의 수**였다 — 산출물에")
+    A("> 남지 않아 다음 회차가 이어 세지 못했고, 재집계하면 다른 수가 나온다. 여기 실리는")
+    A("> 수는 **매 회차가 같은 값을 다시 얻는다.**")
+    A("")
+    A("> ⛔ **판정하지 않는다**(§8-2·§8-3과 같은 규약) — 임계도 경보선도 없다. 발동은 사람이")
+    A("> 정하고(2026-07-08 페이서 분리 500 폭주 203분), **발동 창은 다음 거래일 장전**이다.")
+    A("> 사람이 그 시간대를 레버에 넣으면 이 수는 **다음 거래일에 저절로 0이 된다** —")
+    A("> 「닫혔다」를 따로 적어 줄 필요가 없다.")
     A("")
 
     # ---- 9. 산출물 ----
