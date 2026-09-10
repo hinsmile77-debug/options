@@ -53,6 +53,28 @@ CONTINUOUS_POLLER_DUTY_RATIO = 0.5
 # 09-03 이후 레버에 09시가 추가되더라도 이 창은 사람이 명시적으로 옮기기 전에는 안 움직인다.
 CONGESTED_HOURS = (10, 11, 12, 13, 14)
 
+# ===== 2026-09-10 (09-10 제5부 고도화 3 / §3-1) — **마감이 풀어 주는 혼잡을 센다** =====
+#
+# 09-10 §3-1이 그날의 가장 직접적인 증거를 산문으로만 남겼다: 14시대 REST수집 평균 37~42초가
+# 정규장 마감(15:20) 직후 19~20초로 떨어졌다 — 오전 수준 복귀. **사람이 아무 결정을 안 냈는데
+# 위험이 스스로 사라진 것**이고, 그것이 그날 혼잡의 귀속(KIS냐 우리냐)을 가르는 재료였다.
+# 그런데 그 낙폭은 어느 표에도 안 남아서, 회차가 `logs/observation_loop.log`를 직접 grep해
+# 세 줄(15:30:36 · 15:31:19 · 15:32:18)을 인용했다 — **다음날 재현이 안 된다.**
+#
+# ⚠ **창을 레버에서 읽어오지 않는다** — `CONGESTED_HOURS` 절과 같은 이유다(09-02 P1-5).
+# 마감 시각이 바뀌는 날(조기 종료 등) 지표의 정의가 함께 바뀌면 전후 비교가 끊긴다.
+# 창은 여기 고정하고 산출물에 **함께 인쇄**한다.
+#
+# 마감 전을 **하루 전체가 아니라 직전 2시간**으로 잡는 이유: 하루 전체를 쓰면 오전의 한산한
+# 구간이 분모에 섞여 낙폭이 과소평가된다. §3-1이 실제로 비교한 것도 「14시대 vs 15:30 이후」다.
+#
+# ⛔ **임계를 만들지 않는다.** 이 축에는 경보선이 없다 — 「낙폭 N% 넘으면 KIS 귀속」을 여기서
+# 그으면 08-16이 하루로 지표를 정했다가 뒤집힌 것과 같은 실수가 된다. 귀속 판정은 §17
+# (`crosscheck.backoff-vs-kis-latency`)이 이미 하고, 이 축은 그 판정의 재료를 하나 더
+# 눈앞에 두는 것이 전부다.
+CLOSE_SHIFT_BEFORE = (13 * 3600 + 20 * 60, 15 * 3600 + 20 * 60)  # 13:20 ~ 15:19:59
+CLOSE_SHIFT_AFTER_FROM = 15 * 3600 + 20 * 60  # 15:20 ~ (정규장 옵션 마감)
+
 _TS = r"(\d{4}-\d\d-\d\d) (\d\d):(\d\d):(\d\d),(\d+)"
 
 _CYCLE_RE = re.compile(
@@ -1588,6 +1610,44 @@ def _congested_cycle_seconds(cycles: list[dict]) -> dict:
     }
 
 
+def _close_shift_cycle_seconds(cycles: list[dict]) -> dict:
+    """
+    입력: 파싱된 사이클 목록.
+    계산: 정규장 마감(15:20) **직전 2시간**과 **마감 이후**의 REST수집 소요시간 중앙값, 그리고
+         그 낙폭(%). 낙폭은 `(before - after) / before * 100` — 양수가 「마감 후 빨라졌다」다.
+    해석: 위 `CLOSE_SHIFT_BEFORE` 절. 낙폭이 크면 그날 혼잡의 상당 부분이 **장 참여자 총량**에
+         비례했다는 뜻이고, 그것은 우리 스케줄링으로 줄일 수 있는 종류가 아니다.
+         **단독으로 귀속을 판정하지 않는다** — §17 교차 점검(`backoff-vs-kis-latency`)과
+         §6 백오프를 함께 읽는 재료다.
+    실패 조건: 한쪽 창에 사이클이 없는 날(조기 종료·기동 실패·마감 전 종료)은 그쪽이 `None`이고
+              `drop_pct`도 `None`이다 — **0.0을 내면 안 된다**(규약 C: 「낙폭이 없었다」와
+              「표본이 없었다」가 같은 칸이 된다). `before_p50`이 0인 날도 `None`으로 끊는다.
+    ⚠ 규약 G — 이 축은 그날 KIS 상태에 비례한다. 낙폭이 작은 날은 「우리가 좋아졌다」가 아니라
+              **「그날 KIS가 애초에 안 바빴다」**일 수 있다.
+    """
+    lo, hi = CLOSE_SHIFT_BEFORE
+    before = [c["rest"] for c in cycles if lo <= c["start"] < hi]
+    after = [c["rest"] for c in cycles if c["start"] >= CLOSE_SHIFT_AFTER_FROM]
+    before_p50 = _pctl(before, 0.5)
+    after_p50 = _pctl(after, 0.5)
+    drop_pct = None
+    if before_p50 and after_p50 is not None:
+        drop_pct = round((before_p50 - after_p50) / before_p50 * 100, 1)
+    return {
+        # 창을 **함께 인쇄한다** — 나중에 이 창을 옮기면 옛 사이드카와 새 사이드카를 나란히
+        # 놓았을 때 값이 왜 갈리는지가 지표 자신에게 적혀 있어야 한다(`congested`와 같은 규약).
+        "before_window": [_hhmm(lo), _hhmm(hi)],
+        "after_from": _hhmm(CLOSE_SHIFT_AFTER_FROM),
+        "before_cycles": len(before),
+        "after_cycles": len(after),
+        "before_p50": before_p50,
+        "after_p50": after_p50,
+        "before_max": round(max(before), 1) if before else None,
+        "after_max": round(max(after), 1) if after else None,
+        "drop_pct": drop_pct,
+    }
+
+
 def _cycle_metrics(
     cycles: list[dict],
     calls: list[tuple[float, str, str]],
@@ -1598,6 +1658,8 @@ def _cycle_metrics(
         return {
             "count": 0, "by_hour": [], "by_mod10": [],
             "congested": _congested_cycle_seconds([]),
+            # 2026-09-10 제5부 고도화 3 — 사이클이 0건인 날도 키가 실린다(규약 C).
+            "close_shift": _close_shift_cycle_seconds([]),
             "missing": {"count": 0, "list": [], "downtime_count": 0, "infra_count": 0},
             "duplicate_poll_minutes": {"count": 0, "list": [], "labelled": 0},
         }
@@ -1695,6 +1757,8 @@ def _cycle_metrics(
         "rest_seconds": _stats(rests),
         # 2026-09-02 P1-5 — **레버 E가 직접 조작하는 축**(위 CONGESTED_HOURS 절 참고).
         "congested": _congested_cycle_seconds(cycles),
+        # 2026-09-10 제5부 고도화 3 — **마감이 풀어 주는 혼잡**(위 CLOSE_SHIFT_BEFORE 절 참고).
+        "close_shift": _close_shift_cycle_seconds(cycles),
         "over_60s": sum(1 for x in rests if x > 60),
         "rows_distribution": dict(sorted(collections.Counter(c["rows"] for c in cycles).items())),
         # 2026-08-07(§2-1 / Fix#3) — **두 사이클이 같은 분 라벨로 적재한 경우.**

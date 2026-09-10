@@ -26,6 +26,13 @@ HEADLINE_METRICS: list[tuple[str, str, str, str | None]] = [
     ("적자 시작 배율", "rest.deficit_threshold_multiplier", "{:.2f}배", "up"),
     ("옵션체인 사이클", "cycles.count", "{:,.0f}", "up"),
     ("REST수집 평균", "cycles.rest_seconds.mean", "{:.1f}초", "down"),
+    # 2026-09-10 제5부 고도화 3 (09-10 §3-1) — **마감(15:20)이 풀어 주는 혼잡의 크기.**
+    # 09-10에 14시대 37~42초가 마감 후 19~20초로 떨어졌고, 그것이 그날 혼잡을 KIS에 귀속시킨
+    # 가장 직접적인 증거였는데 **어느 표에도 안 남아** 회차가 로그를 직접 grep했다.
+    # 개선 방향을 `None`으로 두는 이유(규약 G): 낙폭이 큰 날은 우리가 좋아진 것이 아니라
+    # 그날 장중 KIS가 바빴다는 뜻이고, 작은 날은 애초에 안 바빴다는 뜻일 수 있다 —
+    # **이 축 하나로 좋아졌다/나빠졌다를 판정하면 안 된다.** 귀속은 §17이 §6과 맞춰 본다.
+    ("└ 마감 전후 낙폭", "cycles.close_shift.drop_pct", "{:.1f}%", None),
     ("60초 초과(밀림)", "overrun.count", "{:,.0f}건", "down"),
     ("최대 밀림", "overrun.max_seconds", "{:.1f}초", "down"),
     ("결손 분(회수 전)", "cycles.missing.count", "{:,.0f}분", "down"),
@@ -197,6 +204,8 @@ def render(metrics: dict, previous: dict | None = None, db_metrics: dict | None 
     if campaign:
         lines += _section("0-2. 검증 캠페인 (표본이 찰 때까지 판정하지 않는다)",
                           lambda: _render_campaign(campaign))
+    lines += _section("0-3. 교차 점검 요약 — 아래 §17이 이미 맞춰 본 것",
+                      lambda: _render_crosscheck_summary(metrics, db_metrics))
     lines += _section("1. 한눈에 (전일 대비) — 인프라와 **판단 입력**을 같은 화면에",
                       lambda: _render_headline(metrics, previous, db_metrics))
     lines += _section("2. 시간대별 사이클/밀림 (전일 같은 시간대 대비)",
@@ -2614,6 +2623,38 @@ def _render_spot_divergence(db: dict) -> list[str]:
         "계산했다. **두 소스가 어긋난 채 갔는데 아무도 비교하지 않았다.**",
         "",
     ]
+    return out
+
+
+def _render_crosscheck_summary(metrics: dict, db_metrics: dict | None) -> list[str]:
+    """2026-09-10 제5부 고도화 2 (09-10 §3-6) — **§17을 문서 맨 위로 한 줄씩 끌어올린다.**
+
+    09-10 §3-6이 그날 절벽의 원인을 「KIS 귀속」으로 가르면서 §6(백오프)과 §9-1(KIS 응답시간)을
+    눈으로 맞춰봤다. **그 대조는 §17이 이미 자동으로 해 놓은 것**이었다 — 문서 맨 아래에 있어서
+    위에서부터 읽는 사람이 못 만났고, 그래서 매 회차가 같은 대조를 손으로 반복했다.
+
+    ⛔ **여기서 새로 판정하지 않는다.** 고도화 2의 원안은 *"「오늘 지연은 [KIS/우리] 귀속」이라는
+    한 줄 배너"*였는데, 그대로 만들면 `crosscheck.py`가 자기 docstring에 적어 둔 규약
+    (*"판정하지 않고 모순을 지적만 한다 — 어느 쪽이 틀렸는지는 사람이 정한다"*)을 정면으로
+    어긴다. 그래서 **§17이 이미 낸 finding의 `summary`를 그대로 옮겨 인쇄만 한다** —
+    「우리 귀속」이라는 반대쪽 문구를 도구가 지어내는 일은 없다.
+
+    실패 조건: 없다. findings가 0건인 날도 이 절은 실린다(규약 C — 「어긋난 것 없음」과
+              「§17을 안 돌렸다」가 같은 칸이 되면 안 된다).
+    """
+    findings = crosscheck.evaluate(metrics, db_metrics)
+    if not findings:
+        return [
+            "- 어긋난 것 없음 — §17의 규칙에서 오늘은 지표끼리 모순되지 않았다.",
+            "",
+            "> **「어긋난 것 없음」은 「전부 정상」이 아니다.** 근거와 상세는 아래 §17에 그대로 있다.",
+            "",
+        ]
+    out = [f"- ⚠ **모순 {len(findings)}건** — 근거·상세는 아래 §17에 있다.", ""]
+    # 문구를 여기서 다시 쓰지 않고 §17과 **같은 소스**에서 뽑는다 — 두 자리가 갈리면
+    # 사람이 어느 쪽을 믿을지 정해야 하고, 그 순간 이 절은 도움이 아니라 부담이 된다.
+    out += [f"- §{' ↔ §'.join(f.sections)} — {f.summary}" for f in findings]
+    out += [""]
     return out
 
 
