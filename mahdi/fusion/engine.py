@@ -18,7 +18,13 @@ from mahdi.engines.regime import RegimeLabel
 from mahdi.fusion.conflict_resolution import resolve_conflicts
 from mahdi.fusion.ensemble import weighted_consensus
 from mahdi.fusion.meta_label import MetaLabelInputs, TradePermission, classify
-from mahdi.fusion.signal_layer import MEMBER_FIELDS, MemberScores, SignalInputs, build_member_scores
+from mahdi.fusion.signal_layer import (
+    MEMBER_FIELDS,
+    MemberScores,
+    SignalInputs,
+    build_member_scores,
+    member_absence_reason,
+)
 from mahdi.fusion.strategy_palette import (
     enforce_daily_strategy_cap,
     enforce_reentry_cooldown,
@@ -221,7 +227,7 @@ class SignalFusionEngine:
             reject_reasons=reject_reasons,
             member_scores=member_scores,
         )
-        self._log_member_transitions(decision, member_scores, now)
+        self._log_member_transitions(decision, member_scores, now, signal_inputs)
         self._log_shape_transition(decision, member_scores)
         return decision
 
@@ -303,9 +309,10 @@ class SignalFusionEngine:
 
     def _log_member_transitions(
         self, decision: FusionDecision, member_scores: MemberScores, now: datetime | None,
+        signal_inputs: SignalInputs,
     ) -> None:
         """
-        입력: 이번 사이클의 판단, 멤버 점수, (선택) 이번 사이클 시각.
+        입력: 이번 사이클의 판단, 멤버 점수, (선택) 이번 사이클 시각, 그 사이클의 원재료.
         계산: 가용 멤버 **집합**이 직전 사이클과 달라진 축마다 사건 줄 하나. 그 축이 직전
              상태를 얼마나 유지했는지도 함께 적는다.
         해석: 상세 근거는 `LOG_MEMBER_AXIS_EXIT` 위 주석. 첫 사이클은 **아무것도 안 찍는다** —
@@ -329,9 +336,12 @@ class SignalFusionEngine:
 
         for name in previous:
             if name not in available:
+                # 2026-09-11 제4부 P1-3 — **사유는 이탈 줄에만 붙인다.** 복귀는 「왜 돌아왔나」를
+                # 묻지 않는다(원재료가 돌아온 것이 전부이고, 그 사실은 줄 자체가 말한다).
                 self._emit_axis_event(
                     LOG_MEMBER_AXIS_EXIT, name, previous, available,
                     previous_effective, decision.effective_member_count, moment, "편입", "유지",
+                    (member_absence_reason(name, signal_inputs),),
                 )
         for name in available:
             if name not in previous:
@@ -343,6 +353,7 @@ class SignalFusionEngine:
     def _emit_axis_event(
         self, template: str, name: str, previous: tuple[str, ...], available: tuple[str, ...],
         previous_effective: int, effective: int, moment: datetime, since_label: str, span_label: str,
+        extra: tuple[str, ...] = (),
     ) -> None:
         """한 축의 전환 한 줄. **직전 상태를 언제부터 유지했는지**가 이 줄의 절반이다.
 
@@ -359,6 +370,8 @@ class SignalFusionEngine:
             span = f"직전 {since_label} {began:%H:%M:%S} · {minutes:.0f}분 {span_label}"
         logger.info(
             template, name, len(previous), len(available), previous_effective, effective, span,
+            # 이탈 줄의 마지막 `%s`(사유). 복귀 줄은 `extra`가 비어 있고 자리도 없다.
+            *extra,
         )
 
 
@@ -387,5 +400,22 @@ class SignalFusionEngine:
 # 전이가 있는 분에만, **바뀐 축마다 한 줄**이다. 08-21 실측이면 이탈 6 + 복귀 5 = **11줄**이고,
 # 가설이 상한을 하루 20건으로 못박아 뒀다(`2026-08-21-fix7-member-exit-is-an-event`).
 # 매분 찍으면 08-15 `ALERT_ONLY` 94줄의 재현이다 — 그래서 전이에만 반응한다.
-LOG_MEMBER_AXIS_EXIT = "판단 축 이탈: %s (가용 %d→%d, 비영 %d→%d) · %s"
+# ===== 2026-09-11 (09-11 §3-1 / 제4부 P1-3) — **이 줄은 「왜」를 말하지 않았다** =====
+#
+# 09-11 15:24:54 `options_flow`, 15:36:54 `orderflow_ofi_vpin`이 빠졌고 장후 회차는
+# *"입력 데이터 고갈인지 예외 처리 경로인지 로그만으로는 안 갈린다"*고 적은 채 원인 규명을
+# 다음으로 넘겼다. **값은 이미 여기 있었다** — 그 사이클의 `SignalInputs`가 인자로 와 있다.
+# 08-19 Fix#6(가용 4/6이 실질 2.36)·09-02 P1-3(0점축 이름)과 같은 계열의 보강이다.
+#
+# 사유 어휘가 리포트 제안(`input_missing`/`exception`/`timeout`)과 다른 이유는
+# `signal_layer.member_absence_reason()` 위 주석에 적었다 — **뒤 둘은 이 레이어에
+# 존재하지 않는 경로**라 찍으면 거짓말이 된다.
+#
+# ⚠ **꼬리표는 줄 끝에만.** 앞머리(`판단 축 이탈: `)와 괄호 안의 자리를 건드리면
+# `log_metrics._QUALITATIVE_MARKERS["member_axis_exit"]`(부분문자열 "판단 축 이탈")와
+# `collect_evidence`의 파서가 눈이 먼다 — 08-04에 문구가 움직여 362건이 0건이 된 자리다.
+# ⚠ **줄 수는 안 는다** — 이 줄은 가용 집합이 바뀐 분에만, 바뀐 축마다 하나다.
+#   상한 하루 20건은 `2026-08-21-fix7-member-exit-is-an-event`가 이미 못박아 뒀다.
+# ⛔ **복귀 줄에는 안 붙인다.** 복귀 시점의 원재료는 「지금 있다」라서 사유가 늘 `미상`이 된다.
+LOG_MEMBER_AXIS_EXIT = "판단 축 이탈: %s (가용 %d→%d, 비영 %d→%d) · %s · 사유 %s"
 LOG_MEMBER_AXIS_RETURN = "판단 축 복귀: %s (가용 %d→%d, 비영 %d→%d) · %s"

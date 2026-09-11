@@ -196,6 +196,117 @@ def _flow_position_score(inputs: SignalInputs) -> float | None:
     return _directional_sign(inputs.foreign_net_flow)
 
 
+# ===== 2026-09-11 (09-11 §3-1 / 제4부 P1-3) — **이탈 줄이 「왜」를 말하지 않았다** =====
+#
+# ## 그날 두 축이 조용히 빠졌고, 사유는 아무 데도 없었다
+#
+# 09-11 15:24:54에 `options_flow`가, 15:36:54에 `orderflow_ofi_vpin`이 가용 목록에서 빠졌다.
+# 「판단 축 이탈」 줄(08-23 Fix#3)은 **언제·몇 개**를 정확히 말했지만 — `(가용 4→3, 비영 2→2)
+# · 직전 편입 09:00:00 · 384분 유지` — **왜**는 말하지 않는다. 장후 회차가 §3-1에 *"입력
+# 데이터 고갈인지 예외 처리 경로인지 로그만으로는 안 갈린다"*고 적고 원인 규명을 다음으로 넘겼다.
+#
+# ## ⚠ 리포트가 제안한 어휘를 그대로 쓰지 않았다 — 착수 전 코드 확인에서 뒤집혔다
+#
+# 제4부 P1-3은 사유 값으로 `input_missing` / `exception` / `timeout` 셋을 제안했다.
+# 그런데 `build_member_scores()`의 docstring이 이미 못박아 뒀다 — *"실패 조건: 없음 —
+# 원재료 부재는 개별 멤버의 None으로 표현된다."* **이 레이어에는 예외를 삼키는 자리도
+# 타임아웃도 없다.** 뒤 두 값은 영원히 안 나오는 값이고, 찍으면 거짓말이 된다
+# (없는 분기를 가리키는 어휘가 로그에 남으면 다음 사람이 그 경로를 찾느라 시간을 쓴다).
+#
+# 대신 **실제로 갈리는 두 갈래**를 쓴다. 리포트의 세 값 어디에도 자리가 없던 갈래가 있다:
+#
+#   ⓐ `원재료없음[...]` — 그 멤버가 읽는 입력 필드가 실제로 비어 있었다. 이름까지 적는다.
+#   ⓑ `부호0[...]`       — 입력은 **다 있었는데** 방향 부호가 0이라 성분이 기각됐다.
+#                          `_options_flow_score`의 `distance_sign == 0.0`(스팟이 기준선과
+#                          정확히 같은 값) 과 `charm_sign == 0.0`이 그 자리다.
+#
+# ⓑ는 「입력 고갈」과 **전혀 다른 사건**이다 — 데이터는 멀쩡히 흘러들어왔고 그날 시장이
+# 마침 기준선 위에 얹혀 있었다는 뜻이다. 이 둘을 한 칸에 섞으면 09-11이 답을 못 찾은 그
+# 질문("고갈인가")에 다음에도 답할 수 없다.
+#
+# ## 규칙을 아는 쪽이 소유한다
+#
+# 이 함수가 `engine.py`가 아니라 여기 있는 이유는 `IMPLEMENTED_MEMBER_FIELDS`·
+# `options_flow_reference()`와 같다 — **점수를 내는 규칙과 「왜 못 냈는가」를 말하는 규칙은
+# 같은 규칙**이다. 갈라 두면 `_options_flow_score`의 조건이 바뀐 날 사유만 옛말을 하고,
+# 그것은 틀린 로그라 없느니만 못하다. 아래 각 절은 위 점수 함수의 조건을 **그대로** 따라간다
+# (`tests/test_fusion_engine_axis_exit_reason.py`가 둘의 일치를 못박는다).
+#
+# ⛔ **판정은 한 글자도 안 바뀐다.** 이 함수는 점수를 만들지도, 되돌려 쓰지도 않는다 —
+# 같은 입력을 한 번 더 읽어 문자열을 만들 뿐이다. 로그 문구에만 쓰인다.
+REASON_UNTRAINED = "미학습"
+REASON_UNKNOWN = "미상"
+
+
+def _options_flow_absence(inputs: SignalInputs) -> tuple[list[str], list[str]]:
+    """`_options_flow_score()`가 성분을 하나도 못 모은 이유 — (없던 원재료, 부호가 0이던 성분)."""
+    missing: list[str] = []
+    zero_sign: list[str] = []
+    reference, source = options_flow_reference(inputs.gamma_flip, inputs.gamma_wall)
+    if inputs.gex is None:
+        missing.append("gex")
+    if reference is None:
+        # 폴백까지 갔는데도 없으면 **둘 다** 없던 것이다(게이트가 꺼져 있으면 월은 애초에 안 본다).
+        missing.append("gamma_flip" if not OPTIONS_FLOW_GAMMA_WALL_FALLBACK else "gamma_flip·wall")
+    if inputs.spot is None:
+        missing.append("spot")
+    if not missing and _directional_sign(inputs.spot - reference) == 0.0:
+        # 스팟이 기준선과 정확히 같다 — 데이터는 멀쩡했고 방향이 없었을 뿐이다.
+        zero_sign.append(f"스팟−기준선({source})")
+    # Charm 성분은 **14:00 이후에만** 대상이다(v6 §13.2). 비활성 시간대의 부재는 결손이
+    # 아니므로 세지 않는다 — 세면 오전 내내 있지도 않은 결손이 로그에 남는다.
+    if inputs.charm_active:
+        if inputs.total_charm is None:
+            missing.append("total_charm")
+        elif _directional_sign(inputs.total_charm) == 0.0:
+            zero_sign.append("total_charm")
+    return missing, zero_sign
+
+
+def member_absence_reason(field: str, inputs: SignalInputs) -> str:
+    """
+    입력: 멤버 필드 이름과 그 사이클의 원재료.
+    계산: 그 멤버의 점수가 None인 이유를 **위 점수 함수들의 조건 그대로** 되짚어 한 문장으로
+         만든다. 상세 근거는 위 `REASON_UNTRAINED` 절.
+    해석: 「판단 축 이탈」 줄 끝에 붙는 꼬리표다. `원재료없음[...]`은 입력이 끊긴 것이고,
+         `부호0[...]`은 **입력은 멀쩡했는데 방향이 없던 것**이다 — 조치가 다르다.
+    실패 조건: 없음 — 어느 갈래에도 안 걸리면 `미상`이다(규약 C: 빈칸을 내면 「사유가
+              없었다」와 「이 꼬리표가 아직 안 실린 버전」이 같은 글자가 된다).
+    """
+    if field in UNTRAINED_MEMBER_FIELDS:
+        return REASON_UNTRAINED
+    # ⛔ **점수가 나온 축에는 사유가 없다.** 이 한 줄이 「규칙이 두 곳에 적히는 것」을 구조적으로
+    # 막는다 — 아래 절들이 점수 함수의 조건을 손으로 되짚는 이상, 언젠가 한쪽만 바뀐다.
+    # 그때 이 게이트가 없으면 **점수가 멀쩡한 축에 사유가 붙는다**(구현 당일 실제로 그랬다:
+    # `charm_sign == 0`인데 거리 성분이 살아 있어 점수가 났는데도 `부호0[total_charm]`이
+    # 붙었고, `tests/test_fusion_engine_axis_exit_reason.py`의 일치 시험이 그것을 잡았다).
+    # 비용은 그 사이클 점수를 한 번 더 계산하는 것뿐이고, 이 함수는 **이탈이 난 분에만**
+    # 불린다(하루 상한 20건 — `2026-08-21-fix7-member-exit-is-an-event`).
+    if getattr(build_member_scores(inputs), field, None) is not None:
+        return REASON_UNKNOWN
+    if field == "regime_hmm":
+        return "원재료없음[regime_state]" if inputs.regime_state is None else REASON_UNKNOWN
+    if field == "options_flow":
+        missing, zero_sign = _options_flow_absence(inputs)
+        parts = []
+        if missing:
+            parts.append(f"원재료없음[{'·'.join(missing)}]")
+        if zero_sign:
+            parts.append(f"부호0[{'·'.join(zero_sign)}]")
+        return " ".join(parts) or REASON_UNKNOWN
+    if field == "orderflow_ofi_vpin":
+        # ⚠ 이 멤버는 **부호0으로는 None이 되지 않는다** — `_orderflow_ofi_vpin_score`는 값이
+        # 있으면 부호가 0이어도 성분에 담는다(0.0을 돌려준다). 그래서 갈래가 하나뿐이다.
+        missing = [
+            name for name, value in (("ofi", inputs.ofi), ("queue_imbalance", inputs.queue_imbalance))
+            if value is None
+        ]
+        return f"원재료없음[{'·'.join(missing)}]" if len(missing) == 2 else REASON_UNKNOWN
+    if field == "flow_position":
+        return "원재료없음[foreign_net_flow]" if inputs.foreign_net_flow is None else REASON_UNKNOWN
+    return REASON_UNKNOWN
+
+
 def build_member_scores(inputs: SignalInputs) -> MemberScores:
     """
     입력: SignalInputs(원재료 전부 선택적).

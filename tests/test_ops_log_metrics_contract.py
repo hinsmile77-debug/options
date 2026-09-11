@@ -1084,9 +1084,13 @@ def test_member_axis_exit_and_return_are_counted_apart():
     """이탈과 복귀는 **다른 사건**이다 — 한 칸에 합치면 「6번 빠지고 5번 돌아왔다」가 사라진다."""
     from mahdi.fusion import engine as fusion_engine
 
+    # 2026-09-11 제4부 P1-3 — 이탈 줄 **끝에** 사유 꼬리표가 붙었다(복귀 줄은 그대로다).
+    # 꼬리표가 줄 끝에만 붙으므로 부분문자열로 세는 파서는 종전과 같은 값을 낸다 —
+    # 이 시험이 그것을 못박는다(08-04에 문구가 움직여 362건이 0건이 된 자리).
     exit_line = _emit(
         "mahdi.fusion.engine", "INFO", fusion_engine.LOG_MEMBER_AXIS_EXIT,
         "options_flow", 4, 3, 3, 2, "직전 편입 14:03:10 · 42분 유지",
+        "원재료없음[gex·spot]",
     )
     return_line = _emit(
         "mahdi.fusion.engine", "INFO", fusion_engine.LOG_MEMBER_AXIS_RETURN,
