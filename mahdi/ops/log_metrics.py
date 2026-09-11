@@ -75,6 +75,37 @@ CONGESTED_HOURS = (10, 11, 12, 13, 14)
 CLOSE_SHIFT_BEFORE = (13 * 3600 + 20 * 60, 15 * 3600 + 20 * 60)  # 13:20 ~ 15:19:59
 CLOSE_SHIFT_AFTER_FROM = 15 * 3600 + 20 * 60  # 15:20 ~ (정규장 옵션 마감)
 
+# ===== 2026-09-11 (09-11 §3-1) — **마감 직전 전멸이 이틀 연속 같은 자리에서 났다** =====
+#
+# ## 어제와 오늘이 거의 겹친다
+#
+# 09-11: 「이번 분 전멸」(rows=0)이 **15:01 · 15:02 · 15:20** — 최장 연속 2분 + 단발 1건.
+# 09-10: 같은 성격의 사건이 **15:00~15:02 연속 3분**(09-10 §3-6).
+# **시각이 ±1분이고 총 분량도 3분으로 같다.** 09-11 장후가 이것을 *"우연이 아니라 패턴"*으로
+# 읽고, dev_memory 초안 절에 검정할 주장을 적었다 — *"마감 직전 15:00~15:20 구간에서 rows=0
+# 또는 ERROR급 전멸이 이틀 이상 연속되면 그것은 KIS 쪽 마감 혼잡의 구조적 패턴이다."*
+#
+# ## 그 비교를 오늘은 **사람이 산문을 읽어서** 했다
+#
+# 사이드카에 있는 것은 하루 전체를 뭉뚱그린 `cycles.zero_row_minutes`뿐이다. 「마감 직전에
+# 몰렸는가」는 그 목록을 눈으로 훑어야 보이고, 어제 것과 맞대려면 어제 보고서 본문을 읽어야
+# 한다. 09-10 고도화 3(`close_shift`)이 고친 것과 **같은 형태의 결손**이다 — 판단의 재료가
+# 산문에만 있으면 다음날 재현이 안 된다.
+#
+# ## 창을 15:20:59까지 잡는 이유
+#
+# 리포트가 지목한 구간이 「15:00~15:20」이고, 09-11의 전멸 한 건이 **정확히 15:20**이다.
+# 15:20에서 끊으면 오늘 3분 중 1분이 창 밖으로 나가 어제와 다른 잣대가 된다.
+#
+# ⚠ **창을 레버에서 읽어오지 않는다** — `CLOSE_SHIFT_BEFORE`·`CONGESTED_HOURS`와 같은
+# 규약(09-02 P1-5). 창은 여기 고정하고 산출물에 **함께 인쇄**한다.
+# ⛔ **임계를 만들지 않는다.** 「이틀 연속이면 구조적」은 사람이 가설로 판정할 문장이지
+# 도구가 그을 경보선이 아니다(08-16이 하루짜리 표본으로 지표를 정했다가 뒤집힌 전례).
+# 이 축은 **세는 것만** 하고 아무 분기도 만들지 않는다.
+# ⛔ **`zero_row_minutes`는 손대지 않는다.** 하루 전체 축은 08-10이 세 원인을 가르려고 만든
+# 것이고 창을 좁히면 그 구분이 깨진다 — 이 축은 그 부분집합을 따로 인쇄할 뿐이다.
+CLOSE_WINDOW = (15 * 3600, 15 * 3600 + 21 * 60)  # 15:00 ~ 15:20:59
+
 _TS = r"(\d{4}-\d\d-\d\d) (\d\d):(\d\d):(\d\d),(\d+)"
 
 _CYCLE_RE = re.compile(
@@ -1648,6 +1679,40 @@ def _close_shift_cycle_seconds(cycles: list[dict]) -> dict:
     }
 
 
+def _close_window_zero_rows(cycles: list[dict]) -> dict:
+    """
+    입력: 파싱된 사이클 목록.
+    계산: 마감 직전 창(위 `CLOSE_WINDOW`) 안에서 **적재가 0행이던 분**의 목록·건수와
+         **최장 연속 분 수**. 연속은 분 라벨이 1분씩 이어지는 구간의 길이다.
+    해석: 위 `CLOSE_WINDOW` 절. 이 값이 이틀 이상 비슷한 크기로 서면 그것이 「마감 혼잡의
+         구조적 패턴」이라는 주장의 재료다 — **판정은 하지 않는다.**
+    실패 조건: 없음. 창에 사이클이 아예 없는 날(조기 종료·기동 실패)도 키는 실리고
+              `cycles`가 0으로 함께 인쇄된다 — 규약 C: 「전멸이 없었다」(count 0, cycles>0)와
+              「표본이 없었다」(cycles 0)가 같은 칸이 되면 안 된다.
+    ⚠ 규약 G — 이 축은 그날 KIS 마감 혼잡에 비례한다. 0인 날은 「우리가 좋아졌다」가 아니라
+              **「그날 마감이 안 막혔다」**일 수 있다.
+    """
+    lo, hi = CLOSE_WINDOW
+    inside = [c for c in cycles if lo <= c["start"] < hi]
+    minutes = sorted(c["poll_minute"] or _hhmm(c["start"]) for c in inside if c["rows"] == 0)
+    longest = run = 0
+    previous = None
+    for label in minutes:
+        current = int(label[:2]) * 60 + int(label[3:])
+        run = run + 1 if previous is not None and current == previous + 1 else 1
+        longest = max(longest, run)
+        previous = current
+    return {
+        # 창을 **함께 인쇄한다** — 나중에 창을 옮기면 옛 사이드카와 값이 왜 갈리는지가
+        # 지표 자신에게 적혀 있어야 한다(`congested`·`close_shift`와 같은 규약).
+        "window": [_hhmm(lo), _hhmm(hi)],
+        "cycles": len(inside),
+        "rows_zero_minutes": minutes,
+        "rows_zero_count": len(minutes),
+        "max_consecutive": longest,
+    }
+
+
 def _cycle_metrics(
     cycles: list[dict],
     calls: list[tuple[float, str, str]],
@@ -1660,6 +1725,8 @@ def _cycle_metrics(
             "congested": _congested_cycle_seconds([]),
             # 2026-09-10 제5부 고도화 3 — 사이클이 0건인 날도 키가 실린다(규약 C).
             "close_shift": _close_shift_cycle_seconds([]),
+            # 2026-09-11 — 같은 이유로 이 축도 0건인 날에 실린다(위 CLOSE_WINDOW 절).
+            "close_window": _close_window_zero_rows([]),
             "missing": {"count": 0, "list": [], "downtime_count": 0, "infra_count": 0},
             "duplicate_poll_minutes": {"count": 0, "list": [], "labelled": 0},
         }
@@ -1759,6 +1826,9 @@ def _cycle_metrics(
         "congested": _congested_cycle_seconds(cycles),
         # 2026-09-10 제5부 고도화 3 — **마감이 풀어 주는 혼잡**(위 CLOSE_SHIFT_BEFORE 절 참고).
         "close_shift": _close_shift_cycle_seconds(cycles),
+        # 2026-09-11 §3-1 — **마감 직전에 몰리는 전멸**(위 CLOSE_WINDOW 절 참고).
+        # 아래 `zero_row_minutes`(하루 전체)의 부분집합이다 — 그 축은 손대지 않는다.
+        "close_window": _close_window_zero_rows(cycles),
         "over_60s": sum(1 for x in rests if x > 60),
         "rows_distribution": dict(sorted(collections.Counter(c["rows"] for c in cycles).items())),
         # 2026-08-07(§2-1 / Fix#3) — **두 사이클이 같은 분 라벨로 적재한 경우.**
