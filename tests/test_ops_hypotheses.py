@@ -639,6 +639,101 @@ def test_normalized_claim_rule_allows_invariants_and_non_claim_roles():
     )
 
 
+# ===== 2026-09-15(09-14 §3-13 / 제4부 Fix 7) — `== N`(N≠0)은 불변식이 아니다 =====
+
+
+def test_normalized_claim_rule_flags_nonzero_equality_the_09_11_mistake():
+    """09-11에 실제로 빠져나간 그 형태 — 등식은 부등식보다 더 깨지기 쉽다.
+
+    `== 3`은 양쪽이 다 막혀 있어 구조 변수가 조금만 움직여도 반증이 난다. 09-14 실측
+    (`rows_zero_count` 6)으로 예측 4개가 전부 「반증」으로 찍혔는데 구현은 멀쩡했다 —
+    같은 날 §3-12가 **그 축의 수치를 인용해** 신규 P1을 보고했다.
+    """
+    assert hypotheses.violates_normalized_claim_rule(
+        "주장", "cycles.close_window.rows_zero_count", "== 3"
+    )
+    # `_consecutive`(연속 전멸 **분 수**)도 건수 계열이다 — 종전엔 목록에 없어 대상 밖이었다.
+    assert hypotheses.is_count_shaped("cycles.close_window.max_consecutive")
+    assert hypotheses.violates_normalized_claim_rule(
+        "주장", "cycles.close_window.max_consecutive", "== 2"
+    )
+
+
+def test_normalized_claim_rule_still_allows_zero_invariants_after_tightening():
+    """**판정 무변경** — 좁힌 것은 `== N`(N≠0)뿐이고 0 경계는 종전 그대로다.
+
+    `== 0`(불변식)·`>= 0`(경로 생존)·`> 0`은 구조 변수가 무엇이든 판정이 안 바뀌므로
+    거짓 반증을 만들 수 없다. 08-07 Fix#1의 `chain_leg_over_design_minutes == 0`이
+    그 형태이고, 그것까지 막으면 이 규약이 자기 목적을 넘는다.
+    """
+    assert not hypotheses.violates_normalized_claim_rule(
+        "주장", "db.signal_reach.chain_leg_over_design_minutes", "== 0"
+    )
+    assert not hypotheses.violates_normalized_claim_rule(
+        "주장", "db.tables.underlying_spot_1m.rows", ">= 0"
+    )
+    assert not hypotheses.violates_normalized_claim_rule(
+        "주장", "cycles.close_window.rows_zero_count", "== 0"
+    )
+
+
+def test_normalized_claim_rule_tightening_does_not_spill_into_cost_axes():
+    """대가·참고의 `== N`은 **다른 것을 묻는다** — 여기까지 번지면 규약이 문서를 검열한다.
+
+    `2026-09-10-adv3`의 `cycles.count == 493`은 *"**그날을 다시 집계했을 때** 종전 축이 같은
+    값을 내는가"*(판정 무변경)를 묻는 것이지 다른 날과 비교하지 않는다. 09-15 전수 점검에서
+    이 형태가 15건 있었고 전부 정당하다.
+    """
+    for metric, expect in (
+        ("cycles.count", "== 493"),
+        ("cycles.rest_seconds.mean", "== 32.89"),
+        ("qualitative.chain_cycle_empty", "== 3"),
+    ):
+        assert not hypotheses.violates_normalized_claim_rule("대가", metric, expect)
+        assert not hypotheses.violates_normalized_claim_rule("참고", metric, expect)
+
+
+def test_tightening_adds_exactly_the_two_close_window_predictions_and_nothing_else():
+    """**판정 무변경(저장소 전체)** — 좁힌 규칙이 새로 긁는 것은 **그 두 줄뿐**이어야 한다.
+
+    이 저장소에는 **좁히기 전부터 이미** 규약 F에 걸리던 항목이 따로 있다(범위형
+    `structural_minutes (5 ~ 12)` 등, 전부 이미 닫힌 항목이라 `pending` 린트에 안 걸린다).
+    그래서 "위반 총량"을 세면 이 변경이 무엇을 바꿨는지가 안 보인다 — **증분**을 재야 한다.
+
+    09-15 전수 점검의 결론(*"주장 역할이 자동 판정 `== N`(N≠0)을 쓴 것은 파일 전체에 한
+    항목뿐"*)을 그 증분으로 고정한다. 그 항목은 같은 회차에 `inconclusive`로 닫혔고,
+    후속 `2026-09-15-close-window-axis-reads-two-days`가 재설계된 예측을 받았다.
+    """
+    def _rule_before_tightening(role, metric, expect):
+        """2026-09-15 이전의 `violates_normalized_claim_rule` — `==`를 값과 무관하게 면제했다."""
+        if str(role) != hypotheses.ROLE_CLAIM or not hypotheses.is_count_shaped(metric):
+            return False
+        text = str(expect).strip()
+        comparison = hypotheses._COMPARISON_RE.match(text)
+        if comparison:
+            op, raw = comparison.group(1), float(comparison.group(2))
+            return not (op == "==" or (op in (">=", ">") and raw == 0))
+        return bool(hypotheses._RANGE_RE.match(text))
+
+    entries = hypotheses.load(PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml")
+    newly_flagged = [
+        f"{e['id']}: {p['metric']} ({p.get('expect')})"
+        for e in entries
+        for p in e.get("예측") or []
+        for role in [p.get("역할", hypotheses.ROLE_REFERENCE)]
+        if hypotheses.violates_normalized_claim_rule(role, p["metric"], p.get("expect", ""))
+        and not _rule_before_tightening(role, p["metric"], p.get("expect", ""))
+    ]
+    assert newly_flagged == [
+        "2026-09-11-close-window-zero-rows-axis: cycles.close_window.rows_zero_count (== 3)",
+        "2026-09-11-close-window-zero-rows-axis: cycles.close_window.max_consecutive (== 2)",
+    ], (
+        "좁힌 규약 F의 **증분**이 달라졌다. 늘었으면 새로 등재된 `== N`(N≠0) 주장이 있다는 "
+        "뜻이니 그 항목을 먼저 볼 것(그게 이 규칙이 하려는 일이다). 줄었으면 위 두 줄을 "
+        f"정리한 것이니 이 기대값을 함께 줄일 것: {newly_flagged}"
+    )
+
+
 # ===== 규약 G (2026-08-11 Fix#6) — 시장 상태 의존 지표에 무조건부 하한 금지 =====
 
 

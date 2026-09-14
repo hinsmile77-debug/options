@@ -73,7 +73,12 @@ ROLE_REFERENCE = "참고"
 # 그래서 **주장 역할에 한해** 건수 계열 지표에 부등식을 걸면 경고한다. 대가·참고는 막지 않는다
 # (대가는 "얼마나 늘었나"가 본질이라 건수가 맞는 경우가 많다). 정말 건수로 재야 하면
 # `수기 판정`으로 내리면 된다 — 그건 사람이 그날의 구조 변수를 보고 읽겠다는 선언이다.
-_COUNT_METRIC_SUFFIXES = ("_minutes", "_count", "_calls", ".rows", "_rows", "_legs", "_today")
+# 2026-09-15(09-14 §3-13 / 제4부 Fix 7) — `_consecutive` 추가. `cycles.close_window.max_consecutive`
+# (연속 전멸 **분 수**)가 이 목록에 없어 규약 F의 대상 자체가 아니었고, 그래서 `== 2`가 그대로
+# 등재됐다. 분 단위 길이는 그날 마감 혼잡에 정비례한다 — `_minutes`와 같은 계열이다.
+_COUNT_METRIC_SUFFIXES = (
+    "_minutes", "_count", "_calls", ".rows", "_rows", "_legs", "_today", "_consecutive",
+)
 # **접미사로만** 판정한다 — 부분 문자열로 보면 `_minutes`가 `_min`에 걸려 정규화로 오분류된다.
 _NORMALIZED_SUFFIXES = ("_pct", "_ratio", "_median", "_mean", "_avg", "_max", "_min")
 _NORMALIZED_SUBSTRINGS = ("per_", "_per_")
@@ -113,8 +118,24 @@ def violates_normalized_claim_rule(role: str, metric: str, expect: str) -> bool:
     comparison = _COMPARISON_RE.match(text)
     if comparison:
         op, raw = comparison.group(1), float(comparison.group(2))
-        # `== 0` / `>= 0`은 구조 변수가 무엇이든 판정이 안 바뀐다 — 불변식·경로 생존 확인이다.
-        return not (op == "==" or (op in (">=", ">") and raw == 0))
+        # `== 0` / `>= 0` / `> 0`은 구조 변수가 무엇이든 판정이 안 바뀐다 — 불변식·경로 생존 확인이다.
+        #
+        # ===== 2026-09-15(09-14 §3-13 / 제4부 Fix 7) — **면제를 `== 0`으로 좁혔다** =====
+        #
+        # 종전 코드는 `op == "=="`이면 **값과 무관하게** 통과시켰다. 그런데 바로 위 줄의 주석과
+        # `test_normalized_claim_rule_allows_invariants_and_non_claim_roles`라는 테스트 이름은
+        # 둘 다 **`== 0`(불변식)만** 정당화한다 — 의도와 구현이 갈려 있었다.
+        #
+        # 그 틈으로 `2026-09-11-close-window-zero-rows-axis`가 빠져나갔다:
+        # `cycles.close_window.rows_zero_count == 3`. **`== 3`은 불변식이 아니라 구조 변수에
+        # 정면으로 비례하는, 이 규약이 아는 가장 깨지기 쉬운 형태다** — 부등식은 적어도 한쪽이
+        # 열려 있는데 등식은 양쪽이 다 막혀 있다. 그 결과 09-14 실측으로 예측 4개가 전부
+        # 「반증」으로 찍혔고, 정작 구현은 멀쩡했다(같은 날 §3-12가 그 축의 수치를 인용해 신규
+        # P1을 보고했다). 08-07에 같은 병으로 세 번 데어 만든 규칙이 네 번째를 못 막은 것이다.
+        #
+        # 09-15 전수 점검에서 파일 183항목 중 이 형태는 **그 한 건뿐**임을 확인했다 — 좁혀도
+        # 기존 항목을 새로 깨뜨리지 않는다.
+        return not (op in ("==", ">=", ">") and raw == 0)
     return bool(_RANGE_RE.match(text))
 
 
