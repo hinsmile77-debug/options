@@ -5124,19 +5124,38 @@ def _books_for_cadence_test():
     ]
 
 
-def test_books_due_pairs_monthly_with_weekly_mon_on_even_minutes():
+# ===== 2026-09-15(제4부 Fix 3 / 9시 레버 (A) 발동) — **기본 격분 규약은 레버와 별개다** =====
+#
+# 아래 다섯 테스트는 2026-07-31 축소안 (a)의 **기본 2분 격분**을 지킨다. 표본 시각으로 9시를
+# 쓰고 있었는데(그때는 레버 밖 시간대였다) 09-15에 9시가 혼잡 레버에 들어가면서 다섯 개가
+# 한꺼번에 깨졌다 — **규약이 깨진 것이 아니라 표본 시각이 레버 안으로 들어온 것**이다.
+#
+# 그래서 시각을 옮기는 대신 **레버를 비워 고정한다.** 시각을 옮기면 다음에 그 시간대가
+# 레버에 들어갈 때 또 깨지고(지금 10~14시가 전부 레버 안이라 고를 수 있는 시각도 거의 없다),
+# 무엇보다 이 테스트들이 재려는 것은 «레버가 없을 때의 기본 격분»이다.
+# 레버가 켜진 시간대의 동작은 `test_the_congestion_lever_is_on_since_20260831`과
+# `_books_due_this_cycle`의 every_n 경로가 따로 지킨다.
+def _clear_congestion_lever(monkeypatch):
+    """이 테스트가 재는 것은 레버가 **없을 때**의 기본 격분이다 — 레버 값에 흔들리면 안 된다."""
+    monkeypatch.setattr(mahdi_main, "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS", {})
+
+
+def test_books_due_pairs_monthly_with_weekly_mon_on_even_minutes(monkeypatch):
     # 2026-08-03 §4 우선순위 2: 매 분 먼슬리 1북 + 위클리 1북 = 20레그로 평탄해진다.
+    _clear_congestion_lever(monkeypatch)
     due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 30))
     assert [series for _m, series in due] == ["regular", "weekly_mon"]
 
 
-def test_books_due_pairs_monthly_with_weekly_thu_on_odd_minutes():
+def test_books_due_pairs_monthly_with_weekly_thu_on_odd_minutes(monkeypatch):
+    _clear_congestion_lever(monkeypatch)
     due = _books_due_this_cycle(_books_for_cadence_test(), datetime(2026, 7, 31, 9, 31))
     assert [series for _m, series in due] == ["regular", "weekly_thu"]  # 먼슬리는 언제나 매분
 
 
-def test_books_due_halves_weekly_call_volume_over_an_hour():
+def test_books_due_halves_weekly_call_volume_over_an_hour(monkeypatch):
     # 축소안 (a)의 정량 목표: 위클리 호출량이 정확히 절반이 되는지(먼슬리는 그대로).
+    _clear_congestion_lever(monkeypatch)
     books = _books_for_cadence_test()
     counts = {"regular": 0, "weekly_mon": 0, "weekly_thu": 0}
     for minute in range(60):
@@ -5145,6 +5164,24 @@ def test_books_due_halves_weekly_call_volume_over_an_hour():
     assert counts["regular"] == 60
     assert counts["weekly_mon"] == 30
     assert counts["weekly_thu"] == 30
+
+
+def test_books_due_quarters_weekly_call_volume_in_a_congested_hour(monkeypatch):
+    """**레버가 켜진 시간대는 다시 절반**(2분 격분 → 4분 격분)이 된다 — 09-15에 9시가 그렇게 됐다.
+
+    위 테스트의 짝이다. 위가 «레버 없을 때 60 → 30»을 지키고, 여기가 «레버 있을 때 30 → 15»를
+    지킨다. 둘이 같이 있어야 09-15처럼 레버가 움직였을 때 **어느 쪽이 바뀐 것인지**가 갈린다.
+    ⛔ 먼슬리는 어느 쪽에서도 안 줄어든다 — 판단 입력이다.
+    """
+    monkeypatch.setattr(mahdi_main, "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS", {9: 4})
+    books = _books_for_cadence_test()
+    counts = {"regular": 0, "weekly_mon": 0, "weekly_thu": 0}
+    for minute in range(60):
+        for _m, series in _books_due_this_cycle(books, datetime(2026, 7, 31, 9, minute)):
+            counts[series] += 1
+    assert counts["regular"] == 60          # 먼슬리는 그대로 매분
+    assert counts["weekly_mon"] == 15
+    assert counts["weekly_thu"] == 15
 
 
 def test_books_due_keeps_unknown_series_every_cycle():
@@ -5162,6 +5199,7 @@ def test_books_due_preserves_input_order_so_monthly_is_polled_first():
 def test_poll_option_chain_uses_weekly_thu_on_odd_minutes(monkeypatch):
     # 실제 폴러 경로에서도 위클리 심볼이 조회되지 않는지 확인한다(헬퍼 단위테스트만으로는
     # 호출측이 due_books를 실제로 쓰는지 보장되지 않는다).
+    _clear_congestion_lever(monkeypatch)  # 기본 격분 경로를 재는 테스트다(09-15)
     rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
 
     requested_series: list[str] = []
@@ -5194,6 +5232,7 @@ def test_poll_option_chain_uses_weekly_thu_on_odd_minutes(monkeypatch):
 
 
 def test_poll_option_chain_uses_weekly_mon_on_even_minutes(monkeypatch):
+    _clear_congestion_lever(monkeypatch)  # 기본 격분 경로를 재는 테스트다(09-15)
     rest_client = _FakeRestClientChain(_SAMPLE_OPTION_QUOTE)
 
     requested_series: list[str] = []
@@ -6718,23 +6757,34 @@ def _due_series(poll_time: datetime) -> list[str]:
 
 
 def test_the_congestion_lever_is_on_since_20260831():
-    """**레버가 켜졌다** — 2026-08-31 저녁, 무조건발동일(09-01) 하루 전에 사용자 승인으로.
+    """**레버가 켜졌다** — 2026-08-31 저녁(10~14시), 그리고 **2026-09-15 아침에 9시가 추가**됐다.
 
-    `2026-08-12-eE-on-congested-hours`(유예 9회)의 발동이다. 이전에는 이 테스트가
-    "내려져 있다"를 지켰다 — 지금은 "그 값 그대로"를 지킨다. 값을 바꿀 때는
-    `hypotheses.yaml`의 그 항목과 이 테스트를 **같은 커밋에서** 옮길 것.
+    `2026-08-12-eE-on-congested-hours`(유예 9회)의 발동이 앞의 것이고, 9시 추가는
+    `2026-09-15-eE-adds-nine-to-congested-hours`다 — 09-09·10·11·14 **나흘 연속 미결** 끝에
+    09-14 장후 「사용자 조치」 1번에서 사용자가 **(A) 켠다**를 골랐다.
+
+    이 테스트는 "그 값 그대로"를 지킨다. 값을 바꿀 때는 `hypotheses.yaml`의 그 항목과 이
+    테스트를 **같은 커밋에서** 옮길 것.
+    ⚠ 09-15에 그 규약이 실제로 한 번 깨졌다 — `mahdi/main.py`에만 9시가 들어가고 등재·테스트가
+    빠져 저장소가 **여섯 건 빨간 채로** 장을 맞을 뻔했다. 같은 회차가 셋을 한 커밋으로 묶었다.
     """
     from mahdi.main import OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS
 
-    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
+    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {9: 4, 10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
     # 혼잡 시간대(10시) — 위클리가 4분 주기로 격분된다.
     assert _due_series(datetime(2026, 9, 1, 10, 0)) == ["regular", "weekly_mon"]
     assert _due_series(datetime(2026, 9, 1, 10, 1)) == ["regular", "weekly_thu"]
     assert _due_series(datetime(2026, 9, 1, 10, 2)) == ["regular"]
     assert _due_series(datetime(2026, 9, 1, 10, 3)) == ["regular"]
-    # 규칙 밖 시간대(9시) — 종전 2분 주기 그대로다.
-    assert _due_series(datetime(2026, 9, 1, 9, 0)) == ["regular", "weekly_mon"]
-    assert _due_series(datetime(2026, 9, 1, 9, 1)) == ["regular", "weekly_thu"]
+    # 9시 — 2026-09-15부터 **같은 4분 주기**다(종전에는 2분 주기였다).
+    assert _due_series(datetime(2026, 9, 15, 9, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 9, 15, 9, 1)) == ["regular", "weekly_thu"]
+    assert _due_series(datetime(2026, 9, 15, 9, 2)) == ["regular"]
+    assert _due_series(datetime(2026, 9, 15, 9, 3)) == ["regular"]
+    # 규칙 밖 시간대(15시) — 종전 2분 주기 그대로다. **레버는 10~14시와 9시만 덮는다.**
+    assert _due_series(datetime(2026, 9, 15, 15, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 9, 15, 15, 1)) == ["regular", "weekly_thu"]
+    assert _due_series(datetime(2026, 9, 15, 15, 2)) == ["regular", "weekly_mon"]
 
 
 def test_pulling_the_lever_halves_weekly_polling_in_that_hour_only(monkeypatch):
