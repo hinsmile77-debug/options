@@ -1656,6 +1656,36 @@ def lever_is_on(key: str, line: str):
     return value not in off
 
 
+def lever_cleanup_is_pending(on, days_left: int, started) -> bool:
+    """켜진 레버의 무조건발동일이 지났을 때 **아직 정리할 것이 남았는가** (2026-09-15 장후).
+
+    §7의 「발동은 끝났는데 날짜가 안 옮겨진 레버」 절이 요구하는 것은 둘이다 —
+    **「가설의 날짜를 옮길 것」**과 **「실제로 켠 날짜를 적을 것」**. 그 둘이 끝났다는
+    표식이 `hypotheses.yaml`의 `발동일`이다.
+
+    ## 왜 이 함수가 생겼는가
+
+    08-26 P2-1이 조건에 「레버가 꺼져 있다」를 더해 다섯 회차 연속 오탐을 멎게 했는데,
+    그 뒤로 남은 조건이 `지남 AND 켜짐` **둘뿐**이라 `발동일`을 안 봤다. 그래서 정리가
+    다 끝난 레버도 매일 다시 호명되고 **경과일수만 1씩 늘었다** — 09-15 실측으로
+    `use_effective_member_count` 23일 · `SIGNAL_FUSION_PHASE_OFFSET_SECONDS` 13일 ·
+    `OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS` 15일이었고, **셋 다 켠 날짜가 코드 주석과
+    `발동일`에 이미 적혀 있었다**(`strategy_params.yaml:87` · `main.py:269` · `main.py:938`).
+    09-15 리포트 §1-5가 5거래일째 「만성」으로 든 항목이 이것이고, 고칠 자리는 사람의
+    손이 아니라 이 조건이었다.
+
+    ## 무엇을 바꾸지 않는가 (08-26 P2-1의 대가 축을 그대로 잇는다)
+
+    - `발동일`이 **없는** 켜진 레버 → 그대로 정리 목록에 남는다. 그 경우까지 조용해지면
+      「언제 켰는지 아무도 모르는 레버」가 영원히 묻힌다.
+    - **꺼진** 레버(`on is False`)와 **못 읽은** 레버(`on is None`) → 이 함수는 손대지
+      않는다. §7의 `⚠`도 §12 적신호(`flags`)도 종전 그대로다.
+
+    실패 조건: 없다 — 판정에 쓰이지 않는 정리 목록의 등급만 정한다.
+    """
+    return on is True and days_left < 0 and not started
+
+
 def lever_schedule(root: Path):
     """반환: `{레버 이름: {"유예횟수": n, "무조건발동일": "YYYY-MM-DD", "발동일": ...}}`.
 
@@ -2676,10 +2706,11 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         info = schedule.get(key, {})
         deferrals = info.get("유예횟수")
         deadline = info.get("무조건발동일")
+        started = info.get("발동일")
         if deadline:
             left = (_date.fromisoformat(deadline) - day).days
             when = f"{deadline} (D{left:+d})" if left else f"{deadline} (**오늘**)"
-            if left < 0 and on is True:
+            if lever_cleanup_is_pending(on, left, started):
                 # **발동은 끝났고 날짜만 안 옮겨졌다.** 경고를 없애는 것이 아니라 등급을 내린다.
                 when = f"{deadline} (**{-left}일 지남 · 발동 완료 · 날짜 정리 필요**)"
                 lever_cleanup.append(
@@ -2687,6 +2718,10 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                     f"무조건발동일({deadline})만 {-left}일 지난 채 남았다 — "
                     "가설의 날짜를 옮기고 **실제로 켠 날짜를 그 줄 주석에 적을 것.**"
                 )
+            elif left < 0 and on is True:
+                # 2026-09-15 장후 — **정리가 끝난 레버다**(`발동일`이 적혀 있다).
+                # 위 절이 요구하는 것을 이미 다 했으므로 정리 목록에 넣지 않고 날짜만 읽는다.
+                when = f"{deadline} (**발동 완료 {started}**)"
             elif left < 0:
                 # 꺼져 있거나 판정 못 한 경우 — 종전 그대로 ⚠와 적신호다.
                 unread = " · **값을 못 읽었다**" if on is None else ""
