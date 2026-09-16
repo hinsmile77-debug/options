@@ -94,18 +94,72 @@ def test_a_day_without_db_metrics_says_nothing():
 
 
 # ===== 판정 무변경 =====
+#
+# ⚠ **2026-09-16 고도화 2 — 여기서 09-03이 그은 선을 한 칸 옮겼다. 옮긴 사실을 적어 둔다.**
+#
+# 09-03의 원래 테스트는 `rows(calm) == rows(cliff)`, 즉 **절벽일에 표가 한 글자도 안 바뀐다**
+# 였다. 그때 이 항목이 더한 것이 표 **위의 한 줄**뿐이었으므로 그것이 가장 싼 표현이었다.
+# 09-16 고도화 2가 표 안에 「오염」 열을 더하면서 그 표현이 그대로는 성립하지 않는다.
+#
+# ⛔ **느슨하게 푼 것이 아니라 열 단위로 다시 적었다.** 09-03이 지키려던 것(테스트 이름이
+# 말하는 것)은 **`판정` 열이 자동으로 안 바뀐다**였고, 그것은 아래에서 **행마다 칸 단위로**
+# 강제된다 — 원래 표현보다 좁고 분명하다. 새 열은 **기존 일곱 열 뒤에 덧붙을 뿐**이고
+# 그 사실 자체도 테스트가 된다.
+#
+# ⚠ 절벽이 **없는** 날의 출력이 한 글자도 안 바뀐다는 판정선은 **그대로 남는다**(맨 아래).
+
+
+def _table_rows(lines: list[str]) -> list[list[str]]:
+    return [
+        [c.strip() for c in ln.strip().strip("|").split("|")]
+        for ln in lines
+        if ln.startswith("| ") and not ln.startswith("|---")
+    ]
 
 
 def test_the_verdict_column_is_untouched_on_a_cliff_day():
-    """플래그는 표 **위의 한 줄**이다. 자동으로 판정을 무르면 그것이야말로
-    「숫자를 보고 기준을 고치는 것」이다."""
-    calm = [ln for ln in report._render_hypotheses(_RESULTS, _db(0))]
-    cliff = [ln for ln in report._render_hypotheses(_RESULTS, _db(53))]
+    """자동으로 판정을 무르면 그것이야말로 「숫자를 보고 기준을 고치는 것」이다."""
+    calm = _table_rows(report._render_hypotheses(_RESULTS, _db(0)))
+    cliff = _table_rows(report._render_hypotheses(_RESULTS, _db(53)))
 
-    def rows(lines):
-        return [ln for ln in lines if ln.startswith("| ")]
+    assert len(calm) == len(cliff)
+    for before, after in zip(calm, cliff):
+        assert after[:7] == before[:7], "기존 일곱 열이 달라지면 판정을 무른 것이다"
 
-    assert rows(calm) == rows(cliff), "표가 한 글자라도 달라지면 판정을 무른 것이다"
+
+def test_the_cliff_column_is_only_appended_never_inserted():
+    """열이 **뒤에** 붙어야 기존 파서·눈이 읽던 자리가 그대로다."""
+    calm = _table_rows(report._render_hypotheses(_RESULTS, _db(0)))
+    cliff = _table_rows(report._render_hypotheses(_RESULTS, _db(53)))
+
+    assert len(cliff[0]) == len(calm[0]) + 1
+    assert cliff[0][-1] == "오염"
+    assert calm[0][-1] == "판정", "절벽 없는 날의 마지막 열은 종전대로 판정이다"
+
+
+def test_every_row_carries_the_cliff_mark():
+    """이 열은 **그날 전체**가 절벽일인가만 말한다 — 행을 가리지 않는다."""
+    body = _table_rows(report._render_hypotheses(_RESULTS, _db(53)))[1:]
+
+    assert body, "표본이 없으면 이 테스트가 아무것도 안 지킨다"
+    assert all(row[-1] == "⚠" for row in body)
+
+
+def test_the_column_note_says_it_is_a_day_flag_not_a_row_verdict():
+    """「⚠가 붙었으니 이 행은 오염됐다」로 읽히면 모르는 것을 아는 척한 것이다."""
+    lines = report._render_hypotheses(_RESULTS, _db(53))
+    note = [ln for ln in lines if ln.startswith("> **오염**")]
+
+    assert note, "열만 달고 뜻을 안 적으면 다음 사람이 뜻을 지어낸다"
+    assert "절벽일" in note[0]
+    assert "반드시 오염됐다는 뜻은 아니다" in note[0]
+
+
+def test_a_calm_day_has_no_cliff_column_at_all():
+    """열이 비어 실리면 「쟀는데 0」과 「그날은 안 실린다」가 안 갈린다."""
+    for run in (0, 19, None):
+        lines = report._render_hypotheses(_RESULTS, _db(run))
+        assert not [ln for ln in lines if "오염" in ln], run
 
 
 def test_a_calm_day_renders_byte_identical_to_before_this_change():

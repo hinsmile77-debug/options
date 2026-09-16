@@ -66,13 +66,48 @@ def test_an_unreadable_state_says_nothing(loop):
 
 
 def test_the_hint_names_how_many_samples_it_stands_on(loop):
-    """「대체로」라고 쓰면 다섯 번째 표본이 나와도 이 문구는 영원히 안 늙는다."""
+    """「대체로」라고 쓰면 새 표본이 나와도 이 문구는 영원히 안 늙는다."""
     hint = loop._NO_INGEST_RECOVERY_HINT
 
     assert "3건" in hint
     assert "15:25~15:26" in hint
     for sample in ("08-26", "09-01", "09-03"):
         assert sample in hint
+
+
+# ===== 2026-09-16 제5부 고도화 1 — 이탈 표본을 함께 말하게 한다 =====
+#
+# 09-08(15:30 · 마감 +10분)과 09-16(15:29:51 · +9분51초)이 연속으로 「마감 +5~6분」을 벗어났다.
+# 인용이 정확한 것과 **사람이 그것을 보장으로 읽는 것**은 다른 문제다.
+
+
+def test_the_hint_says_how_many_of_how_many(loop):
+    """「3건」만 적으면 그것이 전부인지 일부인지 알 수 없다."""
+    assert "5건에서 3건" in loop._NO_INGEST_RECOVERY_HINT
+
+
+def test_the_hint_names_the_samples_that_broke_the_pattern(loop):
+    """이탈을 안 적으면 다음 사람이 이 문장을 규칙으로 읽는다."""
+    hint = loop._NO_INGEST_RECOVERY_HINT
+
+    for deviant in ("09-08", "09-16"):
+        assert deviant in hint, deviant
+    assert "어긋났다" in hint
+
+
+def test_the_hint_refuses_to_be_read_as_a_promise(loop):
+    assert "보장이 아니라" in loop._NO_INGEST_RECOVERY_HINT
+
+
+def test_the_hint_still_says_nobody_touched_anything(loop):
+    """표본이 여섯이 됐어도 「우리 쪽 조치 없음」은 여섯 건 전부에서 사실이다."""
+    assert "우리 쪽 조치는 없었다" in loop._NO_INGEST_RECOVERY_HINT
+
+
+def test_the_suppression_rule_did_not_move_with_the_wording(loop):
+    """**대가 축** — 문구를 늘렸어도 줄 **수**는 종전 그대로다(45분 사건에 2줄)."""
+    assert loop._RECOVERY_HINT_REPEAT_MINUTES == 30
+    assert sum(1 for m in range(1, 46) if loop._recovery_hint_due({"minutes": m})) == 2
 
 
 def test_the_hint_does_not_promise_an_automatic_fix(loop):
