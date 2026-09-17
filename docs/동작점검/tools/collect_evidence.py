@@ -1314,6 +1314,67 @@ def preemptive_uncovered_streak(rows):
     return streak
 
 
+# ===== 2026-09-17 (09-17 §1-6 / 제4부 Fix B) — **「이틀」은 매번 전날 하루만 본 수였다** =====
+#
+# §5-1의 🔔 줄은 조건이 며칠째 서 있든 언제나 「이틀 연속」이라고 적는다 — 전날 사이드카
+# 하나와만 대조하기 때문이다. 09-14부터 나흘째 같은 조건이 서 있었는데 09-15·09-16·09-17이
+# 전부 「이틀」로 보고했고, 그래서 「오늘도 그냥 이틀이네」로 읽혔다.
+#
+# **위 §8-4와 다른 축이다.** §8-4는 「레버가 **아직 안 덮은** 시간대가 며칠째인가」를
+# `inquire-price`만으로 센다. 이 축은 §5-1과 **같은 축**(전 엔드포인트 — 2026-08-25 P1-1 ④가
+# 그렇게 정했다: 08-25 성립 6구간에 `inquire-balance`가 있었다)의 **거래일** 연속이다.
+# 같은 사실을 두 축으로 세면 어느 쪽이 맞는지 묻는 날이 온다 — 그래서 축을 명시해 둔다.
+#
+# ⛔ **임계를 만들지 않는다.** 「N일 넘으면 발동」을 긋지 않는다. 발동 조건은 여전히
+# 「이틀 연속」이고 발동은 사람이, 발동 창은 다음 거래일 장전이다. 바꾼 것은 **무엇을
+# 재는가**이지 **얼마부터 위험한가**가 아니다.
+
+def _all_endpoint_breach_hours(latency: dict):
+    """반환: 그날 **전 엔드포인트** p95가 그날의 임계를 넘은 `(엔드포인트, 시)` 집합.
+
+    임계는 **그 사이드카에 적힌 값**을 쓴다 — 그날 실제로 걸려 있던 임계여야 한다
+    (`two_day_p95_overlap`·`_price_breach_hours`와 같은 원칙).
+    `_price_breach_hours`와 달리 엔드포인트를 좁히지 않는다: §5-1의 🔔 판정이 그 축이다.
+    """
+    threshold = float(latency.get("p95_warn_threshold") or P95_WARN_THRESHOLD_SECONDS)
+    return {
+        (endpoint, int(hour))
+        for hour, row in (latency.get("p95_by_hour") or {}).items()
+        for endpoint, value in row.items()
+        if value > threshold
+    }
+
+
+def consecutive_latency_days(auto: Path, day: _date, max_days=PREEMPTIVE_STREAK_MAX_DAYS):
+    """반환: `(연속 거래일 수, 가장 이른 성립일 또는 None, 멈춘 사유)`.
+
+    입력: `auto/` 디렉터리, 기준일.
+    계산: 기준일부터 거슬러 오르며 **그날과 그날의 직전 거래일**이 같은 `(엔드포인트, 시)`에서
+         함께 p95 임계를 넘었는지 본다. 성립하면 하루 세고 직전 거래일로 옮겨 다시 본다.
+    해석: 사유가 `"끊김"`이면 그 수가 **정확한 연속일수**다. `"계측없음"`이면
+         **「최소 N일째 — 그 앞은 모른다」**이지 「연속이 끊겼다」가 아니다(규약 C) —
+         사이드카가 없거나 `p95_by_hour`가 빈 날에서 멈춘 것이다.
+         `"한계"`는 `max_days`까지 내리 성립한 경우다.
+    실패 조건: 없다 — 못 읽으면 사유가 `"계측없음"`으로 돌아온다.
+    """
+    streak, earliest, cursor = 0, None, day
+    for _ in range(max_days):
+        latency = _sidecar_latency(auto, cursor)
+        if latency is None:
+            return streak, earliest, "계측없음"
+        prev_day = _previous_latency_day(auto, cursor)
+        prev_latency = _sidecar_latency(auto, prev_day) if prev_day else None
+        if prev_latency is None:
+            # 「이틀 연속」 판정을 못 한다 — **「연속이 끊겼다」가 아니다.**
+            return streak, earliest, "계측없음"
+        if not (_all_endpoint_breach_hours(latency) & _all_endpoint_breach_hours(prev_latency)):
+            return streak, earliest, "끊김"
+        streak += 1
+        earliest = cursor
+        cursor = prev_day
+    return streak, earliest, "한계"
+
+
 def previous_metric_sidecar(auto: Path, day: _date, max_back=PREV_SIDECAR_MAX_BACKTRACK_DAYS):
     """반환: `(찾은 날짜, 거슬러 오른 일수)` — `max_back`일 안에 없으면 `(None, max_back)`.
 
@@ -2285,6 +2346,25 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
                       "미리 정해 둔 조치: **해당 시간대 위클리 폴링 2분 → 4분 격분(먼슬리는 안 "
                       "건드린다)**. ⛔ **자동 발동하지 않는다** — 발동은 사람이 결정한다"
                       "(2026-07-08 페이서 분리 500 폭주 203분).")
+                    # ===== 2026-09-17 (09-17 §1-6 / 제4부 Fix B) — **며칠째인가** =====
+                    #
+                    # 위 줄의 「이틀 연속」은 **전날 하루와만 대조한 수**다. 09-14부터
+                    # 나흘째 서 있던 조건을 09-15·16·17이 전부 「이틀」로 적었다.
+                    # 위 줄의 문구는 한 글자도 안 바꾼다(부분문자열 파서 보호) —
+                    # 이 줄이 **뒤에만 덧붙는다.**
+                    run_days, run_since, run_stop = consecutive_latency_days(auto, day)
+                    if run_stop == "계측없음":
+                        A(f"- 📅 **최소 {run_days}거래일째** — 그 앞은 지연 계측이 실린 "
+                          "사이드카를 못 찾아 **모른다.** 「여기서 끊겼다」가 **아니다**(규약 C).")
+                    else:
+                        A(f"- 📅 **{run_days}거래일째**"
+                          + (f"({run_since}부터)" if run_since else "")
+                          + " — 위 줄의 「이틀 연속」은 **전날 하루와 대조한 결과**이고, "
+                            "이 수는 그 대조를 과거로 이어 센 것이다"
+                          + ("(더 거슬러 오르면 조건이 끊긴다)." if run_stop == "끊김"
+                             else f"({PREEMPTIVE_STREAK_MAX_DAYS}일 한계까지 내리 성립했다).")
+                          + " ⛔ **여기에 임계는 없다** — 발동 조건은 여전히 「이틀 연속」이고 "
+                            "발동은 사람이 정한다.")
                     # ===== 2026-08-26 (08-26 §1-8 / P1-3) — **발동 창을 문구에 박는다** =====
                     #
                     # 08-04에 만들어진 뒤 3주째 **한 번도 발동한 적이 없다.** 미룬 것이 아니라

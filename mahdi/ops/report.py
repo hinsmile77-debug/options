@@ -81,6 +81,28 @@ HEADLINE_DB_METRICS: list[tuple[str, str, str, str | None]] = [
 ]
 
 
+# ===== 2026-09-17 (09-17 §3-4 / 제4부 Fix C) — **전멸을 §1에서 보이게 한다** =====
+#
+# 09-17 15:00:52·15:01:53에 옵션체인이 그 분 20레그 중 0행만 적재했다(그날 유일한 ERROR 로그
+# 2건). 그 2분 동안 판단은 **어제가 아니라 직전 스냅샷**을 보고 났다 — 폴백은 설계대로
+# 돌았지만, 그 사실은 §5-1 **산문에만** 있었다. §1만 읽는 사람은 그날을 평범한 날로 읽는다.
+#
+# **위 `HEADLINE_DB_METRICS`와 정의가 다르다 — 그것이 이 줄의 요점이다.**
+#   · `최장 연속 0행 구간` · `단발 완전실패` → **DB `rows=0` 분 수**(09-17: 2분 · 0건)
+#   · 이 줄                                  → **ERROR 로그 건수**(09-17: 2건)
+# 09-17은 두 축이 우연히 같은 수였지만 같은 것을 세지 않는다: DB 축은 적재 결과를, 이 축은
+# 수집 사이클이 스스로 「이번 분은 비었다」고 선언한 횟수를 센다. 두 수가 갈리는 날이
+# 「적재는 됐는데 우리가 전멸이라 불렀다」거나 그 반대를 말해 준다.
+#
+# 경로에 `db.` 접두사가 없는 이유: 이 값은 `db_metrics`가 아니라 **로그 집계**(`metrics`)에서
+# 온다. 그래서 별도 목록으로 두고 `_render_headline`이 다른 원본에서 꺼낸다.
+#
+# ⛔ **임계를 만들지 않는다.** 이 행은 세기만 한다 — 몇 건부터 위험한가는 긋지 않았다.
+HEADLINE_JUDGEMENT_LOG_METRICS: list[tuple[str, str, str, str | None]] = [
+    ("**옵션체인 전멸(ERROR)**", "qualitative.chain_cycle_empty", "{:,.0f}건", "down"),
+]
+
+
 # 2026-08-06 §3-1 / Fix#3 — **리스트 절을 자연 키로 색인한다.**
 #
 # 08-05 `p6`이 적은 경로는 `db.tables.underlying_spot_1m.rows`였다. `db.tables`는 표를 그리기
@@ -581,14 +603,18 @@ def _render_headline(metrics: dict, previous: dict | None, db_metrics: dict | No
         # 않는다」는 다른 절의 계약(§12의 절대 커버리지 줄)과 문자열이 충돌하고, 무엇보다
         # 「무엇을 고쳐야 이 줄이 생기는가」에 답하는 것은 키 쪽이다.
         missing = [f"`db.{spec[1]}`" for spec in HEADLINE_DB_METRICS if spec not in available]
+        # 2026-09-17 Fix C — 로그에서 오는 판단 입력 줄. DB 집계가 통째로 없는 날에도 이 축은
+        # 살아 있으므로, 아래 조기 반환 경로에서도 **함께 인쇄한다** — 그날 남은 유일한
+        # 판단 입력 신호를 「DB가 없다」는 이유로 같이 묻으면 규약 C를 스스로 어기는 셈이다.
+        log_rows = build_rows(metrics, HEADLINE_JUDGEMENT_LOG_METRICS, "")
         if not available:
             return out + [
                 f"> **판단 입력 {len(missing)}행이 이 집계에 없다** — {', '.join(missing)}. "
                 "「좋았다」가 아니라 **「재지 않았다」**이다(규약 C).",
                 "",
-            ]
+            ] + _table(headers, log_rows)
         out += ["**판단 입력** — 위 표가 전부 초록이어도 여기가 비면 그날 판단은 눈을 감고 났다.", ""]
-        out += _table(headers, build_rows(db_metrics, available, "db."))
+        out += _table(headers, build_rows(db_metrics, available, "db.") + log_rows)
         if missing:
             out += [f"> ⚠ 이 집계에 없어 뺀 줄: {', '.join(missing)} — 「좋았다」가 아니라 「재지 않았다」이다.", ""]
         out += [
@@ -596,6 +622,12 @@ def _render_headline(metrics: dict, previous: dict | None, db_metrics: dict | No
             "**둘은 같은 날 반대 방향으로 갈 수 있다** — 08-14가 그랬다: 밀림 0건 · 결손 0분 · "
             "REST 수요 전일의 80%인 채로 GEX 입력이 78분 사라졌고 먼슬리 커버리지가 82.6%로 내려갔다. "
             "그날 §1만 읽은 대시보드는 그 하루를 **완벽한 하루**로 인쇄했다.",
+            "",
+            "> **「옵션체인 전멸(ERROR)」은 위 두 0행 줄과 다른 것을 센다.** 최장 연속 0행 구간·"
+            "단발 완전실패는 **DB에 `rows=0`으로 남은 분 수**이고, 전멸은 **수집 사이클이 스스로 "
+            "「이번 분은 비었다」고 선언한 ERROR 로그 건수**다. 그 분의 판단은 멈추지 않고 "
+            "신선도 창 안의 **직전 스냅샷**으로 났다 — 09-17 15:00~15:01이 그랬다. "
+            "두 수가 갈리는 날이 「적재는 됐는데 전멸이라 불렀다」거나 그 반대를 말해 준다.",
             "",
         ]
     return out
