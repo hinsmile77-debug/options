@@ -854,6 +854,109 @@ def _live_episode(state: dict | None, now: datetime) -> dict | None:
     return {"since": since, "last_at": last, "minutes": minutes}
 
 
+# ===== 2026-09-18 (09-18 §1-10 / 제4부 P1-2) — 삽화 **사이**를 센다 =====
+#
+# 09-18에 `no_ingest` 삽화가 **9회 · 누적 196분**이었다(정규장 380분의 49.7%). 그런데 그
+# 「9회」는 로그가 말한 것이 아니다 — 장중②가 8회, 장후가 9회를 **사람 손으로 비-OK 줄을
+# 묶어** 냈다. 08-21에 16분/3구간을 손으로 묶었던 것과 정확히 같은 자리이고, 그때 만든 답이
+# `track_degraded_episode()`였다. 다만 그 함수는 삽화 **안**의 분을 센다 — 4분짜리 삽화가
+# 아홉 번 난 날과 한 번 난 날이 로그에서 **같은 모양**으로 보이는 이유가 그것이다.
+#
+# ⛔ **`track_degraded_episode()`의 상태에 얹을 수 없다.** 그 상태는 삽화가 닫히는 순간
+# 호출측이 **파일째 지운다**(`_write_degraded_episode(None)` → `unlink`). 얹었으면 이
+# 카운터가 영원히 1에서 멈춘다 — `_MISSING_CHECK_STATE` 주석이 `next_state()`에 대해 이미
+# 똑같은 함정을 적어 뒀고, `_DEGRADED_EPISODE_STATE`가 별도 파일이 된 이유도 같다.
+# **같은 함정에 세 번째로 걸리지 않기 위해 별도 파일 + 별도 함수로 간다.**
+#
+# ⛔ **판정에 들어가지 않는다.** `next_state()`·`should_alert`·재기동 임계 어디에도 입력되지
+# 않는다 — 세기만 하는 축이다(규약 E: 대가도 판정도 공유 축에 얹지 않는다).
+_NO_INGEST_LEDGER_FILENAME = ".watchdog_no_ingest_ledger.json"
+
+
+def no_ingest_ledger_path(log_dir: Path) -> Path:
+    return log_dir / _NO_INGEST_LEDGER_FILENAME
+
+
+def _ledger_entries(ledger: dict | None, now: datetime) -> list[dict]:
+    """반환: **오늘의** 삽화 목록. 날짜가 다르거나 깨졌으면 빈 목록(지어내지 않는다)."""
+    if not ledger or ledger.get("date") != now.date().isoformat():
+        return []
+    rows = ledger.get("episodes")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    for row in rows:
+        try:
+            datetime.fromisoformat(str(row["since"]))
+            datetime.fromisoformat(str(row["last_at"]))
+            minutes = int(row["minutes"])
+        except (KeyError, TypeError, ValueError):
+            return []  # 한 줄이라도 못 읽으면 대장 전체를 「모른다」로 둔다
+        if minutes < 1:
+            return []
+        out.append({
+            "since": str(row["since"]),
+            "last_at": str(row["last_at"]),
+            "minutes": minutes,
+        })
+    return out
+
+
+def track_no_ingest_ledger(
+    ledger: dict | None, now: datetime, episode: dict | None, reason: str | None,
+) -> tuple[dict | None, str | None]:
+    """
+    입력: 직전 대장(파일에서 읽은 dict, 없으면 None), 현재 시각,
+         `track_degraded_episode()`가 방금 낸 **다음 상태**, 이번 판정의 `reason`.
+    계산: 오늘의 `no_ingest` 삽화 구간을 이어 적고, **새 삽화가 열린 그 한 번**에 순번 문구를 만든다.
+    반환: `(다음 대장, 순번 문구)`.
+         - 순번 문구는 **두 번째 이후** 삽화의 첫 분에만 나온다. 첫 삽화엔 「직전」이 없고,
+           「오늘 1번째」는 아무것도 말해 주지 않으면서 평범한 하루마다 한 줄을 더한다.
+         - 그래서 억제는 **삽화 1회당 최대 1줄**이다 — 역대 최다인 09-18 기준으로도 8줄이고,
+           회복 참고 문구 14줄과 합쳐도 하루 30줄 예산 안이다(§5 억제 규약).
+    해석: 순수 함수다(파일도 시계도 안 건드린다) — `track_degraded_episode()`와 같은 이유로,
+         테스트가 「9회 삽화의 하루」를 시각 시퀀스로 재현할 수 있어야 한다.
+    실패 조건: 없다. 대장이 깨져 있으면 오늘을 새로 시작한다(못 읽은 과거를 지어내지 않는다).
+         ⚠ 그 경우 순번이 되감긴다 — 그것은 「삽화가 없었다」가 아니라 **「셀 수 없었다」**이고,
+         문구가 안 나오는 것으로 드러난다(규약 C).
+    """
+    entries = _ledger_entries(ledger, now)
+    today = now.date().isoformat()
+
+    # `no_ingest`가 아닌 DEGRADED(박동 이상 등)는 이 대장의 축이 아니다 — 세지 않는다.
+    # 삽화가 닫힌 분(`episode is None`)도 여기서는 아무것도 안 한다: 마지막 줄의 `last_at`은
+    # 그 삽화의 마지막 DEGRADED 분에서 이미 최신이다.
+    if episode is None or reason != REASON_NO_INGEST:
+        return ({"date": today, "episodes": entries} if entries else None), None
+
+    try:
+        since = str(episode["since"])
+        last_at = str(episode["last_at"])
+        minutes = int(episode["minutes"])
+    except (KeyError, TypeError, ValueError):
+        return ({"date": today, "episodes": entries} if entries else None), None
+
+    if entries and entries[-1]["since"] == since:
+        # 같은 삽화가 이어지는 중 — 끝만 늘린다. 문구는 첫 분에 이미 나갔다.
+        entries[-1] = {"since": since, "last_at": last_at, "minutes": minutes}
+        return {"date": today, "episodes": entries}, None
+
+    # 새 삽화다. **`since`로 가른다** — `minutes == 1`로 가르면 무기록 뒤 재시작(`stale`)을
+    # 같은 삽화로 잘못 이어 붙인다.
+    note = None
+    if entries:
+        prev = entries[-1]
+        prev_since = datetime.fromisoformat(prev["since"])
+        prev_last = datetime.fromisoformat(prev["last_at"])
+        gap = int((datetime.fromisoformat(since) - prev_last).total_seconds() // 60)
+        note = (
+            f"오늘 {len(entries) + 1}번째 삽화 · 직전 삽화"
+            f"({prev_since:%H:%M}~{prev_last:%H:%M}, {prev['minutes']}분) 종료로부터 {gap}분"
+        )
+    entries.append({"since": since, "last_at": last_at, "minutes": minutes})
+    return {"date": today, "episodes": entries}, note
+
+
 def track_degraded_episode(
     state: dict | None, now: datetime, action: str,
 ) -> tuple[dict | None, str | None, str | None]:

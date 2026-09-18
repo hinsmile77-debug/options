@@ -299,6 +299,34 @@ def _recovery_hint_due(episode: dict | None) -> bool:
     return minutes == 1 or minutes % _RECOVERY_HINT_REPEAT_MINUTES == 0
 
 
+# ===== 2026-09-18 (09-18 §1-10 / 제4부 P1-2) — 삽화 대장 =====
+#
+# 판정은 `liveness.track_no_ingest_ledger()`에 있고 여기서는 **파일 I/O만** 한다
+# (`_DEGRADED_EPISODE_STATE`와 같은 구조·같은 이유다). 별도 파일인 이유는 그 상수의 주석에
+# 이미 적혀 있다: 삽화 상태는 삽화가 닫힐 때 지워지므로 거기 얹은 카운터는 1에서 멈춘다.
+_NO_INGEST_LEDGER_STATE = liveness.no_ingest_ledger_path(LOG_DIR)
+
+
+def _read_no_ingest_ledger() -> dict | None:
+    try:
+        return json.loads(_NO_INGEST_LEDGER_STATE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — 없거나 깨졌으면 「모른다」이고, 오늘을 새로 시작한다
+        return None
+
+
+def _write_no_ingest_ledger(ledger: dict | None) -> None:
+    try:
+        if ledger is None:
+            _NO_INGEST_LEDGER_STATE.unlink(missing_ok=True)
+            return
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _NO_INGEST_LEDGER_STATE.write_text(
+            json.dumps(ledger, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 — 못 써도 판정은 계속돼야 한다(순번만 되감긴다)
+        pass
+
+
 def _read_degraded_episode() -> dict | None:
     try:
         return json.loads(_DEGRADED_EPISODE_STATE.read_text(encoding="utf-8"))
@@ -489,6 +517,11 @@ def main() -> None:
         _read_degraded_episode(), now, decision.action,
     )
     _write_degraded_episode(episode)
+    # 2026-09-18 P1-2 — 대장은 삽화 상태를 **읽기만** 한다(판정에 되먹이지 않는다).
+    ledger, sequence_note = liveness.track_no_ingest_ledger(
+        _read_no_ingest_ledger(), now, episode, decision.reason,
+    )
+    _write_no_ingest_ledger(ledger)
     if closing_note:
         _log(f"{stamp} RECOVERED — {closing_note}")
 
@@ -527,6 +560,11 @@ def main() -> None:
         # 정지(...)`)를 건드리면 `mahdi/ops/watchdog_metrics.py`의 `startswith` 집계가 눈이 먼다.
         if decision.reason == liveness.REASON_NO_INGEST and _recovery_hint_due(episode):
             message += f" · {_NO_INGEST_RECOVERY_HINT}"
+        # 2026-09-18 P1-2 — **여기도 줄 끝에만 붙인다.** 앞머리를 건드리면
+        # `mahdi/ops/watchdog_metrics.py`의 `startswith` 집계가 눈이 먼다(09-03 P2-3과 같다).
+        # 문구는 두 번째 이후 삽화의 첫 분에만 나오므로 줄 **수**는 안 는다.
+        if sequence_note:
+            message += f" · {sequence_note}"
     else:
         message = f"관측 루프 생존 신호 이상({decision.reason}) — {decision.detail}"
     _log(f"{stamp} {decision.action.upper()} — {message}")
