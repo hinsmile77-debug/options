@@ -19,6 +19,14 @@ REM 판정은 mtime만 보므로 내용은 사람이 읽기 위한 것이다(cmd
 REM 표식은 다음 기동 스크립트가 **시작하면서** 지운다 — 만료를 여기서 관리하지 않는다.
 echo intentional stop %date% %time% > "%PROJECT_DIR%\logs\.intentional_stop"
 
+REM 2026-09-17 — 이 필터가 Chrome 을 죽이지 않는 것은 **설계가 아니라 우연이다.**
+REM 필터는 영문 「Mahdi COCKPIT」인데, COCKPIT 페이지 제목은 한글이다
+REM   (mahdi/dashboard/app.py: st.set_page_config(page_title="마흐디 COCKPIT v1")).
+REM Streamlit 은 기동하면서 기본 브라우저를 여는데(.streamlit/config.toml 이 없어
+REM server.headless 가 기본 false), 그 Chrome 창 제목이 「마흐디 COCKPIT v1 - Chrome」이라
+REM 영문 필터에 **안 걸릴 뿐이다.** page_title 을 영문 「Mahdi COCKPIT」으로 바꾸는 순간
+REM 아래 taskkill 이 /T 로 **Chrome 을 통째로** 죽인다 — 장마감마다, 열려 있던 모든 탭이.
+REM page_title 을 손대려면 이 필터부터 창 제목이 아닌 PID 기반으로 바꿔라.
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi COCKPIT*" >> "%LOG_FILE%" 2>&1
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi Observation Loop*" >> "%LOG_FILE%" 2>&1
 
