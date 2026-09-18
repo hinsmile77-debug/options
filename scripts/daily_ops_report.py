@@ -367,16 +367,26 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
     except Exception:
         logger.warning("검증 캠페인 건너뜀", exc_info=True)
 
-    md_path = out_dir / f"{target.isoformat()}_지표.md"
-    md_path.write_text(
-        report.render(
-            metrics, previous=previous, db_metrics=db_metrics_result,
-            hypotheses=hypothesis_results, history=history,
-            levers=lever_state, watchdog=watchdog_result,
-            campaign=campaign_results, crash=crash_result,
-        ),
-        encoding="utf-8", newline="\n",  # 위 json과 같은 이유
+    body = report.render(
+        metrics, previous=previous, db_metrics=db_metrics_result,
+        hypotheses=hypothesis_results, history=history,
+        levers=lever_state, watchdog=watchdog_result,
+        campaign=campaign_results, crash=crash_result,
     )
+
+    # 2026-09-06 — 당일 맥점 예측 채점(§18). 배지가 아침에 낸 수를 그날 실제 고·저로 채점하고 누적을 붙인다.
+    # `report.render()` 밖에 두는 이유: 이 절의 원천은 로그·DB가 아니라 `data/premarket_levels/<날짜>.json`이라
+    # render()가 받는 지표 dict에 없다. 다른 절과 같은 원칙으로 **실패해도 리포트는 나온다**.
+    if use_db:
+        try:
+            from mahdi.ops import premarket_levels_store
+
+            body += "\n" + premarket_levels_store.score_markdown(target)
+        except Exception:
+            logger.warning("맥점 예측 채점 절 건너뜀", exc_info=True)
+
+    md_path = out_dir / f"{target.isoformat()}_지표.md"
+    md_path.write_text(body, encoding="utf-8", newline="\n")  # 위 json과 같은 이유
     return md_path
 
 

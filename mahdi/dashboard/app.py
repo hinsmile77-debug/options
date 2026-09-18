@@ -14,6 +14,7 @@ from mahdi.dashboard.data_source import (
     get_health_summary,
     get_latest_decision_context,
     get_market_halt_status,
+    get_premarket_levels_cards,
     get_slack_alerts_enabled,
     load_snapshot,
     record_cockpit_startup,
@@ -199,6 +200,11 @@ def render() -> None:
         st.plotly_chart(build_decision_history_table(decision_context["history"]), width='stretch', key='decision_history')
     else:
         st.caption("아직 Signal Fusion 판단 이력이 없습니다.")
+
+    # 2026-09-06 — 당일 맥점 예측 배지(08:50 / 09:30 × 거리모델 / 구조모델). 근거·검증은
+    # docs/Dev_md/RESEARCH_PREMARKET_EXTREMES_v1.md. 판단·주문에 연결되지 않은 참고 정보다.
+    st.subheader("당일 맥점 예측 (08:50 / 09:30 — 참고용, 판단 미연결)")
+    _render_cards(get_premarket_levels_cards())
 
     st.subheader("계좌 현황")
     _render_cards(build_account_summary_cards(get_account_status_view()))

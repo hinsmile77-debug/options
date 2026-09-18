@@ -27,6 +27,7 @@ from mahdi.features.options_intel import find_gamma_flip, gamma_walls as compute
 from mahdi.execution.entry import tick_size_for_price
 from mahdi.features.orderflow import absorption_score, flat_range_limit
 from mahdi.ops import db_metrics
+from mahdi.ops import premarket_levels_store
 from mahdi import session
 
 logger = logging.getLogger("mahdi.dashboard.data_source")
@@ -1302,6 +1303,19 @@ def get_health_summary(underlying: str = "KOSPI200") -> list[HealthCheck]:
     except Exception:
         logger.warning("점검 요약 조회 실패", exc_info=True)
         return [HealthCheck("오늘의 점검 요약", "warning", "DB 연결 실패로 조회 불가")]
+
+
+def get_premarket_levels_cards() -> list[dict]:
+    """당일 맥점 예측 배지 4장 — [08:50 거리모델] [08:50 구조모델] [09:30 거리모델] [09:30 구조모델].
+
+    2026-09-06. 산출·굳히기는 `mahdi.ops.premarket_levels_store.badge_cards()`가 한다(때가 되면 그 안에서
+    당일 봉을 읽어 단계를 파일에 굳힌다). 여기서는 예외만 막는다 — 맥점 배지가 죽어도 COCKPIT은 떠야 한다.
+    """
+    try:
+        return premarket_levels_store.badge_cards(db.local_now())
+    except Exception:
+        logger.warning("맥점 배지 산출 실패", exc_info=True)
+        return [dict(label="당일 맥점", value="산출 실패 — cockpit.log 참고", status="warning")]
 
 
 def get_latest_decision_context(limit: int = 20) -> dict:

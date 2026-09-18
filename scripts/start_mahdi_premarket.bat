@@ -161,6 +161,12 @@ REM 콘솔에 그대로 찍는다: 로그 파일로 보내면 아침에 아무�
 echo [%date% %time%] 레버 발동일 점검 >> "%LOG_FILE%"
 call uv run python scripts\check_lever_due.py
 
+REM 2026-09-06 — 당일 맥점 예측 준비(이력 캐시 갱신 + 거리 모델 파라미터 + 구조 후보 → data\premarket_levels\<오늘>.json).
+REM 미륵 DB는 08:40 이전에만 읽는다(미륵 장중 스캔 금지). 실패해도 기동을 막지 않는다 — COCKPIT 배지가 「파일 없음」으로 알린다.
+echo [%date% %time%] 당일 맥점 예측 준비 >> "%LOG_FILE%"
+call uv run python scripts\premarket_levels_publish.py >> "%LOG_FILE%" 2>&1
+if errorlevel 1 echo [%date% %time%] 경고: 맥점 예측 준비 실패 (계속 진행) >> "%LOG_FILE%"
+
 echo [%date% %time%] COCKPIT 대시보드 실행 (새 창) >> "%LOG_FILE%"
 start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && uv run streamlit run mahdi/dashboard/app.py >> logs\cockpit.log 2>&1"
 
