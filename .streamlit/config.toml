@@ -1,0 +1,22 @@
+# 2026-09-20 — Streamlit 이 기동하면서 기본 브라우저를 여는 것을 끈다.
+#
+# 왜: stop_mahdi_marketclose.bat 의 `taskkill /F /T /FI "WINDOWTITLE eq Mahdi COCKPIT*"` 는
+# **제목이 아니라 프로세스 트리**로 죽인다(/T). 제목 필터는 뿌리(COCKPIT cmd 창)만 고르고,
+# 그 아래 자손은 제목과 무관하게 전부 함께 죽는다.
+# 이 파일이 없으면 server.headless 가 기본 false 라 Streamlit 이 기동할 때 브라우저를 여는데,
+# 그때 Chrome 이 안 떠 있었다면 chrome.exe 가 Streamlit 의 **자식**이 되고 COCKPIT 창의
+# 자손이 된다 → 15:45 의 /T 가 Chrome 을 통째로 데려간다.
+#
+# stop 배치 22~29행 주석(2026-09-17)은 「영문 제목 필터가 한글 Chrome 창에 안 걸린다」까지만
+# 보고 안전하다고 판단했다. 그 판단은 /T 의 트리 종료를 계산에 넣지 않았다.
+#
+# 실측(premarket_startup.log, 장마감 종료 블록의 SUCCESS PID 수):
+#   09-11 33개(한 부모에 자식 19) · 09-14 31개(17) · 09-15 29개(15) · 09-16 30개(16)
+#   09-17 11개(최대 2)  ← 큰 묶음 없음
+#   09-18 29개(15)      ← 있음.  그날 16:01 예약 수집이 「확장 0개」로 실패했다.
+# 한 프로세스가 자식 15~19개를 매다는 것은 브라우저의 다중프로세스 서명이다.
+#
+# COCKPIT 은 여전히 자동으로 열린다 — start_mahdi_premarket.bat 이 COCKPIT 창이 아닌
+# **자기 자신**의 자식으로 브라우저를 띄우기 때문이다(그 배치는 곧 끝나므로 고아가 된다).
+[server]
+headless = true

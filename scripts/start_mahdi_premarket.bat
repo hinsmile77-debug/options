@@ -169,6 +169,18 @@ if errorlevel 1 echo [%date% %time%] 경고: 맥점 예측 준비 실패 (계속
 
 echo [%date% %time%] COCKPIT 대시보드 실행 (새 창) >> "%LOG_FILE%"
 start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && uv run streamlit run mahdi/dashboard/app.py >> logs\cockpit.log 2>&1"
+REM 2026-09-20 — 브라우저는 **이 배치**가 연다(COCKPIT 창이 아니라).
+REM .streamlit\config.toml 의 headless=true 로 Streamlit 은 더 이상 브라우저를 열지 않는다.
+REM 여기서 열면 Chrome 은 이 배치의 자식이고, 이 배치는 곧 끝나므로 고아가 된다 —
+REM 즉 「Mahdi COCKPIT」 창의 자손이 아니므로 15:45 의 taskkill /T 가 닿지 못한다.
+REM Chrome 이 이미 떠 있으면 새 탭만 열고 넘기므로 어느 쪽이든 안전하다.
+REM 서버가 뜨기 전에 열면 빈 화면이 나오므로 3초 기다린다.
+REM 2026-09-20 — timeout 대신 ping을 쓴다: 작업 스케줄러 기동처럼 stdin이 리다이렉트되면
+REM timeout은 "ERROR: Input redirection is not supported"로 실패한다(배치는 안 멈추지만
+REM 대기 없이 곧장 다음 줄로 넘어가 빈 화면을 열 수 있다). ping은 104행에서도 쓰는 이 프로젝트의
+REM 기존 관용구이고 리다이렉트에 영향받지 않는다. -n 4 = 약 3초(첫 핑은 대기 없이 나간다).
+ping -n 4 127.0.0.1 >nul
+start "" "http://localhost:8501"
 
 echo [%date% %time%] 관측 루프 실행 (새 창) >> "%LOG_FILE%"
 REM 2026-07-19(§5-5 로그 위생): stdout을 여기서 logs\observation_loop.log로 리다이렉트하면

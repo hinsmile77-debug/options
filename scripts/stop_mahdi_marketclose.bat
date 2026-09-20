@@ -27,8 +27,17 @@ REM server.headless 가 기본 false), 그 Chrome 창 제목이 「마흐디 COC
 REM 영문 필터에 **안 걸릴 뿐이다.** page_title 을 영문 「Mahdi COCKPIT」으로 바꾸는 순간
 REM 아래 taskkill 이 /T 로 **Chrome 을 통째로** 죽인다 — 장마감마다, 열려 있던 모든 탭이.
 REM page_title 을 손대려면 이 필터부터 창 제목이 아닌 PID 기반으로 바꿔라.
+REM 2026-09-20 — taskkill 진단 로깅. taskkill 로그는 죽인 PID만 남기고 이름(예: chrome.exe)은
+REM 안 남겨서, 09-17 주석의 「COCKPIT 창 제목 필터가 아니라 /T 트리 종료가 Chrome을 죽인다」는
+REM 가설이 실측 없이 「유력 가설」에 머물렀다. taskkill 앞뒤로 chrome.exe 생존 여부를 찍어
+REM 09-20 조치(A: headless=true, B: 브라우저를 COCKPIT의 자손이 아닌 배치의 자식으로 열기)가
+REM 실제로 들었는지 다음 장마감 로그로 확정한다.
+echo --- [chrome BEFORE taskkill] --- >> "%LOG_FILE%"
+tasklist /FI "IMAGENAME eq chrome.exe" /FO CSV /NH >> "%LOG_FILE%" 2>&1
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi COCKPIT*" >> "%LOG_FILE%" 2>&1
 taskkill /F /T /FI "WINDOWTITLE eq Mahdi Observation Loop*" >> "%LOG_FILE%" 2>&1
+echo --- [chrome AFTER taskkill] --- >> "%LOG_FILE%"
+tasklist /FI "IMAGENAME eq chrome.exe" /FO CSV /NH >> "%LOG_FILE%" 2>&1
 
 REM 2026-07-21 이상점 대응: 위 taskkill은 창 제목(WINDOWTITLE) 기반이라, 사고 대응 중 사람이
 REM 새 터미널에서 수동으로 COCKPIT/관측 루프를 재시작하면(배치스크립트의 start "..." 명명
