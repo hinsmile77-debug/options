@@ -117,6 +117,30 @@ _START_MARKER_RE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})(?:[.,]\d+)?\]\s*=+\s*관측 루프 기동"
 )
 
+
+# 2026-09-21 (09-21 §1-1 · 제4부 P1-1) — **표식도 `^C`를 벗고 읽는다.**
+#
+# 09-21 07:30 기동 표식만 `^C`(0x5e 0x43) 접두가 붙어 이 정규식이 못 맞췄다. 그 결과
+# 사이드카가 하루만 뒤집혔다: `starts` 09-15~09-18 **1·1·1·1 → 09-21 0**,
+# `marker_present` **True → False**. 정상 기동한 날에 「셀 수 없었다」가 찍힌 것이다.
+#
+# 이 파일은 이미 `_segment_crash()`와 `unattributed` 집계에서 `.lstrip("^C")`를 쓰고 있다
+# (*"bat 창이 Ctrl+C로 끊긴 흔적"*). 표식 줄에만 안 썼을 뿐이고, 여기서 같은 문법을 맞춘다.
+#
+# ⚠ **같은 버그가 `collect_evidence.py::_CRASH_START_MARKER_RE`에도 있었다** — 두 파서가
+# 규약상 문구 상수를 공유하지 않기로 했기 때문이다(그쪽 08-23 주석). 공유하지 않는 대가가
+# 「한 번 고치면 두 번 고쳐야 한다」이고, 09-21에 실제로 두 곳을 함께 고쳤다.
+# ⛔ 아래 `_INTENTIONAL_STOP_RE`·`_CLEAN_SHUTDOWN_RE`는 **손대지 않았다** — 그 둘이 읽는
+# `premarket_startup.log`에서 `^C` 접두 줄은 하루치 통틀어 1건이고 종료 표식에 붙은 전례가
+# 없다. 근거 없이 넓히지 않는다(필요해지는 날 같은 자리에 같은 문법을 쓸 것).
+def _start_marker(line: str):
+    """반환: 기동 표식이면 매치 객체, 아니면 `None`. **`^C` 접두를 벗고** 본다.
+
+    `^`나 `C`로 시작하는 본문 줄을 잘못 먹지 않는다 — 벗긴 뒤에도 `[YYYY-MM-DD`가
+    와야 정규식이 맞기 때문이다.
+    """
+    return _START_MARKER_RE.match(line.lstrip("^C"))
+
 # 트레이스백 마지막 줄 — `psycopg.OperationalError: ...` / `KeyboardInterrupt` 등.
 #
 # **점을 포함한 전체 이름을 잡는다**(`psycopg.OperationalError`). 마지막 조각만 세면
@@ -183,7 +207,7 @@ def parse(lines: list[str], target: date) -> dict:
     """
     segments: list[tuple[date | None, str | None, list[str]]] = [(None, None, [])]
     for line in lines:
-        marker = _START_MARKER_RE.match(line)
+        marker = _start_marker(line)
         if marker:
             day = date.fromisoformat(marker.group(1))
             at = f"{int(marker.group(2)):02d}:{marker.group(3)}:{marker.group(4)}"

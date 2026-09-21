@@ -1655,6 +1655,29 @@ _CRASH_START_MARKER_RE = re.compile(
 _CRASH_TRACEBACK_HEAD_RE = re.compile(r"^Traceback \(most recent call last\):")
 
 
+# ===== 2026-09-21 (09-21 §1-1 · 제4부 P1-1 · 제5부 고도화 1) — 표식도 `^C`를 벗고 읽는다 =====
+#
+# 08-23이 판정을 mtime에서 **표식**으로 옮겼는데, 09-21에 그 표식을 **못 찾았다.** 원인은
+# 문구가 바뀐 것도 옛 로그도 아니고 **줄 앞의 `^C` 두 글자**다:
+#
+#     127: ^C[2026-09-21  7:30:46.71] ===== 관측 루프 기동 =====
+#     126:   [2026-09-20 10:43:21.38] ===== 관측 루프 기동 =====   ← 108~126행은 전부 정상
+#
+# bat 창이 Ctrl+C로 끊긴 흔적이 다음 append 앞에 리터럴 `^C`(0x5e 0x43)로 남는다. 이 파일은
+# **이미 그 사실을 알고 있었다** — 바로 아래 `count`가 트레이스백 머리 줄에 `.lstrip("^C")`를
+# 쓰고 그 주석이 *"08-19 로그의 세 트레이스백이 전부 그랬다"*고 적어 뒀다. 표식 줄에만 안 썼다.
+#
+# 대가가 컸다: 정상 기동한 날에 *"이 줄이 있는 동안 아래 판정은 믿을 수 없다"*가 뜨고,
+# 그 문구는 **진짜 크래시가 난 날과 글자 하나 다르지 않다.** 오탐이 반복되면 진짜를 지나친다.
+#
+# ⛔ **세는 규칙은 안 바꾼다.** `count`의 상한 규약도 구간을 끊는 규칙도 그대로이고,
+# 바뀌는 것은 「그 줄이 표식인가」뿐이다. `^`나 `C`로 시작하는 본문 줄을 잘못 먹지 않는다 —
+# 벗긴 뒤에도 `[YYYY-MM-DD`가 와야 정규식이 맞기 때문이다.
+def _crash_marker(line):
+    """반환: 기동 표식이면 매치 객체, 아니면 None. **`^C` 접두를 벗고** 본다."""
+    return _CRASH_START_MARKER_RE.match(line.lstrip("^C"))
+
+
 def crash_since_last_start(lines, day):
     """반환: 그날 **마지막 기동 표식 이후**의 `{"at", "traceback", "count"}`. 표식이 없으면 None.
 
@@ -1666,7 +1689,7 @@ def crash_since_last_start(lines, day):
     """
     last = None
     for index, line in enumerate(lines):
-        m = _CRASH_START_MARKER_RE.match(line)
+        m = _crash_marker(line)
         if m and m.group(1) == day.isoformat():
             last = (index, f"{int(m.group(2)):02d}:{m.group(3)}:{m.group(4)}")
     if last is None:
@@ -1676,7 +1699,7 @@ def crash_since_last_start(lines, day):
     # 딸려 들어와 「그날 크래시」가 부풀려진다(도입 직후 08-20을 조회해 실제로 확인했다).
     body = []
     for line in lines[index + 1:]:
-        if _CRASH_START_MARKER_RE.match(line):
+        if _crash_marker(line):
             break
         if line.strip():
             body.append(line)
