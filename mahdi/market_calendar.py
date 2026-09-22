@@ -162,6 +162,44 @@ def previous_trading_day(
     return None
 
 
+NEXT_TRADING_DAY_MAX_LOOKAHEAD = 10
+
+
+def next_trading_day(
+    value: date | datetime, calendar: dict | None, max_lookahead: int = NEXT_TRADING_DAY_MAX_LOOKAHEAD
+) -> date | None:
+    """반환: `value` **다음의 거래일**(주말도 등재된 휴장일도 아닌 첫 날). 못 찾으면 `None`.
+
+    입력: 날짜(또는 datetime)와 달력 원본 dict. `previous_trading_day()`의 **거울상**이고
+         같이 **파일을 안 읽는다**.
+
+    해석: 2026-09-22 (09-22 보고서 제4부 P2-1). 사전 대응 규칙의 **발동 창은 「다음 거래일
+         장전(07:30 기동 전)」**인데, 지금까지 그 날짜를 세는 것은 **사람의 암산**이었다.
+         `phases.md` A-2가 *"결정을 내릴 수 있는 시각이 하루에 한 순간도 없었다"*까지만
+         적고 반영일은 안 적어서, 결정이 24거래일째 미뤄지는 동안 「오늘 미루면 며칠을 더
+         잃는가」가 어디에도 안 남았다.
+
+         🔴 **「D+1」은 틀린 규칙이다.** 09-22 보고서가 *"항상 D+1"*이라고 적었지만 바로
+         그 주가 반례다 — 09-23(수)에 내린 결정의 반영일은 09-24가 아니라 **09-28**이다
+         (09-24·25 추석 휴장 + 26·27 주말). 달력을 안 보고 하루를 더하면 2026-08-18에
+         깨진 그 가정(**평일 = 거래일**)이 그대로 재발한다. 그래서 이 함수는
+         `previous_trading_day()`와 **같은 달력·같은 규약**을 쓴다.
+
+    실패 조건: `max_lookahead`일을 나아가도 거래일이 없으면 `None`. 그때 호출측은 날짜를
+              **생략해야 한다** — 「모름」을 그럴듯한 날짜로 접으면 08-18이 반복된다.
+    """
+    day = _as_date(value)
+    for _ in range(max(0, max_lookahead)):
+        day += timedelta(days=1)
+        if is_trading_day(day, calendar):
+            return day
+    logger.warning(
+        "%s 다음 %d일 안에 거래일이 없다 — 달력이 잘못됐거나 연휴가 비정상적으로 길다",
+        _as_date(value), max_lookahead,
+    )
+    return None
+
+
 def coverage_gap_days(calendar: dict | None, today: date) -> int | None:
     """반환: `covered_through`가 `today`보다 며칠 지났는지. 유효하면 0, 못 읽으면 None.
 

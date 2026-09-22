@@ -218,3 +218,51 @@ def test_an_impossible_calendar_returns_none_not_a_plausible_date():
 def test_the_lookback_bound_is_wide_enough_for_a_real_holiday_run():
     """한국 시장 최장 연휴(연휴 + 주말)가 상한 안에 들어야 한다 — 안 그러면 그날 델타가 사라진다."""
     assert market_calendar.PREVIOUS_TRADING_DAY_MAX_LOOKBACK >= 9
+
+
+# ===== 다음 거래일 — 2026-09-22 제4부 P2-1 =====
+#
+# 사전 대응 규칙의 **발동 창은 「다음 거래일 장전」**이다. 그 날짜를 지금까지 사람이 암산했고,
+# 09-22 보고서는 그것을 *"항상 D+1"*이라고 적었다 — **그 주가 바로 반례다.**
+
+# 2026 추석: 09-24(목)·09-25(금) 휴장, 09-26·27은 주말. 저장소 달력 84·86행.
+_CHUSEOK = {
+    "covered_through": "2026-12-31",
+    "holidays": [
+        {"date": "2026-09-24", "name": "추석"},
+        {"date": "2026-09-25", "name": "추석 다음날"},
+    ],
+}
+
+
+def test_the_ordinary_case_is_tomorrow():
+    assert market_calendar.next_trading_day(date(2026, 9, 22), _CHUSEOK) == date(2026, 9, 23)
+
+
+def test_the_chuseok_week_is_not_d_plus_one():
+    """🔴 **「항상 D+1」이 깨지는 자리다.** 09-23에 내린 결정은 09-24가 아니라 09-28에 반영된다.
+
+    달력을 안 보고 하루를 더하면 2026-08-18에 깨진 그 가정(**평일 = 거래일**)이 재발한다 —
+    그날 §1 델타 넷이 전부 «거래일 vs 휴장일» 비교라 붉은 ⚠ 넷이 거짓이었다.
+    """
+    assert market_calendar.next_trading_day(date(2026, 9, 23), _CHUSEOK) == date(2026, 9, 28)
+
+
+def test_a_friday_skips_the_weekend():
+    assert market_calendar.next_trading_day(date(2026, 9, 18), _CHUSEOK) == date(2026, 9, 21)
+
+
+def test_it_is_the_mirror_of_previous_trading_day():
+    """거울상이어야 한다 — 두 방향이 다른 달력을 쓰면 그 자리에서 조용히 갈라진다."""
+    nxt = market_calendar.next_trading_day(date(2026, 9, 23), _CHUSEOK)
+    assert market_calendar.previous_trading_day(nxt, _CHUSEOK) == date(2026, 9, 23)
+
+
+def test_it_never_returns_the_day_itself():
+    """휴장일에서 물어도 **그날**을 돌려주지 않는다 — 「다음」이지 「가장 가까운」이 아니다."""
+    assert market_calendar.next_trading_day(date(2026, 9, 24), _CHUSEOK) == date(2026, 9, 28)
+
+
+def test_an_endless_holiday_returns_none_not_a_plausible_date():
+    """못 찾으면 `None`이다 — 「모름」을 그럴듯한 날짜로 접으면 08-18이 반복된다."""
+    assert market_calendar.next_trading_day(date(2026, 9, 23), _CHUSEOK, max_lookahead=2) is None

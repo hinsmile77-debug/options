@@ -75,6 +75,35 @@ def _delta_baseline_metric(
     }
 
 
+def _preemptive_decision_metric(target: date, calendar: dict) -> dict:
+    """반환: 「오늘 결정을 내리면 실제로 반영되는 날」 — 사전 대응 규칙의 발동 창.
+
+    입력: 집계 대상일과 휴장일 달력.
+    계산: `market_calendar.next_trading_day()`. **달력을 여기 다시 적지 않는다**(규약 A).
+
+    해석: 2026-09-22 (09-22 보고서 제4부 P2-1). 발동 창은 **「다음 거래일 장전(07:30 기동
+         전)」**이고 점검 세션은 08:00에 돈다 — **구조적으로 못 맞춘다.** 그래서 어느
+         회차가 결정을 내려도 반영은 언제나 다음 거래일이고, 이 결정은 그 사이에
+         **24거래일째** 미뤄졌다. 그 「하루」가 실제로 며칠인지가 지금까지 산출물에
+         안 남아서, 미루는 대가를 사람이 매번 달력으로 암산해야 했다.
+
+         🔴 **`effective_in_calendar_days`가 1이 아닌 날이 있다는 것이 이 축의 요점이다.**
+         09-23(수)에 정하면 반영일은 09-28로 **5일 뒤**다(추석 09-24·25 + 주말).
+         「항상 D+1」로 읽으면 연휴 앞에서 나흘을 조용히 잃는다.
+
+    실패 조건: 달력이 답을 못 주면 두 값 다 `None` — **「내일」로 접지 않는다.**
+              ⛔ 임계도 경보선도 없다(§8-4와 같은 규약) — 이 절은 **세기만 하고**,
+              발동은 사람이 누른다(2026-07-08 페이서 분리 500 폭주 203분).
+    """
+    effective = market_calendar.next_trading_day(target, calendar)
+    return {
+        "effective_date": effective.isoformat() if effective else None,
+        # 달력상 며칠 뒤인가. 1이 보통이고, 연휴 앞에서는 더 크다.
+        "effective_in_calendar_days": (effective - target).days if effective else None,
+        "target_holiday_name": market_calendar.holiday_name(target, calendar),
+    }
+
+
 # ===== 2026-08-19 장후 (08-19 보고서 Fix#8) — **과거 날짜 재생성은 일부 값을 파괴한다** =====
 #
 # ## 무엇이 일어났는가
@@ -245,6 +274,9 @@ def build(target: date, out_dir: Path, use_db: bool) -> Path:
     # **가설이 참조할 수 있으려면 `metrics` 본체에 실려야 한다**(아래 `levers`/`watchdog`과 같은
     # 이유). `2026-08-19-fix3-delta-baseline-is-a-trading-day`의 주장 지표가 이것이다.
     metrics["delta_baseline"] = _delta_baseline_metric(target, baseline, calendar, previous)
+    # 2026-09-22 제4부 P2-1 — **전용 축**으로 둔다(규약 E). `delta_baseline`은 「비교 기준일」
+    # (과거)이고 이것은 「결정 반영일」(미래)이라, 같은 절에 얹으면 두 질문이 섞인다.
+    metrics["preemptive_decision"] = _preemptive_decision_metric(target, calendar)
 
     # 2026-08-12 Fix#6(규약 H) — **가설 검정보다 먼저 읽는다.** 검정이 이 값을 받아야
     # "레버가 꺼진 채 판정하는" 08-12의 오독을 막을 수 있다.

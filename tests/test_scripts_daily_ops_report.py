@@ -176,3 +176,54 @@ def test_a_collector_that_ignores_the_date_says_so_in_its_signature():
 def test_cumulative_paths_name_a_db_section(path):
     """오타가 나면 이 모듈은 **조용히 아무것도 보존하지 않는다** — 그래서 모양부터 못 박는다."""
     assert path.startswith("db.") and path.count(".") >= 2
+
+
+# ===== 사전 대응 규칙의 반영일 — 2026-09-22 제4부 P2-1 =====
+
+
+def test_the_effective_date_of_a_decision_is_the_next_trading_day():
+    """발동 창은 「다음 거래일 장전」이다 — 그 날짜를 산출물이 직접 센다.
+
+    지금까지는 사람이 달력으로 암산했고, `phases.md` A-2는 *"결정을 내릴 수 있는 시각이
+    하루에 한 순간도 없었다"*까지만 적고 **반영일은 안 적었다.**
+    """
+    from datetime import date
+
+    from scripts.daily_ops_report import _preemptive_decision_metric
+
+    cal = {"covered_through": "2026-12-31", "holidays": []}
+    got = _preemptive_decision_metric(date(2026, 9, 22), cal)
+    assert got["effective_date"] == "2026-09-23"
+    assert got["effective_in_calendar_days"] == 1
+
+
+def test_a_holiday_week_is_not_d_plus_one():
+    """🔴 09-22 보고서의 *"항상 D+1"*이 틀린 자리 — 09-23의 반영일은 09-28이다.
+
+    09-24·25 추석 휴장 + 26·27 주말. 「내일」로 접으면 나흘을 조용히 잃는다.
+    """
+    from datetime import date
+
+    from scripts.daily_ops_report import _preemptive_decision_metric
+
+    cal = {
+        "covered_through": "2026-12-31",
+        "holidays": [{"date": "2026-09-24", "name": "추석"},
+                     {"date": "2026-09-25", "name": "추석 다음날"}],
+    }
+    got = _preemptive_decision_metric(date(2026, 9, 23), cal)
+    assert got["effective_date"] == "2026-09-28"
+    assert got["effective_in_calendar_days"] == 5
+
+
+def test_an_unanswerable_calendar_leaves_none_not_tomorrow():
+    """⛔ 「모름」을 「내일」로 접지 않는다 — 08-18에 깨진 그 가정이 재발한다."""
+    from datetime import date
+
+    from scripts.daily_ops_report import _preemptive_decision_metric
+
+    holidays = [{"date": f"2026-10-{d:02d}", "name": "가상 연휴"} for d in range(1, 32)]
+    got = _preemptive_decision_metric(date(2026, 9, 30),
+                                      {"covered_through": "2026-12-31", "holidays": holidays})
+    assert got["effective_date"] is None
+    assert got["effective_in_calendar_days"] is None
