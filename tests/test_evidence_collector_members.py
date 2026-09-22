@@ -121,3 +121,75 @@ def test_the_denominator_tag_only_fires_when_the_lever_is_on_and_count_is_one():
     assert note(True, 0) == DENOMINATOR_NOTE, "0도 구조적 1.00이 나는 자리다"
     assert note(True, 2) == "", "분모가 2면 붙지 않는다"
     assert note(False, 1) == "", "레버가 꺼져 있으면 분모가 다른 값이다 — 붙으면 오탐이다"
+
+
+# ===== 비영 구간의 시각 — 2026-09-22 제5부 고도화 2 =====
+#
+# 09-22에 「비영 0(전 축 중립) 최장 74분」이 나왔는데 **그 구간이 몇 시인지 증거에 없어**
+# 구조적 사유(장전·단일가)인지 실제 신호 고갈인지 가리지 못했다. 값만으로는 안 갈린다.
+
+
+def test_consecutive_samples_with_the_same_value_are_one_run(collector):
+    """전이 줄은 형태가 바뀔 때만 찍힌다 — 같은 값이 이어지면 **한 구간**이다."""
+    runs = collector.nonzero_member_runs(
+        [("09:00:10", 0), ("09:30:00", 0), ("10:14:00", 2)], log_end="15:45:01",
+    )
+
+    assert [(r[0], r[1], r[2], r[3]) for r in runs] == [
+        ("09:00:10", "10:14:00", 74, 0),   # 09-22의 그 74분
+        ("10:14:00", "15:45:01", 331, 2),
+    ]
+
+
+def test_the_last_run_has_no_end_when_the_log_just_stops(collector):
+    """⚠ 마지막 구간은 「그때 끝났다」가 아니다 — 로그가 거기서 끊겼을 뿐이다."""
+    runs = collector.nonzero_member_runs([("09:00:00", 1)], log_end=None)
+
+    assert runs == [("09:00:00", None, None, 1)]
+
+
+def test_no_samples_is_not_a_run_of_zero(collector):
+    """**「비영 0이었다」가 아니다** — 옛 로그에는 그 값이 아예 없다(규약 C)."""
+    assert collector.nonzero_member_runs([], log_end="15:45:01") == []
+
+
+def test_a_value_that_returns_later_is_a_separate_run(collector):
+    """0 → 2 → 0은 **세 구간**이다. 접으면 「언제 중립이었나」가 사라진다."""
+    runs = collector.nonzero_member_runs(
+        [("09:00:00", 0), ("10:00:00", 2), ("11:00:00", 0)], log_end="11:30:00",
+    )
+
+    assert [r[3] for r in runs] == [0, 2, 0]
+    assert [r[2] for r in runs] == [60, 60, 30]
+
+
+# ---- 판정 무변경 축 (B등급 규약) ----
+
+
+def test_the_shared_axis_is_untouched(collector):
+    """⛔ `member_nonzero`에 얹지 않았다 — `min`/`max`/`len`이 걸려 있는 공유 축이다(규약 E).
+
+    새 축이 옛 축의 값을 한 글자도 바꾸면 안 된다. 바꾸면 §5-2의 「비영 최소·최대」 줄이
+    조용히 움직인다.
+    """
+    scan = collector.LoopScan()
+    for line in ("2026-09-22 09:00:10,000 INFO:mahdi.fusion:" + NEW,
+                 "2026-09-22 10:14:00,000 INFO:mahdi.fusion:" + NEW):
+        scan.feed(line)
+
+    assert scan.member_nonzero == [2, 2], "공유 축은 종전 그대로 값만 쌓는다"
+    assert scan.member_nonzero_at == [("09:00:10", 2), ("10:14:00", 2)]
+    assert scan.member_transitions == 2
+
+
+def test_the_old_wording_adds_nothing_to_the_new_axis(collector):
+    """옛 로그(Fix#6 이전)에는 비영 값이 없다 — 새 축도 **비어 있어야** 한다.
+
+    「안 셌다」를 「0이었다」로 접으면 09-22의 74분이 옛 로그에서도 허위로 나온다.
+    """
+    scan = collector.LoopScan()
+    scan.feed("2026-08-18 09:00:10,000 INFO:mahdi.fusion:" + OLD)
+
+    assert scan.member_nonzero == []
+    assert scan.member_nonzero_at == []
+    assert scan.member_transitions == 1, "전이 자체는 셌다 — 없는 것은 비영 값뿐이다"

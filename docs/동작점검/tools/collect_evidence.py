@@ -705,6 +705,11 @@ class LoopScan:
         # 2026-08-19 Fix#6 — 새 문구가 실은 「비영 N」들. 옛 로그에서는 **빈 목록**이고,
         # 그것은 「비영이 0이었다」가 아니라 **「안 셌다」**다.
         self.member_nonzero = []
+        # 2026-09-22 제5부 고도화 2 — 위 축의 **시각 짝**. `member_nonzero`에는 `min`/`max`/
+        # `len`이 걸려 있어 거기에 얹으면 세 줄이 같이 흔들린다(규약 E — 전용 축으로 둔다).
+        # 09-22에 「비영 0 최장 74분」이 나왔는데 **그 구간이 몇 시인지 증거에 없어** 구조적
+        # 사유(장전·단일가)인지 실제 신호 고갈인지 가리지 못했다.
+        self.member_nonzero_at = []                       # [(hhmmss, 비영 수)]
         self.member_conviction = collections.Counter()
         self.member_total = None                          # 분모(6) — 로그가 알려 준다
         # 2026-08-14 고도화 3 — 계측 부재 신고. 상세 근거는 `MEASUREMENT_MAP` 주석.
@@ -770,6 +775,7 @@ class LoopScan:
                 # 「비영 0」과 「안 셌다」는 조치가 다르다(전자는 사고, 후자는 옛 로그다).
                 if mm.group(4) is not None:
                     self.member_nonzero.append(int(mm.group(4)))
+                    self.member_nonzero_at.append((hhmmss, int(mm.group(4))))
                 if mm.group(5):
                     self.member_conviction[mm.group(5)] += 1
                 for name in MEMBER_NAME_RE.findall(mm.group(1)):
@@ -1176,6 +1182,39 @@ def discarded_items(root: Path):
 # 「7일 전 것이 있으니 정상」이 된다. 연휴 최대치(추석·설 4~5일)를 덮으면서 그보다 긴 침묵은
 # 사건으로 남기는 자리가 5다. 못 찾으면 **적신호를 낸다** — 이 fix는 경보를 끄는 것이 아니다.
 PREV_SIDECAR_MAX_BACKTRACK_DAYS = 5
+
+
+def nonzero_member_runs(samples, log_end=None):
+    """반환: `[(시작 hhmmss, 종료 hhmmss 또는 None, 지속 분, 비영 수)]` — 같은 값이 이어진 구간.
+
+    입력: `Scan.member_nonzero_at`(`[(hhmmss, 비영 수)]`)과 로그 마지막 레코드 시각.
+
+    해석: 2026-09-22 제5부 고도화 2. §5-2는 「비영 최소 N · 최대 M」만 적어서, 09-22의
+         「비영 0(전 축 중립) 최장 74분」이 **몇 시였는지** 다음 회차가 알 수 없었다.
+         그 74분이 장전·단일가 같은 **구조적 사유**인지 실제 **신호 고갈**인지는 시각을
+         봐야 갈리고, 그러려면 로그를 다시 통째로 훑어야 했다.
+
+    ⚠ **「종료」는 관측이 아니라 추론이다.** 「판단 형태 전이」 줄은 **형태가 바뀔 때만**
+      찍힌다(`MEMBER_TOKEN` 위 절 주석). 그래서 한 구간의 끝은 **다음 전이 줄의 시각**이지
+      「그때 끝나는 것을 봤다」가 아니다. 호출측이 그 사실을 함께 인쇄한다 — 안 적으면
+      다음 회차가 이 표를 관측으로 오독한다(규약 C와 같은 취지).
+
+    ⚠ **마지막 구간은 종료가 `None`이다** — 로그 끝까지 이어진 것이고, 「그 시각에 끝났다」가
+      아니다. 호출측이 `log_end`를 「로그 끝」이라고 밝혀 적는다.
+
+    실패 조건: 없다 — 표본이 없으면 빈 목록이다(**「비영 0이었다」가 아니다**).
+    """
+    runs = []
+    for hhmmss, value in samples:
+        if runs and runs[-1][3] == value:
+            continue  # 같은 값이면 같은 구간이다 — 전이 줄은 형태가 바뀔 때만 찍힌다.
+        runs.append([hhmmss, None, None, value])
+    for i, run in enumerate(runs):
+        end = runs[i + 1][0] if i + 1 < len(runs) else log_end
+        run[1] = end
+        if end:
+            run[2] = max(hhmm_to_min(end[:5]) - hhmm_to_min(run[0][:5]), 0)
+    return [tuple(r) for r in runs]
 
 
 def _previous_priority_retry(auto: Path, day: _date):
@@ -2589,6 +2628,27 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
         if scan.member_conviction:
             A("- 확신도: " + ", ".join(f"{k} ×{v}" for k, v in scan.member_conviction.most_common()))
         A("")
+        # 2026-09-22 제5부 고도화 2 — **언제였는지**를 함께 낸다. 상세 근거는
+        # `nonzero_member_runs()` docstring. 값만으로는 구조적 사유와 신호 고갈이 안 갈린다.
+        # ⚠ 위 불릿 목록 **뒤에** 낸다 — 사이에 끼우면 「확신도」 줄이 표 밑으로 밀린다.
+        runs = nonzero_member_runs(scan.member_nonzero_at, scan.last[0] if scan.last else None)
+        if runs:
+            A("| 비영 구간 시작 | 종료 | 지속 | 비영 |")
+            A("|---|---|---|---|")
+            for start, end, minutes, value in runs:
+                if end is None:
+                    end_cell, dur = "(로그 끝 — 모름)", "—"
+                else:
+                    end_cell = end
+                    dur = "—" if minutes is None else f"{minutes}분"
+                A(f"| {start} | {end_cell} | {dur} | {value}/{scan.member_total} |")
+            A("")
+            A("> ⚠ **「종료」는 관측이 아니라 다음 전이 줄의 시각이다** — 「판단 형태 전이」는")
+            A("> **형태가 바뀔 때만** 찍히므로, 그 사이에 무엇을 봤다는 뜻이 아니다. 마지막")
+            A("> 줄은 로그 끝까지 이어진 구간이라 **종료가 없다**(「그때 끝났다」가 아니다).")
+            A("> **비영 0이 길게 이어진 구간은 시각을 먼저 보라** — 장전·단일가 같은 구조적")
+            A("> 사유인지 실제 신호 고갈인지는 값이 아니라 그 시간대가 가른다(09-22 §2-4).")
+            A("")
         A("> **최초 편입 시각이 09:00보다 한참 뒤면 그 멤버는 장전 내내 죽어 있었던 것이다.**")
         A("> 08-14에 `options_flow`가 넉 달 만에 09:01:10에 합류했고, 같은 날 오후 입력 고갈로")
         A("> 다시 빠졌다 — 두 사건 다 이 표 한 줄로 보인다.")
@@ -3088,6 +3148,15 @@ def build(root: Path, day: _date, phase: str, cfg_phases) -> str:
     A("")
     A("> ⛔ **판정하지 않는다**(§8-2·§8-3과 같은 규약) — 임계도 경보선도 없다. 발동은 사람이")
     A("> 정하고(2026-07-08 페이서 분리 500 폭주 203분), **발동 창은 다음 거래일 장전**이다.")
+    # 2026-09-22 제4부 P2-1 — **날짜를 여기서 세지 않는다.** 이 파일은 stdlib 전용이라
+    # 휴장일 달력을 못 읽고, 달력을 여기 다시 적으면 두 곳이 조용히 갈라진다(규약 A —
+    # 위 `PREV_SIDECAR_MAX_BACKTRACK_DAYS` 절 주석과 같은 이유). 계산은 달력을 이미 쓰는
+    # `scripts/daily_ops_report._preemptive_decision_metric()`이 하고, 여기서는 **「내일」과
+    # 「다음 거래일」이 다른 날일 수 있다**는 사실만 못 박는다 — 리포트가 적은 「항상 D+1」은
+    # 틀렸고(09-23의 반영일은 09-28), 그 오독이 2026-08-18의 「평일 = 거래일」 재발이다.
+    A("> ⚠ **「다음 거래일」은 「내일」이 아닐 수 있다** — 주말·휴장일이 끼면 며칠 뒤다.")
+    A("> 그 날짜는 지표 사이드카 `preemptive_decision.effective_date`가 **거래일 달력**으로")
+    A("> 계산해 싣는다. **여기서 세지 않는다**(이 파일은 달력을 안 읽는다 — 규약 A).")
     A("> 사람이 그 시간대를 레버에 넣으면 이 수는 **다음 거래일에 저절로 0이 된다** —")
     A("> 「닫혔다」를 따로 적어 줄 필요가 없다.")
     A("")
