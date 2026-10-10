@@ -168,12 +168,17 @@ call uv run python scripts\premarket_levels_publish.py >> "%LOG_FILE%" 2>&1
 if errorlevel 1 echo [%date% %time%] 경고: 맥점 예측 준비 실패 (계속 진행) >> "%LOG_FILE%"
 
 echo [%date% %time%] COCKPIT 대시보드 실행 (새 창) >> "%LOG_FILE%"
-start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && uv run streamlit run mahdi/dashboard/app.py >> logs\cockpit.log 2>&1"
+REM 2026-10-10 — COCKPIT 창 맨 위에 접속 주소 배너를 찍는다. Streamlit 출력은 전부 cockpit.log 로
+REM 가서 창이 비어 있었다 — 브라우저는 자동으로 열지 않으므로(아래 주석) 이 주소를 복사해 붙여 넣는다.
+REM 포트를 --server.port 로 명시해 배너와 실제 포트가 어긋나지 않게 한다.
+set "COCKPIT_PORT=8501"
+start "Mahdi COCKPIT" cmd /k "cd /d %PROJECT_DIR% && echo ================================================================&& echo   MAHDI Command Center — 아래 주소를 복사해 브라우저에 붙여 넣기&& echo     http://localhost:%COCKPIT_PORT%&& echo ================================================================&& echo.&& uv run streamlit run mahdi/dashboard/app.py --server.port %COCKPIT_PORT% >> logs\cockpit.log 2>&1"
 REM 2026-10-10 — **기동은 서버만 띄우고 브라우저는 열지 않는다.**
 REM .streamlit\config.toml 의 headless=true 로 Streamlit 도 브라우저를 열지 않으므로, 자동 기동
 REM (작업 스케줄러 08:xx · 워치독 재기동)은 화면에 아무 탭도 띄우지 않고 백그라운드로만 돈다.
 REM 워치독 재기동이 이 스크립트를 그대로 부르므로, 예전처럼 여기서 열면 재기동마다 탭이 하나씩 늘었다.
-REM 화면이 필요하면 scripts\open_mahdi_cockpit.bat 로 수동으로 연다(서버 응답 확인 후 연다).
+REM 화면이 필요하면 COCKPIT 창 배너의 주소를 복사해 브라우저에 붙여 넣거나,
+REM scripts\open_mahdi_cockpit.bat 로 연다(서버 응답 확인 후 연다).
 REM 2026-09-20 의 「브라우저를 COCKPIT 창의 자손이 아니게 연다」 원칙은 그 스크립트가 이어받는다 —
 REM 별도 프로세스에서 열므로 15:45 의 taskkill /T 가 Chrome 에 닿지 않는다.
 
