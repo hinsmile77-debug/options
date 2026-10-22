@@ -1,0 +1,638 @@
+{
+  "date": "2026-10-09",
+  "cycles": {
+    "count": 0,
+    "by_hour": [],
+    "by_mod10": [],
+    "congested": {
+      "hours": [
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "cycles": 0,
+      "rest_p50": null,
+      "rest_p95": null,
+      "rest_max": null,
+      "end_second_p50": null,
+      "end_second_p95": null,
+      "end_second_max": null,
+      "ended_before_55s_pct": null
+    },
+    "close_shift": {
+      "before_window": [
+        "13:20",
+        "15:20"
+      ],
+      "after_from": "15:20",
+      "before_cycles": 0,
+      "after_cycles": 0,
+      "before_p50": null,
+      "after_p50": null,
+      "before_max": null,
+      "after_max": null,
+      "drop_pct": null
+    },
+    "close_window": {
+      "window": [
+        "15:00",
+        "15:21"
+      ],
+      "cycles": 0,
+      "rows_zero_minutes": [],
+      "rows_zero_count": 0,
+      "max_consecutive": 0
+    },
+    "missing": {
+      "count": 0,
+      "list": [],
+      "downtime_count": 0,
+      "infra_count": 0
+    },
+    "duplicate_poll_minutes": {
+      "count": 0,
+      "list": [],
+      "labelled": 0
+    }
+  },
+  "rest": {
+    "total_calls": 0,
+    "calls_per_second": null,
+    "capacity_pct": null
+  },
+  "backoff": {
+    "expand": 0,
+    "recover": 0,
+    "max_multiplier": 1.0,
+    "mean_multiplier_by_hour": {}
+  },
+  "bursts": {},
+  "stalls": [],
+  "slow_calls": {
+    "count": 0,
+    "pacer_dominant": 0,
+    "http_dominant": 0,
+    "samples": [],
+    "censored": {
+      "count": 0,
+      "by_endpoint": {},
+      "by_minute": {},
+      "phase_minutes": [
+        0,
+        1,
+        2,
+        3,
+        30,
+        31,
+        32,
+        33
+      ],
+      "phase_count": 0,
+      "phase_concentration": null,
+      "phase_baseline": 0.133,
+      "phase_ratio": null,
+      "samples": []
+    }
+  },
+  "rest_latency": {},
+  "atm_rolls": {
+    "count": 0,
+    "round_trips": 0,
+    "round_trip_pct": null
+  },
+  "budget_exceeded": {
+    "count": 0,
+    "skipped_legs_total": 0,
+    "priority_cut_minutes": null,
+    "priority_before_others_minutes": null,
+    "labelled": 0,
+    "samples": []
+  },
+  "timeout_abort": {
+    "count": 0,
+    "skipped_legs_total": 0,
+    "priority_cut_minutes": null,
+    "priority_before_others_minutes": null,
+    "labelled": 0,
+    "minutes": [],
+    "samples": []
+  },
+  "catchups": {
+    "count": 0,
+    "minutes": []
+  },
+  "priority_retry": {
+    "cycles": 0,
+    "attempted": 0,
+    "recovered": 0,
+    "failed_cycles": 0,
+    "failed_minutes": [],
+    "total_failure_cycles": 0,
+    "total_failure_minutes": [],
+    "recovery_pct": null
+  },
+  "ws_disconnect": {
+    "count": 0,
+    "by_hour": {},
+    "busiest_hour": null,
+    "busiest_hour_count": 0,
+    "first_at": null,
+    "last_at": null
+  },
+  "poller_phase": {},
+  "log_volume": {
+    "total_bytes": 0,
+    "total_lines": 0,
+    "httpx_bytes": 0,
+    "httpx_pct": null,
+    "human_lines": 0,
+    "traceback_lines": 0,
+    "httpx_lines": 0,
+    "by_level": {}
+  },
+  "qualitative": {
+    "expiry_burst_done": 0,
+    "member_axis_exit": 0,
+    "member_axis_return": 0,
+    "regime_warmup_end": 0,
+    "position_opened": 0,
+    "position_closed": 0,
+    "position_qty_changed": 0,
+    "orphan_position": 0,
+    "order_notice_subscribed": 0,
+    "order_notice_received": 0,
+    "order_notice_not_configured": 0,
+    "order_notice_stream_down": 0,
+    "notice_stream_reconnect": 0,
+    "order_submitted": 0,
+    "order_blocked": 0,
+    "order_state_changed": 0,
+    "exit_triggered": 0,
+    "exit_price_missing": 0,
+    "forced_flat_verified": 0,
+    "balance_poll_failed": 0,
+    "entry_no_candidate": 0,
+    "gamma_flip_out_of_leg_range": 0,
+    "gamma_flip_uncomputable": 0,
+    "alert_suppressed_toggle_off": 0,
+    "tick_rule_fallback": 0,
+    "rest_latency_pressure": 0,
+    "chain_cycle_empty": 0
+  },
+  "qualitative_suppressed": {},
+  "process_starts": [],
+  "parser_audit": {
+    "blind": {},
+    "loose_counts": {}
+  },
+  "failures": {},
+  "failures_by_cause": {},
+  "overrun": {
+    "count": 0,
+    "max_seconds": 0.0,
+    "total_seconds": 0
+  },
+  "failure_budget_abort": {
+    "count": 0,
+    "skipped_legs_total": 0,
+    "priority_cut_minutes": null,
+    "priority_before_others_minutes": null,
+    "labelled": 0,
+    "minutes": []
+  },
+  "overrun_by_poller": {},
+  "delta_baseline": {
+    "date": "2026-10-08",
+    "baseline_is_trading_day": 1,
+    "skipped_non_trading_days": 0,
+    "target_is_trading_day": 0,
+    "target_holiday_name": "한글날",
+    "calendar_coverage_gap_days": 0,
+    "sidecar_found": 1
+  },
+  "preemptive_decision": {
+    "effective_date": "2026-10-12",
+    "effective_in_calendar_days": 3,
+    "target_holiday_name": "한글날"
+  },
+  "levers": {
+    "levers": [
+      {
+        "key": "use_effective_member_count",
+        "위치": "strategy_params.yaml",
+        "value": true,
+        "default": false,
+        "on": true
+      },
+      {
+        "key": "reentry_cooldown_minutes",
+        "위치": "strategy_params.yaml · strategy_gates",
+        "value": 0,
+        "default": 0,
+        "on": false
+      },
+      {
+        "key": "SIGNAL_FUSION_PHASE_OFFSET_SECONDS",
+        "위치": "mahdi/main.py",
+        "value": 55.0,
+        "default": 10.0,
+        "on": true
+      },
+      {
+        "key": "OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS",
+        "위치": "mahdi/main.py",
+        "value": {
+          "9": 4,
+          "10": 4,
+          "11": 4,
+          "12": 4,
+          "13": 4,
+          "14": 4
+        },
+        "default": {},
+        "on": true
+      },
+      {
+        "key": "OPTION_CHAIN_READ_TIMEOUT_SECONDS",
+        "위치": "mahdi/broker/rest_client.py",
+        "value": null,
+        "default": null,
+        "on": false
+      },
+      {
+        "key": "REGIME_RESTORE_SESSION_WINDOW",
+        "위치": "mahdi/engines/regime_pipeline.py",
+        "value": false,
+        "default": false,
+        "on": false
+      }
+    ],
+    "git_head": "bc65b05"
+  },
+  "watchdog": {
+    "checks": 6,
+    "restarts": 0,
+    "restart_failures": 0,
+    "alert_only": 0,
+    "degraded_checks": 0,
+    "recovered_episodes": 0,
+    "episode_sequence_notes": 0,
+    "missing_check_alerts": 0,
+    "stale_lock_sweeps": 0,
+    "max_silence_minutes": 400.2,
+    "silence_over_cadence_ratio": 40.02,
+    "max_silence_window": "07:40~14:20",
+    "first_at": "14:20:14",
+    "last_at": "15:40:01",
+    "silence_warn_minutes": 20.0,
+    "invocation_trail_available": true,
+    "invocations": 65,
+    "invocations_in_window": 63,
+    "max_invocation_gap_minutes": 400.2,
+    "invocation_gap_over_cadence_ratio": 400.23,
+    "max_invocation_gap_window": "07:40~14:20",
+    "invocation_first_at": "14:20:14",
+    "invocation_last_at": "15:46:01",
+    "invocation_actions": {
+      "idle": 65
+    },
+    "invocation_cadence_minutes": 1.0,
+    "invocation_gap_warn_minutes": 5.0
+  },
+  "crash": {
+    "starts": 0,
+    "crashes": 0,
+    "causes": {},
+    "events": [],
+    "unattributed": 3,
+    "marker_present": false,
+    "intentional_stops": 0,
+    "clean_shutdowns": 1,
+    "clean_shutdown_source": "로그줄",
+    "marketclose_marker_day": "2026-10-09",
+    "unexplained_deaths": 0
+  },
+  "db": {
+    "tables": [
+      {
+        "table": "option_analysis_1m",
+        "rows": 0,
+        "minutes": 0,
+        "note": "옵션체인 그릭스"
+      },
+      {
+        "table": "underlying_spot_1m",
+        "rows": 0,
+        "minutes": 0,
+        "note": "기초자산 스팟"
+      },
+      {
+        "table": "market_raw_1m",
+        "rows": 0,
+        "minutes": 0,
+        "note": "WS 체결 1분봉"
+      },
+      {
+        "table": "investor_flow_1m",
+        "rows": 0,
+        "minutes": 0,
+        "note": "투자자 수급"
+      },
+      {
+        "table": "expiry_liquidity_1m",
+        "rows": 0,
+        "minutes": 0,
+        "note": "만기 유동성"
+      },
+      {
+        "table": "macro_snapshot_5m",
+        "rows": 0,
+        "minutes": 0,
+        "note": "매크로"
+      },
+      {
+        "table": "account_balance_snapshots",
+        "rows": 0,
+        "minutes": 0,
+        "note": "계좌 잔고"
+      },
+      {
+        "table": "signal_decisions",
+        "rows": 0,
+        "minutes": 0,
+        "note": "판단"
+      },
+      {
+        "table": "risk_snapshots",
+        "rows": 0,
+        "minutes": 0,
+        "note": "리스크 스냅샷"
+      },
+      {
+        "table": "regime_state",
+        "rows": 0,
+        "minutes": 0,
+        "note": "레짐"
+      },
+      {
+        "table": "feature_store",
+        "rows": 0,
+        "minutes": 0,
+        "note": "레짐 피처"
+      },
+      {
+        "table": "rate_limiter_status_history",
+        "rows": 0,
+        "minutes": 0,
+        "note": "레이트리밋 이력"
+      },
+      {
+        "table": "market_halt_event_history",
+        "rows": 0,
+        "minutes": 0,
+        "note": "CB 전이 이력"
+      },
+      {
+        "table": "decision_outcomes",
+        "rows": 0,
+        "minutes": 0,
+        "note": "판단 사후 평가"
+      },
+      {
+        "table": "execution_logs",
+        "rows": 0,
+        "minutes": 0,
+        "note": "주문 실행 이력(사람이 주문한 날만 자란다)"
+      }
+    ],
+    "chain_minute_coverage": {
+      "available": false
+    },
+    "monthly_leg_completeness": {
+      "available": false
+    },
+    "spot_source_divergence": {
+      "available": false,
+      "reason": "지수/선물 공통 분 없음"
+    },
+    "book_coverage": [],
+    "book_gamma_map": [],
+    "wide_oi_landscape": [],
+    "member_availability": {
+      "available": false,
+      "reason": "member_unavailable 미기록(2026-08-04 고도화#2 이전)"
+    },
+    "member_score_quality": {
+      "available": false,
+      "reason": "member_scores 미기록(2026-08-05 고도화#4 이전)"
+    },
+    "strike_window_quality": {
+      "available": false,
+      "reason": "먼슬리 북 식별 불가(만기유동성·판단 이력 모두 없음)"
+    },
+    "signal_decisions": [],
+    "decisions": {
+      "total": 0,
+      "member_count": {
+        "available": false,
+        "reason": "effective_member_count 미기록(2026-08-06 고도화#2 이전)"
+      },
+      "decision": {},
+      "conviction": {},
+      "reject_reason": {},
+      "vrp": {
+        "non_null": 0,
+        "non_null_ratio": null
+      },
+      "entry_strategies": {},
+      "distinct_entry_strategies": 0,
+      "entry_cutoff": {
+        "cutoff_time": "14:50",
+        "forced_flat_time": "15:10",
+        "blocked_count": 0,
+        "enter_after_cutoff": 0,
+        "enter_after_forced_flat": 0
+      },
+      "selected_instruments": {
+        "available": true,
+        "recorded_minutes": 0,
+        "enter_minutes": 0,
+        "enter_minutes_with_candidate": 0,
+        "enter_minutes_with_candidate_pct": null,
+        "reason": {},
+        "leg_count": 0,
+        "symbol_resolved_pct": null,
+        "expiry_day_leg_count": 0,
+        "order_submitted_true_count": 0,
+        "strategy_attempts": {},
+        "strategy_rejected": {}
+      }
+    },
+    "signal_reach": {
+      "available": false
+    },
+    "decision_outcomes": {
+      "available": false,
+      "reason": "그날 ENTER 판단 없음 또는 미계산"
+    },
+    "risk_gate_distinct": 0,
+    "regime": {
+      "visits": [
+        {
+          "regime": "1",
+          "today": 0,
+          "total": 33,
+          "days": 1
+        },
+        {
+          "regime": "2",
+          "today": 0,
+          "total": 9849,
+          "days": 26
+        },
+        {
+          "regime": "3",
+          "today": 0,
+          "total": 7045,
+          "days": 37
+        },
+        {
+          "regime": "5",
+          "today": 0,
+          "total": 8806,
+          "days": 32
+        },
+        {
+          "regime": "7",
+          "today": 0,
+          "total": 14,
+          "days": 1
+        }
+      ],
+      "today_total": 0,
+      "trend_minutes": 0,
+      "warmup_minutes": 0,
+      "warmup_runs": 0,
+      "warmup_restart_minutes": 0,
+      "warmup_unknown_minutes": 0
+    },
+    "regime_vs_futures_bars": {
+      "available": true,
+      "futures_symbol": "A01612",
+      "futures_bar_minutes": 0,
+      "regime_minutes": 0,
+      "gap": 0,
+      "minutes": []
+    },
+    "feature_store": {
+      "today": 0,
+      "total": 24169,
+      "hmm_threshold": 8000,
+      "hmm_progress_pct": 302.1,
+      "non_neutral_pct": {},
+      "model": {
+        "trained_at": "2026-08-10T16:56:34",
+        "samples": 8223,
+        "sessions": 21,
+        "feature_version": "v1",
+        "iv_chg_source": "먼슬리 단독 재계산(이력 7832/8242행, 95.0%)",
+        "db_rows_modified": false
+      }
+    },
+    "macro": {
+      "vix_front": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "vix_next": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "vix_term_structure": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "usdcnh": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "es_front": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "zn_front": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "us10y_yield": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "usdkrw": {
+        "non_null": 0,
+        "distinct": 0
+      },
+      "move_index": {
+        "non_null": 0,
+        "distinct": 0
+      }
+    },
+    "market_halt": {
+      "updated_at": "15:40:58",
+      "last_message_at": null
+    },
+    "ws_status": {
+      "updated_at": "15:40:58",
+      "connected_since": "14:25:15",
+      "last_message_at": "15:34:59",
+      "reconnect_count_today": 2,
+      "market_op_subscribed_at": "14:25:19",
+      "atm_roll_count_today": 57,
+      "atm_roll_dropped_subs_today": 184
+    },
+    "remaining_processes": 0,
+    "rate_limiter": {
+      "rows": 0,
+      "overrun_rows": 0,
+      "max_multiplier": null,
+      "mean_multiplier": null
+    },
+    "positions": {
+      "available": true,
+      "rows": 0,
+      "snapshot_minutes": 0,
+      "symbols": 0,
+      "max_concurrent_symbols": 0,
+      "side_distribution": {},
+      "unknown_side_count_max": 0
+    },
+    "slack_alerts": {
+      "available": true,
+      "enabled": false,
+      "source": "slack_alert_settings"
+    },
+    "ledger": {
+      "opened": 0,
+      "closed": 0,
+      "open_now": 0,
+      "unknown_entry_time": 0,
+      "origin": {},
+      "trades": 0,
+      "trades_without_net_pnl": 0
+    },
+    "order_notices": {
+      "notices": 0,
+      "field_count_mismatched": 0,
+      "field_count_distribution": {}
+    },
+    "orders": {
+      "submitted": 0,
+      "by_state": {},
+      "open": 0,
+      "filled": 0,
+      "rejected": 0
+    }
+  }
+}
