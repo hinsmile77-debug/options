@@ -6757,7 +6757,8 @@ def _due_series(poll_time: datetime) -> list[str]:
 
 
 def test_the_congestion_lever_is_on_since_20260831():
-    """**레버가 켜졌다** — 2026-08-31 저녁(10~14시), 그리고 **2026-09-15 아침에 9시가 추가**됐다.
+    """**레버가 켜졌다** — 2026-08-31 저녁(10~14시), **2026-09-15 아침에 9시**, **2026-10-22 저녁에
+    15시**가 추가됐다(`2026-10-22-eE-adds-fifteen-to-congested-hours`).
 
     `2026-08-12-eE-on-congested-hours`(유예 9회)의 발동이 앞의 것이고, 9시 추가는
     `2026-09-15-eE-adds-nine-to-congested-hours`다 — 09-09·10·11·14 **나흘 연속 미결** 끝에
@@ -6770,7 +6771,9 @@ def test_the_congestion_lever_is_on_since_20260831():
     """
     from mahdi.main import OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS
 
-    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {9: 4, 10: 4, 11: 4, 12: 4, 13: 4, 14: 4}
+    assert OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS == {
+        9: 4, 10: 4, 11: 4, 12: 4, 13: 4, 14: 4, 15: 4,
+    }
     # 혼잡 시간대(10시) — 위클리가 4분 주기로 격분된다.
     assert _due_series(datetime(2026, 9, 1, 10, 0)) == ["regular", "weekly_mon"]
     assert _due_series(datetime(2026, 9, 1, 10, 1)) == ["regular", "weekly_thu"]
@@ -6781,10 +6784,16 @@ def test_the_congestion_lever_is_on_since_20260831():
     assert _due_series(datetime(2026, 9, 15, 9, 1)) == ["regular", "weekly_thu"]
     assert _due_series(datetime(2026, 9, 15, 9, 2)) == ["regular"]
     assert _due_series(datetime(2026, 9, 15, 9, 3)) == ["regular"]
-    # 규칙 밖 시간대(15시) — 종전 2분 주기 그대로다. **레버는 10~14시와 9시만 덮는다.**
-    assert _due_series(datetime(2026, 9, 15, 15, 0)) == ["regular", "weekly_mon"]
-    assert _due_series(datetime(2026, 9, 15, 15, 1)) == ["regular", "weekly_thu"]
-    assert _due_series(datetime(2026, 9, 15, 15, 2)) == ["regular", "weekly_mon"]
+    # 15시 — 2026-10-22 저녁 사용자 (A) 선택으로 **같은 4분 주기**다(종전에는 2분 주기였다).
+    # 예측치: `2026-10-22-eE-adds-fifteen-to-congested-hours`.
+    assert _due_series(datetime(2026, 10, 23, 15, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 10, 23, 15, 1)) == ["regular", "weekly_thu"]
+    assert _due_series(datetime(2026, 10, 23, 15, 2)) == ["regular"]
+    assert _due_series(datetime(2026, 10, 23, 15, 3)) == ["regular"]
+    # 규칙 밖 시간대(8시) — 종전 2분 주기 그대로다. **레버는 9–15시만 덮는다.**
+    assert _due_series(datetime(2026, 10, 23, 8, 0)) == ["regular", "weekly_mon"]
+    assert _due_series(datetime(2026, 10, 23, 8, 1)) == ["regular", "weekly_thu"]
+    assert _due_series(datetime(2026, 10, 23, 8, 2)) == ["regular", "weekly_mon"]
 
 
 def test_pulling_the_lever_halves_weekly_polling_in_that_hour_only(monkeypatch):

@@ -316,8 +316,11 @@ def test_the_premise_lever_column_is_field_absence_not_a_parser_bug(collector):
     `SIGNAL_FUSION_PHASE_OFFSET_SECONDS`를 전제레버로 달았다(3주 방치돼 있던 레버를 켠 항목).
     **이 수가 오르는 것 자체가 이 테스트가 바라는 동작이다** — 새 항목이 규약 H(전제 레버가
     꺼진 날의 숫자로 판정하지 않는다)를 실제로 쓰고 있다는 뜻이므로.
+
+    2026-10-22: 다섯 → **여섯**. `2026-10-22-eE-adds-fifteen-to-congested-hours`가 혼잡 레버
+    `OPTION_CHAIN_SLOW_SERIES_CONGESTED_HOURS`를 전제레버로 달았다(15시 추가 발동).
     """
     yaml_text = (PROJECT_ROOT / "docs" / "동작점검" / "hypotheses.yaml").read_text(encoding="utf-8")
-    assert yaml_text.count("\n  전제레버:") == 5, "이 수가 바뀌면 위 판정을 다시 해야 한다"
+    assert yaml_text.count("\n  전제레버:") == 6, "이 수가 바뀌면 위 판정을 다시 해야 한다"
     schedule = collector.lever_schedule(PROJECT_ROOT)
     assert "use_effective_member_count" in schedule
