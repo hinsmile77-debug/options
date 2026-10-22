@@ -124,6 +124,33 @@ def _to_float(value) -> float:
     return float(value) if value not in (None, "") else 0.0
 
 
+# ===== 2026-10-22 (10-22 제4부 Fix A) — output2 결손 예외에 **KIS가 뭐라고 했는지**를 싣는다 =====
+#
+# 10-13–10-22 여드레 동안 잔고 폴링이 전량 실패했는데(10-22 사이드카 99건 · 성공 0건), 그 로그의
+# 트레이스백 마지막 줄은 매번 「output2가 없습니다」 한 문장뿐이었다. KIS가 거부 코드를 보냈는지,
+# 정상 응답인데 필드 모양이 다른지가 **한 번도 기록되지 않아** 원인을 못 가렸다.
+#
+# 앞 문장은 그대로 두고 **괄호 안만** 붙인다 — `log_metrics`의
+# `balance_output2_missing_coded` 마커가 「없습니다 (rt_cd=」를 부분문자열로 센다.
+# ⛔ `"rt_cd"`(따옴표 포함)는 쓰지 않는다 — 그것은 `log_metrics._KIS_ERROR_BODY_TOKEN`이라
+# 파서 감사(`kis_error_response`)를 거짓으로 올린다. 그래서 `rt_cd=…` 형태로 적는다.
+LOG_BALANCE_OUTPUT2_MISSING = (
+    "get_balance() 응답에 output2가 없습니다 (rt_cd=%s · msg_cd=%s · msg1=%s · 키=%s)"
+)
+
+
+def _describe_missing_output2(response: dict) -> str:
+    """반환: `LOG_BALANCE_OUTPUT2_MISSING`을 채운 문장. 없는 필드는 `없음`으로 적는다(지어내지 않는다)."""
+    def field_of(key: str) -> str:
+        value = response.get(key)
+        return "없음" if value in (None, "") else str(value).strip()
+
+    keys = ",".join(sorted(str(k) for k in response)) or "없음"
+    return LOG_BALANCE_OUTPUT2_MISSING % (
+        field_of("rt_cd"), field_of("msg_cd"), field_of("msg1"), keys,
+    )
+
+
 def parse_balance_response(response: dict, timestamp: datetime) -> BalanceSnapshot:
     """
     입력: `KISRestClient.get_balance()` 원본 응답(`output1` 배열 + `output2` dict), 조회 시각.
@@ -134,11 +161,13 @@ def parse_balance_response(response: dict, timestamp: datetime) -> BalanceSnapsh
          담지 않는다. 반면 **값이 있는데 우리가 모르는 값**은 `unknown_side_count`로 세고
          경고를 남긴다 — 상세 근거는 `_BUY_SIDE_TOKENS` 위 주석.
     실패 조건: `output2`가 없으면(비정상 응답 — 예: 요청 파라미터 오류로 인한 실패 응답)
-              ValueError. `output1`이 없으면 빈 배열로 취급(포지션 없음).
+              ValueError — 메시지에 KIS의 `rt_cd`/`msg_cd`/`msg1`과 응답 키 목록을 함께 싣는다
+              (`LOG_BALANCE_OUTPUT2_MISSING` 위 절 주석). `output1`이 없으면 빈 배열로
+              취급(포지션 없음).
     """
     output2 = response.get("output2")
     if output2 is None:
-        raise ValueError("get_balance() 응답에 output2가 없습니다")
+        raise ValueError(_describe_missing_output2(response))
 
     rows = response.get("output1") or []
     records: list[PositionRecord] = []

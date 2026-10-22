@@ -482,6 +482,15 @@ _QUALITATIVE_MARKERS = {
     #
     # 포맷 원본: `mahdi.main.LOG_BALANCE_POLL_FAILED`
     "balance_poll_failed": "계좌 잔고 폴링 사이클 실패",
+    # ===== 2026-10-22 (10-22 제4부 Fix A) — 그 실패 중 **KIS 응답 코드가 실린** 것 =====
+    #
+    # 위 줄은 「실패했다」만 센다. 이 마커는 트레이스백 마지막 줄(예외 메시지)의 **괄호 꼬리**를
+    # 센다 — 실패 1건에 트레이스백 1개이므로 사건 1건 = 1줄이다. 위 값과 같으면 모든 실패가
+    # 코드를 실었다는 뜻이고, 이 값만 0이면 문구가 안 바뀐 버전이다(규약 C — 0도 인쇄한다).
+    # ⚠ 규약 G — 그날 KIS 상태에 비례한다. 잔고 조회가 복구된 날은 둘 다 0이 정상이다.
+    #
+    # 포맷 원본: `mahdi.execution.account_tracker.LOG_BALANCE_OUTPUT2_MISSING`
+    "balance_output2_missing_coded": "output2가 없습니다 (rt_cd=",
     # ===== 2026-08-25 (08-24 §1-6 / Fix#3) — 진입 판단은 섰는데 후보 종목이 0건인 분 =====
     #
     # 분 단위 정본은 DB(`selected_instruments.reason` · `strategy_rejected`)다. 이쪽은 **장중에
@@ -570,6 +579,9 @@ _QUALITATIVE_ALWAYS_PRESENT = (
     # 이 값은 하루 2건(08-24) 수준이라 0인 날이 흔하고, 그런 날 키가 없으면 이 축이 있는지
     # 없는지 다음 사람이 매번 다시 확인해야 한다.
     "balance_poll_failed",
+    # 2026-10-22 Fix A — 잔고 조회가 성공하는 날의 0이 정상값이다. 키가 없으면 「코드가 안
+    # 실렸다」와 「그 문구가 없던 버전」이 같은 빈칸이 된다(규약 C).
+    "balance_output2_missing_coded",
     # 2026-08-25 Fix#3 — 후보가 매 분 잘 골라지는 날은 이 값이 0이고, **0이 인쇄돼야
     # 「고르는 데 실패가 없던 하루」와 「그 줄이 없던 버전」이 갈린다**(규약 C).
     "entry_no_candidate",
